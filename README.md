@@ -48,11 +48,11 @@ For each data file , the correct answer is given in folder `Solutions/`,  e.g. t
 ## The dataset
 
 The data in the competition is taken from [here](https://github.com/monperrus/real-bug-fixes-icse-2015/), which consist of bug fixes in the [Apache software foundation](http://apache.org) extracted by Hao Zhong and Zhendong Su and analysed in [*An Empirical Study on Real Bug Fixes*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf). They claim that
-> ..., and most Apache projects carefully maintains the link between bug reports and bug fixes...
+> ..., and most Apache projects carefully maintains the link between bug reports and bug fixes ...
 
 We extracted all the one line replacement changes from the dataset and filter it further based on the following criteria:
 * Only Java files
-* Not only comment changes, but changes like 'int a = 1' to '//int a = 1' are possible, and verse versa
+* Not only comment changes, but changes like `int a = 1` to `//int a = 1` are possible, and verse versa
 * Inserted or removed line are not empty lines. Meaning that the inserted code line are not empty line, and the replaced code line are not empty line either
 * No test files
 
