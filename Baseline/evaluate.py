@@ -71,8 +71,6 @@ def main():
         except IOError:
             print(filename + " does not exist!")
             raise
-    print(str(sum(score.values())))
-    print(str(total_files))
     print("Total files: " + str(total_files))
     print("Average line error: " + str(sum(score.values())/(total_files*1.0)) + " (the lower, the better)")
     print("Top " + str(k) + " accuracy: " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")

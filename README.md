@@ -6,7 +6,7 @@ As input, you are given a pair (Java line, Java file) and as output you give a l
 
 ## Submission format
 
-To play in the competition, you have to submit a program which takes as input, a pair (Java line, Java file), and outputs on the console, the predicted line numbers (line number starts from 1!). Several line numbers can be predicted if the tool is not 100% sure of the prediction. The loss function of the competition in takes this into account.
+To play in the competition, you have to submit a program which takes as input, a pair (Java line, Java file), and outputs on the console, the predicted line numbers (line number starts from 1). Several line numbers can be predicted if the tool is not 100% sure of the prediction. The loss function of the competition in takes this into account.
 
 ```
 <FileName> <line numer>
@@ -20,6 +20,28 @@ E.g.;
 2.txt 78 526
 ...
 ```
+
+## How to evaluate your algorithm
+
+You can evaluate the performance of your algorithms by piping the outputs to `Baseline/evaluate.py`, for example:
+```shell
+python randomGuess.py -k 5 | python evaluate.py
+```
+
+The output will be something like this:
+```
+Total files: 2760
+Average line error: 0.960075351257 (the lower, the better)
+Top 5 accuracy: 0.0246376811594 (the higher, the better)
+```
+
+Explanation of each field:
+*`Total files`: Number of files in `Files/``
+*`Average line error`: Average loss of your prediction, more information in **Loss function**
+*`Top k accuracy`: Top k accuracy, meaning percentage of correct answers in your top k predictions. k is calculated as the maximum number of predictions made by your algorithm. In the above example, randomGuess.py product 5 predictions for each file.
+
+If your program failed to predict on certain files. They will have maximum loss, more information about loss in **Loss function**
+
 
 ## Folder structure and input format
 
