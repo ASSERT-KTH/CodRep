@@ -1,0 +1,244 @@
+public abstract class Token<T> implements RingPosition<Token<T>>
+
+/*
+* Licensed to the Apache Software Foundation (ASF) under one
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership.  The ASF licenses this file
+* to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*    http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
+package org.apache.cassandra.dht;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import java.io.Serializable;
+import java.nio.ByteBuffer;
+
+import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.db.RowPosition;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+public abstract class Token<T> implements RingPosition<Token<T>>, Serializable
+{
+    private static final long serialVersionUID = 1L;
+
+    private static final TokenSerializer serializer = new TokenSerializer();
+    public static TokenSerializer serializer()
+    {
+        return serializer;
+    }
+
+    public final T token;
+
+    private final transient KeyBound minimumBound = new KeyBound(true);
+    private final transient KeyBound maximumBound = new KeyBound(false);
+
+    protected Token(T token)
+    {
+        this.token = token;
+    }
+
+    /**
+     * This determines the comparison for node destination purposes.
+     */
+    abstract public int compareTo(Token<T> o);
+
+    @Override
+    public String toString()
+    {
+        return token.toString();
+    }
+
+    @Override
+    public boolean equals(Object obj)
+    {
+        if (this == obj)
+            return true;
+        if (obj == null || this.getClass() != obj.getClass())
+            return false;
+
+        return token.equals(((Token<T>)obj).token);
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return token.hashCode();
+    }
+
+    public static abstract class TokenFactory<T>
+    {
+        public abstract ByteBuffer toByteArray(Token<T> token);
+        public abstract Token<T> fromByteArray(ByteBuffer bytes);
+        public abstract String toString(Token<T> token); // serialize as string, not necessarily human-readable
+        public abstract Token<T> fromString(String string); // deserialize
+
+        public abstract void validate(String token) throws ConfigurationException;
+    }
+
+    public static class TokenSerializer implements ISerializer<Token>
+    {
+        public void serialize(Token token, DataOutput dos) throws IOException
+        {
+            IPartitioner p = StorageService.getPartitioner();
+            ByteBuffer b = p.getTokenFactory().toByteArray(token);
+            ByteBufferUtil.writeWithLength(b, dos);
+        }
+
+        public Token deserialize(DataInput dis) throws IOException
+        {
+            IPartitioner p = StorageService.getPartitioner();
+            int size = dis.readInt();
+            byte[] bytes = new byte[size];
+            dis.readFully(bytes);
+            return p.getTokenFactory().fromByteArray(ByteBuffer.wrap(bytes));
+        }
+
+        public long serializedSize(Token object)
+        {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    public Token<T> getToken()
+    {
+        return this;
+    }
+
+    public boolean isMinimum(IPartitioner partitioner)
+    {
+        return this.equals(partitioner.getMinimumToken());
+    }
+
+    public boolean isMinimum()
+    {
+        return isMinimum(StorageService.getPartitioner());
+    }
+
+    /*
+     * A token corresponds to the range of all the keys having this token.
+     * A token is thus no comparable directly to a key. But to be able to select
+     * keys given tokens, we introduce two "fake" keys for each token T:
+     *   - lowerBoundKey: a "fake" key representing the lower bound T represents.
+     *                    In other words, lowerBoundKey is the smallest key that
+     *                    have token T.
+     *   - upperBoundKey: a "fake" key representing the upper bound T represents.
+     *                    In other words, upperBoundKey is the largest key that
+     *                    have token T.
+     *
+     * Note that those are "fake" keys and should only be used for comparison
+     * of other keys, for selection of keys when only a token is known.
+     */
+    public KeyBound minKeyBound(IPartitioner partitioner)
+    {
+        return minimumBound;
+    }
+
+    public KeyBound minKeyBound()
+    {
+        return minKeyBound(null);
+    }
+
+    public KeyBound maxKeyBound(IPartitioner partitioner)
+    {
+        /*
+         * For each token, we needs both minKeyBound and maxKeyBound
+         * because a token corresponds to a range of keys. But the minimun
+         * token corresponds to no key, so it is valid and actually much
+         * simpler to associate the same value for minKeyBound and
+         * maxKeyBound for the minimun token.
+         */
+        if (isMinimum(partitioner))
+            return minimumBound;
+        return maximumBound;
+    }
+
+    public KeyBound maxKeyBound()
+    {
+        return maxKeyBound(StorageService.getPartitioner());
+    }
+
+    public <T extends RingPosition> T asSplitValue(Class<T> klass)
+    {
+        if (klass.equals(getClass()))
+            return (T)this;
+        else
+            return (T)maxKeyBound();
+    }
+
+    public class KeyBound extends RowPosition
+    {
+        public final boolean isMinimumBound;
+
+        private KeyBound(boolean isMinimumBound)
+        {
+            this.isMinimumBound = isMinimumBound;
+        }
+
+        public Token getToken()
+        {
+            return Token.this;
+        }
+
+        public int compareTo(RowPosition pos)
+        {
+            if (this == pos)
+                return 0;
+
+            int cmp = getToken().compareTo(pos.getToken());
+            if (cmp != 0)
+                return cmp;
+
+            // We've already eliminated the == case
+            return isMinimumBound ? -1 : 1;
+        }
+
+        public boolean isMinimum(IPartitioner partitioner)
+        {
+            return getToken().isMinimum(partitioner);
+        }
+
+        public RowPosition.Kind kind()
+        {
+            return isMinimumBound ? RowPosition.Kind.MIN_BOUND : RowPosition.Kind.MAX_BOUND;
+        }
+
+        @Override
+        public boolean equals(Object obj)
+        {
+            if (this == obj)
+                return true;
+            if (obj == null || this.getClass() != obj.getClass())
+                return false;
+
+            KeyBound other = (KeyBound)obj;
+            return getToken().equals(other.getToken());
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return getToken().hashCode() + (isMinimumBound ? 0 : 1);
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("%s(%s)", isMinimumBound ? "min" : "max", getToken().toString());
+        }
+    }
+}
