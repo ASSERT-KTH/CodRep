@@ -32,7 +32,7 @@ Each file contains:
 ```
 
 In the example below of data file `foo.txt`, `double b = 0.1` is the code line to be added somewhere in the file in place of another line.
-```java{.line-numbers}
+```java {.line-numbers}
 double b = 0.1
 
 public class test{
