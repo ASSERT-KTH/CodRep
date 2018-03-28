@@ -1,12 +1,88 @@
-# The CodRep Competition
+# CodRep: Machine Learning on Source Code Competition
 
-This competition is about predicting source Code Replacement (CodRep) changes.
+CodRep is a machine learning competition on source code data.
+The goal of the competition is provide different communities (machine learning, software engineering, programming language) with a common playground to test and compare ideas.
+The competition is designed with the following principles:
 
-As input, you are given a pair (Java line, Java file) and as output you give a line number corresponding to the line to be replaced by in the file.
+1. there is no specific background or skill requirements on program analysis to understand the data
+2. the systems that use the competition data can be used beyond the competition itself. In particular, there potential usages in the field of automated program repair.   
 
-## Submission format
+To take part to the competition, you have to write a program which predicts where to insert a specific line into a source code file. 
+In particular, we consider replacement insertions, where the new line replaces an old line, such as
 
-To play in the competition, you have to submit a program which takes as input, a pair (Java line, Java file), and outputs on the console, the predicted line numbers (line number starts from 1). Several line numbers can be predicted if the tool is not 100% sure of the prediction. The loss function of the competition in takes this into account.
+```diff
+public class test{
+  int a = 1
+-  int b = 0.1
++  double b = 0.1
+}
+```
+
+More specifically, the program  takes as input a set of pairs (Java source code line, Java source code file), and outputs, for each pair,  the predicted line number of the line to be replaced by in the initial source code file.
+
+The competition is organized by KTH Royal Institute of Technology, Stockholm, Sweden. The current organization team is Zimin Chen and Martin Monperrus.
+
+## The winners
+
+What the winner gets? 
+
+1. She gets her name in the hall of fame below
+2. She receives some KTH goodies by post
+3. Her solution is invited to be part of the futuristic program repair bot designed and implemented at KTH
+
+Hall of fame:
+
+| Data | Name | Score | Link |
+| --- | --- |--- | --- |
+| ... | ... | ... | ... |
+
+
+
+
+## Data Structure and Format
+
+The provided data is `Files/*.txt`. The txt files are meant to be parsed by competing programs. Their format is as follows, each file contains:
+```
+{Code line to insert}
+\newline
+{The full program file}
+```
+
+For instance, let's consider this example input file, called `foo.txt`.
+```java
+double b = 0.1
+
+public class test{
+  int a = 1
+  int b = 0.1
+}
+```
+In this example, `double b = 0.1` is the code line to be added somewhere in the file in place of another line.
+
+For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1`) with the new code line `double b = 0.1`.
+
+To train the system, the correct answer for all input files is given in folder `Solutions/`,  e.g. the correct answer to `Files/1.txt` is in `Solutions/1.txt`
+
+## Data provenance
+
+The data used in the competition is taken from real commits in open-source projects.
+For a number of different projects, we have analyzed all commits and extracted all the one line replacement changes.
+We have further filtered the data  based on the following criteria:
+
+* Only Java files are kept
+* Comment-only changes are discarded (eg insertion of `//int a = 1`)
+* Inserted or removed lines are not empty lines, and are not space-only changes
+
+## Command-line interface
+
+To play in the competition, your program takes as input input a folder name, that folder containing input data files (per the format explained above).
+
+```shell
+$ your-predictor Files
+```
+
+Your programs outputs on the console, for each input data file, the predicted line numbers. Several line numbers can be predicted if the tool is not 100% sure of a single prediction. Warning: by convention, line numbers start from 1 (and not 0).
+Your program does not have to predict something for all input files, if there is no clear answer, simply don't output anything, the error computation takes that into account, more information about this in **Loss function** below.
 
 ```
 <FileName> <line numer>
@@ -21,84 +97,49 @@ E.g.;
 ...
 ```
 
-## How to evaluate your algorithm
+## How to evaluate your competing program
 
-You can evaluate the performance of your algorithms by piping the outputs to `Baseline/evaluate.py`, for example:
+You can evaluate the performance of your program by piping the output to `Baseline/evaluate.py`, for example:
 ```shell
-python randomGuess.py -k 5 | python evaluate.py
+cd Baseline
+your-program Files | python evaluate.py
 ```
 
-The output will be something like this:
+The output of `evaluate.py` will be:
 ```
 Total files: 2760
-Average line error: 0.960075351257 (the lower, the better)
+Average error: 0.960075351257 (the lower, the better)
+Top 1 accuracy: 0.0187232372644 (the higher, the better)
 Top 5 accuracy: 0.0246376811594 (the higher, the better)
 ```
 
-Explanation of each field:
-* `Total files`: Number of files in `Files/``
-* `Average line error`: Average loss of your prediction, more information in **Loss function**
-* `Top k accuracy`: Top k accuracy, meaning percentage of correct answers in your top k predictions. k is calculated as the maximum number of predictions made by your algorithm. In the above example, randomGuess.py product 5 predictions for each file.
-
-If your program failed to predict on certain files. They will have maximum loss, more information about loss in **Loss function**
-
-
-## Folder structure and input format
-
-The provided data is `Files/*.txt`. The txt files are in a format that has been designed to be super easy to parse.
-Each file contains:
-```
-{Code line to insert}
-\newline
-{The program}
-```
-
-In the example below of data file `foo.txt`, `double b = 0.1` is the code line to be added somewhere in the file in place of another line.
-```java
-double b = 0.1
-
-public class test{
-  int a = 1
-  int b = 0.1
-}
-```
-
-If your program output `foo.txt 3`, it means replace line 3 (`int b = 0.1`) with the new code line `double b = 0.1`.
-
-For each data file , the correct answer is given in folder `Solutions/`,  e.g. the correct answer to `Files/1.txt` is in `Solutions/1.txt`
-
-## The dataset
-
-The data in the competition is taken from [here](https://github.com/monperrus/real-bug-fixes-icse-2015/), which consist of bug fixes in the [Apache software foundation](http://apache.org) extracted by Hao Zhong and Zhendong Su and analysed in [*An Empirical Study on Real Bug Fixes*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf). They claim that
-> ..., and most Apache projects carefully maintains the link between bug reports and bug fixes ...
-
-We extracted all the one line replacement changes from the dataset and filter it further based on the following criteria:
-* Only Java files
-* Not only comment changes, but changes like `int a = 1` to `//int a = 1` are possible, and verse versa
-* Inserted or removed line are not empty lines. Meaning that the inserted code line are not empty line, and the replaced code line are not empty line either
-* No test files
-
+Explanation of the output of `evaluate.py`:
+* `Total files`: Number of prediction tasks in `Files/`
+* `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition.
+* `Top k accuracy`: The percentage of correct answers in your top k predictions. As such, `Top 1 accuracy` is the percentage of perfect predictions. We give the accuracy because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
 
 ## Loss function
 
-The loss, or average line error, outputs by `evaluate.py`, is a measurement on how well your program performs on the competition. The lower the average line error is, the better are your predictions. The loss function was designed with following properties in mind:
-* 0 loss when your prediction is perfect
-* Constant loss even when your prediction is far away (The maximum loss is bounded)
-* Logarithmic curve between 0 and the constant so that the loss function outputs loss in the same magnitude when predictions are equally bad (Deviation of 50 or 100 lines are both equally bad!). And small gain if your prediction are really close (Since some code replacement are insensitive to locations, e.g. importing modules).
-* Symmetric, continuous and differentiable
+The average error is a loss function, output by `evaluate.py`, it measures how well your program performs on predicting the lines to be replaced. The lower the average line  is, the better are your predictions. 
 
-When comparing different algorithms, the outputs of average line error should be compared, not the accuracy. Since the accuracy is just a 0-1 loss function.
+The loss function for one prediction task is `tanh(abs({predicted line}-{correct line}))`. The average error is the loss function over all tasks, as calculated as the average of all individual loss. 
 
-The loss function we used is tanh(abs({predicted line}-{correct line})). And the average line error is calculated as the average of all loss. The range of tanh(abs(x)) is between 0 and 1, meaning maximum loss from a prediction is 1. By using bounded range, we also assure that we do not punish prediction on longer files, since the maximum loss is always 1. One example of advantages of using tanh(abs(x)) is illustrated in **Base line systems**
+This loss function is designed with the following properties in mind:
+* there i 0 loss when the prediction is perfect
+* there is a bounded and constant loss even when the prediction is far away
+* before the bound, the loss is logarithmic
+* a perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
+* the loss is symmetric, continuous and differentiable
 
+We note that the `Top k accuracy` does not comply with all those properties. 
 
 ## Base line systems
 
-We provide 5 stupid systems for illustrating our to parse the data, and having a baseline performance. These are:
-* `guessFirst.py`: Always predict the first line
-* `guessMiddle.py`: Always predict the line in the middle
-* `guessLast.py`: Always predict the last line
-* `randomGuess.py`: Predict random line, can take as argument number of outputs
-* `maximumError.py`: Predict the farthest line from the solution
+We provide 5 dumb systems for illustrating how to parse the data and having a baseline performance. These are:
+* `guessFirst.py`: Always predict the first line of the file
+* `guessMiddle.py`: Always predict the line in the middle of the file
+* `guessLast.py`: Always predict the last line of the file
+* `randomGuess.py`: Predict a random line in the file
+* `maximumError.py`: Predict the worst case, the farthest line from the correct solution
 
-We would expect that `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` performs equally bad and the loss function, or average line error, should reflect that. A test run shows that even when `guessMiddle.py` and `randomGuess.py` have 10x better accuracy (the intuition is `randomGuess.py` and `guessMiddle.py` are statically closer in average to the solution), the difference in the average line error is unnoticeable!.
+Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same error, the value of `average error` is comparable. 
