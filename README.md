@@ -18,25 +18,30 @@ public class test{
 }
 ```
 
-More specifically, the program  takes as input a set of pairs (Java source code line, Java source code file), and outputs, for each pair,  the predicted line number of the line to be replaced by in the initial source code file.
+More specifically, the program  takes as input a set of pairs (source code line, source code file), and outputs, for each pair,  the predicted line number of the line to be replaced by in the initial source code file.
 
 The competition is organized by KTH Royal Institute of Technology, Stockholm, Sweden. The current organization team is Zimin Chen and Martin Monperrus.
 
 ## The winners
 
-What the winner gets?
-
-1. She gets her name in the hall of fame below
-2. She receives some KTH goodies by post
-3. Her solution is invited to be part of the futuristic program repair bot designed and implemented at KTH
-
 Hall of fame:
 
-| Data | Name | Score | Link |
-| --- | --- |--- | --- |
-| ... | ... | ... | ... |
+| Data | Name | Score Visible | Score Hidden | Link |
+| --- | --- |--- | --- |--- |
+| ... | ... | ... | ... |--- |
 
+The scores are computed on the dataset present in this repository, as well as on an hidden dataset. The score on the hidden dataset is used for the final ranking.
 
+What the participants get?
+
+1. All participants get their name in the CodRep hall of fame
+1. All participants will be invited to present their solutions at a physical workshop with proceedings.
+
+What the winner gets?
+
+1. She gets the ultimate CodRep fame
+2. She receives nice KTH goodies by post
+4. Her solution is invited to be part of the futuristic program repair bot designed and implemented at KTH
 
 
 ## Data Structure and Format
@@ -69,9 +74,11 @@ The data used in the competition is taken from real commits in open-source proje
 For a number of different projects, we have analyzed all commits and extracted all the one line replacement changes.
 We have further filtered the data  based on the following criteria:
 
-* Only Java files are kept
+* Only source code files are kept (Java files in dataset00)
 * Comment-only changes are discarded (e.g. replacing `// TODO` with '// Fixed')
 * Inserted or removed lines are not empty lines, and are not space-only changes
+
+**Contributing**: If you like to contribute with a new dataset, drop us a new email.
 
 ## Command-line interface
 
