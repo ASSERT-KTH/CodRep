@@ -75,7 +75,7 @@ For a number of different projects, we have analyzed all commits and extracted a
 We have further filtered the data  based on the following criteria:
 
 * Only source code files are kept (Java files in dataset00)
-* Comment-only changes are discarded (e.g. replacing `// TODO` with '// Fixed')
+* Comment-only changes are discarded (e.g. replacing `// TODO` with `// Fixed`)
 * Inserted or removed lines are not empty lines, and are not space-only changes
 
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
@@ -132,11 +132,11 @@ The average error is a loss function, output by `evaluate.py`, it measures how w
 The loss function for one prediction task is `tanh(abs({predicted line}-{correct line}))`. The average error is the loss function over all tasks, as calculated as the average of all individual loss.
 
 This loss function is designed with the following properties in mind:
-* there i 0 loss when the prediction is perfect
-* there is a bounded and constant loss even when the prediction is far away
-* before the bound, the loss is logarithmic
-* a perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
-* the loss is symmetric, continuous and differentiable
+* There is 0 loss when the prediction is perfect
+* There is a bounded and constant loss even when the prediction is far away
+* Before the bound, the loss is logarithmic
+* A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
+* The loss is symmetric, continuous and differentiable
 
 We note that the `Top k accuracy` does not comply with all those properties.
 
