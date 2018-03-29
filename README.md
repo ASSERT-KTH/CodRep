@@ -4,10 +4,10 @@ CodRep is a machine learning competition on source code data.
 The goal of the competition is provide different communities (machine learning, software engineering, programming language) with a common playground to test and compare ideas.
 The competition is designed with the following principles:
 
-1. there is no specific background or skill requirements on program analysis to understand the data
-2. the systems that use the competition data can be used beyond the competition itself. In particular, there potential usages in the field of automated program repair.   
+1. There is no specific background or skill requirements on program analysis to understand the data.
+2. The systems that use the competition data can be used beyond the competition itself. In particular, there potential usages in the field of automated program repair.   
 
-To take part to the competition, you have to write a program which predicts where to insert a specific line into a source code file. 
+To take part to the competition, you have to write a program which predicts where to insert a specific line into a source code file.
 In particular, we consider replacement insertions, where the new line replaces an old line, such as
 
 ```diff
@@ -24,7 +24,7 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 
 ## The winners
 
-What the winner gets? 
+What the winner gets?
 
 1. She gets her name in the hall of fame below
 2. She receives some KTH goodies by post
@@ -70,7 +70,7 @@ For a number of different projects, we have analyzed all commits and extracted a
 We have further filtered the data  based on the following criteria:
 
 * Only Java files are kept
-* Comment-only changes are discarded (eg insertion of `//int a = 1`)
+* Comment-only changes are discarded (e.g. replacing `// TODO` with '// Fixed')
 * Inserted or removed lines are not empty lines, and are not space-only changes
 
 ## Command-line interface
@@ -120,9 +120,9 @@ Explanation of the output of `evaluate.py`:
 
 ## Loss function
 
-The average error is a loss function, output by `evaluate.py`, it measures how well your program performs on predicting the lines to be replaced. The lower the average line  is, the better are your predictions. 
+The average error is a loss function, output by `evaluate.py`, it measures how well your program performs on predicting the lines to be replaced. The lower the average line  is, the better are your predictions.
 
-The loss function for one prediction task is `tanh(abs({predicted line}-{correct line}))`. The average error is the loss function over all tasks, as calculated as the average of all individual loss. 
+The loss function for one prediction task is `tanh(abs({predicted line}-{correct line}))`. The average error is the loss function over all tasks, as calculated as the average of all individual loss.
 
 This loss function is designed with the following properties in mind:
 * there i 0 loss when the prediction is perfect
@@ -131,7 +131,7 @@ This loss function is designed with the following properties in mind:
 * a perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
 * the loss is symmetric, continuous and differentiable
 
-We note that the `Top k accuracy` does not comply with all those properties. 
+We note that the `Top k accuracy` does not comply with all those properties.
 
 ## Base line systems
 
@@ -142,4 +142,4 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 * `randomGuess.py`: Predict a random line in the file
 * `maximumError.py`: Predict the worst case, the farthest line from the correct solution
 
-Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same error, the value of `average error` is comparable. 
+Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same error, the value of `average error` is comparable.
