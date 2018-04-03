@@ -87,7 +87,7 @@ The datasets used in this competition are from:
 
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
 
-## Statistics on datasets
+## Statistics on the competition
 
 | Directory | Total source code files | Lines of code (LOC) |
 | --- | --- |--- |
@@ -135,7 +135,7 @@ Top 5 accuracy: 0.0246376811594 (the higher, the better)
 
 For evaluating specific datasets, use [-d] or [-datasets=] options and specify paths to datasets. The default behaviour is evaluating on all datasets. The path must be absolute path and multiple paths should be separated by `:`, for example:
 ```shell
-your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Datasets/Dataset1
+your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Datasets/Dataset1:/Users/foo/bar/CodRep-competition/Datasets/Dataset1
 ```
 
 Explanation of the output of `evaluate.py`:
