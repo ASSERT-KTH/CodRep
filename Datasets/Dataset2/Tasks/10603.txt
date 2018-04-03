@@ -1,0 +1,79 @@
+import org.columba.api.gui.frame.IFrameMediator;
+
+//The contents of this file are subject to the Mozilla Public License Version 1.1
+//(the "License"); you may not use this file except in compliance with the
+//License. You may obtain a copy of the License at http://www.mozilla.org/MPL/
+//
+//Software distributed under the License is distributed on an "AS IS" basis,
+//WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+//for the specific language governing rights and
+//limitations under the License.
+//
+//The Original Code is "The Columba Project"
+//
+//The Initial Developers of the Original Code are Frederik Dietz and Timo Stich.
+//Portions created by Frederik Dietz and Timo Stich are Copyright (C) 2003.
+//
+//All Rights Reserved.
+package org.columba.mail.gui.tree.action;
+
+import java.awt.event.ActionEvent;
+import java.awt.event.KeyEvent;
+
+import javax.swing.KeyStroke;
+
+import org.columba.core.gui.frame.IFrameMediator;
+import org.columba.mail.command.MailFolderCommandReference;
+import org.columba.mail.folder.AbstractFolder;
+import org.columba.mail.folder.IMailFolder;
+import org.columba.mail.gui.frame.MailFrameMediator;
+import org.columba.mail.gui.frame.TreeViewOwner;
+import org.columba.mail.gui.tree.FolderTreeModel;
+import org.columba.mail.util.MailResourceLoader;
+
+/**
+ * Move selected folder up for one row.
+ * <p>
+ *
+ * @author fdietz
+ * @author redsolo
+ */
+public class MoveUpAction extends AbstractMoveFolderAction {
+
+    /**
+     * @param frameMediator the frame cpntroller.
+     */
+    public MoveUpAction(IFrameMediator frameMediator) {
+        super(frameMediator,
+            MailResourceLoader.getString("menu", "mainframe",
+                "menu_folder_moveup"));
+        setEnabled(false);
+
+        // shortcut key
+        putValue(ACCELERATOR_KEY,
+            KeyStroke.getKeyStroke(KeyEvent.VK_UP, ActionEvent.ALT_MASK));
+    }
+
+    /**
+     * @see java.awt.event.ActionListener#actionPerformed(java.awt.event.ActionEvent)
+     */
+    public void actionPerformed(ActionEvent arg0) {
+        MailFolderCommandReference r = (MailFolderCommandReference) ((MailFrameMediator) frameMediator).getTreeSelection();
+
+        IMailFolder folder = (IMailFolder) r.getSourceFolder();
+
+        int newIndex = folder.getParent().getIndex(folder);
+        newIndex = newIndex - 1;
+        ((AbstractFolder) folder.getParent()).insert(folder, newIndex);
+
+        FolderTreeModel.getInstance().nodeStructureChanged(folder.getParent());
+        
+        // select folder again after move operation
+        ((TreeViewOwner) frameMediator).getTreeController().setSelected(folder);
+    }
+
+    /** {@inheritDoc} */
+    protected boolean isActionEnabledByIndex(int folderIndex) {
+        return (folderIndex > 0);
+    }
+}

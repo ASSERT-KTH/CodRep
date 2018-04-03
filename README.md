@@ -46,7 +46,7 @@ What the winner gets?
 
 ## Data Structure and Format
 
-The provided data is `Files/*.txt`. The txt files are meant to be parsed by competing programs. Their format is as follows, each file contains:
+The provided data are in `Datasets/.../Tasks/*.txt`. The txt files are meant to be parsed by competing programs. Their format is as follows, each file contains:
 ```
 {Code line to insert}
 \newline
@@ -66,7 +66,7 @@ In this example, `double b = 0.1` is the code line to be added somewhere in the 
 
 For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1`) with the new code line `double b = 0.1`.
 
-To train the system, the correct answer for all input files is given in folder `Solutions/`,  e.g. the correct answer to `Files/1.txt` is in `Solutions/1.txt`
+To train the system, the correct answer for all input files is given in folder `Datasets/.../Solutions/*.txt`,  e.g. the correct answer to `Datasets/Datasets1/Tasks/1.txt` is in `Datasets/Datasets1/Solutions/1.txt`
 
 ## Data provenance
 
@@ -78,7 +78,22 @@ We have further filtered the data  based on the following criteria:
 * Comment-only changes are discarded (e.g. replacing `// TODO` with `// Fixed`)
 * Inserted or removed lines are not empty lines, and are not space-only changes
 
+The datasets used in this competition are from:
+
+| Directory | Original dataset | Published paper |
+| --- | --- |--- |
+| Dataset1/ | [github](https://github.com/monperrus/real-bug-fixes-icse-2015/) | *[An Empirical Study on Real Bug Fixes (ICSE 2015)](An Empirical Study on Real Bug Fixes)* |
+| Dataset2/ | [link to origin]() | [link to paper]() |
+
+
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
+
+## Statistics on datasets
+
+| Directory | Total source code files | Lines of code (LOC) |
+| --- | --- |--- |
+| Dataset1/ | 4421 | 2305784 |
+| Dataset2/ | 11141 | 5556153 |
 
 ## Command-line interface
 
@@ -108,7 +123,6 @@ E.g.;
 
 You can evaluate the performance of your program by piping the output to `Baseline/evaluate.py`, for example:
 ```shell
-cd Baseline
 your-program Files | python evaluate.py
 ```
 
@@ -120,10 +134,15 @@ Top 1 accuracy: 0.0187232372644 (the higher, the better)
 Top 5 accuracy: 0.0246376811594 (the higher, the better)
 ```
 
+For evaluating specific datasets, use [-d] or [-datasets=] options and specify paths to datasets. The default behaviour is evaluating on all datasets. The path must be absolute path and multiple paths should be separated by `:`, for example:
+```shell
+your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Datasets/Dataset1
+```
+
 Explanation of the output of `evaluate.py`:
 * `Total files`: Number of prediction tasks in `Files/`
 * `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition.
-* `Top k accuracy`: The percentage of correct answers in your top k predictions. As such, `Top 1 accuracy` is the percentage of perfect predictions. We give the accuracy because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
+* `Top k accuracy`: The percentage of correct answers in your top k predictions. As such, `Top 1 accuracy` is the percentage of perfect predictions in your top-1 prediction. We give the accuracy because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
 
 ## Loss function
 

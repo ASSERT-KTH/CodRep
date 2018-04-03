@@ -3,11 +3,20 @@ import glob
 import sys
 
 def main():
-    path_files = "../Files"
-    for filename in glob.glob(os.path.join(path_files, "*.txt")):
-        with open(filename, 'r') as file:
-            length = len(file.readlines()) - 2
-            print(os.path.basename(filename) + " " + str(length))
+    path_to_current = os.path.abspath(os.path.dirname(__file__))
+    path_to_datasets = os.path.join(path_to_current, "../Datasets/")
+
+    for dataset_dir in os.listdir(path_to_datasets):
+        path_to_dataset = os.path.join(path_to_datasets, dataset_dir)
+        if(os.path.isdir(path_to_dataset)):
+            path_to_tasks = os.path.join(path_to_dataset, "Tasks/")
+            for task in os.listdir(path_to_tasks):
+                if(task.endswith(".txt")):
+                    path_to_task = os.path.abspath(os.path.join(path_to_tasks, task))
+                    with open(path_to_task, 'r') as file:
+                        length = len(file.readlines())-2
+                        # Always guess the last line
+                        print(path_to_task + " " + str(length))
 
 if __name__=="__main__":
     main()

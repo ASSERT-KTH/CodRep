@@ -1,0 +1,389 @@
+if (name.isAbsolute())
+
+// Copyright (c) 1999 Brian Wellington (bwelling@xbill.org)
+// Portions Copyright (c) 1999 Network Associates, Inc.
+
+/* High level API */
+
+package org.xbill.DNS;
+
+import java.util.*;
+import java.io.*;
+import java.net.*;
+
+/**
+ * High level API for mapping queries to DNS Records.  Caching is used
+ * when possible to reduce the number of DNS requests, and a Resolver
+ * is used to perform the queries.  A search path can be set or determined
+ * by FindServer, which allows lookups of unqualified names.
+ * @see Resolver
+ * @see FindServer
+ *
+ * @author Brian Wellington
+ */
+
+public final class dns {
+
+private static Resolver res;
+private static Map caches;
+private static Name [] searchPath;
+private static boolean searchPathSet;
+private static boolean initialized;
+
+static {
+	initialize();
+}
+
+/* Otherwise the class could be instantiated */
+private
+dns() {}
+
+private static synchronized void
+clearCaches() {
+	Iterator it = caches.entrySet().iterator();
+	while (it.hasNext()) {
+		Cache c = (Cache)it.next();
+		c.clearCache();
+	}
+}
+
+private static synchronized void
+initialize() {
+	if (initialized)
+		return;
+	initialized = true;
+	if (res == null) {
+		try {
+			setResolver(new ExtendedResolver());
+		}
+		catch (UnknownHostException uhe) {
+			System.err.println("Failed to initialize resolver");
+			System.exit(-1);
+		}
+	}
+	if (!searchPathSet)
+		searchPath = FindServer.searchPath();
+	
+	if (caches == null)
+		caches = new HashMap();
+	else
+		clearCaches();
+}
+
+static boolean
+matchType(short type1, short type2) {
+	return (type1 == Type.ANY || type2 == Type.ANY || type1 == type2);
+}
+
+/**
+ * Converts an InetAddress into the corresponding domain name
+ * (127.0.0.1 -> 1.0.0.127.IN-ADDR.ARPA.)
+ * @return A String containing the domain name.
+ */
+public static String
+inaddrString(InetAddress addr) {
+	byte [] address = addr.getAddress();
+	StringBuffer sb = new StringBuffer();
+	for (int i = 3; i >= 0; i--) {
+		sb.append(address[i] & 0xFF);
+		sb.append(".");
+	}
+	sb.append("IN-ADDR.ARPA.");
+	return sb.toString();
+}
+
+/**
+ * Converts an String containing an IP address in dotted quad form into the
+ * corresponding domain name.
+ * ex. 127.0.0.1 -> 1.0.0.127.IN-ADDR.ARPA.
+ * @return A String containing the domain name.
+ */
+public static String
+inaddrString(String s) {
+	InetAddress address;
+	try {
+		address = InetAddress.getByName(s);
+	}
+	catch (UnknownHostException e) {
+		return null;
+	}
+	return inaddrString(address);
+}
+
+/**
+ * Sets the Resolver to be used by functions in the dns class
+ */
+public static synchronized void
+setResolver(Resolver res) {
+	initialize();
+	dns.res = res;
+}
+
+/**
+ * Obtains the Resolver used by functions in the dns class.  This can be used
+ * to set Resolver properties.
+ */
+public static synchronized Resolver
+getResolver() {
+	return res;
+}
+
+/**
+ * Specifies the domains which will be appended to unqualified names before
+ * beginning the lookup process.  If this is not set, FindServer will be used.
+ * @see FindServer
+ */
+public static synchronized void
+setSearchPath(String [] domains) {
+	if (domains == null || domains.length == 0)
+		searchPath = null;
+	else {
+		List l = new ArrayList();
+		for (int i = 0; i < domains.length; i++) {
+			try {
+				l.add(Name.fromString(domains[i], Name.root));
+			}
+			catch (TextParseException e) {
+			}
+		}
+		searchPath = (Name [])l.toArray(new Name[l.size()]);
+	}
+	searchPathSet = true;
+}
+
+/**
+ * Obtains the Cache used by functions in the dns class.  This can be used
+ * to perform more specific queries and/or remove elements.
+ *
+ * @param dclass The dns class of data in the cache
+ */
+public static synchronized Cache
+getCache(short dclass) {
+	Cache c = (Cache) caches.get(DClass.toShort(dclass));
+	if (c == null) {
+		c = new Cache(dclass);
+		caches.put(DClass.toShort(dclass), c);
+	}
+	return c;
+}
+
+/**
+ * Obtains the (class IN) Cache used by functions in the dns class.  This
+ * can be used to perform more specific queries and/or remove elements.
+ *
+ * @param dclass The dns class of data in the cache
+ */
+public static synchronized Cache
+getCache() {
+	return getCache(DClass.IN);
+}
+
+private static Record []
+lookup(Name name, short type, short dclass, byte cred, int iterations,
+       boolean querysent)
+{
+	Cache cache;
+
+	if (iterations > 6)
+		return null;
+
+	if (Options.check("verbose"))
+		System.err.println("lookup " + name + " " + Type.string(type));
+	cache = getCache(dclass);
+	SetResponse cached = cache.lookupRecords(name, type, cred);
+	if (Options.check("verbose"))
+		System.err.println(cached);
+	if (cached.isSuccessful()) {
+		RRset [] rrsets = cached.answers();
+		List l = new ArrayList();
+		Iterator it;
+		Record [] answers;
+		int i = 0;
+
+		for (i = 0; i < rrsets.length; i++) {
+			it = rrsets[i].rrs();
+			while (it.hasNext()) {
+				l.add(it.next());
+			}
+		}
+
+		return (Record []) l.toArray(new Record[l.size()]);
+	}
+	else if (cached.isNXDOMAIN() || cached.isNXRRSET()) {
+		return null;
+	}
+	else if (cached.isCNAME()) {
+		CNAMERecord cname = cached.getCNAME();
+		return lookup(cname.getTarget(), type, dclass, cred,
+			      ++iterations, false);
+	}
+	else if (cached.isDNAME()) {
+		DNAMERecord dname = cached.getDNAME();
+		Name newname;
+		try {
+			newname = name.fromDNAME(dname);
+		}
+		catch (NameTooLongException e) {
+			return null;
+		}
+		return lookup(newname, type, dclass, cred, ++iterations, false);
+	}
+	else if (querysent) {
+		return null;
+	}
+	else {
+		Record question = Record.newRecord(name, type, dclass);
+		Message query = Message.newQuery(question);
+		Message response;
+
+		try {
+			response = res.send(query);
+		}
+		catch (Exception ex) {
+			return null;
+		}
+
+		short rcode = response.getHeader().getRcode();
+		if (rcode == Rcode.NOERROR || rcode == Rcode.NXDOMAIN)
+			cache.addMessage(response);
+
+		if (rcode != Rcode.NOERROR)
+			return null;
+
+		return lookup(name, type, dclass, cred, iterations, true);
+	}
+}
+
+
+private static Record []
+lookupAppend(Name name, Name suffix, short type, short dclass, byte cred,
+	     int iterations, boolean querysent)
+{
+	try {
+		Name newname = Name.concatenate(name, suffix);
+		return lookup(newname, type, dclass, cred, iterations,
+			      querysent);
+	}
+	catch (NameTooLongException e) {
+		return null;
+	}
+}
+
+/**
+ * Finds records with the given name, type, and class with a certain credibility
+ * @param namestr The name of the desired records
+ * @param type The type of the desired records
+ * @param dclass The class of the desired records
+ * @param cred The minimum credibility of the desired records
+ * @see Credibility
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getRecords(String namestr, short type, short dclass, byte cred) {
+	Record [] answers = null;
+	Name name;
+
+	try {
+		name = Name.fromString(namestr, null);
+	} catch (TextParseException e) {
+		return null;
+	}
+
+	if (!Type.isRR(type) && type != Type.ANY)
+		return null;
+
+	if (name.isQualified())
+		answers = lookup(name, type, dclass, cred, 0, false);
+	else if (searchPath == null) {
+		answers = lookupAppend(name, Name.root, type, dclass,
+				       cred, 0, false);
+	} else {
+		answers = null;
+
+		if (name.labels() > 1)
+			answers = lookupAppend(name, Name.root, type, dclass,
+					       cred, 0, false);
+
+		for (int i = 0; answers == null && i < searchPath.length; i++)
+			answers = lookupAppend(name, searchPath[i], type,
+					       dclass, cred, 0, false);
+
+		if (answers == null && name.labels() <= 1)
+			answers = lookupAppend(name, Name.root, type, dclass,
+					       cred, 0, false);
+	}
+
+	return answers;
+}
+
+/**
+ * Finds credible records with the given name, type, and class
+ * @param namestr The name of the desired records
+ * @param type The type of the desired records
+ * @param dclass The class of the desired records
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getRecords(String namestr, short type, short dclass) {
+	return getRecords(namestr, type, dclass, Credibility.NORMAL);
+}
+
+/**
+ * Finds any records with the given name, type, and class
+ * @param namestr The name of the desired records
+ * @param type The type of the desired records
+ * @param dclass The class of the desired records
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getAnyRecords(String namestr, short type, short dclass) {
+	return getRecords(namestr, type, dclass, Credibility.ANY);
+}
+
+/**
+ * Finds credible records with the given name and type in class IN
+ * @param namestr The name of the desired records
+ * @param type The type of the desired records
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getRecords(String name, short type) {
+	return getRecords(name, type, DClass.IN, Credibility.NORMAL);
+}
+
+/**
+ * Finds any records with the given name and type in class IN
+ * @param namestr The name of the desired records
+ * @param type The type of the desired records
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getAnyRecords(String name, short type) {
+	return getRecords(name, type, DClass.IN, Credibility.ANY);
+}
+
+/**
+ * Finds credible records for the given dotted quad address and type in class IN
+ * @param addr The dotted quad address of the desired records
+ * @param type The type of the desired records
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getRecordsByAddress(String addr, short type) {
+	String name = inaddrString(addr);
+	return getRecords(name, type, DClass.IN, Credibility.NORMAL);
+}
+
+/**
+ * Finds any records for the given dotted quad address and type in class IN
+ * @param addr The dotted quad address of the desired records
+ * @param type The type of the desired records
+ * @return The matching records, or null if none are found
+ */
+public static Record []
+getAnyRecordsByAddress(String addr, short type) {
+	String name = inaddrString(addr);
+	return getRecords(name, type, DClass.IN, Credibility.ANY);
+}
+
+}

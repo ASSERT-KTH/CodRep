@@ -1,0 +1,51 @@
+public void releaseLock(Object locker) {
+
+//The contents of this file are subject to the Mozilla Public License Version 1.1
+//(the "License"); you may not use this file except in compliance with the 
+//License. You may obtain a copy of the License at http://www.mozilla.org/MPL/
+//
+//Software distributed under the License is distributed on an "AS IS" basis,
+//WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License 
+//for the specific language governing rights and
+//limitations under the License.
+//
+//The Original Code is "The Columba Project"
+//
+//The Initial Developers of the Original Code are Frederik Dietz and Timo Stich.
+//Portions created by Frederik Dietz and Timo Stich are Copyright (C) 2003. 
+//
+//All Rights Reserved.
+package org.columba.core.command;
+
+import org.columba.core.util.Lock;
+
+/**
+ * Encapsulates the reference for a {@link Command}-
+ *
+ * @author fdietz, tstich
+ */
+public class DefaultCommandReference {
+
+	/**
+	 * a lock to claim access on some resource
+	 */
+	protected Lock lock;
+
+	/**
+	 * Try to get lock.
+	 * 
+	 * @param locker	the instance who wants to have the lock
+	 *  
+	 * @return			true, if locker has got the lock, false otherwise
+	 */
+	public boolean tryToGetLock(Object locker) {
+		return true;
+	}
+
+	/**
+	 * Release lock.
+	 */
+	public void releaseLock() {
+
+	}
+}

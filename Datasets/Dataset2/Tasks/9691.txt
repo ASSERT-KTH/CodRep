@@ -1,0 +1,20 @@
+return "4.4-snapshot-20070629-0646";
+
+package junit.runner;
+
+/**
+ * This class defines the current version of JUnit
+ */
+public class Version {
+	private Version() {
+		// don't instantiate
+	}
+
+	public static String id() {
+		return "4.4-snapshot-20070322-1027";
+	}
+	
+	public static void main(String[] args) {
+		System.out.println(id());
+	}
+}

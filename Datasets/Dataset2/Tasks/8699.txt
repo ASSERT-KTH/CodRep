@@ -1,0 +1,32 @@
+return "" + character; // TODO 1.4 Character.toString(character);
+
+/*******************************************************************************
+ * Copyright (c) 2000, 2003 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials 
+ * are made available under the terms of the Common Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/cpl-v10.html
+ * 
+ * Contributors:
+ *     IBM Corporation - initial API and implementation
+ *******************************************************************************/
+
+package org.eclipse.ui.internal.commands.keys;
+
+public class CharacterKey extends NonModifierKey {
+
+	private char character;
+	
+	CharacterKey(char character) {
+		super();
+		this.character = character;
+	}
+
+	public char getCharacter() {
+		return character;
+	}
+
+	public String toString() {
+		return Character.toString(character);
+	}
+}

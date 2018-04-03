@@ -2,22 +2,30 @@ import os
 import glob
 import random
 
-def maximumError(program_length, solution_line):
-    if(solution_line-1 > program_length-solution_line):
+def maximumError(program_length, solution):
+    if(solution-1 > program_length-solution):
         return 1
     else:
         return program_length
 
 def main():
-    path_files = "../Files"
-    for filename in glob.glob(os.path.join(path_files, "*.txt")):
-        with open(filename, 'r') as file:
-            with open(filename.replace("Files", "Solutions"), "r") as solution:
-                lines = file.readlines()
-                # Since first two lines are not part of the program
-                program_length = len(lines)-2
-                solution_line = int(solution.readline())
-                print(os.path.basename(filename) + " " + str(maximumError(program_length,solution_line)))
+    path_to_current = os.path.abspath(os.path.dirname(__file__))
+    path_to_datasets = os.path.join(path_to_current, "../Datasets/")
+
+    for dataset_dir in os.listdir(path_to_datasets):
+        path_to_dataset = os.path.join(path_to_datasets, dataset_dir)
+        if(os.path.isdir(path_to_dataset)):
+            path_to_tasks = os.path.join(path_to_dataset, "Tasks/")
+            for task in os.listdir(path_to_tasks):
+                if(task.endswith(".txt")):
+                    path_to_task = os.path.abspath(os.path.join(path_to_tasks, task))
+                    with open(path_to_task, 'r') as file:
+                        program_length = len(file.readlines())-2
+                    with open(path_to_task.replace("Tasks","Solutions"), "r") as file:
+                        solution = int(file.readline())
+                    # Guess the line farthest from the solution
+                    print(path_to_task + " " + str(maximumError(program_length,solution)))
+
 
 if __name__=="__main__":
     main()

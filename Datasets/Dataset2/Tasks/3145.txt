@@ -1,0 +1,382 @@
+byte error = tsig.verifyAXFR(m, in, null,
+
+// Copyright (c) 1999 Brian Wellington (bwelling@xbill.org)
+// Portions Copyright (c) 1999 Network Associates, Inc.
+
+package org.xbill.DNS;
+
+import java.util.*;
+import java.io.*;
+import java.net.*;
+import org.xbill.DNS.utils.*;
+import org.xbill.Task.*;
+
+/**
+ * An implementation of Resolver that sends one query to one server.
+ * SimpleResolver handles TCP retries, transaction security (TSIG), and
+ * EDNS 0.
+ * @see Resolver
+ * @see TSIG
+ * @see OPTRecord
+ *
+ * @author Brian Wellington
+ */
+
+
+public class SimpleResolver implements Resolver {
+
+/** The default port to send queries to */
+public static final int DEFAULT_PORT = 53;
+
+private InetAddress addr;
+private int port = DEFAULT_PORT;
+private boolean useTCP, ignoreTruncation;
+private byte EDNSlevel = -1;
+private TSIG tsig;
+private int timeoutValue = 10 * 1000;
+
+private static final short DEFAULT_UDPSIZE = 512;
+private static final short EDNS_UDPSIZE = 1280;
+
+private static String defaultResolver = "localhost";
+private static int uniqueID = 0;
+
+
+/**
+ * Creates a SimpleResolver that will query the specified host 
+ * @exception UnknownHostException Failure occurred while finding the host
+ */
+public
+SimpleResolver(String hostname) throws UnknownHostException {
+	if (hostname == null) {
+		hostname = FindServer.server();
+		if (hostname == null)
+			hostname = defaultResolver;
+	}
+	if (hostname.equals("0"))
+		addr = InetAddress.getLocalHost();
+	else
+		addr = InetAddress.getByName(hostname);
+}
+
+/**
+ * Creates a SimpleResolver.  The host to query is either found by
+ * FindServer, or the default host is used.
+ * @see FindServer
+ * @exception UnknownHostException Failure occurred while finding the host
+ */
+public
+SimpleResolver() throws UnknownHostException {
+	this(null);
+}
+
+/** Sets the default host (initially localhost) to query */
+public static void
+setDefaultResolver(String hostname) {
+	defaultResolver = hostname;
+}
+
+public void
+setPort(int port) {
+	this.port = port;
+}
+
+public void
+setTCP(boolean flag) {
+	this.useTCP = flag;
+}
+
+public void
+setIgnoreTruncation(boolean flag) {
+	this.ignoreTruncation = flag;
+}
+
+public void
+setEDNS(int level) {
+	if (level != 0 && level != -1)
+		throw new UnsupportedOperationException("invalid EDNS level " +
+							"- must be 0 or -1");
+	this.EDNSlevel = (byte) level;
+}
+
+public void
+setTSIGKey(Name name, byte [] key) {
+	tsig = new TSIG(name, key);
+}
+
+public void
+setTSIGKey(String name, String key) {
+	byte [] keyArray;
+	Name keyname;
+	if (key.length() > 1 && key.charAt(0) == ':')
+		keyArray = base16.fromString(key.substring(1));
+	else
+		keyArray = base64.fromString(key);
+	if (keyArray == null)
+		throw new IllegalArgumentException("Invalid TSIG key string");
+	try {
+		keyname = Name.fromString(name, Name.root);
+	}
+	catch (TextParseException e) {
+		throw new IllegalArgumentException("Invalid TSIG key name");
+	}
+	setTSIGKey(keyname, keyArray);
+}
+
+public void
+setTSIGKey(String key) throws UnknownHostException {
+	setTSIGKey(InetAddress.getLocalHost().getHostName(), key);
+}
+
+public void
+setTimeout(int secs) {
+	timeoutValue = secs * 1000;
+}
+
+private byte []
+readUDP(DatagramSocket s, int max) throws IOException {
+	DatagramPacket dp = new DatagramPacket(new byte[max], max);
+	s.receive(dp);
+	byte [] in = new byte[dp.getLength()];
+	System.arraycopy(dp.getData(), 0, in, 0, in.length);
+	if (Options.check("verbosemsg"))
+		System.err.println(hexdump.dump("UDP read", in));
+	return (in);
+}
+
+private void
+writeUDP(DatagramSocket s, byte [] out, InetAddress addr, int port)
+throws IOException
+{
+	if (Options.check("verbosemsg"))
+		System.err.println(hexdump.dump("UDP write", out));
+	s.send(new DatagramPacket(out, out.length, addr, port));
+}
+
+private byte []
+readTCP(Socket s) throws IOException {
+	DataInputStream dataIn;
+
+	dataIn = new DataInputStream(s.getInputStream());
+	int inLength = dataIn.readUnsignedShort();
+	byte [] in = new byte[inLength];
+	dataIn.readFully(in);
+	if (Options.check("verbosemsg"))
+		System.err.println(hexdump.dump("TCP read", in));
+	return (in);
+}
+
+private void
+writeTCP(Socket s, byte [] out) throws IOException {
+	DataOutputStream dataOut;
+
+	if (Options.check("verbosemsg"))
+		System.err.println(hexdump.dump("TCP write", out));
+	dataOut = new DataOutputStream(s.getOutputStream());
+	dataOut.writeShort(out.length);
+	dataOut.write(out);
+}
+
+private Message
+parseMessage(byte [] b) throws WireParseException {
+	try {
+		return (new Message(b));
+	}
+	catch (IOException e) {
+		if (Options.check("verbose"))
+			e.printStackTrace();
+		if (!(e instanceof WireParseException))
+			e = new WireParseException("Error parsing message");
+		throw (WireParseException) e;
+	}
+}
+
+private void
+verifyTSIG(Message query, Message response, byte [] b, TSIG tsig) {
+	if (tsig == null)
+		return;
+	response.TSIGsigned = true;
+	byte error = tsig.verify(response, b, query.getTSIG());
+	if (error == Rcode.NOERROR)
+		response.TSIGverified = true;
+	if (Options.check("verbose"))
+		System.err.println("TSIG verify: " + Rcode.string(error));
+}
+
+private void
+applyEDNS(Message query) {
+	if (EDNSlevel < 0 || query.getOPT() != null)
+		return;
+	OPTRecord opt = new OPTRecord(EDNS_UDPSIZE, Rcode.NOERROR, (byte)0);
+	query.addRecord(opt, Section.ADDITIONAL);
+}
+
+private int
+maxUDPSize(Message query) {
+	OPTRecord opt = query.getOPT();
+	if (opt == null)
+		return DEFAULT_UDPSIZE;
+	else
+		return opt.getPayloadSize();
+}
+
+/**
+ * Sends a message to a single server and waits for a response.  No checking
+ * is done to ensure that the response is associated with the query.
+ * @param query The query to send.
+ * @return The response.
+ * @throws IOException An error occurred while sending or receiving.
+ */
+public Message
+send(Message query) throws IOException {
+	if (Options.check("verbose"))
+		System.err.println("Sending to " + addr.getHostAddress() +
+				   ":" + port);
+
+	if (query.getHeader().getOpcode() == Opcode.QUERY) {
+		Record question = query.getQuestion();
+		if (question != null && question.getType() == Type.AXFR)
+			return sendAXFR(query);
+	}
+
+	query = (Message) query.clone();
+	applyEDNS(query);
+	if (tsig != null)
+		query.setTSIG(tsig, Rcode.NOERROR, null);
+
+	byte [] out = query.toWire(Message.MAXLENGTH);
+	int udpSize = maxUDPSize(query);
+	boolean tcp = false;
+	do {
+		byte [] in;
+
+		if (useTCP || out.length > udpSize)
+			tcp = true;
+		if (tcp) {
+			Socket s = new Socket(addr, port);
+			s.setSoTimeout(timeoutValue);
+			try {
+				writeTCP(s, out);
+				in = readTCP(s);
+			}
+			finally {
+				s.close();
+			}
+		} else {
+			DatagramSocket s = new DatagramSocket();
+			s.setSoTimeout(timeoutValue);
+			try {
+				writeUDP(s, out, addr, port);
+				in = readUDP(s, udpSize);
+			}
+			finally {
+				s.close();
+			}
+		}
+		Message response = parseMessage(in);
+		verifyTSIG(query, response, in, tsig);
+		if (!tcp && !ignoreTruncation &&
+		    response.getHeader().getFlag(Flags.TC))
+			tcp = true;
+		else
+			return response;
+	} while (true);
+}
+
+/**
+ * Asynchronously sends a message to a single server, registering a listener
+ * to receive a callback on success or exception.  Multiple asynchronous
+ * lookups can be performed in parallel.  Since the callback may be invoked
+ * before the function returns, external synchronization is necessary.
+ * @param query The query to send
+ * @param listener The object containing the callbacks.
+ * @return An identifier, which is also a parameter in the callback
+ */
+public Object
+sendAsync(final Message query, final ResolverListener listener) {
+	final Object id;
+	synchronized (this) {
+		id = new Integer(uniqueID++);
+	}
+	Record question = query.getQuestion();
+	String qname;
+	if (question != null)
+		qname = question.getName().toString();
+	else
+		qname = "(none)";
+	String name = this.getClass() + ": " + qname;
+	WorkerThread.assignThread(new ResolveThread(this, query, id, listener),
+				  name);
+	return id;
+}
+
+private Message
+sendAXFR(Message query) throws IOException {
+	Socket s = new Socket(addr, port);
+	s.setSoTimeout(timeoutValue);
+
+	try {
+		query = (Message) query.clone();
+		if (tsig != null)
+			tsig.apply(query, null);
+
+		byte [] out = query.toWire(Message.MAXLENGTH);
+		writeTCP(s, out);
+		byte [] in = readTCP(s);
+		Message response = parseMessage(in);
+		if (response.getHeader().getRcode() != Rcode.NOERROR)
+			return response;
+		if (tsig != null) {
+			tsig.verifyAXFRStart();
+			verifyTSIG(query, response, in, tsig);
+		}
+		int soacount = 0;
+		Record [] records = response.getSectionArray(Section.ANSWER);
+		for (int i = 0; i < records.length; i++)
+			if (records[i] instanceof SOARecord)
+				soacount++;
+
+		while (soacount < 2) {
+			in = readTCP(s);
+			Message m = parseMessage(in);
+			short rcode = m.getHeader().getRcode();
+			if (rcode != Rcode.NOERROR)
+				throw new WireParseException
+					("AXFR: rcode " + Rcode.string(rcode));
+			Header header = m.getHeader();
+			if (header.getCount(Section.QUESTION) > 1 ||
+			    header.getCount(Section.ANSWER) <= 0 ||
+			    header.getCount(Section.AUTHORITY) != 0)
+			{
+				if (Options.check("verbosemsg"))
+					System.err.println(m);
+			    	throw new WireParseException
+					("AXFR: invalid record counts");
+			}
+			records = m.getSectionArray(Section.ANSWER);
+			for (int i = 0; i < records.length; i++) {
+				response.addRecord(records[i], Section.ANSWER);
+				if (records[i] instanceof SOARecord)
+					soacount++;
+			}
+			if (soacount > 2)
+				throw new WireParseException
+					("AXFR: too many SOAs");
+			if (tsig == null)
+				continue;
+			byte error = tsig.verifyAXFR(m, in, query.getTSIG(),
+						     (soacount > 1), false);
+			if (error != Rcode.NOERROR)
+				response.TSIGverified = false;
+			if (Options.check("verbose"))
+				System.err.println("TSIG verify: " +
+						   Rcode.string(error));
+		}
+		return response;
+	}
+	finally {
+		s.close();
+	}
+}
+
+}

@@ -1,0 +1,224 @@
+return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, comp, null).defaultValidator(comp);
+
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * <p/>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p/>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import org.apache.commons.lang.NotImplementedException;
+
+import com.google.common.base.Charsets;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.db.ColumnFamilyType;
+import org.apache.cassandra.db.KeyspaceNotDefinedException;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.thrift.IndexType;
+
+import org.junit.BeforeClass;
+
+public class SchemaLoader
+{
+    @BeforeClass
+    public static void loadSchema()
+    {
+        try
+        {
+            for (KSMetaData ksm : schemaDefinition())
+            {
+                for (CFMetaData cfm : ksm.cfMetaData().values())
+                    CFMetaData.map(cfm);
+                DatabaseDescriptor.setTableDefinition(ksm, DatabaseDescriptor.getDefsVersion());
+            }
+        }
+        catch (ConfigurationException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static Collection<KSMetaData> schemaDefinition()
+    {
+        List<KSMetaData> schema = new ArrayList<KSMetaData>();
+
+        // A whole bucket of shorthand
+        String ks1 = "Keyspace1";
+        String ks2 = "Keyspace2";
+        String ks3 = "Keyspace3";
+        String ks4 = "Keyspace4";
+        String ks5 = "Keyspace5";
+        String ks_kcs = "KeyCacheSpace";
+        String ks_rcs = "RowCacheSpace";
+
+        Class<? extends AbstractReplicationStrategy> simple = SimpleStrategy.class;
+        Map<String, String> no_opts = Collections.<String, String>emptyMap();
+        int rep_factor1 = 1;
+        int rep_factor2 = 2;
+        int rep_factor3 = 3;
+        int rep_factor5 = 5;
+
+        ColumnFamilyType st = ColumnFamilyType.Standard;
+        ColumnFamilyType su = ColumnFamilyType.Super;
+        AbstractType bytes = BytesType.instance;
+
+        // Keyspace 1
+        schema.add(new KSMetaData(ks1,
+                                  simple,
+                                  no_opts,
+                                  rep_factor1,
+
+                                  // Column Families
+                                  standardCFMD(ks1, "Standard1"),
+                                  standardCFMD(ks1, "Standard2"),
+                                  standardCFMD(ks1, "Standard3"),
+                                  standardCFMD(ks1, "Standard4"),
+                                  standardCFMD(ks1, "StandardLong1"),
+                                  standardCFMD(ks1, "StandardLong2"),
+                                  superCFMD(ks1, "Super1", LongType.instance),
+                                  superCFMD(ks1, "Super2", LongType.instance),
+                                  superCFMD(ks1, "Super3", LongType.instance),
+                                  superCFMD(ks1, "Super4", UTF8Type.instance),
+                                  superCFMD(ks1, "Super5", bytes),
+                                  indexCFMD(ks1, "Indexed1", true),
+                                  indexCFMD(ks1, "Indexed2", false),
+                                  new CFMetaData(ks1,
+                                                 "StandardInteger1",
+                                                 st,
+                                                 IntegerType.instance,
+                                                 null)
+                                                 .keyCacheSize(0),
+                                  new CFMetaData(ks1,
+                                                 "Counter1",
+                                                 st,
+                                                 bytes,
+                                                 null)
+                                                 .defaultValidator(CounterColumnType.instance),
+                                  new CFMetaData(ks1,
+                                                 "SuperCounter1",
+                                                 su,
+                                                 bytes,
+                                                 bytes)
+                                                 .defaultValidator(CounterColumnType.instance),
+                                  jdbcCFMD(ks1, "JdbcInteger", IntegerType.instance),
+                                  jdbcCFMD(ks1, "JdbcUtf8", UTF8Type.instance),
+                                  jdbcCFMD(ks1, "JdbcLong", LongType.instance),
+                                  jdbcCFMD(ks1, "JdbcBytes", bytes),
+                                  jdbcCFMD(ks1, "JdbcAscii", AsciiType.instance)));
+
+        // Keyspace 2
+        schema.add(new KSMetaData(ks2,
+                                  simple,
+                                  no_opts,
+                                  rep_factor1,
+
+                                  // Column Families
+                                  standardCFMD(ks2, "Standard1"),
+                                  standardCFMD(ks2, "Standard3"),
+                                  superCFMD(ks2, "Super3", bytes),
+                                  superCFMD(ks2, "Super4", TimeUUIDType.instance),
+                                  indexCFMD(ks2, "Indexed1", true)));
+
+        // Keyspace 3
+        schema.add(new KSMetaData(ks3,
+                                  simple,
+                                  no_opts,
+                                  rep_factor5,
+
+                                  // Column Families
+                                  standardCFMD(ks3, "Standard1"),
+                                  indexCFMD(ks3, "Indexed1", true)));
+
+        // Keyspace 4
+        schema.add(new KSMetaData(ks4,
+                                  simple,
+                                  no_opts,
+                                  rep_factor3,
+
+                                  // Column Families
+                                  standardCFMD(ks4, "Standard1"),
+                                  standardCFMD(ks4, "Standard3"),
+                                  superCFMD(ks4, "Super3", bytes),
+                                  superCFMD(ks4, "Super4", TimeUUIDType.instance),
+                                  new CFMetaData(ks4,
+                                                 "Super5",
+                                                 su,
+                                                 TimeUUIDType.instance,
+                                                 bytes)
+                                                 .keyCacheSize(0)));
+
+        // Keyspace 5
+        schema.add(new KSMetaData(ks5,
+                                  simple,
+                                  no_opts,
+                                  rep_factor2,
+
+                                  // Column Families
+                                  standardCFMD(ks5, "Standard1"),
+                                  standardCFMD(ks5, "Counter1")
+                                               .defaultValidator(CounterColumnType.instance)));
+
+        // KeyCacheSpace
+        schema.add(new KSMetaData(ks_kcs,
+                                  simple,
+                                  no_opts,
+                                  rep_factor1,
+                                  standardCFMD(ks_kcs, "Standard1")
+                                              .keyCacheSize(0.5),
+                                  standardCFMD(ks_kcs, "Standard2")
+                                              .keyCacheSize(1.0)));
+
+        // RowCacheSpace
+        schema.add(new KSMetaData(ks_rcs,
+                                  simple,
+                                  no_opts,
+                                  rep_factor1,
+                                  standardCFMD(ks_rcs, "CFWithoutCache"),
+                                  standardCFMD(ks_rcs, "CachedCF")
+                                              .rowCacheSize(100)));
+
+        return schema;
+    }
+
+    private static CFMetaData standardCFMD(String ksName, String cfName)
+    {
+        return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, BytesType.instance, null).keyCacheSize(0);
+    }
+    private static CFMetaData superCFMD(String ksName, String cfName, AbstractType subcc)
+    {
+        return new CFMetaData(ksName, cfName, ColumnFamilyType.Super, BytesType.instance, subcc).keyCacheSize(0);
+    }
+    private static CFMetaData indexCFMD(String ksName, String cfName, final Boolean withIdxType)
+    {
+        return standardCFMD(ksName, cfName)
+                .columnMetadata(Collections.unmodifiableMap(new HashMap<ByteBuffer, ColumnDefinition>()
+                    {{
+                        ByteBuffer cName = ByteBuffer.wrap("birthdate".getBytes(Charsets.UTF_8));
+                        IndexType keys = withIdxType ? IndexType.KEYS : null;
+                        put(cName,
+                            new ColumnDefinition(cName, LongType.instance, keys, null));
+                    }}));
+    }
+    private static CFMetaData jdbcCFMD(String ksName, String cfName, AbstractType comp)
+    {
+        return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, comp, comp);
+    }
+}
