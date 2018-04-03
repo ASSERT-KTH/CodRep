@@ -82,9 +82,8 @@ The datasets used in this competition are from:
 
 | Directory | Original dataset | Published paper |
 | --- | --- |--- |
-| Dataset1/ | [github](https://github.com/monperrus/real-bug-fixes-icse-2015/) | *[An Empirical Study on Real Bug Fixes (ICSE 2015)](An Empirical Study on Real Bug Fixes)* |
-| Dataset2/ | [link to origin]() | [link to paper]() |
-
+| Dataset1/ | [github](https://github.com/monperrus/real-bug-fixes-icse-2015/) | [*An Empirical Study on Real Bug Fixes (ICSE 2015)*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf) |
+| Dataset2/ | [HAL](https://hal.archives-ouvertes.fr/hal-00769121) | [*CVS-Vintage: A Dataset of 14 CVS Repositories of Java Software*](https://hal.archives-ouvertes.fr/hal-00769121/document) |
 
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
 
@@ -107,15 +106,15 @@ Your programs outputs on the console, for each input data file, the predicted li
 Your program does not have to predict something for all input files, if there is no clear answer, simply don't output anything, the error computation takes that into account, more information about this in **Loss function** below.
 
 ```
-<FileName> <line numer>
-<FileName1> <line numer> <line numer>
-<FileName2> <line numer>
+<Path1> <line numer>
+<Path2> <line numer> <line numer>
+<Path3> <line numer>
 ```
 
 E.g.;
 ```
-1.txt 42
-2.txt 78 526
+/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/1.txt 42
+/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/2.txt 78 526
 ...
 ```
 
@@ -140,7 +139,7 @@ your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Dat
 ```
 
 Explanation of the output of `evaluate.py`:
-* `Total files`: Number of prediction tasks in `Files/`
+* `Total files`: Number of prediction tasks in datasets
 * `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition.
 * `Top k accuracy`: The percentage of correct answers in your top k predictions. As such, `Top 1 accuracy` is the percentage of perfect predictions in your top-1 prediction. We give the accuracy because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
 
@@ -155,7 +154,7 @@ This loss function is designed with the following properties in mind:
 * There is a bounded and constant loss even when the prediction is far away
 * Before the bound, the loss is logarithmic
 * A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
-* The loss is symmetric, continuous and differentiable
+* The loss is symmetric, continuous and differentiable (except at 0)
 
 We note that the `Top k accuracy` does not comply with all those properties.
 
@@ -168,4 +167,4 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 * `randomGuess.py`: Predict a random line in the file
 * `maximumError.py`: Predict the worst case, the farthest line from the correct solution
 
-Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same error, the value of `average error` is comparable.
+Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, the value of `average error` are comparable.
