@@ -1,8 +1,8 @@
-super(size);
+results.add("Operation " + operation + " caused exception:", ex);
 
-package org.apache.lucene.search.spans;
+package org.apache.solr.cloud;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,302 +19,396 @@ package org.apache.lucene.search.spans;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.IndexReader.AtomicReaderContext;
-import org.apache.lucene.util.PriorityQueue;
-
-import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.HashSet;
 
-/**
- * Similar to {@link NearSpansOrdered}, but for the unordered case.
- * 
- * Expert:
- * Only public for subclassing.  Most implementations should not need this class
- */
-public class NearSpansUnordered extends Spans {
-  private SpanNearQuery query;
+import org.apache.solr.client.solrj.SolrResponse;
+import org.apache.solr.cloud.DistributedQueue.QueueEvent;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.cloud.ClosableThread;
+import org.apache.solr.common.cloud.ClusterState;
+import org.apache.solr.common.cloud.DocCollection;
+import org.apache.solr.common.cloud.Replica;
+import org.apache.solr.common.cloud.Slice;
+import org.apache.solr.common.cloud.ZkNodeProps;
+import org.apache.solr.common.cloud.ZkStateReader;
+import org.apache.solr.common.cloud.ZooKeeperException;
+import org.apache.solr.common.params.CoreAdminParams;
+import org.apache.solr.common.params.CoreAdminParams.CoreAdminAction;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.StrUtils;
+import org.apache.solr.handler.component.ShardHandler;
+import org.apache.solr.handler.component.ShardRequest;
+import org.apache.solr.handler.component.ShardResponse;
+import org.apache.zookeeper.KeeperException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  private List<SpansCell> ordered = new ArrayList<SpansCell>();         // spans in query order
-  private Spans[] subSpans;  
-  private int slop;                               // from query
+public class OverseerCollectionProcessor implements Runnable, ClosableThread {
+  
+  public static final String NUM_SLICES = "numShards";
+  
+  public static final String REPLICATION_FACTOR = "replicationFactor";
+  
+  public static final String MAX_SHARDS_PER_NODE = "maxShardsPerNode";
+  
+  public static final String CREATE_NODE_SET = "createNodeSet";
+  
+  public static final String DELETECOLLECTION = "deletecollection";
 
-  private SpansCell first;                        // linked list of spans
-  private SpansCell last;                         // sorted by doc only
+  public static final String CREATECOLLECTION = "createcollection";
 
-  private int totalLength;                        // sum of current lengths
+  public static final String RELOADCOLLECTION = "reloadcollection";
+  
+  // TODO: use from Overseer?
+  private static final String QUEUE_OPERATION = "operation";
 
-  private CellQueue queue;                        // sorted queue of spans
-  private SpansCell max;                          // max element in queue
 
-  private boolean more = true;                    // true iff not done
-  private boolean firstTime = true;               // true before first next()
+  
+  private static Logger log = LoggerFactory
+      .getLogger(OverseerCollectionProcessor.class);
+  
+  private DistributedQueue workQueue;
+  
+  private String myId;
 
-  private class CellQueue extends PriorityQueue<SpansCell> {
-    public CellQueue(int size) {
-      initialize(size);
-    }
-    
-    @Override
-    protected final boolean lessThan(SpansCell spans1, SpansCell spans2) {
-      if (spans1.doc() == spans2.doc()) {
-        return NearSpansOrdered.docSpansOrdered(spans1, spans2);
-      } else {
-        return spans1.doc() < spans2.doc();
-      }
-    }
+  private ShardHandler shardHandler;
+
+  private String adminPath;
+
+  private ZkStateReader zkStateReader;
+
+  private boolean isClosed;
+  
+  public OverseerCollectionProcessor(ZkStateReader zkStateReader, String myId, ShardHandler shardHandler, String adminPath) {
+    this(zkStateReader, myId, shardHandler, adminPath, Overseer.getCollectionQueue(zkStateReader.getZkClient()));
   }
 
-
-  /** Wraps a Spans, and can be used to form a linked list. */
-  private class SpansCell extends Spans {
-    private Spans spans;
-    private SpansCell next;
-    private int length = -1;
-    private int index;
-
-    public SpansCell(Spans spans, int index) {
-      this.spans = spans;
-      this.index = index;
-    }
-
-    @Override
-    public boolean next() throws IOException {
-      return adjust(spans.next());
-    }
-
-    @Override
-    public boolean skipTo(int target) throws IOException {
-      return adjust(spans.skipTo(target));
-    }
-    
-    private boolean adjust(boolean condition) {
-      if (length != -1) {
-        totalLength -= length;  // subtract old length
-      }
-      if (condition) {
-        length = end() - start(); 
-        totalLength += length; // add new length
-
-        if (max == null || doc() > max.doc()
-            || (doc() == max.doc()) && (end() > max.end())) {
-          max = this;
-        }
-      }
-      more = condition;
-      return condition;
-    }
-
-    @Override
-    public int doc() { return spans.doc(); }
-    
-    @Override
-    public int start() { return spans.start(); }
-    
-    @Override
-    public int end() { return spans.end(); }
-                    // TODO: Remove warning after API has been finalized
-    @Override
-    public Collection<byte[]> getPayload() throws IOException {
-      return new ArrayList<byte[]>(spans.getPayload());
-    }
-
-    // TODO: Remove warning after API has been finalized
-    @Override
-    public boolean isPayloadAvailable() {
-      return spans.isPayloadAvailable();
-    }
-
-    @Override
-    public String toString() { return spans.toString() + "#" + index; }
+  protected OverseerCollectionProcessor(ZkStateReader zkStateReader, String myId, ShardHandler shardHandler, String adminPath, DistributedQueue workQueue) {
+    this.zkStateReader = zkStateReader;
+    this.myId = myId;
+    this.shardHandler = shardHandler;
+    this.adminPath = adminPath;
+    this.workQueue = workQueue;
   }
-
-
-  public NearSpansUnordered(SpanNearQuery query, AtomicReaderContext context)
-    throws IOException {
-    this.query = query;
-    this.slop = query.getSlop();
-
-    SpanQuery[] clauses = query.getClauses();
-    queue = new CellQueue(clauses.length);
-    subSpans = new Spans[clauses.length];    
-    for (int i = 0; i < clauses.length; i++) {
-      SpansCell cell =
-        new SpansCell(clauses[i].getSpans(context), i);
-      ordered.add(cell);
-      subSpans[i] = cell.spans;
-    }
-  }
-  public Spans[] getSubSpans() {
-	  return subSpans;
-  }
+  
   @Override
-  public boolean next() throws IOException {
-    if (firstTime) {
-      initList(true);
-      listToQueue(); // initialize queue
-      firstTime = false;
-    } else if (more) {
-      if (min().next()) { // trigger further scanning
-        queue.updateTop(); // maintain queue
-      } else {
-        more = false;
-      }
-    }
-
-    while (more) {
-
-      boolean queueStale = false;
-
-      if (min().doc() != max.doc()) {             // maintain list
-        queueToList();
-        queueStale = true;
-      }
-
-      // skip to doc w/ all clauses
-
-      while (more && first.doc() < last.doc()) {
-        more = first.skipTo(last.doc());          // skip first upto last
-        firstToLast();                            // and move it to the end
-        queueStale = true;
-      }
-
-      if (!more) return false;
-
-      // found doc w/ all clauses
-
-      if (queueStale) {                           // maintain the queue
-        listToQueue();
-        queueStale = false;
-      }
-
-      if (atMatch()) {
+  public void run() {
+       log.info("Process current queue of collection creations");
+       while (amILeader() && !isClosed) {
+         try {
+           QueueEvent head = workQueue.peek(true);
+           final ZkNodeProps message = ZkNodeProps.load(head.getBytes());
+           log.info("Overseer Collection Processor: Get the message id:" + head.getId() + " message:" + message.toString());
+           final String operation = message.getStr(QUEUE_OPERATION);
+           SolrResponse response = processMessage(message, operation);
+           head.setBytes(SolrResponse.serializable(response));
+           workQueue.remove(head);
+          log.info("Overseer Collection Processor: Message id:" + head.getId() + " complete, response:"+ response.getResponse().toString());
+        } catch (KeeperException e) {
+          if (e.code() == KeeperException.Code.SESSIONEXPIRED
+              || e.code() == KeeperException.Code.CONNECTIONLOSS) {
+             log.warn("Overseer cannot talk to ZK");
+             return;
+           }
+           SolrException.log(log, "", e);
+           throw new ZooKeeperException(
+               SolrException.ErrorCode.SERVER_ERROR, "", e);
+         } catch (InterruptedException e) {
+           Thread.currentThread().interrupt();
+           return;
+         } catch (Throwable e) {
+           SolrException.log(log, "", e);
+         }
+       }
+  }
+  
+  public void close() {
+    isClosed = true;
+  }
+  
+  protected boolean amILeader() {
+    try {
+      ZkNodeProps props = ZkNodeProps.load(zkStateReader.getZkClient().getData(
+          "/overseer_elect/leader", null, null, true));
+      if (myId.equals(props.getStr("id"))) {
         return true;
       }
-      
-      more = min().next();
-      if (more) {
-        queue.updateTop();                      // maintain queue
-      }
+    } catch (KeeperException e) {
+      log.warn("", e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
     }
-    return false;                                 // no more matches
-  }
-
-  @Override
-  public boolean skipTo(int target) throws IOException {
-    if (firstTime) {                              // initialize
-      initList(false);
-      for (SpansCell cell = first; more && cell!=null; cell=cell.next) {
-        more = cell.skipTo(target);               // skip all
-      }
-      if (more) {
-        listToQueue();
-      }
-      firstTime = false;
-    } else {                                      // normal case
-      while (more && min().doc() < target) {      // skip as needed
-        if (min().skipTo(target)) {
-          queue.updateTop();
-        } else {
-          more = false;
-        }
-      }
-    }
-    return more && (atMatch() ||  next());
-  }
-
-  private SpansCell min() { return queue.top(); }
-
-  @Override
-  public int doc() { return min().doc(); }
-  @Override
-  public int start() { return min().start(); }
-  @Override
-  public int end() { return max.end(); }
-
-  // TODO: Remove warning after API has been finalized
-  /**
-   * WARNING: The List is not necessarily in order of the the positions
-   * @return Collection of <code>byte[]</code> payloads
-   * @throws IOException
-   */
-  @Override
-  public Collection<byte[]> getPayload() throws IOException {
-    Set<byte[]> matchPayload = new HashSet<byte[]>();
-    for (SpansCell cell = first; cell != null; cell = cell.next) {
-      if (cell.isPayloadAvailable()) {
-        matchPayload.addAll(cell.getPayload());
-      }
-    }
-    return matchPayload;
-  }
-
-  // TODO: Remove warning after API has been finalized
-  @Override
-  public boolean isPayloadAvailable() {
-    SpansCell pointer = min();
-    while (pointer != null) {
-      if (pointer.isPayloadAvailable()) {
-        return true;
-      }
-      pointer = pointer.next;
-    }
-
+    log.info("According to ZK I (id=" + myId + ") am no longer a leader.");
     return false;
   }
-
-  @Override
-  public String toString() {
-    return getClass().getName() + "("+query.toString()+")@"+
-      (firstTime?"START":(more?(doc()+":"+start()+"-"+end()):"END"));
-  }
-
-  private void initList(boolean next) throws IOException {
-    for (int i = 0; more && i < ordered.size(); i++) {
-      SpansCell cell = ordered.get(i);
-      if (next)
-        more = cell.next();                       // move to first entry
-      if (more) {
-        addToList(cell);                          // add to list
+  
+  
+  protected SolrResponse processMessage(ZkNodeProps message, String operation) {
+    
+    NamedList results = new NamedList();
+    try {
+      if (CREATECOLLECTION.equals(operation)) {
+        createCollection(zkStateReader.getClusterState(), message);
+      } else if (DELETECOLLECTION.equals(operation)) {
+        ModifiableSolrParams params = new ModifiableSolrParams();
+        params.set(CoreAdminParams.ACTION, CoreAdminAction.UNLOAD.toString());
+        params.set(CoreAdminParams.DELETE_INSTANCE_DIR, true);
+        collectionCmd(zkStateReader.getClusterState(), message, params);
+      } else if (RELOADCOLLECTION.equals(operation)) {
+        ModifiableSolrParams params = new ModifiableSolrParams();
+        params.set(CoreAdminParams.ACTION, CoreAdminAction.RELOAD.toString());
+        collectionCmd(zkStateReader.getClusterState(), message, params);
+      } else {
+        throw new SolrException(ErrorCode.BAD_REQUEST, "Unknow the operation:"
+            + operation);
       }
+      int failed = 0;
+      ShardResponse srsp;
+      
+      do {
+        srsp = shardHandler.takeCompletedIncludingErrors();
+        if (srsp != null) {
+          Throwable e = srsp.getException();
+          if (e != null) {
+            failed++;
+            log.error("Error talking to shard: " + srsp.getShard(), e);
+            results.add(srsp.getShard(), e);
+          } else {
+            results.add(srsp.getShard(), srsp.getSolrResponse().getResponse());
+          }
+        }
+      } while (srsp != null);
+    } catch (SolrException ex) {
+      SolrException.log(log, "Collection " + operation + " of " + operation
+          + " failed");
+      results.add("Operation " + operation + " cause exception:", ex);
+    } finally {
+      return new OverseerSolrResponse(results);
     }
   }
 
-  private void addToList(SpansCell cell) throws IOException {
-    if (last != null) {			  // add next to end of list
-      last.next = cell;
-    } else
-      first = cell;
-    last = cell;
-    cell.next = null;
-  }
-
-  private void firstToLast() {
-    last.next = first;			  // move first to end of list
-    last = first;
-    first = first.next;
-    last.next = null;
-  }
-
-  private void queueToList() throws IOException {
-    last = first = null;
-    while (queue.top() != null) {
-      addToList(queue.pop());
+  private boolean createCollection(ClusterState clusterState, ZkNodeProps message) {
+    String collectionName = message.getStr("name");
+    if (clusterState.getCollections().contains(collectionName)) {
+      SolrException.log(log, "collection already exists: " + collectionName);
+      return false;
+    }
+    
+    try {
+      // look at the replication factor and see if it matches reality
+      // if it does not, find best nodes to create more cores
+      
+      int repFactor = msgStrToInt(message, REPLICATION_FACTOR, 1);
+      int numSlices = msgStrToInt(message, NUM_SLICES, 0);
+      int maxShardsPerNode = msgStrToInt(message, MAX_SHARDS_PER_NODE, 1);
+      String createNodeSetStr; 
+      List<String> createNodeList = ((createNodeSetStr = message.getStr(CREATE_NODE_SET)) == null)?null:StrUtils.splitSmart(createNodeSetStr, ",", true);
+      
+      if (repFactor <= 0) {
+        SolrException.log(log, REPLICATION_FACTOR + " must be > 0");
+        return false;
+      }
+      
+      if (numSlices < 0) {
+        SolrException.log(log, NUM_SLICES + " must be > 0");
+        return false;
+      }
+      
+      String configName = message.getStr("collection.configName");
+      
+      // we need to look at every node and see how many cores it serves
+      // add our new cores to existing nodes serving the least number of cores
+      // but (for now) require that each core goes on a distinct node.
+      
+      // TODO: add smarter options that look at the current number of cores per
+      // node?
+      // for now we just go random
+      Set<String> nodes = clusterState.getLiveNodes();
+      List<String> nodeList = new ArrayList<String>(nodes.size());
+      nodeList.addAll(nodes);
+      if (createNodeList != null) nodeList.retainAll(createNodeList);
+      Collections.shuffle(nodeList);
+      
+      if (nodeList.size() <= 0) {
+        log.error("Cannot create collection " + collectionName
+            + ". No live Solr-instaces" + ((createNodeList != null)?" among Solr-instances specified in " + CREATE_NODE_SET:""));
+        return false;
+      }
+      
+      if (repFactor > nodeList.size()) {
+        log.warn("Specified "
+            + REPLICATION_FACTOR
+            + " of "
+            + repFactor
+            + " on collection "
+            + collectionName
+            + " is higher than or equal to the number of Solr instances currently live ("
+            + nodeList.size()
+            + "). Its unusual to run two replica of the same slice on the same Solr-instance.");
+      }
+      
+      int maxShardsAllowedToCreate = maxShardsPerNode * nodeList.size();
+      int requestedShardsToCreate = numSlices * repFactor;
+      if (maxShardsAllowedToCreate < requestedShardsToCreate) {
+        log.error("Cannot create collection " + collectionName + ". Value of "
+            + MAX_SHARDS_PER_NODE + " is " + maxShardsPerNode
+            + ", and the number of live nodes is " + nodeList.size()
+            + ". This allows a maximum of " + maxShardsAllowedToCreate
+            + " to be created. Value of " + NUM_SLICES + " is " + numSlices
+            + " and value of " + REPLICATION_FACTOR + " is " + repFactor
+            + ". This requires " + requestedShardsToCreate
+            + " shards to be created (higher than the allowed number)");
+        return false;
+      }
+      
+      for (int i = 1; i <= numSlices; i++) {
+        for (int j = 1; j <= repFactor; j++) {
+          String nodeName = nodeList.get((repFactor * (i - 1) + (j - 1)) % nodeList.size());
+          String sliceName = "shard" + i;
+          String shardName = collectionName + "_" + sliceName + "_replica" + j;
+          log.info("Creating shard " + shardName + " as part of slice "
+              + sliceName + " of collection " + collectionName + " on "
+              + nodeName);
+          
+          // Need to create new params for each request
+          ModifiableSolrParams params = new ModifiableSolrParams();
+          params.set(CoreAdminParams.ACTION, CoreAdminAction.CREATE.toString());
+          
+          params.set(CoreAdminParams.NAME, shardName);
+          params.set("collection.configName", configName);
+          params.set(CoreAdminParams.COLLECTION, collectionName);
+          params.set(CoreAdminParams.SHARD, sliceName);
+          params.set(ZkStateReader.NUM_SHARDS_PROP, numSlices);
+          
+          ShardRequest sreq = new ShardRequest();
+          params.set("qt", adminPath);
+          sreq.purpose = 1;
+          String replica = zkStateReader.getZkClient()
+            .getBaseUrlForNodeName(nodeName);
+          if (replica.startsWith("http://")) replica = replica.substring(7);
+          sreq.shards = new String[] {replica};
+          sreq.actualShards = sreq.shards;
+          sreq.params = params;
+          
+          shardHandler.submit(sreq, replica, sreq.params);
+          
+        }
+      }
+      
+      int failed = 0;
+      ShardResponse srsp;
+      do {
+        srsp = shardHandler.takeCompletedOrError();
+        if (srsp != null) {
+          Throwable e = srsp.getException();
+          if (e != null) {
+            // should we retry?
+            // TODO: we should return errors to the client
+            // TODO: what if one fails and others succeed?
+            failed++;
+            log.error("Error talking to shard: " + srsp.getShard(), e);
+          }
+        }
+      } while (srsp != null);
+      
+      // if all calls succeeded, return true
+      if (failed > 0) {
+        return false;
+      }
+      log.info("Successfully created all shards for collection "
+          + collectionName);
+      return true;
+    } catch (Exception ex) {
+      // Expecting that the necessary logging has already been performed
+      return false;
     }
   }
   
-  private void listToQueue() {
-    queue.clear(); // rebuild queue
-    for (SpansCell cell = first; cell != null; cell = cell.next) {
-      queue.add(cell);                      // add to queue from list
+  private boolean collectionCmd(ClusterState clusterState, ZkNodeProps message, ModifiableSolrParams params) {
+    log.info("Executing Collection Cmd : " + params);
+    String collectionName = message.getStr("name");
+    
+    DocCollection coll = clusterState.getCollection(collectionName);
+    
+    if (coll == null) {
+      throw new SolrException(ErrorCode.BAD_REQUEST,
+          "Could not find collection:" + collectionName);
+    }
+    
+    for (Map.Entry<String,Slice> entry : coll.getSlicesMap().entrySet()) {
+      Slice slice = entry.getValue();
+      Map<String,Replica> shards = slice.getReplicasMap();
+      Set<Map.Entry<String,Replica>> shardEntries = shards.entrySet();
+      for (Map.Entry<String,Replica> shardEntry : shardEntries) {
+        final ZkNodeProps node = shardEntry.getValue();
+        if (clusterState.liveNodesContain(node.getStr(ZkStateReader.NODE_NAME_PROP))) {
+          // For thread safety, only simple clone the ModifiableSolrParams
+          ModifiableSolrParams cloneParams = new ModifiableSolrParams();
+          cloneParams.add(params);
+          cloneParams.set(CoreAdminParams.CORE,
+              node.getStr(ZkStateReader.CORE_NAME_PROP));
+          
+          String replica = node.getStr(ZkStateReader.BASE_URL_PROP);
+          ShardRequest sreq = new ShardRequest();
+          
+          // yes, they must use same admin handler path everywhere...
+          cloneParams.set("qt", adminPath);
+          sreq.purpose = 1;
+          // TODO: this sucks
+          if (replica.startsWith("http://")) replica = replica.substring(7);
+          sreq.shards = new String[] {replica};
+          sreq.actualShards = sreq.shards;
+          sreq.params = cloneParams;
+          log.info("Collection Admin sending CoreAdmin cmd to " + replica
+              + " params:" + sreq.params);
+          shardHandler.submit(sreq, replica, sreq.params);
+        }
+      }
+    }
+    
+    int failed = 0;
+    ShardResponse srsp;
+    do {
+      srsp = shardHandler.takeCompletedOrError();
+      if (srsp != null) {
+        Throwable e = srsp.getException();
+        if (e != null) {
+          // should we retry?
+          // TODO: we should return errors to the client
+          // TODO: what if one fails and others succeed?
+          failed++;
+          log.error("Error talking to shard: " + srsp.getShard(), e);
+        }
+      }
+    } while (srsp != null);
+
+    
+    // if all calls succeeded, return true
+    if (failed > 0) {
+      return false;
+    }
+    return true;
+  }
+  
+  private int msgStrToInt(ZkNodeProps message, String key, Integer def)
+      throws Exception {
+    String str = message.getStr(key);
+    try {
+      return str == null ? def : Integer.parseInt(str);
+    } catch (Exception ex) {
+      SolrException.log(log, "Could not parse " + key, ex);
+      throw ex;
     }
   }
 
-  private boolean atMatch() {
-    return (min().doc() == max.doc())
-        && ((max.end() - min().start() - totalLength) <= slop);
+  @Override
+  public boolean isClosed() {
+    return isClosed;
   }
 }

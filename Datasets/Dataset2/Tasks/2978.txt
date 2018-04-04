@@ -1,91 +1,212 @@
-s += new String(label) + ": " + statement.toString(0); //$NON-NLS-1$
+String[] paths = index.queryDocumentNames(""); // all file names //$NON-NLS-1$
 
-package org.eclipse.jdt.internal.compiler.ast;
+/*******************************************************************************
+ * Copyright (c) 2000, 2003 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials 
+ * are made available under the terms of the Common Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/cpl-v10.html
+ * 
+ * Contributors:
+ *     IBM Corporation - initial API and implementation
+ *******************************************************************************/
+package org.eclipse.jdt.internal.core.search.indexing;
 
-/*
- * (c) Copyright IBM Corp. 2000, 2001.
- * All Rights Reserved.
- */
-import org.eclipse.jdt.internal.compiler.IAbstractSyntaxTreeVisitor;
-import org.eclipse.jdt.internal.compiler.impl.*;
-import org.eclipse.jdt.internal.compiler.codegen.*;
-import org.eclipse.jdt.internal.compiler.flow.*;
-import org.eclipse.jdt.internal.compiler.lookup.*;
+import java.io.IOException;
+import java.util.HashSet;
 
-public class LabeledStatement extends Statement {
-	public Statement statement;
-	public char[] label;
-	public Label targetLabel;
+import org.eclipse.core.resources.IFile;
+import org.eclipse.core.resources.IProject;
+import org.eclipse.core.resources.IResource;
+import org.eclipse.core.resources.IResourceProxy;
+import org.eclipse.core.resources.IResourceProxyVisitor;
+import org.eclipse.core.resources.IWorkspaceRoot;
+import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IPath;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.jdt.core.IClasspathEntry;
+import org.eclipse.jdt.core.JavaCore;
+import org.eclipse.jdt.internal.core.ClasspathEntry;
+import org.eclipse.jdt.internal.core.JavaProject;
+import org.eclipse.jdt.internal.core.index.Index;
+import org.eclipse.jdt.internal.core.search.JavaSearchDocument;
+import org.eclipse.jdt.internal.core.search.processing.JobManager;
+import org.eclipse.jdt.internal.core.util.SimpleLookupTable;
+import org.eclipse.jdt.internal.core.util.Util;
 
-	// for local variables table attributes
-	int mergedInitStateIndex = -1;
-/**
- * LabeledStatement constructor comment.
- */
-public LabeledStatement(char[] l , Statement st, int s,int e) {
-	statement = st ;
-	label = l ;
-	sourceStart = s;
-	sourceEnd = e;
-}
-public FlowInfo analyseCode(BlockScope currentScope, FlowContext flowContext, FlowInfo flowInfo) {
+public class IndexAllProject extends IndexRequest {
+	IProject project;
 
-	// need to stack a context to store explicit label, answer inits in case of normal completion merged
-	// with those relative to the exit path from break statement occurring inside the labeled statement.
-
-	if (statement == null) {
-		return flowInfo;
-	} else {
-		LabelFlowContext labelContext;
-		FlowInfo mergedInfo = statement.analyseCode(
-			currentScope,
-			(labelContext = new LabelFlowContext(flowContext, this, label, (targetLabel = new Label()), currentScope)),
-			flowInfo).
-				mergedWith(labelContext.initsOnBreak);
-		mergedInitStateIndex = currentScope.methodScope().recordInitializationStates(mergedInfo);
-		return mergedInfo;
+	public IndexAllProject(IProject project, IndexManager manager) {
+		super(project.getFullPath(), manager);
+		this.project = project;
 	}
-}
-public AstNode concreteStatement() {
-	return statement.concreteStatement();
-}
-/**
- * Code generation for labeled statement
- *
- * may not need actual source positions recording
- *
- * @param currentScope org.eclipse.jdt.internal.compiler.lookup.BlockScope
- * @param codeStream org.eclipse.jdt.internal.compiler.codegen.CodeStream
- */
-public void generateCode(BlockScope currentScope, CodeStream codeStream) {
-	int pc = codeStream.position;
-	if (targetLabel != null) {
-		targetLabel.codeStream = codeStream;
-		if (statement != null) {
-			statement.generateCode(currentScope, codeStream);
+	public boolean equals(Object o) {
+		if (o instanceof IndexAllProject)
+			return this.project.equals(((IndexAllProject) o).project);
+		return false;
+	}
+	/**
+	 * Ensure consistency of a project index. Need to walk all nested resources,
+	 * and discover resources which have either been changed, added or deleted
+	 * since the index was produced.
+	 */
+	public boolean execute(IProgressMonitor progressMonitor) {
+
+		if (this.isCancelled || progressMonitor != null && progressMonitor.isCanceled()) return true;
+		if (!project.isAccessible()) return true; // nothing to do
+
+		Index index = this.manager.getIndexForUpdate(this.containerPath, true, /*reuse index file*/ true /*create if none*/);
+		if (index == null) return true;
+		ReadWriteMonitor monitor = this.manager.getMonitorFor(index);
+		if (monitor == null) return true; // index got deleted since acquired
+
+		try {
+			monitor.enterRead(); // ask permission to read
+			saveIfNecessary(index, monitor);
+
+			String[] paths = index.queryInDocumentNames(""); // all file names //$NON-NLS-1$
+			int max = paths == null ? 0 : paths.length;
+			final SimpleLookupTable indexedFileNames = new SimpleLookupTable(max == 0 ? 33 : max + 11);
+			final String OK = "OK"; //$NON-NLS-1$
+			final String DELETED = "DELETED"; //$NON-NLS-1$
+			for (int i = 0; i < max; i++)
+				indexedFileNames.put(paths[i], DELETED);
+			final long indexLastModified = max == 0 ? 0L : index.getIndexFile().lastModified();
+
+			JavaProject javaProject = (JavaProject)JavaCore.create(this.project);
+			// Do not create marker nor log problems while getting raw classpath (see bug 41859)
+			IClasspathEntry[] entries = javaProject.getRawClasspath(false, false);
+			IWorkspaceRoot root = this.project.getWorkspace().getRoot();
+			for (int i = 0, length = entries.length; i < length; i++) {
+				if (this.isCancelled) return false;
+
+				IClasspathEntry entry = entries[i];
+				if ((entry.getEntryKind() == IClasspathEntry.CPE_SOURCE)) { // Index only source folders. Libraries are done as a separate job
+					IResource sourceFolder = root.findMember(entry.getPath());
+					if (sourceFolder != null) {
+						
+						// collect output locations if source is project (see http://bugs.eclipse.org/bugs/show_bug.cgi?id=32041)
+						final HashSet outputs = new HashSet();
+						if (sourceFolder.getType() == IResource.PROJECT) {
+							// Do not create marker nor log problems while getting output location (see bug 41859)
+							outputs.add(javaProject.getOutputLocation(false, false));
+							for (int j = 0; j < length; j++) {
+								IPath output = entries[j].getOutputLocation();
+								if (output != null) {
+									outputs.add(output);
+								}
+							}
+						}
+						final boolean hasOutputs = !outputs.isEmpty();
+						
+						final char[][] patterns = ((ClasspathEntry) entry).fullExclusionPatternChars();
+						if (max == 0) {
+							sourceFolder.accept(
+								new IResourceProxyVisitor() {
+									public boolean visit(IResourceProxy proxy) {
+										if (isCancelled) return false;
+										switch(proxy.getType()) {
+											case IResource.FILE :
+												if (org.eclipse.jdt.internal.compiler.util.Util.isJavaFileName(proxy.getName())) {
+													IFile file = (IFile) proxy.requestResource();
+													if (file.getLocation() != null && (patterns == null || !Util.isExcluded(file, patterns)))
+														indexedFileNames.put(new JavaSearchDocument(file, null).getPath(), file);
+												}
+												return false;
+											case IResource.FOLDER :
+												if (patterns != null && Util.isExcluded(proxy.requestResource(), patterns))
+													return false;
+												if (hasOutputs && outputs.contains(proxy.requestFullPath())) {
+													return false;
+												}
+										}
+										return true;
+									}
+								},
+								IResource.NONE
+							);
+						} else {
+							sourceFolder.accept(
+								new IResourceProxyVisitor() {
+									public boolean visit(IResourceProxy proxy) {
+										if (isCancelled) return false;
+										switch(proxy.getType()) {
+											case IResource.FILE :
+												if (org.eclipse.jdt.internal.compiler.util.Util.isJavaFileName(proxy.getName())) {
+													IFile file = (IFile) proxy.requestResource();
+													IPath location = file.getLocation();
+													if (location != null && (patterns == null || !Util.isExcluded(file, patterns))) {
+														String path = new JavaSearchDocument(file, null).getPath();
+														indexedFileNames.put(path,
+															indexedFileNames.get(path) == null || indexLastModified < location.toFile().lastModified()
+																? (Object) file
+																: (Object) OK);
+													}
+												}
+												return false;
+											case IResource.FOLDER :
+												if (patterns != null && Util.isExcluded(proxy.requestResource(), patterns))
+													return false;
+												if (hasOutputs && outputs.contains(proxy.requestFullPath())) {
+													return false;
+												}
+										}
+										return true;
+									}
+								},
+								IResource.NONE
+							);
+						}
+					}
+				}
+			}
+
+			Object[] names = indexedFileNames.keyTable;
+			Object[] values = indexedFileNames.valueTable;
+			for (int i = 0, length = names.length; i < length; i++) {
+				String name = (String) names[i];
+				if (name != null) {
+					if (this.isCancelled) return false;
+
+					Object value = values[i];
+					if (value != OK) {
+						if (value == DELETED)
+							this.manager.remove(name, this.containerPath);
+						else
+							this.manager.addSource((IFile) value, this.containerPath);
+					}
+				}
+			}
+
+			// request to save index when all cus have been indexed... also sets state to SAVED_STATE
+			this.manager.request(new SaveIndex(this.containerPath, this.manager));
+		} catch (CoreException e) {
+			if (JobManager.VERBOSE) {
+				JobManager.verbose("-> failed to index " + this.project + " because of the following exception:"); //$NON-NLS-1$ //$NON-NLS-2$
+				e.printStackTrace();
+			}
+			this.manager.removeIndex(this.containerPath);
+			return false;
+		} catch (IOException e) {
+			if (JobManager.VERBOSE) {
+				JobManager.verbose("-> failed to index " + this.project + " because of the following exception:"); //$NON-NLS-1$ //$NON-NLS-2$
+				e.printStackTrace();
+			}
+			this.manager.removeIndex(this.containerPath);
+			return false;
+		} finally {
+			monitor.exitRead(); // free read lock
 		}
-		targetLabel.place();
+		return true;
 	}
-	// May loose some local variable initializations : affecting the local variable attributes
-	if (mergedInitStateIndex != -1) {
-		codeStream.removeNotDefinitelyAssignedVariables(currentScope, mergedInitStateIndex);
+	public int hashCode() {
+		return this.project.hashCode();
 	}
-	codeStream.recordPositionsFrom(pc, this);
-}
-public void resolve(BlockScope scope) {
-	statement.resolve(scope);
-}
-public String toString(int tab) {
-	/* slow code */
-
-	String s = tabString(tab);
-	s += new String(label) + ": "/*nonNLS*/ + statement.toString(0);
-	return s;
-}
-public void traverse(IAbstractSyntaxTreeVisitor visitor, BlockScope blockScope) {
-	if (visitor.visit(this, blockScope)) {
-		statement.traverse(visitor, blockScope);
+	protected Integer updatedIndexState() {
+		return IndexManager.REBUILDING_STATE;
 	}
-	visitor.endVisit(this, blockScope);
-}
+	public String toString() {
+		return "indexing project " + this.project.getFullPath(); //$NON-NLS-1$
+	}
 }

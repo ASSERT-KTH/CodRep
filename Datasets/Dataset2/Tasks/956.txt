@@ -1,4 +1,4 @@
-this.setAttribute(HAS_MODIFIED_RESOURCE_ATTR, TRUE);
+Thread.sleep(10000); // wait 10 seconds so as not to interfere with plugin startup
 
 /*******************************************************************************
  * Copyright (c) 2000, 2001, 2002 International Business Machines Corp. and others.
@@ -10,309 +10,482 @@ this.setAttribute(HAS_MODIFIED_RESOURCE_ATTR, TRUE);
  * Contributors:
  *     IBM Corporation - initial API and implementation
  ******************************************************************************/
-package org.eclipse.jdt.internal.core;
+package org.eclipse.jdt.internal.core.search.indexing;
 
-import org.eclipse.jdt.core.IBuffer;
-import org.eclipse.jdt.core.ICompilationUnit;
-import org.eclipse.jdt.core.IJavaElement;
-import org.eclipse.jdt.core.IJavaModelStatus;
-import org.eclipse.jdt.core.IJavaModelStatusConstants;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.zip.CRC32;
+
+import org.eclipse.core.resources.IContainer;
+import org.eclipse.core.resources.IFile;
+import org.eclipse.core.resources.IFolder;
+import org.eclipse.core.resources.IProject;
+import org.eclipse.core.resources.IResource;
+import org.eclipse.core.resources.IResourceVisitor;
+import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IPath;
+import org.eclipse.jdt.core.IClasspathEntry;
+import org.eclipse.jdt.core.IJavaModel;
+import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
-import org.eclipse.jdt.core.jdom.DOMFactory;
-import org.eclipse.jdt.core.jdom.IDOMCompilationUnit;
-import org.eclipse.jdt.core.jdom.IDOMNode;
-import org.eclipse.jdt.internal.core.jdom.DOMNode;
+import org.eclipse.jdt.internal.core.DeltaProcessor;
+import org.eclipse.jdt.internal.core.JavaModel;
+import org.eclipse.jdt.internal.core.JavaModelManager;
+import org.eclipse.jdt.internal.core.JavaProject;
+import org.eclipse.jdt.internal.core.index.IIndex;
+import org.eclipse.jdt.internal.core.index.impl.Index;
+import org.eclipse.jdt.internal.core.search.IndexSelector;
+import org.eclipse.jdt.internal.core.search.JavaWorkspaceScope;
+import org.eclipse.jdt.internal.core.search.Util;
+import org.eclipse.jdt.internal.core.search.processing.IJob;
+import org.eclipse.jdt.internal.core.search.processing.JobManager;
+
+public class IndexManager extends JobManager implements IIndexConstants {
+	/* number of file contents in memory */
+	public static int MAX_FILES_IN_MEMORY = 0;
+	
+	public IWorkspace workspace;
+
+	/* indexes */
+	Map indexes = new HashMap(5);
+
+	/* read write monitors */
+	private Map monitors = new HashMap(5);
+
+	/* need to save ? */
+	private boolean needToSave = false;
+	private static final CRC32 checksumCalculator = new CRC32();
+	private IPath javaPluginLocation = null;
+	
+	/* projects to check consistency for */
+	IProject[] projectsToCheck = null;
+	
+/**
+ * Before processing all jobs, need to ensure that the indexes are up to date.
+ */
+public void activateProcessing() {
+	try {
+		Thread.currentThread().sleep(10000); // wait 10 seconds so as not to interfere with plugin startup
+	} catch (InterruptedException ie) {
+	}	
+	checkIndexConsistency();
+	super.activateProcessing();
+}
+/**
+ * Trigger addition of a resource to an index
+ * Note: the actual operation is performed in background
+ */
+public void addSource(IFile resource, IPath indexedContainer){
+	if (JavaCore.getPlugin() == null) return;	
+	AddCompilationUnitToIndex job = new AddCompilationUnitToIndex(resource, this, indexedContainer);
+	if (this.awaitingJobsCount() < MAX_FILES_IN_MEMORY) {
+		job.initializeContents();
+	}
+	request(job);
+}
+/**
+ * Trigger addition of a resource to an index
+ * Note: the actual operation is performed in background
+ */
+public void addBinary(IFile resource, IPath indexedContainer){
+	if (JavaCore.getPlugin() == null) return;	
+	AddClassFileToIndex job = new AddClassFileToIndex(resource, this, indexedContainer);
+	if (this.awaitingJobsCount() < MAX_FILES_IN_MEMORY) {
+		job.initializeContents();
+	}
+	request(job);
+}
+/**
+ * Index the content of the given source folder.
+ */
+public void indexSourceFolder(JavaProject javaProject, IPath sourceFolder) {
+	IProject project = javaProject.getProject();
+	final IPath container = project.getFullPath();
+	IContainer folder;
+	if (container.equals(sourceFolder)) {
+		folder = project;
+	} else {
+		folder = ResourcesPlugin.getWorkspace().getRoot().getFolder(sourceFolder);
+	}
+	try {
+		folder.accept(new IResourceVisitor() {
+			/*
+			 * @see IResourceVisitor#visit(IResource)
+			 */
+			public boolean visit(IResource resource) throws CoreException {
+				if (resource instanceof IFile) {
+					if ("java".equalsIgnoreCase(resource.getFileExtension())) {  //$NON-NLS-1$
+						addSource((IFile)resource, container);
+					}
+					return false;
+				} else {
+					return true;
+				}
+			}
+		});
+	} catch (CoreException e) {
+		// Folder does not exist.
+		// It will be indexed only when DeltaProcessor detects its addition
+	}
+}
+/**
+ * Ensures that indexes are up to date with workbench content. Typically
+ * it is invoked in background when activate the job processing.
+ */
+public void checkIndexConsistency() {
+
+	if (VERBOSE) JobManager.verbose("STARTING ensuring consistency"); //$NON-NLS-1$
+
+	boolean wasEnabled = isEnabled();	
+	try {
+		disable();
+
+		IWorkspace workspace =  ResourcesPlugin.getWorkspace();
+		if (workspace == null) return; // NB: workspace can be null if it has shut down (see http://dev.eclipse.org/bugs/show_bug.cgi?id=16175)
+		if (this.projectsToCheck != null){
+			IProject[] projects = this.projectsToCheck;
+			this.projectsToCheck = null;
+			for (int i = 0, max = projects.length; i < max; i++){
+				IProject project = projects[i];
+				// not only java project, given at startup nature may not have been set yet
+				if (project.isOpen()) { 
+					indexAll(project);
+				}
+			}
+		}
+	} finally {
+		if (wasEnabled) enable();
+		if (VERBOSE) JobManager.verbose("DONE ensuring consistency"); //$NON-NLS-1$
+	}
+}
+private String computeIndexName(IPath path) {
+	
+	String pathString = path.toOSString();
+	byte[] pathBytes = pathString.getBytes();
+	checksumCalculator.reset();
+	checksumCalculator.update(pathBytes);
+	String fileName = Long.toString(checksumCalculator.getValue()) + ".index"; //$NON-NLS-1$
+	if (VERBOSE) JobManager.verbose("-> index name for " + pathString + " is " + fileName); //$NON-NLS-1$ //$NON-NLS-2$
+	IPath indexPath = getJavaPluginWorkingLocation();
+	String indexDirectory = indexPath.toOSString();
+	if (indexDirectory.endsWith(File.separator)) {
+		return indexDirectory + fileName;
+	} else {
+		return indexDirectory + File.separator + fileName;
+	} 
+}
 
 /**
- * <p>This abstract class implements behavior common to <code>CreateElementInCUOperations</code>.
- * To create a compilation unit, or an element contained in a compilation unit, the
- * source code for the entire compilation unit is updated and saved.
- *
- * <p>The element being created can be positioned relative to an existing
- * element in the compilation unit via the methods <code>#createAfter</code>
- * and <code>#createBefore</code>. By default, the new element is positioned
- * as the last child of its parent element.
- *
+ * Returns the index for a given project, according to the following algorithm:
+ * - if index is already in memory: answers this one back
+ * - if (reuseExistingFile) then read it and return this index and record it in memory
+ * - if (createIfMissing) then create a new empty index and record it in memory
+ * 
+ * Warning: Does not check whether index is consistent (not being used)
  */
-public abstract class CreateElementInCUOperation extends JavaModelOperation {
-	/**
-	 * The compilation unit DOM used for this operation
-	 */
-	protected IDOMCompilationUnit fCUDOM;
-	/**
-	 * A constant meaning to position the new element
-	 * as the last child of its parent element.
-	 */
-	protected static final int INSERT_LAST = 1;
-	/**
-	 * A constant meaning to position the new element
-	 * after the element defined by <code>fAnchorElement</code>.
-	 */
-	protected static final int INSERT_AFTER = 2;
-
-	/**
-	 * A constant meaning to position the new element
-	 * before the element defined by <code>fAnchorElement</code>.
-	 */
-	protected static final int INSERT_BEFORE = 3;
-	/**
-	 * One of the position constants, describing where
-	 * to position the newly created element.
-	 */
-	protected int fInsertionPolicy = INSERT_LAST;
-	/**
-	 * The element that the newly created element is
-	 * positioned relative to, as described by
-	 * <code>fInsertPosition</code>, or <code>null</code>
-	 * if the newly created element will be positioned
-	 * last.
-	 */
-	protected IJavaElement fAnchorElement = null;
-	/**
-	 * A flag indicating whether creation of a new element occurred.
-	 * A request for creating a duplicate element would request in this
-	 * flag being set to <code>false</code>. Ensures that no deltas are generated
-	 * when creation does not occur.
-	 */
-	protected boolean fCreationOccurred = true;
-	/**
-	 * The element that is being created.
-	 */
-	protected DOMNode fCreatedElement;
-	/**
-	 * The position of the element that is being created.
-	 */
-	protected int fInsertionPosition = -1;
-	/**
-	 * The number of characters the new element replaces,
-	 * or 0 if the new element is inserted,
-	 * or -1 if the new element is append to the end of the CU.
-	 */
-	protected int fReplacementLength = -1;
-	/**
-	 * Constructs an operation that creates a Java Language Element with
-	 * the specified parent, contained within a compilation unit.
-	 */
-	public CreateElementInCUOperation(IJavaElement parentElement) {
-		super(null, new IJavaElement[]{parentElement});
-		initializeDefaultPosition();
-	}
-	/**
-	 * Only allow cancelling if this operation is not nested.
-	 */
-	protected void checkCanceled() {
-		if (!fNested) {
-			super.checkCanceled();
+public synchronized IIndex getIndex(IPath path, boolean reuseExistingFile, boolean createIfMissing) {
+	// Path is already canonical per construction
+	IIndex index = (IIndex) indexes.get(path);
+	if (index == null) {
+		try {
+			String indexPath = null;
+			
+			// index isn't cached, consider reusing an existing index file
+			if (reuseExistingFile){
+				indexPath = computeIndexName(path);
+				File indexFile = new File(indexPath);
+				if (indexFile.exists()){ // check before creating index so as to avoid creating a new empty index if file is missing
+					index = new Index(indexPath, "Index for " + path.toOSString(), true /*reuse index file*/); //$NON-NLS-1$
+					if (index != null){
+						indexes.put(path, index);
+						monitors.put(index, new ReadWriteMonitor());
+						return index;
+					}
+				}
+			} 
+			// index wasn't found on disk, consider creating an empty new one
+			if (createIfMissing){
+				if (indexPath == null) indexPath = computeIndexName(path);
+				index = new Index(indexPath, "Index for " + path.toOSString(), false /*do not reuse index file*/); //$NON-NLS-1$
+				if (index != null){
+					indexes.put(path, index);
+					monitors.put(index, new ReadWriteMonitor());
+					return index;
+				}
+			}
+		} catch (IOException e) {
+			// The file could not be created. Possible reason: the project has been deleted.
+			return null;
 		}
 	}
-	/**
-	 * Instructs this operation to position the new element after
-	 * the given sibling, or to add the new element as the last child
-	 * of its parent if <code>null</code>.
-	 */
-	public void createAfter(IJavaElement sibling) {
-		setRelativePosition(sibling, INSERT_AFTER);
+	//System.out.println(" index name: " + path.toOSString() + " <----> " + index.getIndexFile().getName());	
+	return index;
+}
+private IPath getJavaPluginWorkingLocation() {
+	if (javaPluginLocation == null) {
+		javaPluginLocation = JavaCore.getPlugin().getStateLocation();
 	}
-	/**
-	 * Instructs this operation to position the new element before
-	 * the given sibling, or to add the new element as the last child
-	 * of its parent if <code>null</code>.
-	 */
-	public void createBefore(IJavaElement sibling) {
-		setRelativePosition(sibling, INSERT_BEFORE);
-	}
-	/**
-	 * Execute the operation - generate new source for the compilation unit
-	 * and save the results.
-	 *
-	 * @exception JavaModelException if the operation is unable to complete
-	 */
-	protected void executeOperation() throws JavaModelException {
+	return javaPluginLocation;
+}
+/**
+ * Index access is controlled through a read-write monitor so as
+ * to ensure there is no concurrent read and write operations
+ * (only concurrent reading is allowed).
+ */
+public ReadWriteMonitor getMonitorFor(IIndex index){
+	
+	return (ReadWriteMonitor)monitors.get(index);
+}
+/**
+ * Trigger addition of the entire content of a project
+ * Note: the actual operation is performed in background 
+ */
+public void indexAll(IProject project) {
+	if (JavaCore.getPlugin() == null) return;
+
+	// Also request indexing of binaries on the classpath
+	// determine the new children
+	try {
+		IJavaModel model = JavaModelManager.getJavaModelManager().getJavaModel();
+		IJavaProject javaProject = ((JavaModel) model).getJavaProject(project);	
+		// only consider immediate libraries - each project will do the same
+		// NOTE: force to resolve CP variables before calling indexer - 19303, so that initializers
+		// will be run in the current thread.
+		IClasspathEntry[] entries = javaProject.getResolvedClasspath(true);	
+		for (int i = 0; i < entries.length; i++) {
+			IClasspathEntry entry= entries[i];
+			if (entry.getEntryKind() == IClasspathEntry.CPE_LIBRARY) {
+				this.indexLibrary(entry.getPath(), project);
+			}
+		}
+	} catch(JavaModelException e){ // cannot retrieve classpath info
+	}	
+	this.request(new IndexAllProject(project, this));
+}
+
+
+/**
+ * Advance to the next available job, once the current one has been completed.
+ * Note: clients awaiting until the job count is zero are still waiting at this point.
+ */
+protected synchronized void moveToNextJob() {
+
+	// remember that one job was executed, and we will need to save indexes at some point
+	needToSave = true;
+	super.moveToNextJob();
+}
+/**
+ * No more job awaiting.
+ */
+protected void notifyIdle(long idlingTime){
+	if (idlingTime > 1000 && needToSave) saveIndexes();
+}
+/**
+ * Name of the background process
+ */
+public String processName(){
+	return Util.bind("process.name"); //$NON-NLS-1$
+}
+
+/**
+ * Recreates the index for a given path, keeping the same read-write monitor.
+ * Returns the new empty index or null if it didn't exist before.
+ * Warning: Does not check whether index is consistent (not being used)
+ */
+public synchronized IIndex recreateIndex(IPath path) {
+	IIndex index = (IIndex) indexes.get(path);
+	if (index != null) {
 		try {
-			beginTask(getMainTaskName(), getMainAmountOfWork());
-			JavaElementDelta delta = newJavaElementDelta();
-			ICompilationUnit unit = getCompilationUnit();
-			generateNewCompilationUnitDOM(unit);
-			if (fCreationOccurred) {
-				//a change has really occurred
-				IBuffer buffer = unit.getBuffer();
-				if (buffer  == null) return;
-				char[] bufferContents = buffer.getCharacters();
-				if (bufferContents == null) return;
-				char[] elementContents = org.eclipse.jdt.internal.core.Util.normalizeCRs(fCreatedElement.getCharacters(), bufferContents);
-				switch (fReplacementLength) {
-					case -1 : 
-						// element is append at the end
-						buffer.append(elementContents);
-						break;
-					case 0 :
-						// element is inserted
-						buffer.replace(fInsertionPosition, 0, elementContents);
-						break;
-					default :
-						// element is replacing the previous one
-						buffer.replace(fInsertionPosition, fReplacementLength, elementContents);
+			// Path is already canonical
+			String indexPath = computeIndexName(path);
+			ReadWriteMonitor monitor = (ReadWriteMonitor)monitors.remove(index);
+			index = new Index(indexPath, "Index for " + path.toOSString(), true /*reuse index file*/); //$NON-NLS-1$
+			index.empty();
+			indexes.put(path, index);
+			monitors.put(index, monitor);
+		} catch (IOException e) {
+			// The file could not be created. Possible reason: the project has been deleted.
+			return null;
+		}
+	}
+	//System.out.println(" index name: " + path.toOSString() + " <----> " + index.getIndexFile().getName());	
+	return index;
+}
+/**
+ * Trigger removal of a resource to an index
+ * Note: the actual operation is performed in background
+ */
+public void remove(String resourceName, IPath indexedContainer){
+	request(new RemoveFromIndex(resourceName, indexedContainer, this));
+}
+/**
+ * Removes the index for a given path. 
+ * This is a no-op if the index did not exist.
+ */
+public synchronized void removeIndex(IPath path) {
+	IIndex index = (IIndex)this.indexes.get(path);
+	if (index == null) return;
+	index.getIndexFile().delete();
+	this.indexes.remove(path);
+	this.monitors.remove(index);
+}
+/**
+ * Removes all indexes whose paths start with (or are equal to) the given path. 
+ */
+public synchronized void removeIndexFamily(IPath path) {
+	ArrayList toRemove = null;
+	Iterator iterator = this.indexes.keySet().iterator();
+	while (iterator.hasNext()) {
+		IPath indexPath = (IPath)iterator.next();
+		if (path.isPrefixOf(indexPath)) {
+			if (toRemove == null) {
+				toRemove = new ArrayList();
+			}
+			toRemove.add(indexPath);
+		}
+	}
+	if (toRemove != null) {
+		for (int i = 0, length = toRemove.size(); i < length; i++) {
+			this.removeIndex((IPath)toRemove.get(i));
+		}
+	}
+}
+/**
+ * Remove the content of the given source folder from the index.
+ */
+public void removeSourceFolderFromIndex(JavaProject javaProject, IPath sourceFolder) {
+	this.request(new RemoveFolderFromIndex(sourceFolder.toString(), javaProject.getProject().getFullPath(), this));
+}
+
+/**
+ * Flush current state
+ */
+public void reset(){
+
+	IWorkspace workspace = ResourcesPlugin.getWorkspace();
+	if (workspace != null){
+		// force to resolve classpaths for projects to check, so as to avoid running CP variable initializers in the background thread
+		this.projectsToCheck = workspace.getRoot().getProjects();
+		for (int i = 0, max = this.projectsToCheck == null ? 0 : this.projectsToCheck.length; i < max; i++){
+			IJavaProject project = JavaCore.create(this.projectsToCheck[i]);
+			try {
+				// force to resolve CP variables before calling indexer - 19303 (indirectly through consistency check)
+				project.getResolvedClasspath(true);
+			} catch (JavaModelException e) {
+			}
+		} 
+	}
+	super.reset();
+	if (indexes != null){
+		indexes = new HashMap(5);
+		monitors = new HashMap(5);
+	}
+	javaPluginLocation = null;
+}
+/**
+ * Commit all index memory changes to disk
+ */
+public void saveIndexes(){
+
+	ArrayList indexList = new ArrayList();
+	synchronized(this){
+		for (Iterator iter = indexes.values().iterator(); iter.hasNext();){
+			indexList.add(iter.next());
+		}
+	}
+
+	for (Iterator iter = indexList.iterator(); iter.hasNext();){		
+		IIndex index = (IIndex)iter.next();
+		if (index == null) continue; // index got deleted since acquired
+		ReadWriteMonitor monitor = getMonitorFor(index);
+		if (monitor == null) continue; // index got deleted since acquired
+		try {
+			monitor.enterWrite();
+			if (IndexManager.VERBOSE){
+				if (index.hasChanged()){ 
+					JobManager.verbose("-> merging index " + index.getIndexFile()); //$NON-NLS-1$
 				}
-				unit.save(null, false);
-				boolean isWorkingCopy = unit.isWorkingCopy();
-				if (!isWorkingCopy)
-					this.setAttribute("hasModifiedResource", "true");
-				worked(1);
-				fResultElements = generateResultHandles();
-				if (!isWorkingCopy // if unit is working copy, then save will have already fired the delta
-						&& !Util.isExcluded(unit)
-						&& unit.getParent().exists()) {
-					for (int i = 0; i < fResultElements.length; i++) {
-						delta.added(fResultElements[i]);
-					}
-					addDelta(delta);
-				} // else unit is created outside classpath
-				  // non-java resource delta will be notified by delta processor
+			}
+			try {
+				index.save();
+			} catch(IOException e){
+				if (IndexManager.VERBOSE) {
+					JobManager.verbose("-> got the following exception while merging:"); //$NON-NLS-1$
+					e.printStackTrace();
+				}
+				//org.eclipse.jdt.internal.core.Util.log(e);
 			}
 		} finally {
-			done();
+			monitor.exitWrite();
 		}
 	}
-	/**
-	 * Returns a JDOM document fragment for the element being created.
-	 */
-	protected abstract IDOMNode generateElementDOM() throws JavaModelException;
-	/**
-	 * Returns the DOM with the new source to use for the given compilation unit.
-	 */
-	protected void generateNewCompilationUnitDOM(ICompilationUnit cu) throws JavaModelException {
-		IBuffer buffer = cu.getBuffer();
-		if (buffer == null) return;
-		char[] prevSource = buffer.getCharacters();
-		if (prevSource == null) return;
+	needToSave = false;
+}
+
+public void shutdown() {
 	
-		// create a JDOM for the compilation unit
-		fCUDOM = (new DOMFactory()).createCompilationUnit(prevSource, cu.getElementName());
-		IDOMNode child = generateElementDOM();
-		if (child != null) {
-			insertDOMNode(fCUDOM, child);
+	HashMap keepingIndexesPaths = new HashMap();
+	IndexSelector indexSelector = new IndexSelector(new JavaWorkspaceScope(), null, this);
+	IIndex[] selectedIndexes = indexSelector.getIndexes();
+	for (int i = 0, max = selectedIndexes.length; i < max; i++) {
+		String path = selectedIndexes[i].getIndexFile().getAbsolutePath();
+		keepingIndexesPaths.put(path, path);
+	}
+	File indexesDirectory = new File(this.getJavaPluginWorkingLocation().toOSString());
+	if (indexesDirectory.isDirectory()) {
+		File[] indexesFiles = indexesDirectory.listFiles();
+		for (int i = 0, indexesFilesLength = indexesFiles.length; i < indexesFilesLength; i++) {
+			String fileName = indexesFiles[i].getAbsolutePath();
+			if (fileName.toLowerCase().endsWith(".index") && keepingIndexesPaths.get(fileName) == null) { //$NON-NLS-1$
+				if (VERBOSE) {
+					JobManager.verbose("Deleting index file " + indexesFiles[i]); //$NON-NLS-1$
+				}
+				indexesFiles[i].delete();
+			}
 		}
-		worked(1);
+		
 	}
-	/**
-	 * Creates and returns the handle for the element this operation created.
-	 */
-	protected abstract IJavaElement generateResultHandle();
-	/**
-	 * Creates and returns the handles for the elements this operation created.
-	 */
-	protected IJavaElement[] generateResultHandles() throws JavaModelException {
-		return new IJavaElement[]{generateResultHandle()};
-	}
-	/**
-	 * Returns the compilation unit in which the new element is being created.
-	 */
-	protected ICompilationUnit getCompilationUnit() {
-		return getCompilationUnitFor(getParentElement());
-	}
-	/**
-	 * Returns the amount of work for the main task of this operation for
-	 * progress reporting.
-	 */
-	protected int getMainAmountOfWork(){
-		return 2;
-	}
-	/**
-	 * Returns the name of the main task of this operation for
-	 * progress reporting.
-	 */
-	public abstract String getMainTaskName();
-	/**
-	 * Returns the elements created by this operation.
-	 */
-	public IJavaElement[] getResultElements() {
-		return fResultElements;
-	}
-	/**
-	 * Sets the default position in which to create the new type
-	 * member. By default, the new element is positioned as the
-	 * last child of the parent element in which it is created.
-	 * Operations that require a different default position must
-	 * override this method.
-	 */
-	protected void initializeDefaultPosition() {
+	super.shutdown();		
+}
+
+/**
+ * Trigger addition of a library to an index
+ * Note: the actual operation is performed in background
+ */
+public void indexLibrary(IPath path, IProject referingProject) {
+	if (JavaCore.getPlugin() == null) return;
+
+	Object target = JavaModel.getTarget(ResourcesPlugin.getWorkspace().getRoot(), path, true);
 	
+	IndexRequest request = null;
+	if (target instanceof IFile) {
+		request = new AddJarFileToIndex((IFile)target, this, referingProject.getName());
+	} else if (target instanceof java.io.File) {
+		// remember the timestamp of this library
+		long timestamp = DeltaProcessor.getTimeStamp((java.io.File)target);
+		JavaModelManager.getJavaModelManager().deltaProcessor.externalTimeStamps.put(path, new Long(timestamp));
+		request = new AddJarFileToIndex(path, this, referingProject.getName());
+	} else if (target instanceof IFolder) {
+		request = new IndexBinaryFolder((IFolder)target, this, referingProject);
+	} else {
+		return;
 	}
-	/**
-	 * Inserts the given child into the given JDOM, 
-	 * based on the position settings of this operation.
-	 *
-	 * @see createAfter(IJavaElement)
-	 * @see createBefore(IJavaElement);
-	 */
-	protected void insertDOMNode(IDOMNode parent, IDOMNode child) {
-		if (fInsertionPolicy != INSERT_LAST) {
-			IDOMNode sibling = ((JavaElement)fAnchorElement).findNode(fCUDOM);
-			if (sibling != null && fInsertionPolicy == INSERT_AFTER) {
-				sibling = sibling.getNextNode();
-			}
-			if (sibling != null) {
-				sibling.insertSibling(child);
-				fCreatedElement = (DOMNode)child;
-				fInsertionPosition = ((DOMNode)sibling).getStartPosition();
-				fReplacementLength = 0;
-				return;
-			}
-		}
-		//add as the last element of the parent
-		parent.addChild(child);
-		fCreatedElement = (DOMNode)child;
-		fInsertionPosition = ((DOMNode)parent).getInsertionPosition();
-	//	fInsertionPosition = lastChild == null ? ((DOMNode)parent).getInsertionPosition() : lastChild.getInsertionPosition();
-		fReplacementLength = parent.getParent() == null ? -1 : 0;
-	}
-	/**
-	 * Sets the name of the <code>DOMNode</code> that will be used to
-	 * create this new element.
-	 * Used by the <code>CopyElementsOperation</code> for renaming.
-	 * Only used for <code>CreateTypeMemberOperation</code>
-	 */
-	protected void setAlteredName(String newName) {
-	}
-	/**
-	 * Instructs this operation to position the new element relative
-	 * to the given sibling, or to add the new element as the last child
-	 * of its parent if <code>null</code>. The <code>position</code>
-	 * must be one of the position constants.
-	 */
-	protected void setRelativePosition(IJavaElement sibling, int policy) throws IllegalArgumentException {
-		if (sibling == null) {
-			fAnchorElement = null;
-			fInsertionPolicy = INSERT_LAST;
-		} else {
-			fAnchorElement = sibling;
-			fInsertionPolicy = policy;
+	
+	// check if the same request is not already in the queue
+	for (int i = this.jobEnd; i >= this.jobStart; i--) {
+		IJob awaiting = this.awaitingJobs[i];
+		if (awaiting != null && request.equals(awaiting)) {
+			return;
 		}
 	}
-	/**
-	 * Possible failures: <ul>
-	 *  <li>NO_ELEMENTS_TO_PROCESS - the compilation unit supplied to the operation is
-	 * 		<code>null</code>.
-	 *  <li>INVALID_NAME - no name, a name was null or not a valid
-	 * 		import declaration name.
-	 *  <li>INVALID_SIBLING - the sibling provided for positioning is not valid.
-	 * </ul>
-	 * @see IJavaModelStatus
-	 * @see JavaConventions
-	 */
-	public IJavaModelStatus verify() {
-		if (getParentElement() == null) {
-			return new JavaModelStatus(IJavaModelStatusConstants.NO_ELEMENTS_TO_PROCESS);
-		}
-		if (fAnchorElement != null) {
-			IJavaElement domPresentParent = fAnchorElement.getParent();
-			if (domPresentParent.getElementType() == IJavaElement.IMPORT_CONTAINER) {
-				domPresentParent = domPresentParent.getParent();
-			}
-			if (!domPresentParent.equals(getParentElement())) {
-				return new JavaModelStatus(IJavaModelStatusConstants.INVALID_SIBLING, fAnchorElement);
-			}
-		}
-		return JavaModelStatus.VERIFIED_OK;
-	}
+
+	this.request(request);
+}
 }

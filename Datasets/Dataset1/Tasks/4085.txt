@@ -1,6 +1,24 @@
-@Override public float lengthNorm(FieldInvertState state) { return state.getBoost(); }
+0),
 
-package org.apache.lucene.search;
+package org.apache.lucene.facet.search.sampling;
+
+import java.io.IOException;
+
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.Bits;
+
+import org.apache.lucene.facet.search.DrillDown;
+import org.apache.lucene.facet.search.ScoredDocIDs;
+import org.apache.lucene.facet.search.ScoredDocIDsIterator;
+import org.apache.lucene.facet.search.params.FacetSearchParams;
+import org.apache.lucene.facet.search.results.FacetResult;
+import org.apache.lucene.facet.search.results.FacetResultNode;
+import org.apache.lucene.facet.taxonomy.CategoryPath;
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,154 +37,149 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.document.Field;
-import org.apache.lucene.util.LuceneTestCase;
-
-import java.io.IOException;
-
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.FieldInvertState;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Norm;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.similarities.DefaultSimilarity;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-
-/** Similarity unit test.
- *
- *
+/**
+ * Fix sampling results by counting the intersection between two lists: a
+ * TermDocs (list of documents in a certain category) and a DocIdSetIterator
+ * (list of documents matching the query).
+ * 
+ * 
+ * @lucene.experimental
  */
-public class TestSimilarity extends LuceneTestCase {
+// TODO (Facet): implement also an estimated fixing by ratio (taking into
+// account "translation" of counts!)
+class TakmiSampleFixer implements SampleFixer {
   
-  public static class SimpleSimilarity extends DefaultSimilarity {
-    public float queryNorm(float sumOfSquaredWeights) { return 1.0f; }
-    public float coord(int overlap, int maxOverlap) { return 1.0f; }
-    @Override public void computeNorm(FieldInvertState state, Norm norm) { norm.setByte(encodeNormValue(state.getBoost())); }
-    @Override public float tf(float freq) { return freq; }
-    @Override public float sloppyFreq(int distance) { return 2.0f; }
-    @Override public float idf(long docFreq, long numDocs) { return 1.0f; }
-    @Override public Explanation idfExplain(CollectionStatistics collectionStats, TermStatistics[] stats) {
-      return new Explanation(1.0f, "Inexplicable"); 
+  private TaxonomyReader taxonomyReader;
+  private IndexReader indexReader;
+  private FacetSearchParams searchParams;
+  
+  public TakmiSampleFixer(IndexReader indexReader,
+      TaxonomyReader taxonomyReader, FacetSearchParams searchParams) {
+    this.indexReader = indexReader;
+    this.taxonomyReader = taxonomyReader;
+    this.searchParams = searchParams;
+  }
+
+  public void fixResult(ScoredDocIDs origDocIds, FacetResult fres)
+      throws IOException {
+    FacetResultNode topRes = fres.getFacetResultNode();
+    fixResultNode(topRes, origDocIds);
+  }
+  
+  /**
+   * Fix result node count, and, recursively, fix all its children
+   * 
+   * @param facetResNode
+   *          result node to be fixed
+   * @param docIds
+   *          docids in effect
+   * @throws IOException
+   */
+  private void fixResultNode(FacetResultNode facetResNode, ScoredDocIDs docIds)
+      throws IOException {
+    recount(facetResNode, docIds);
+    for (FacetResultNode frn : facetResNode.getSubResults()) {
+      fixResultNode(frn, docIds);
     }
   }
 
-  public void testSimilarity() throws Exception {
-    Directory store = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), store, 
-        newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random()))
-        .setSimilarity(new SimpleSimilarity()));
+  /**
+   * Internal utility: recount for a facet result node
+   * 
+   * @param fresNode
+   *          result node to be recounted
+   * @param docIds
+   *          full set of matching documents.
+   * @throws IOException
+   */
+  private void recount(FacetResultNode fresNode, ScoredDocIDs docIds)
+      throws IOException {
+    // TODO (Facet): change from void to return the new, smaller docSet, and use
+    // that for the children, as this will make their intersection ops faster.
+    // can do this only when the new set is "sufficiently" smaller.
     
-    Document d1 = new Document();
-    d1.add(newTextField("field", "a c", Field.Store.YES));
+    /* We need the category's path name in order to do its recounting.
+     * If it is missing, because the option to label only part of the
+     * facet results was exercise, we need to calculate them anyway, so
+     * in essence sampling with recounting spends some extra cycles for
+     * labeling results for which labels are not required. */
+    CategoryPath catPath = fresNode.getLabel(taxonomyReader); // force labeling
 
-    Document d2 = new Document();
-    d2.add(newTextField("field", "a b c", Field.Store.YES));
+    Term drillDownTerm = DrillDown.term(searchParams, catPath);
+    // TODO (Facet): avoid Multi*?
+    Bits liveDocs = MultiFields.getLiveDocs(indexReader);
+    int updatedCount = countIntersection(MultiFields.getTermDocsEnum(indexReader, liveDocs,
+                                                                     drillDownTerm.field(), drillDownTerm.bytes(),
+                                                                     false),
+                                         docIds.iterator());
+
+    fresNode.setValue(updatedCount);
+  }
+
+  /**
+   * Count the size of the intersection between two lists: a TermDocs (list of
+   * documents in a certain category) and a DocIdSetIterator (list of documents
+   * matching a query).
+   */
+  private static int countIntersection(DocsEnum p1, ScoredDocIDsIterator p2)
+      throws IOException {
+    // The documentation of of both TermDocs and DocIdSetIterator claim
+    // that we must do next() before doc(). So we do, and if one of the
+    // lists is empty, obviously return 0;
+    if (p1 == null || p1.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+      return 0;
+    }
+    if (!p2.next()) {
+      return 0;
+    }
     
-    writer.addDocument(d1);
-    writer.addDocument(d2);
-    IndexReader reader = writer.getReader();
-    writer.close();
+    int d1 = p1.docID();
+    int d2 = p2.getDocID();
 
-    IndexSearcher searcher = newSearcher(reader);
-    searcher.setSimilarity(new SimpleSimilarity());
-
-    Term a = new Term("field", "a");
-    Term b = new Term("field", "b");
-    Term c = new Term("field", "c");
-
-    searcher.search(new TermQuery(b), new Collector() {
-         private Scorer scorer;
-         @Override
-        public void setScorer(Scorer scorer) {
-           this.scorer = scorer; 
-         }
-         @Override
-        public final void collect(int doc) throws IOException {
-           assertEquals(1.0f, scorer.score(), 0);
-         }
-         @Override
-        public void setNextReader(AtomicReaderContext context) {}
-         @Override
-        public boolean acceptsDocsOutOfOrder() {
-           return true;
-         }
-       });
-
-    BooleanQuery bq = new BooleanQuery();
-    bq.add(new TermQuery(a), BooleanClause.Occur.SHOULD);
-    bq.add(new TermQuery(b), BooleanClause.Occur.SHOULD);
-    //System.out.println(bq.toString("field"));
-    searcher.search(bq, new Collector() {
-         private int base = 0;
-         private Scorer scorer;
-         @Override
-        public void setScorer(Scorer scorer) {
-           this.scorer = scorer; 
-         }
-         @Override
-        public final void collect(int doc) throws IOException {
-           //System.out.println("Doc=" + doc + " score=" + score);
-           assertEquals((float)doc+base+1, scorer.score(), 0);
-         }
-         @Override
-        public void setNextReader(AtomicReaderContext context) {
-           base = context.docBase;
-         }
-         @Override
-        public boolean acceptsDocsOutOfOrder() {
-           return true;
-         }
-       });
-
-    PhraseQuery pq = new PhraseQuery();
-    pq.add(a);
-    pq.add(c);
-    //System.out.println(pq.toString("field"));
-    searcher.search(pq,
-       new Collector() {
-         private Scorer scorer;
-         @Override
-         public void setScorer(Scorer scorer) {
-          this.scorer = scorer; 
-         }
-         @Override
-         public final void collect(int doc) throws IOException {
-           //System.out.println("Doc=" + doc + " score=" + score);
-           assertEquals(1.0f, scorer.score(), 0);
-         }
-         @Override
-         public void setNextReader(AtomicReaderContext context) {}
-         @Override
-         public boolean acceptsDocsOutOfOrder() {
-           return true;
-         }
-       });
-
-    pq.setSlop(2);
-    //System.out.println(pq.toString("field"));
-    searcher.search(pq, new Collector() {
-      private Scorer scorer;
-      @Override
-      public void setScorer(Scorer scorer) {
-        this.scorer = scorer; 
+    int count = 0;
+    for (;;) {
+      if (d1 == d2) {
+        ++count;
+        if (p1.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+          break; // end of list 1, nothing more in intersection
+        }
+        d1 = p1.docID();
+        if (!advance(p2, d1)) {
+          break; // end of list 2, nothing more in intersection
+        }
+        d2 = p2.getDocID();
+      } else if (d1 < d2) {
+        if (p1.advance(d2) == DocIdSetIterator.NO_MORE_DOCS) {
+          break; // end of list 1, nothing more in intersection
+        }
+        d1 = p1.docID();
+      } else /* d1>d2 */ {
+        if (!advance(p2, d1)) {
+          break; // end of list 2, nothing more in intersection
+        }
+        d2 = p2.getDocID();
       }
-      @Override
-      public final void collect(int doc) throws IOException {
-        //System.out.println("Doc=" + doc + " score=" + score);
-        assertEquals(2.0f, scorer.score(), 0);
-      }
-      @Override
-      public void setNextReader(AtomicReaderContext context) {}
-      @Override
-      public boolean acceptsDocsOutOfOrder() {
-        return true;
-      }
-    });
+    }
+    return count;
+  }
 
-    reader.close();
-    store.close();
+  /**
+   * utility: advance the iterator until finding (or exceeding) specific
+   * document
+   * 
+   * @param iterator
+   *          iterator being advanced
+   * @param targetDoc
+   *          target of advancing
+   * @return false if iterator exhausted, true otherwise.
+   */
+  private static boolean advance(ScoredDocIDsIterator iterator, int targetDoc) {
+    while (iterator.next()) {
+      if (iterator.getDocID() >= targetDoc) {
+        return true; // target reached
+      }
+    }
+    return false; // exhausted
   }
 }
+ No newline at end of file

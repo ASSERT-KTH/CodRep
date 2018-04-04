@@ -1,105 +1,186 @@
-public abstract class MX_KXRecord extends Record {
+false, // never consider opt false case for DO loop, since break can always occur (47776)
 
-// Copyright (c) 1999 Brian Wellington (bwelling@xbill.org)
-// Portions Copyright (c) 1999 Network Associates, Inc.
+/*******************************************************************************
+ * Copyright (c) 2000, 2003 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials 
+ * are made available under the terms of the Common Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/cpl-v10.html
+ * 
+ * Contributors:
+ *     IBM Corporation - initial API and implementation
+ *******************************************************************************/
+package org.eclipse.jdt.internal.compiler.ast;
 
-package org.xbill.DNS;
+import org.eclipse.jdt.internal.compiler.ASTVisitor;
+import org.eclipse.jdt.internal.compiler.impl.*;
+import org.eclipse.jdt.internal.compiler.codegen.*;
+import org.eclipse.jdt.internal.compiler.flow.*;
+import org.eclipse.jdt.internal.compiler.lookup.*;
 
-import java.io.*;
-import java.util.*;
-import org.xbill.DNS.utils.*;
+public class DoStatement extends Statement {
 
-/**
- * Implements MX and KX records, which have identical formats
- *
- * @author Brian Wellington
- */
+	public Expression condition;
+	public Statement action;
 
-abstract public class MX_KXRecord extends Record {
+	private Label breakLabel, continueLabel;
 
-private short priority;
-private Name target;
+	// for local variables table attributes
+	int mergedInitStateIndex = -1;
 
-protected
-MX_KXRecord() {}
+	public DoStatement(Expression condition, Statement action, int s, int e) {
 
-protected
-MX_KXRecord(Name name, short type, short dclass, int ttl) {
-        super(name, type, dclass, ttl);
-}
-
-public
-MX_KXRecord(Name name, short type, short dclass, int ttl, int priority,
-	    Name target)
-{
-	super(name, type, dclass, ttl);
-	this.priority = (short) priority;
-	this.target = target;
-}
-
-protected static Record
-rrFromWire(MX_KXRecord rec, DataByteInputStream in)
-throws IOException
-{
-	if (in == null)
-		return rec;
-	rec.priority = (short) in.readUnsignedShort();
-	rec.target = new Name(in);
-	return rec;
-}
-
-protected static Record
-rdataFromString(MX_KXRecord rec, MyStringTokenizer st, Name origin)
-throws TextParseException
-{
-	rec.priority = Short.parseShort(st.nextToken());
-	rec.target = Name.fromString(st.nextToken(), origin);
-	return rec;
-}
-
-/** Converts rdata to a String */
-public String
-rdataToString() {
-	StringBuffer sb = new StringBuffer();
-	if (target != null) {
-		sb.append(priority);
-		sb.append(" ");
-		sb.append(target);
+		this.sourceStart = s;
+		this.sourceEnd = e;
+		this.condition = condition;
+		this.action = action;
+		// remember useful empty statement
+		if (action instanceof EmptyStatement) action.bits |= IsUsefulEmptyStatementMASK;
 	}
-	return sb.toString();
-}
 
-/** Returns the target of the record */
-public Name
-getTarget() {
-	return target;
-}
+	public FlowInfo analyseCode(
+		BlockScope currentScope,
+		FlowContext flowContext,
+		FlowInfo flowInfo) {
 
-/** Returns the priority of this record */
-public short
-getPriority() {
-	return priority;
-}
+		breakLabel = new Label();
+		continueLabel = new Label();
+		LoopingFlowContext loopingContext =
+			new LoopingFlowContext(
+				flowContext,
+				this,
+				breakLabel,
+				continueLabel,
+				currentScope);
 
-void
-rrToWire(DataByteOutputStream out, Compression c) throws IOException {
-	if (target == null)
-		return;
+		Constant cst = condition.constant;
+		boolean isConditionTrue = cst != NotAConstant && cst.booleanValue() == true;
+		cst = condition.optimizedBooleanConstant();
+		boolean isConditionOptimizedTrue = cst != NotAConstant && cst.booleanValue() == true;
+		boolean isConditionOptimizedFalse = cst != NotAConstant && cst.booleanValue() == false;
 
-	out.writeShort(priority);
-	if (type == Type.MX)
-		target.toWire(out, c);
-	else
-		target.toWire(out, null);
-}
+		int previousMode = flowInfo.reachMode();
+				
+		if ((action != null) && !action.isEmptyBlock()) {
+			flowInfo = action.analyseCode(currentScope, loopingContext, flowInfo);
 
-void
-rrToWireCanonical(DataByteOutputStream out) throws IOException {
-	if (target == null)
-		return;
+			// code generation can be optimized when no need to continue in the loop
+			if (!flowInfo.isReachable() && !loopingContext.initsOnContinue.isReachable()) {
+				continueLabel = null;
+			}
+		}
+		/* Reset reach mode, to address following scenario.
+		 *   final blank;
+		 *   do { if (true) break; else blank = 0; } while(false);
+		 *   blank = 1; // may be initialized already 
+		 */
+		flowInfo.setReachMode(previousMode);
+		
+		flowInfo =
+			condition.analyseCode(
+				currentScope,
+				loopingContext,
+				(action == null
+					? flowInfo
+					: (flowInfo.mergedWith(loopingContext.initsOnContinue))));
+		if (!isConditionOptimizedFalse && continueLabel != null) {
+			loopingContext.complainOnFinalAssignmentsInLoop(currentScope, flowInfo);
+		}
 
-	out.writeShort(priority);
-	target.toWireCanonical(out);
-}
+		// end of loop
+		FlowInfo mergedInfo = FlowInfo.mergedOptimizedBranches(
+				loopingContext.initsOnBreak, 
+				isConditionOptimizedTrue, 
+				flowInfo.initsWhenFalse(), 
+				isConditionOptimizedFalse, 
+				!isConditionTrue /*do{}while(true); unreachable(); */);
+		mergedInitStateIndex = currentScope.methodScope().recordInitializationStates(mergedInfo);
+		return mergedInfo;
+	}
 
+	/**
+	 * Do statement code generation
+	 *
+	 */
+	public void generateCode(BlockScope currentScope, CodeStream codeStream) {
+
+		if ((bits & IsReachableMASK) == 0) {
+			return;
+		}
+		int pc = codeStream.position;
+
+		// labels management
+		Label actionLabel = new Label(codeStream);
+		actionLabel.place();
+		breakLabel.codeStream = codeStream;
+		if (continueLabel != null) {
+			continueLabel.codeStream = codeStream;
+		}
+
+		// generate action
+		if (action != null) {
+			action.generateCode(currentScope, codeStream);
+		}
+		// generate condition
+		if (continueLabel != null) {
+			continueLabel.place();
+			condition.generateOptimizedBoolean(
+				currentScope,
+				codeStream,
+				actionLabel,
+				null,
+				true);
+		}
+		breakLabel.place();
+
+		// May loose some local variable initializations : affecting the local variable attributes
+		if (mergedInitStateIndex != -1) {
+			codeStream.removeNotDefinitelyAssignedVariables(
+				currentScope,
+				mergedInitStateIndex);
+		}
+		codeStream.recordPositionsFrom(pc, this.sourceStart);
+
+	}
+
+	public StringBuffer printStatement(int indent, StringBuffer output) {
+
+		printIndent(indent, output).append("do"); //$NON-NLS-1$
+		if (action == null)
+			output.append(" ;\n"); //$NON-NLS-1$
+		else {
+			output.append('\n');
+			action.printStatement(indent + 1, output).append('\n');
+		}
+		output.append("while ("); //$NON-NLS-1$
+		return condition.printExpression(0, output).append(");"); //$NON-NLS-1$
+	}
+
+	public void resetStateForCodeGeneration() {
+		if (this.breakLabel != null) {
+			this.breakLabel.resetStateForCodeGeneration();
+		}
+		if (this.continueLabel != null) {
+			this.continueLabel.resetStateForCodeGeneration();
+		}
+	}
+
+	public void resolve(BlockScope scope) {
+
+		TypeBinding type = condition.resolveTypeExpecting(scope, BooleanBinding);
+		condition.implicitWidening(type, type);
+		if (action != null)
+			action.resolve(scope);
+	}
+
+	public void traverse(ASTVisitor visitor, BlockScope scope) {
+
+		if (visitor.visit(this, scope)) {
+			if (action != null) {
+				action.traverse(visitor, scope);
+			}
+			condition.traverse(visitor, scope);
+		}
+		visitor.endVisit(this, scope);
+	}
 }

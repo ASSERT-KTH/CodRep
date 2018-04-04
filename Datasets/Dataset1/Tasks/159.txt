@@ -1,13 +1,14 @@
-logger.info("DigestMismatchException: " + ex.getMessage());
+builder = new Builder<BytesRef>(FST.INPUT_TYPE.BYTE1, 0, 0, true, true, Integer.MAX_VALUE, outputs, null, doPackFST, acceptableOverheadRatio, true);
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.codecs.memory;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,590 +18,870 @@ logger.info("DigestMismatchException: " + ex.getMessage());
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.cassandra.service;
 
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.lang.management.ManagementFactory;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.SortedMap;
+import java.util.TreeMap;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsConsumer;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.codecs.TermsConsumer;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.store.ByteArrayDataInput;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RAMOutputStream;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IntsRef;
+import org.apache.lucene.util.fst.Builder;
+import org.apache.lucene.util.fst.ByteSequenceOutputs;
+import org.apache.lucene.util.fst.BytesRefFSTEnum;
+import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.fst.Util;
+import org.apache.lucene.util.packed.PackedInts;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.io.DataInputBuffer;
-import org.apache.cassandra.net.EndPoint;
-import org.apache.cassandra.net.IAsyncResult;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.TimedStatsDeque;
-import org.apache.cassandra.locator.TokenMetadata;
+// TODO: would be nice to somehow allow this to act like
+// InstantiatedIndex, by never writing to disk; ie you write
+// to this Codec in RAM only and then when you open a reader
+// it pulls the FST directly from what you wrote w/o going
+// to disk.
 
-import org.apache.log4j.Logger;
+/** Stores terms & postings (docs, positions, payloads) in
+ *  RAM, using an FST.
+ *
+ * <p>Note that this codec implements advance as a linear
+ * scan!  This means if you store large fields in here,
+ * queries that rely on advance will (AND BooleanQuery,
+ * PhraseQuery) will be relatively slow!
+ *
+ * <p><b>NOTE</b>: this codec cannot address more than ~2.1 GB
+ * of postings, because the underlying FST uses an int
+ * to address the underlying byte[].
+ *
+ * @lucene.experimental */
 
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+// TODO: Maybe name this 'Cached' or something to reflect
+// the reality that it is actually written to disk, but
+// loads itself in ram?
+public final class MemoryPostingsFormat extends PostingsFormat {
 
+  private final boolean doPackFST;
+  private final float acceptableOverheadRatio;
 
-public class StorageProxy implements StorageProxyMBean
-{
-    private static Logger logger = Logger.getLogger(StorageProxy.class);
+  public MemoryPostingsFormat() {
+    this(false, PackedInts.DEFAULT);
+  }
 
-    // mbean stuff
-    private static TimedStatsDeque readStats = new TimedStatsDeque(60000);
-    private static TimedStatsDeque rangeStats = new TimedStatsDeque(60000);
-    private static TimedStatsDeque writeStats = new TimedStatsDeque(60000);
-    private StorageProxy() {}
-    static
-    {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(new StorageProxy(), new ObjectName("org.apache.cassandra.service:type=StorageProxy"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+  public MemoryPostingsFormat(boolean doPackFST, float acceptableOverheadRatio) {
+    super("Memory");
+    this.doPackFST = doPackFST;
+    this.acceptableOverheadRatio = acceptableOverheadRatio;
+  }
+  
+  @Override
+  public String toString() {
+    return "PostingsFormat(name=" + getName() + " doPackFST= " + doPackFST + ")";
+  }
+
+  private final static class TermsWriter extends TermsConsumer {
+    private final IndexOutput out;
+    private final FieldInfo field;
+    private final Builder<BytesRef> builder;
+    private final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
+    private final boolean doPackFST;
+    private final float acceptableOverheadRatio;
+    private int termCount;
+
+    public TermsWriter(IndexOutput out, FieldInfo field, boolean doPackFST, float acceptableOverheadRatio) {
+      this.out = out;
+      this.field = field;
+      this.doPackFST = doPackFST;
+      this.acceptableOverheadRatio = acceptableOverheadRatio;
+      builder = new Builder<BytesRef>(FST.INPUT_TYPE.BYTE1, 0, 0, true, true, Integer.MAX_VALUE, outputs, null, doPackFST, acceptableOverheadRatio);
     }
 
-    /**
-     * This method is responsible for creating Message to be
-     * sent over the wire to N replicas where some of the replicas
-     * may be hints.
-     */
-    private static Map<EndPoint, Message> createWriteMessages(RowMutation rm, Map<EndPoint, EndPoint> endpointMap) throws IOException
-    {
-		Map<EndPoint, Message> messageMap = new HashMap<EndPoint, Message>();
-		Message message = rm.makeRowMutationMessage();
+    private class PostingsWriter extends PostingsConsumer {
+      private int lastDocID;
+      private int lastPos;
+      private int lastPayloadLen;
 
-		for (Map.Entry<EndPoint, EndPoint> entry : endpointMap.entrySet())
-		{
-            EndPoint target = entry.getKey();
-            EndPoint hint = entry.getValue();
-            if ( !target.equals(hint) )
-			{
-				Message hintedMessage = rm.makeRowMutationMessage();
-				hintedMessage.addHeader(RowMutation.HINT, EndPoint.toBytes(hint) );
-				if (logger.isDebugEnabled())
-				    logger.debug("Sending the hint of " + hint.getHost() + " to " + target.getHost());
-				messageMap.put(target, hintedMessage);
-			}
-			else
-			{
-				messageMap.put(target, message);
-			}
-		}
-		return messageMap;
-    }
-    
-    /**
-     * Use this method to have this RowMutation applied
-     * across all replicas. This method will take care
-     * of the possibility of a replica being down and hint
-     * the data across to some other replica. 
-     * @param rm the mutation to be applied across the replicas
-    */
-    public static void insert(RowMutation rm)
-	{
-        /*
-         * Get the N nodes from storage service where the data needs to be
-         * replicated
-         * Construct a message for write
-         * Send them asynchronously to the replicas.
-        */
+      // NOTE: not private so we don't pay access check at runtime:
+      int docCount;
+      RAMOutputStream buffer = new RAMOutputStream();
+      
+      int lastOffsetLength;
+      int lastOffset;
 
-        long startTime = System.currentTimeMillis();
-		try
-		{
-            // (This is the ZERO consistency level, so user doesn't care if we don't really have N destinations available.)
-			Map<EndPoint, EndPoint> endpointMap = StorageService.instance().getHintedStorageEndpointMap(rm.key());
-			Map<EndPoint, Message> messageMap = createWriteMessages(rm, endpointMap);
-			for (Map.Entry<EndPoint, Message> entry : messageMap.entrySet())
-			{
-                Message message = entry.getValue();
-                EndPoint endpoint = entry.getKey();
-                if (logger.isDebugEnabled())
-                    logger.debug("insert writing key " + rm.key() + " to " + message.getMessageId() + "@" + endpoint);
-                MessagingService.getMessagingInstance().sendOneWay(message, endpoint);
-			}
-		}
-        catch (IOException e)
-        {
-            throw new RuntimeException("error inserting key " + rm.key(), e);
-        }
-        finally
-        {
-            writeStats.add(System.currentTimeMillis() - startTime);
-        }
-    }
-    
-    public static void insertBlocking(RowMutation rm, int consistency_level) throws UnavailableException
-    {
-        long startTime = System.currentTimeMillis();
-        Message message = null;
-        try
-        {
-            message = rm.makeRowMutationMessage();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        try
-        {
-            Map<EndPoint, EndPoint> endpointMap = StorageService.instance().getHintedStorageEndpointMap(rm.key());
-            int blockFor = determineBlockFor(consistency_level);
-            List<EndPoint> primaryNodes = getUnhintedNodes(endpointMap);
-            if (primaryNodes.size() < blockFor) // guarantee blockFor = W live nodes.
-            {
-                throw new UnavailableException();
-            }
-            QuorumResponseHandler<Boolean> quorumResponseHandler = new QuorumResponseHandler<Boolean>(blockFor, new WriteResponseResolver());
-            if (logger.isDebugEnabled())
-                logger.debug("insertBlocking writing key " + rm.key() + " to " + message.getMessageId() + "@[" + StringUtils.join(endpointMap.keySet(), ", ") + "]");
+      @Override
+      public void startDoc(int docID, int termDocFreq) throws IOException {
+        //System.out.println("    startDoc docID=" + docID + " freq=" + termDocFreq);
+        final int delta = docID - lastDocID;
+        assert docID == 0 || delta > 0;
+        lastDocID = docID;
+        docCount++;
 
-            // Get all the targets and stick them in an array
-            MessagingService.getMessagingInstance().sendRR(message, primaryNodes.toArray(new EndPoint[primaryNodes.size()]), quorumResponseHandler);
-            if (!quorumResponseHandler.get())
-                throw new UnavailableException();
-            if (primaryNodes.size() < endpointMap.size()) // Do we need to bother with Hinted Handoff?
-            {
-                for (Map.Entry<EndPoint, EndPoint> e : endpointMap.entrySet())
-                {
-                    if (e.getKey() != e.getValue()) // Hinted Handoff to target
-                    {
-                        MessagingService.getMessagingInstance().sendOneWay(message, e.getKey());
-                    }
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            logger.error("error writing key " + rm.key(), e);
-            throw new UnavailableException();
-        }
-        finally
-        {
-            writeStats.add(System.currentTimeMillis() - startTime);
-        }
-    }
-
-    private static List<EndPoint> getUnhintedNodes(Map<EndPoint, EndPoint> endpointMap)
-    {
-        List<EndPoint> liveEndPoints = new ArrayList<EndPoint>(endpointMap.size());
-        for (Map.Entry<EndPoint, EndPoint> e : endpointMap.entrySet())
-        {
-            if (e.getKey() == e.getValue())
-            {
-                liveEndPoints.add(e.getKey());
-            }
-        }
-        return liveEndPoints;
-    }
-
-    private static int determineBlockFor(int consistency_level)
-    {
-        int blockFor;
-        if (consistency_level == ConsistencyLevel.ONE)
-        {
-            blockFor = 1;
-        }
-        else if (consistency_level == ConsistencyLevel.QUORUM)
-        {
-            blockFor = (DatabaseDescriptor.getReplicationFactor() / 2) + 1;
-        }
-        else if (consistency_level == ConsistencyLevel.ALL)
-        {
-            blockFor = DatabaseDescriptor.getReplicationFactor();
-        }
-        else
-        {
-            throw new UnsupportedOperationException("invalid consistency level " + consistency_level);
-        }
-        return blockFor;
-    }
-
-    public static void insertBlocking(RowMutation rm) throws UnavailableException
-    {
-        insertBlocking(rm, ConsistencyLevel.QUORUM);
-    }
-    
-
-    /**
-     * Read the data from one replica.  If there is no reply, read the data from another.  In the event we get
-     * the data we perform consistency checks and figure out if any repairs need to be done to the replicas.
-     * @param commands a set of commands to perform reads
-     * @return the row associated with command.key
-     * @throws Exception
-     */
-    private static List<Row> weakReadRemote(List<ReadCommand> commands) throws IOException, UnavailableException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("weakreadlocal reading " + StringUtils.join(commands, ", "));
-
-        List<Row> rows = new ArrayList<Row>();
-        List<IAsyncResult> iars = new ArrayList<IAsyncResult>();
-        int commandIndex = 0;
-
-        for (ReadCommand command: commands)
-        {
-            EndPoint endPoint = StorageService.instance().findSuitableEndPoint(command.key);
-            Message message = command.makeReadMessage();
-
-            if (logger.isDebugEnabled())
-                logger.debug("weakreadremote reading " + command + " from " + message.getMessageId() + "@" + endPoint);
-            message.addHeader(ReadCommand.DO_REPAIR, ReadCommand.DO_REPAIR.getBytes());
-            iars.add(MessagingService.getMessagingInstance().sendRR(message, endPoint));
+        if (field.getIndexOptions() == IndexOptions.DOCS_ONLY) {
+          buffer.writeVInt(delta);
+        } else if (termDocFreq == 1) {
+          buffer.writeVInt((delta<<1) | 1);
+        } else {
+          buffer.writeVInt(delta<<1);
+          assert termDocFreq > 0;
+          buffer.writeVInt(termDocFreq);
         }
 
-        for (IAsyncResult iar: iars)
-        {
-            byte[] body;
-            try
-            {
-                body = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-            }
-            catch (TimeoutException e)
-            {
-                throw new RuntimeException("error reading key " + commands.get(commandIndex).key, e);
-                // TODO retry to a different endpoint?
-            }
-            DataInputBuffer bufIn = new DataInputBuffer();
-            bufIn.reset(body, body.length);
-            ReadResponse response = ReadResponse.serializer().deserialize(bufIn);
-            if (response.row() != null)
-                rows.add(response.row());
-            commandIndex++;
-        }
-        return rows;
-    }
+        lastPos = 0;
+        lastOffset = 0;
+      }
 
-    /**
-     * Performs the actual reading of a row out of the StorageService, fetching
-     * a specific set of column names from a given column family.
-     */
-    public static List<Row> readProtocol(List<ReadCommand> commands, int consistency_level)
-    throws IOException, TimeoutException, InvalidRequestException, UnavailableException
-    {
-        long startTime = System.currentTimeMillis();
+      @Override
+      public void addPosition(int pos, BytesRef payload, int startOffset, int endOffset) throws IOException {
+        assert payload == null || field.hasPayloads();
 
-        List<Row> rows = new ArrayList<Row>();
+        //System.out.println("      addPos pos=" + pos + " payload=" + payload);
 
-        if (consistency_level == ConsistencyLevel.ONE)
-        {
-            List<ReadCommand> localCommands = new ArrayList<ReadCommand>();
-            List<ReadCommand> remoteCommands = new ArrayList<ReadCommand>();
-
-            for (ReadCommand command: commands)
-            {
-                EndPoint[] endpoints = StorageService.instance().getReadStorageEndPoints(command.key);
-                boolean foundLocal = Arrays.asList(endpoints).contains(StorageService.getLocalStorageEndPoint());
-                //TODO: Throw InvalidRequest if we're in bootstrap mode?
-                if (foundLocal && !StorageService.instance().isBootstrapMode())
-                {
-                    localCommands.add(command);
-                }
-                else
-                {
-                    remoteCommands.add(command);
-                }
-            }
-            if (localCommands.size() > 0)
-                rows.addAll(weakReadLocal(localCommands));
-
-            if (remoteCommands.size() > 0)
-                rows.addAll(weakReadRemote(remoteCommands));
-        }
-        else
-        {
-            assert consistency_level == ConsistencyLevel.QUORUM;
-            rows = strongRead(commands);
-        }
-
-        readStats.add(System.currentTimeMillis() - startTime);
-
-        return rows;
-    }
-
-    /*
-     * This function executes the read protocol.
-        // 1. Get the N nodes from storage service where the data needs to be
-        // replicated
-        // 2. Construct a message for read\write
-         * 3. Set one of the messages to get the data and the rest to get the digest
-        // 4. SendRR ( to all the nodes above )
-        // 5. Wait for a response from at least X nodes where X <= N and the data node
-         * 6. If the digest matches return the data.
-         * 7. else carry out read repair by getting data from all the nodes.
-        // 5. return success
-     */
-    private static List<Row> strongRead(List<ReadCommand> commands) throws IOException, TimeoutException, InvalidRequestException, UnavailableException
-    {
-        List<QuorumResponseHandler<Row>> quorumResponseHandlers = new ArrayList<QuorumResponseHandler<Row>>();
-        List<EndPoint[]> commandEndPoints = new ArrayList<EndPoint[]>();
-        List<Row> rows = new ArrayList<Row>();
-
-        int commandIndex = 0;
-
-        for (ReadCommand command: commands)
-        {
-            // TODO: throw a thrift exception if we do not have N nodes
-            assert !command.isDigestQuery();
-            ReadCommand readMessageDigestOnly = command.copy();
-            readMessageDigestOnly.setDigestQuery(true);
-
-            Message message = command.makeReadMessage();
-            Message messageDigestOnly = readMessageDigestOnly.makeReadMessage();
-
-            QuorumResponseHandler<Row> quorumResponseHandler = new QuorumResponseHandler<Row>(DatabaseDescriptor.getQuorum(), new ReadResponseResolver());
-            EndPoint dataPoint = StorageService.instance().findSuitableEndPoint(command.key);
-            List<EndPoint> endpointList = new ArrayList<EndPoint>(Arrays.asList(StorageService.instance().getReadStorageEndPoints(command.key)));
-            /* Remove the local storage endpoint from the list. */
-            endpointList.remove(dataPoint);
-            EndPoint[] endPoints = new EndPoint[endpointList.size() + 1];
-            Message messages[] = new Message[endpointList.size() + 1];
-
-            /*
-             * First message is sent to the node that will actually get
-             * the data for us. The other two replicas are only sent a
-             * digest query.
-            */
-            endPoints[0] = dataPoint;
-            messages[0] = message;
-            if (logger.isDebugEnabled())
-                logger.debug("strongread reading data for " + command + " from " + message.getMessageId() + "@" + dataPoint);
-            for (int i = 1; i < endPoints.length; i++)
-            {
-                EndPoint digestPoint = endpointList.get(i - 1);
-                endPoints[i] = digestPoint;
-                messages[i] = messageDigestOnly;
-                if (logger.isDebugEnabled())
-                    logger.debug("strongread reading digest for " + command + " from " + messageDigestOnly.getMessageId() + "@" + digestPoint);
-            }
-            MessagingService.getMessagingInstance().sendRR(messages, endPoints, quorumResponseHandler);
-            quorumResponseHandlers.add(quorumResponseHandler);
-            commandEndPoints.add(endPoints);
-        }
-
-        for (QuorumResponseHandler<Row> quorumResponseHandler: quorumResponseHandlers)
-        {
-            Row row = null;
-            ReadCommand command = commands.get(commandIndex);
-            try
-            {
-                long startTime2 = System.currentTimeMillis();
-                row = quorumResponseHandler.get();
-                if (row != null)
-                    rows.add(row);
-
-                if (logger.isDebugEnabled())
-                    logger.debug("quorumResponseHandler: " + (System.currentTimeMillis() - startTime2) + " ms.");
-            }
-            catch (DigestMismatchException ex)
-            {
-                if (DatabaseDescriptor.getConsistencyCheck())
-                {
-                    IResponseResolver<Row> readResponseResolverRepair = new ReadResponseResolver();
-                    QuorumResponseHandler<Row> quorumResponseHandlerRepair = new QuorumResponseHandler<Row>(
-                            DatabaseDescriptor.getQuorum(),
-                            readResponseResolverRepair);
-                    logger.info("DigestMismatchException: " + command.key);
-                    Message messageRepair = command.makeReadMessage();
-                    MessagingService.getMessagingInstance().sendRR(messageRepair, commandEndPoints.get(commandIndex), quorumResponseHandlerRepair);
-                    try
-                    {
-                        row = quorumResponseHandlerRepair.get();
-                        if (row != null)
-                            rows.add(row);
-                    }
-                    catch (DigestMismatchException e)
-                    {
-                        // TODO should this be a thrift exception?
-                        throw new RuntimeException("digest mismatch reading key " + command.key, e);
-                    }
-                }
-            }
-            commandIndex++;
-        }
-
-        return rows;
-    }
-
-    private static Map<String, Message[]> constructReplicaMessages(Map<String, ReadCommand[]> readMessages) throws IOException
-    {
-        Map<String, Message[]> messages = new HashMap<String, Message[]>();
-        Set<String> keys = readMessages.keySet();
+        final int delta = pos - lastPos;
+        assert delta >= 0;
+        lastPos = pos;
         
-        for ( String key : keys )
-        {
-            Message[] msg = new Message[DatabaseDescriptor.getReplicationFactor()];
-            ReadCommand[] readParameters = readMessages.get(key);
-            msg[0] = readParameters[0].makeReadMessage();
-            for ( int i = 1; i < msg.length; ++i )
-            {
-                msg[i] = readParameters[1].makeReadMessage();
-            }
-        }        
-        return messages;
+        int payloadLen = 0;
+        
+        if (field.hasPayloads()) {
+          payloadLen = payload == null ? 0 : payload.length;
+          if (payloadLen != lastPayloadLen) {
+            lastPayloadLen = payloadLen;
+            buffer.writeVInt((delta<<1)|1);
+            buffer.writeVInt(payloadLen);
+          } else {
+            buffer.writeVInt(delta<<1);
+          }
+        } else {
+          buffer.writeVInt(delta);
+        }
+        
+        if (field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
+          // don't use startOffset - lastEndOffset, because this creates lots of negative vints for synonyms,
+          // and the numbers aren't that much smaller anyways.
+          int offsetDelta = startOffset - lastOffset;
+          int offsetLength = endOffset - startOffset;
+          if (offsetLength != lastOffsetLength) {
+            buffer.writeVInt(offsetDelta << 1 | 1);
+            buffer.writeVInt(offsetLength);
+          } else {
+            buffer.writeVInt(offsetDelta << 1);
+          }
+          lastOffset = startOffset;
+          lastOffsetLength = offsetLength;
+        }
+        
+        if (payloadLen > 0) {
+          buffer.writeBytes(payload.bytes, payload.offset, payloadLen);
+        }
+      }
+
+      @Override
+      public void finishDoc() {
+      }
+
+      public PostingsWriter reset() {
+        assert buffer.getFilePointer() == 0;
+        lastDocID = 0;
+        docCount = 0;
+        lastPayloadLen = 0;
+        // force first offset to write its length
+        lastOffsetLength = -1;
+        return this;
+      }
     }
 
-    /*
-    * This function executes the read protocol locally and should be used only if consistency is not a concern.
-    * Read the data from the local disk and return if the row is NOT NULL. If the data is NULL do the read from
-    * one of the other replicas (in the same data center if possible) till we get the data. In the event we get
-    * the data we perform consistency checks and figure out if any repairs need to be done to the replicas.
-    */
-    private static List<Row> weakReadLocal(List<ReadCommand> commands) throws IOException
-    {
-        List<Row> rows = new ArrayList<Row>();
-        for (ReadCommand command: commands)
-        {
-            List<EndPoint> endpoints = StorageService.instance().getLiveReadStorageEndPoints(command.key);
-            /* Remove the local storage endpoint from the list. */
-            endpoints.remove(StorageService.getLocalStorageEndPoint());
-            // TODO: throw a thrift exception if we do not have N nodes
+    private final PostingsWriter postingsWriter = new PostingsWriter();
 
-            if (logger.isDebugEnabled())
-                logger.debug("weakreadlocal reading " + command);
+    @Override
+    public PostingsConsumer startTerm(BytesRef text) {
+      //System.out.println("  startTerm term=" + text.utf8ToString());
+      return postingsWriter.reset();
+    }
 
-            Table table = Table.open(command.table);
-            Row row = command.getRow(table);
-            if (row != null)
-                rows.add(row);
-            /*
-            * Do the consistency checks in the background and return the
-            * non NULL row.
-            */
-            if (endpoints.size() > 0 && DatabaseDescriptor.getConsistencyCheck())
-                StorageService.instance().doConsistencyCheck(row, endpoints, command);
+    private final RAMOutputStream buffer2 = new RAMOutputStream();
+    private final BytesRef spare = new BytesRef();
+    private byte[] finalBuffer = new byte[128];
 
+    private final IntsRef scratchIntsRef = new IntsRef();
+
+    @Override
+    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
+
+      assert postingsWriter.docCount == stats.docFreq;
+
+      assert buffer2.getFilePointer() == 0;
+
+      buffer2.writeVInt(stats.docFreq);
+      if (field.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+        buffer2.writeVLong(stats.totalTermFreq-stats.docFreq);
+      }
+      int pos = (int) buffer2.getFilePointer();
+      buffer2.writeTo(finalBuffer, 0);
+      buffer2.reset();
+
+      final int totalBytes = pos + (int) postingsWriter.buffer.getFilePointer();
+      if (totalBytes > finalBuffer.length) {
+        finalBuffer = ArrayUtil.grow(finalBuffer, totalBytes);
+      }
+      postingsWriter.buffer.writeTo(finalBuffer, pos);
+      postingsWriter.buffer.reset();
+
+      spare.bytes = finalBuffer;
+      spare.length = totalBytes;
+
+      //System.out.println("    finishTerm term=" + text.utf8ToString() + " " + totalBytes + " bytes totalTF=" + stats.totalTermFreq);
+      //for(int i=0;i<totalBytes;i++) {
+      //  System.out.println("      " + Integer.toHexString(finalBuffer[i]&0xFF));
+      //}
+
+      builder.add(Util.toIntsRef(text, scratchIntsRef), BytesRef.deepCopyOf(spare));
+      termCount++;
+    }
+
+    @Override
+    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
+      if (termCount > 0) {
+        out.writeVInt(termCount);
+        out.writeVInt(field.number);
+        if (field.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+          out.writeVLong(sumTotalTermFreq);
+        }
+        out.writeVLong(sumDocFreq);
+        out.writeVInt(docCount);
+        FST<BytesRef> fst = builder.finish();
+        fst.save(out);
+        //System.out.println("finish field=" + field.name + " fp=" + out.getFilePointer());
+      }
+    }
+
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+  }
+
+  private static String EXTENSION = "ram";
+
+  @Override
+  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
+
+    final String fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
+    final IndexOutput out = state.directory.createOutput(fileName, state.context);
+    
+    return new FieldsConsumer() {
+      @Override
+      public TermsConsumer addField(FieldInfo field) {
+        //System.out.println("\naddField field=" + field.name);
+        return new TermsWriter(out, field, doPackFST, acceptableOverheadRatio);
+      }
+
+      @Override
+      public void close() throws IOException {
+        // EOF marker:
+        try {
+          out.writeVInt(0);
+        } finally {
+          out.close();
+        }
+      }
+    };
+  }
+
+  private final static class FSTDocsEnum extends DocsEnum {
+    private final IndexOptions indexOptions;
+    private final boolean storePayloads;
+    private byte[] buffer = new byte[16];
+    private final ByteArrayDataInput in = new ByteArrayDataInput(buffer);
+
+    private Bits liveDocs;
+    private int docUpto;
+    private int docID = -1;
+    private int accum;
+    private int freq;
+    private int payloadLen;
+    private int numDocs;
+
+    public FSTDocsEnum(IndexOptions indexOptions, boolean storePayloads) {
+      this.indexOptions = indexOptions;
+      this.storePayloads = storePayloads;
+    }
+
+    public boolean canReuse(IndexOptions indexOptions, boolean storePayloads) {
+      return indexOptions == this.indexOptions && storePayloads == this.storePayloads;
+    }
+    
+    public FSTDocsEnum reset(BytesRef bufferIn, Bits liveDocs, int numDocs) {
+      assert numDocs > 0;
+      if (buffer.length < bufferIn.length - bufferIn.offset) {
+        buffer = ArrayUtil.grow(buffer, bufferIn.length - bufferIn.offset);
+      }
+      in.reset(buffer, 0, bufferIn.length - bufferIn.offset);
+      System.arraycopy(bufferIn.bytes, bufferIn.offset, buffer, 0, bufferIn.length - bufferIn.offset);
+      this.liveDocs = liveDocs;
+      docID = -1;
+      accum = 0;
+      docUpto = 0;
+      freq = 1;
+      payloadLen = 0;
+      this.numDocs = numDocs;
+      return this;
+    }
+
+    @Override
+    public int nextDoc() {
+      while(true) {
+        //System.out.println("  nextDoc cycle docUpto=" + docUpto + " numDocs=" + numDocs + " fp=" + in.getPosition() + " this=" + this);
+        if (docUpto == numDocs) {
+          // System.out.println("    END");
+          return docID = NO_MORE_DOCS;
+        }
+        docUpto++;
+        if (indexOptions == IndexOptions.DOCS_ONLY) {
+          accum += in.readVInt();
+        } else {
+          final int code = in.readVInt();
+          accum += code >>> 1;
+          //System.out.println("  docID=" + accum + " code=" + code);
+          if ((code & 1) != 0) {
+            freq = 1;
+          } else {
+            freq = in.readVInt();
+            assert freq > 0;
+          }
+
+          if (indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
+            // Skip positions/payloads
+            for(int posUpto=0;posUpto<freq;posUpto++) {
+              if (!storePayloads) {
+                in.readVInt();
+              } else {
+                final int posCode = in.readVInt();
+                if ((posCode & 1) != 0) {
+                  payloadLen = in.readVInt();
+                }
+                in.skipBytes(payloadLen);
+              }
+            }
+          } else if (indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) {
+            // Skip positions/offsets/payloads
+            for(int posUpto=0;posUpto<freq;posUpto++) {
+              int posCode = in.readVInt();
+              if (storePayloads && ((posCode & 1) != 0)) {
+                payloadLen = in.readVInt();
+              }
+              if ((in.readVInt() & 1) != 0) {
+                // new offset length
+                in.readVInt();
+              }
+              if (storePayloads) {
+                in.skipBytes(payloadLen);
+              }
+            }
+          }
         }
 
-        return rows;
+        if (liveDocs == null || liveDocs.get(accum)) {
+          //System.out.println("    return docID=" + accum + " freq=" + freq);
+          return (docID = accum);
+        }
+      }
     }
 
-    static List<String> getKeyRange(RangeCommand rawCommand) throws IOException, UnavailableException
-    {
-        long startTime = System.currentTimeMillis();
-        Comparator<String> comparator = StorageService.getPartitioner().getDecoratedKeyComparator();
-        TokenMetadata tokenMetadata = StorageService.instance().getTokenMetadata();
-        List<String> allKeys = new ArrayList<String>();
-        RangeCommand command = rawCommand;
+    @Override
+    public int docID() {
+      return docID;
+    }
 
-        EndPoint endPoint = StorageService.instance().findSuitableEndPoint(command.startWith);
-        EndPoint startEndpoint = endPoint;
-        EndPoint wrapEndpoint = tokenMetadata.getFirstEndpoint();
+    @Override
+    public int advance(int target) {
+      // TODO: we could make more efficient version, but, it
+      // should be rare that this will matter in practice
+      // since usually apps will not store "big" fields in
+      // this codec!
+      //System.out.println("advance start docID=" + docID + " target=" + target);
+      while(nextDoc() < target) {
+      }
+      return docID;
+    }
 
-        do
-        {
-            Message message = command.getMessage();
-            if (logger.isDebugEnabled())
-                logger.debug("reading " + command + " from " + message.getMessageId() + "@" + endPoint);
-            IAsyncResult iar = MessagingService.getMessagingInstance().sendRR(message, endPoint);
+    @Override
+    public int freq() {
+      return freq;
+    }
+  }
 
-            // read response
-            byte[] responseBody;
-            try
-            {
-                responseBody = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
+  private final static class FSTDocsAndPositionsEnum extends DocsAndPositionsEnum {
+    private final boolean storePayloads;
+    private byte[] buffer = new byte[16];
+    private final ByteArrayDataInput in = new ByteArrayDataInput(buffer);
+
+    private Bits liveDocs;
+    private int docUpto;
+    private int docID = -1;
+    private int accum;
+    private int freq;
+    private int numDocs;
+    private int posPending;
+    private int payloadLength;
+    final boolean storeOffsets;
+    int offsetLength;
+    int startOffset;
+
+    private int pos;
+    private final BytesRef payload = new BytesRef();
+
+    public FSTDocsAndPositionsEnum(boolean storePayloads, boolean storeOffsets) {
+      this.storePayloads = storePayloads;
+      this.storeOffsets = storeOffsets;
+    }
+
+    public boolean canReuse(boolean storePayloads, boolean storeOffsets) {
+      return storePayloads == this.storePayloads && storeOffsets == this.storeOffsets;
+    }
+    
+    public FSTDocsAndPositionsEnum reset(BytesRef bufferIn, Bits liveDocs, int numDocs) {
+      assert numDocs > 0;
+
+      // System.out.println("D&P reset bytes this=" + this);
+      // for(int i=bufferIn.offset;i<bufferIn.length;i++) {
+      //   System.out.println("  " + Integer.toHexString(bufferIn.bytes[i]&0xFF));
+      // }
+
+      if (buffer.length < bufferIn.length - bufferIn.offset) {
+        buffer = ArrayUtil.grow(buffer, bufferIn.length - bufferIn.offset);
+      }
+      in.reset(buffer, 0, bufferIn.length - bufferIn.offset);
+      System.arraycopy(bufferIn.bytes, bufferIn.offset, buffer, 0, bufferIn.length - bufferIn.offset);
+      this.liveDocs = liveDocs;
+      docID = -1;
+      accum = 0;
+      docUpto = 0;
+      payload.bytes = buffer;
+      payloadLength = 0;
+      this.numDocs = numDocs;
+      posPending = 0;
+      startOffset = storeOffsets ? 0 : -1; // always return -1 if no offsets are stored
+      offsetLength = 0;
+      return this;
+    }
+
+    @Override
+    public int nextDoc() {
+      while (posPending > 0) {
+        nextPosition();
+      }
+      while(true) {
+        //System.out.println("  nextDoc cycle docUpto=" + docUpto + " numDocs=" + numDocs + " fp=" + in.getPosition() + " this=" + this);
+        if (docUpto == numDocs) {
+          //System.out.println("    END");
+          return docID = NO_MORE_DOCS;
+        }
+        docUpto++;
+        
+        final int code = in.readVInt();
+        accum += code >>> 1;
+        if ((code & 1) != 0) {
+          freq = 1;
+        } else {
+          freq = in.readVInt();
+          assert freq > 0;
+        }
+
+        if (liveDocs == null || liveDocs.get(accum)) {
+          pos = 0;
+          startOffset = storeOffsets ? 0 : -1;
+          posPending = freq;
+          //System.out.println("    return docID=" + accum + " freq=" + freq);
+          return (docID = accum);
+        }
+
+        // Skip positions
+        for(int posUpto=0;posUpto<freq;posUpto++) {
+          if (!storePayloads) {
+            in.readVInt();
+          } else {
+            final int skipCode = in.readVInt();
+            if ((skipCode & 1) != 0) {
+              payloadLength = in.readVInt();
+              //System.out.println("    new payloadLen=" + payloadLength);
             }
-            catch (TimeoutException e)
-            {
-                throw new RuntimeException(e);
+          }
+          
+          if (storeOffsets) {
+            if ((in.readVInt() & 1) != 0) {
+              // new offset length
+              offsetLength = in.readVInt();
             }
-            RangeReply rangeReply = RangeReply.read(responseBody);
-            List<String> rangeKeys = rangeReply.keys;
-
-            // combine keys from most recent response with the others seen so far
-            if (rangeKeys.size() > 0)
-            {
-                if (allKeys.size() > 0)
-                {
-                    if (comparator.compare(rangeKeys.get(rangeKeys.size() - 1), allKeys.get(0)) <= 0)
-                    {
-                        // unlikely, but possible
-                        if (rangeKeys.get(rangeKeys.size() - 1).equals(allKeys.get(0)))
-                        {
-                            rangeKeys.remove(rangeKeys.size() - 1);
-                        }
-                        rangeKeys.addAll(allKeys);
-                        allKeys = rangeKeys;
-                    }
-                    else if (comparator.compare(allKeys.get(allKeys.size() - 1), rangeKeys.get(0)) <= 0)
-                    {
-                        // common case. deal with simple start/end key overlaps
-                        if (allKeys.get(allKeys.size() - 1).equals(rangeKeys.get(0)))
-                        {
-                            allKeys.remove(allKeys.size() - 1);
-                        }
-                        allKeys.addAll(rangeKeys);
-                    }
-                    else
-                    {
-                        // deal with potential large overlap from scanning the first endpoint, which contains
-                        // both the smallest and largest keys
-                        HashSet<String> keys = new HashSet<String>(allKeys);
-                        keys.addAll(rangeKeys);
-                        allKeys = new ArrayList<String>(keys);
-                        Collections.sort(allKeys);
-                    }
-                }
-                else
-                {
-                    allKeys = rangeKeys;
-                }
-            }
-
-            if (allKeys.size() >= rawCommand.maxResults || rangeReply.rangeCompletedLocally)
-            {
-                break;
-            }
-
-            // set up the next query --
-            // it's tempting to try to optimize this by starting with the last key seen for the next node,
-            // but that won't work when you have a replication factor of more than one--any node, not just
-            // the one holding the keys where the range wraps, could include both the smallest keys, and the largest,
-            // so starting with the largest in our scan of the next node means we'd never see keys from the middle.
-            endPoint = tokenMetadata.getNextEndpoint(endPoint); // TODO move this into the Strategies & modify for RackAwareStrategy
-            int maxResults = endPoint == wrapEndpoint ? rawCommand.maxResults : rawCommand.maxResults - allKeys.size();
-            command = new RangeCommand(command.table, command.columnFamily, command.startWith, command.stopAt, maxResults);
-        } while (!endPoint.equals(startEndpoint));
-
-        rangeStats.add(System.currentTimeMillis() - startTime);
-        return (allKeys.size() > rawCommand.maxResults)
-               ? allKeys.subList(0, rawCommand.maxResults)
-               : allKeys;
+          }
+          
+          if (storePayloads) {
+            in.skipBytes(payloadLength);
+          }
+        }
+      }
     }
 
-    public double getReadLatency()
-    {
-        return readStats.mean();
+    @Override
+    public int nextPosition() {
+      //System.out.println("    nextPos storePayloads=" + storePayloads + " this=" + this);
+      assert posPending > 0;
+      posPending--;
+      if (!storePayloads) {
+        pos += in.readVInt();
+      } else {
+        final int code = in.readVInt();
+        pos += code >>> 1;
+        if ((code & 1) != 0) {
+          payloadLength = in.readVInt();
+          //System.out.println("      new payloadLen=" + payloadLength);
+          //} else {
+          //System.out.println("      same payloadLen=" + payloadLength);
+        }
+      }
+      
+      if (storeOffsets) {
+        int offsetCode = in.readVInt();
+        if ((offsetCode & 1) != 0) {
+          // new offset length
+          offsetLength = in.readVInt();
+        }
+        startOffset += offsetCode >>> 1;
+      }
+      
+      if (storePayloads) {
+        payload.offset = in.getPosition();
+        in.skipBytes(payloadLength);
+        payload.length = payloadLength;
+      }
+
+      //System.out.println("      pos=" + pos + " payload=" + payload + " fp=" + in.getPosition());
+      return pos;
     }
 
-    public double getRangeLatency()
-    {
-        return rangeStats.mean();
+    @Override
+    public int startOffset() {
+      return startOffset;
     }
 
-    public double getWriteLatency()
-    {
-        return writeStats.mean();
+    @Override
+    public int endOffset() {
+      return startOffset + offsetLength;
     }
 
-    public int getReadOperations()
-    {
-        return readStats.size();
+    @Override
+    public BytesRef getPayload() {
+      return payload.length > 0 ? payload : null;
     }
 
-    public int getRangeOperations()
-    {
-        return rangeStats.size();
+    @Override
+    public int docID() {
+      return docID;
     }
 
-    public int getWriteOperations()
-    {
-        return writeStats.size();
+    @Override
+    public int advance(int target) {
+      // TODO: we could make more efficient version, but, it
+      // should be rare that this will matter in practice
+      // since usually apps will not store "big" fields in
+      // this codec!
+      //System.out.println("advance target=" + target);
+      while(nextDoc() < target) {
+      }
+      //System.out.println("  return " + docID);
+      return docID;
     }
+
+    @Override
+    public int freq() {
+      return freq;
+    }
+  }
+
+  private final static class FSTTermsEnum extends TermsEnum {
+    private final FieldInfo field;
+    private final BytesRefFSTEnum<BytesRef> fstEnum;
+    private final ByteArrayDataInput buffer = new ByteArrayDataInput();
+    private boolean didDecode;
+
+    private int docFreq;
+    private long totalTermFreq;
+    private BytesRefFSTEnum.InputOutput<BytesRef> current;
+
+    public FSTTermsEnum(FieldInfo field, FST<BytesRef> fst) {
+      this.field = field;
+      fstEnum = new BytesRefFSTEnum<BytesRef>(fst);
+    }
+
+    private void decodeMetaData() {
+      if (!didDecode) {
+        buffer.reset(current.output.bytes, 0, current.output.length);
+        docFreq = buffer.readVInt();
+        if (field.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+          totalTermFreq = docFreq + buffer.readVLong();
+        } else {
+          totalTermFreq = -1;
+        }
+        current.output.offset = buffer.getPosition();
+        //System.out.println("  df=" + docFreq + " totTF=" + totalTermFreq + " offset=" + buffer.getPosition() + " len=" + current.output.length);
+        didDecode = true;
+      }
+    }
+
+    @Override
+    public boolean seekExact(BytesRef text, boolean useCache /* ignored */) throws IOException {
+      //System.out.println("te.seekExact text=" + field.name + ":" + text.utf8ToString() + " this=" + this);
+      current = fstEnum.seekExact(text);
+      didDecode = false;
+      return current != null;
+    }
+
+    @Override
+    public SeekStatus seekCeil(BytesRef text, boolean useCache /* ignored */) throws IOException {
+      //System.out.println("te.seek text=" + field.name + ":" + text.utf8ToString() + " this=" + this);
+      current = fstEnum.seekCeil(text);
+      if (current == null) {
+        return SeekStatus.END;
+      } else {
+
+        // System.out.println("  got term=" + current.input.utf8ToString());
+        // for(int i=0;i<current.output.length;i++) {
+        //   System.out.println("    " + Integer.toHexString(current.output.bytes[i]&0xFF));
+        // }
+
+        didDecode = false;
+
+        if (text.equals(current.input)) {
+          //System.out.println("  found!");
+          return SeekStatus.FOUND;
+        } else {
+          //System.out.println("  not found: " + current.input.utf8ToString());
+          return SeekStatus.NOT_FOUND;
+        }
+      }
+    }
+    
+    @Override
+    public DocsEnum docs(Bits liveDocs, DocsEnum reuse, int flags) {
+      decodeMetaData();
+      FSTDocsEnum docsEnum;
+
+      if (reuse == null || !(reuse instanceof FSTDocsEnum)) {
+        docsEnum = new FSTDocsEnum(field.getIndexOptions(), field.hasPayloads());
+      } else {
+        docsEnum = (FSTDocsEnum) reuse;        
+        if (!docsEnum.canReuse(field.getIndexOptions(), field.hasPayloads())) {
+          docsEnum = new FSTDocsEnum(field.getIndexOptions(), field.hasPayloads());
+        }
+      }
+      return docsEnum.reset(current.output, liveDocs, docFreq);
+    }
+
+    @Override
+    public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, int flags) {
+
+      boolean hasOffsets = field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+      if (field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) < 0) {
+        return null;
+      }
+      decodeMetaData();
+      FSTDocsAndPositionsEnum docsAndPositionsEnum;
+      if (reuse == null || !(reuse instanceof FSTDocsAndPositionsEnum)) {
+        docsAndPositionsEnum = new FSTDocsAndPositionsEnum(field.hasPayloads(), hasOffsets);
+      } else {
+        docsAndPositionsEnum = (FSTDocsAndPositionsEnum) reuse;        
+        if (!docsAndPositionsEnum.canReuse(field.hasPayloads(), hasOffsets)) {
+          docsAndPositionsEnum = new FSTDocsAndPositionsEnum(field.hasPayloads(), hasOffsets);
+        }
+      }
+      //System.out.println("D&P reset this=" + this);
+      return docsAndPositionsEnum.reset(current.output, liveDocs, docFreq);
+    }
+
+    @Override
+    public BytesRef term() {
+      return current.input;
+    }
+
+    @Override
+    public BytesRef next() throws IOException {
+      //System.out.println("te.next");
+      current = fstEnum.next();
+      if (current == null) {
+        //System.out.println("  END");
+        return null;
+      }
+      didDecode = false;
+      //System.out.println("  term=" + field.name + ":" + current.input.utf8ToString());
+      return current.input;
+    }
+
+    @Override
+    public int docFreq() {
+      decodeMetaData();
+      return docFreq;
+    }
+
+    @Override
+    public long totalTermFreq() {
+      decodeMetaData();
+      return totalTermFreq;
+    }
+
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+
+    @Override
+    public void seekExact(long ord) {
+      // NOTE: we could add this...
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long ord() {
+      // NOTE: we could add this...
+      throw new UnsupportedOperationException();
+    }
+  }
+
+  private final static class TermsReader extends Terms {
+
+    private final long sumTotalTermFreq;
+    private final long sumDocFreq;
+    private final int docCount;
+    private final int termCount;
+    private FST<BytesRef> fst;
+    private final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
+    private final FieldInfo field;
+
+    public TermsReader(FieldInfos fieldInfos, IndexInput in, int termCount) throws IOException {
+      this.termCount = termCount;
+      final int fieldNumber = in.readVInt();
+      field = fieldInfos.fieldInfo(fieldNumber);
+      if (field.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+        sumTotalTermFreq = in.readVLong();
+      } else {
+        sumTotalTermFreq = -1;
+      }
+      sumDocFreq = in.readVLong();
+      docCount = in.readVInt();
+      
+      fst = new FST<BytesRef>(in, outputs);
+    }
+
+    @Override
+    public long getSumTotalTermFreq() {
+      return sumTotalTermFreq;
+    }
+
+    @Override
+    public long getSumDocFreq() {
+      return sumDocFreq;
+    }
+
+    @Override
+    public int getDocCount() {
+      return docCount;
+    }
+
+    @Override
+    public long size() {
+      return termCount;
+    }
+
+    @Override
+    public TermsEnum iterator(TermsEnum reuse) {
+      return new FSTTermsEnum(field, fst);
+    }
+
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+
+    @Override
+    public boolean hasOffsets() {
+      return field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+    }
+
+    @Override
+    public boolean hasPositions() {
+      return field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+    }
+    
+    @Override
+    public boolean hasPayloads() {
+      return field.hasPayloads();
+    }
+  }
+
+  @Override
+  public FieldsProducer fieldsProducer(SegmentReadState state) throws IOException {
+    final String fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
+    final IndexInput in = state.dir.openInput(fileName, IOContext.READONCE);
+
+    final SortedMap<String,TermsReader> fields = new TreeMap<String,TermsReader>();
+
+    try {
+      while(true) {
+        final int termCount = in.readVInt();
+        if (termCount == 0) {
+          break;
+        }
+        final TermsReader termsReader = new TermsReader(state.fieldInfos, in, termCount);
+        // System.out.println("load field=" + termsReader.field.name);
+        fields.put(termsReader.field.name, termsReader);
+      }
+    } finally {
+      in.close();
+    }
+
+    return new FieldsProducer() {
+      @Override
+      public Iterator<String> iterator() {
+        return Collections.unmodifiableSet(fields.keySet()).iterator();
+      }
+
+      @Override
+      public Terms terms(String field) {
+        return fields.get(field);
+      }
+      
+      @Override
+      public int size() {
+        return fields.size();
+      }
+
+      @Override
+      public void close() {
+        // Drop ref to FST:
+        for(TermsReader termsReader : fields.values()) {
+          termsReader.fst = null;
+        }
+      }
+    };
+  }
 }

@@ -1,8 +1,8 @@
-public boolean score(Collector collector, int max, int firstDocID) throws IOException {
+newIndexWriter(core, true, false);
 
-package org.apache.lucene.search;
+package org.apache.solr.update;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -20,317 +20,276 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.lucene.search.BooleanClause.Occur;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.solr.cloud.RecoveryStrategy;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.CoreDescriptor;
+import org.apache.solr.core.DirectoryFactory;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.util.RefCounted;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/* See the description in BooleanScorer.java, comparing
- * BooleanScorer & BooleanScorer2 */
-
-/** An alternative to BooleanScorer that also allows a minimum number
- * of optional scorers that should match.
- * <br>Implements skipTo(), and has no limitations on the numbers of added scorers.
- * <br>Uses ConjunctionScorer, DisjunctionScorer, ReqOptScorer and ReqExclScorer.
- */
-class BooleanScorer2 extends Scorer {
+public final class DefaultSolrCoreState extends SolrCoreState implements RecoveryStrategy.RecoveryListener {
+  public static Logger log = LoggerFactory.getLogger(DefaultSolrCoreState.class);
   
-  private final List<Scorer> requiredScorers;
-  private final List<Scorer> optionalScorers;
-  private final List<Scorer> prohibitedScorers;
+  private final boolean SKIP_AUTO_RECOVERY = Boolean.getBoolean("solrcloud.skip.autorecovery");
+  
+  private final Object recoveryLock = new Object();
+  
+  // protects pauseWriter and writerFree
+  private final Object writerPauseLock = new Object();
+  
+  private SolrIndexWriter indexWriter = null;
+  private DirectoryFactory directoryFactory;
 
-  private class Coordinator {
-    float[] coordFactors = null;
-    int maxCoord = 0; // to be increased for each non prohibited scorer
-    int nrMatchers; // to be increased by score() of match counting scorers.
+  private volatile boolean recoveryRunning;
+  private RecoveryStrategy recoveryStrat;
+  private volatile boolean closed = false;
+
+  private RefCounted<IndexWriter> refCntWriter;
+
+  private boolean pauseWriter;
+  private boolean writerFree = true;
+  
+  protected final ReentrantLock commitLock = new ReentrantLock();
+
+  public DefaultSolrCoreState(DirectoryFactory directoryFactory) {
+    this.directoryFactory = directoryFactory;
+  }
+  
+  private void closeIndexWriter(IndexWriterCloser closer) {
+    try {
+      log.info("SolrCoreState ref count has reached 0 - closing IndexWriter");
+      if (closer != null) {
+        log.info("closing IndexWriter with IndexWriterCloser");
+        closer.closeWriter(indexWriter);
+      } else if (indexWriter != null) {
+        log.info("closing IndexWriter...");
+        indexWriter.close();
+      }
+    } catch (Throwable t) {
+      log.error("Error during shutdown of writer.", t);
+    } 
+  }
+  
+  @Override
+  public RefCounted<IndexWriter> getIndexWriter(SolrCore core)
+      throws IOException {
     
-    void init(Similarity sim, boolean disableCoord) { // use after all scorers have been added.
-      coordFactors = new float[optionalScorers.size() + requiredScorers.size() + 1];
-      for (int i = 0; i < coordFactors.length; i++) {
-        coordFactors[i] = disableCoord ? 1.0f : sim.coord(i, maxCoord);
-      }
+    if (closed) {
+      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
     }
-  }
-
-  private final Coordinator coordinator;
-
-  /** The scorer to which all scoring will be delegated,
-   * except for computing and using the coordination factor.
-   */
-  private final Scorer countingSumScorer;
-
-  /** The number of optionalScorers that need to match (if there are any) */
-  private final int minNrShouldMatch;
-
-  private int doc = -1;
-
-  /**
-   * Creates a {@link Scorer} with the given similarity and lists of required,
-   * prohibited and optional scorers. In no required scorers are added, at least
-   * one of the optional scorers will have to match during the search.
-   * 
-   * @param similarity
-   *          The similarity to be used.
-   * @param minNrShouldMatch
-   *          The minimum number of optional added scorers that should match
-   *          during the search. In case no required scorers are added, at least
-   *          one of the optional scorers will have to match during the search.
-   * @param required
-   *          the list of required scorers.
-   * @param prohibited
-   *          the list of prohibited scorers.
-   * @param optional
-   *          the list of optional scorers.
-   */
-  public BooleanScorer2(Weight weight, boolean disableCoord, Similarity similarity, int minNrShouldMatch,
-      List<Scorer> required, List<Scorer> prohibited, List<Scorer> optional, int maxCoord) throws IOException {
-    super(null, weight);   // Similarity not used
-    if (minNrShouldMatch < 0) {
-      throw new IllegalArgumentException("Minimum number of optional scorers should not be negative");
-    }
-    coordinator = new Coordinator();
-    this.minNrShouldMatch = minNrShouldMatch;
-    coordinator.maxCoord = maxCoord;
-
-    optionalScorers = optional;
-    requiredScorers = required;    
-    prohibitedScorers = prohibited;
     
-    coordinator.init(similarity, disableCoord);
-    countingSumScorer = makeCountingSumScorer(disableCoord, similarity);
-  }
-  
-  /** Count a scorer as a single match. */
-  private class SingleMatchScorer extends Scorer {
-    private Scorer scorer;
-    private int lastScoredDoc = -1;
-    // Save the score of lastScoredDoc, so that we don't compute it more than
-    // once in score().
-    private float lastDocScore = Float.NaN;
-
-    SingleMatchScorer(Scorer scorer) {
-      super(null); // No similarity used.
-      this.scorer = scorer;
-    }
-
-    @Override
-    public float score() throws IOException {
-      int doc = docID();
-      if (doc >= lastScoredDoc) {
-        if (doc > lastScoredDoc) {
-          lastDocScore = scorer.score();
-          lastScoredDoc = doc;
-        }
-        coordinator.nrMatchers++;
+    synchronized (writerPauseLock) {
+      if (core == null) {
+        // core == null is a signal to just return the current writer, or null
+        // if none.
+        if (refCntWriter != null) refCntWriter.incref();
+        return refCntWriter;
       }
-      return lastDocScore;
-    }
-
-    @Override
-    public int docID() {
-      return scorer.docID();
-    }
-
-    @Override
-    public int nextDoc() throws IOException {
-      return scorer.nextDoc();
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      return scorer.advance(target);
+      
+      while (pauseWriter) {
+        try {
+          writerPauseLock.wait(100);
+        } catch (InterruptedException e) {}
+        
+        if (closed) {
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
+        }
+      }
+      
+      if (indexWriter == null) {
+        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false);
+      }
+      initRefCntWriter();
+      writerFree = false;
+      writerPauseLock.notifyAll();
+      refCntWriter.incref();
+      return refCntWriter;
     }
   }
 
-  private Scorer countingDisjunctionSumScorer(final List<Scorer> scorers,
-      int minNrShouldMatch) throws IOException {
-    // each scorer from the list counted as a single matcher
-    return new DisjunctionSumScorer(scorers, minNrShouldMatch) {
-      private int lastScoredDoc = -1;
-      // Save the score of lastScoredDoc, so that we don't compute it more than
-      // once in score().
-      private float lastDocScore = Float.NaN;
-      @Override public float score() throws IOException {
-        int doc = docID();
-        if (doc >= lastScoredDoc) {
-          if (doc > lastScoredDoc) {
-            lastDocScore = super.score();
-            lastScoredDoc = doc;
+  private void initRefCntWriter() {
+    if (refCntWriter == null) {
+      refCntWriter = new RefCounted<IndexWriter>(indexWriter) {
+        @Override
+        public void close() {
+          synchronized (writerPauseLock) {
+            writerFree = true;
+            writerPauseLock.notifyAll();
           }
-          coordinator.nrMatchers += super.nrMatchers;
         }
-        return lastDocScore;
-      }
-    };
+      };
+    }
   }
 
-  private Scorer countingConjunctionSumScorer(boolean disableCoord,
-                                              Similarity similarity,
-                                              List<Scorer> requiredScorers) throws IOException {
-    // each scorer from the list counted as a single matcher
-    final int requiredNrMatchers = requiredScorers.size();
-    return new ConjunctionScorer(disableCoord ? 1.0f : similarity.coord(requiredScorers.size(), requiredScorers.size()), requiredScorers) {
-      private int lastScoredDoc = -1;
-      // Save the score of lastScoredDoc, so that we don't compute it more than
-      // once in score().
-      private float lastDocScore = Float.NaN;
-      @Override public float score() throws IOException {
-        int doc = docID();
-        if (doc >= lastScoredDoc) {
-          if (doc > lastScoredDoc) {
-            lastDocScore = super.score();
-            lastScoredDoc = doc;
+  @Override
+  public synchronized void newIndexWriter(SolrCore core, boolean rollback, boolean forceNewDir) throws IOException {
+    if (closed) {
+      throw new AlreadyClosedException("SolrCoreState already closed");
+    }
+    log.info("Creating new IndexWriter...");
+    String coreName = core.getName();
+    synchronized (writerPauseLock) {
+      // we need to wait for the Writer to fall out of use
+      // first lets stop it from being lent out
+      pauseWriter = true;
+      // then lets wait until its out of use
+      log.info("Waiting until IndexWriter is unused... core=" + coreName);
+      
+      while (!writerFree) {
+        try {
+          writerPauseLock.wait(100);
+        } catch (InterruptedException e) {}
+        
+        if (closed) {
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
+        }
+      }
+
+      try {
+        if (indexWriter != null) {
+          if (!rollback) {
+            try {
+              log.info("Closing old IndexWriter... core=" + coreName);
+              indexWriter.close();
+            } catch (Throwable t) {
+              SolrException.log(log, "Error closing old IndexWriter. core="
+                  + coreName, t);
+            }
+          } else {
+            try {
+              log.info("Rollback old IndexWriter... core=" + coreName);
+              indexWriter.rollback();
+            } catch (Throwable t) {
+              SolrException.log(log, "Error rolling back old IndexWriter. core="
+                  + coreName, t);
+            }
           }
-          coordinator.nrMatchers += requiredNrMatchers;
         }
-        // All scorers match, so defaultSimilarity super.score() always has 1 as
-        // the coordination factor.
-        // Therefore the sum of the scores of the requiredScorers
-        // is used as score.
-        return lastDocScore;
-      }
-    };
-  }
-
-  private Scorer dualConjunctionSumScorer(boolean disableCoord,
-                                          Similarity similarity,
-                                          Scorer req1, Scorer req2) throws IOException { // non counting.
-    return new ConjunctionScorer(disableCoord ? 1.0f : similarity.coord(2, 2), req1, req2);
-    // All scorers match, so defaultSimilarity always has 1 as
-    // the coordination factor.
-    // Therefore the sum of the scores of two scorers
-    // is used as score.
-  }
-
-  /** Returns the scorer to be used for match counting and score summing.
-   * Uses requiredScorers, optionalScorers and prohibitedScorers.
-   */
-  private Scorer makeCountingSumScorer(boolean disableCoord,
-                                       Similarity similarity) throws IOException { // each scorer counted as a single matcher
-    return (requiredScorers.size() == 0)
-      ? makeCountingSumScorerNoReq(disableCoord, similarity)
-      : makeCountingSumScorerSomeReq(disableCoord, similarity);
-  }
-
-  private Scorer makeCountingSumScorerNoReq(boolean disableCoord, Similarity similarity) throws IOException { // No required scorers
-    // minNrShouldMatch optional scorers are required, but at least 1
-    int nrOptRequired = (minNrShouldMatch < 1) ? 1 : minNrShouldMatch;
-    Scorer requiredCountingSumScorer;
-    if (optionalScorers.size() > nrOptRequired)
-      requiredCountingSumScorer = countingDisjunctionSumScorer(optionalScorers, nrOptRequired);
-    else if (optionalScorers.size() == 1)
-      requiredCountingSumScorer = new SingleMatchScorer(optionalScorers.get(0));
-    else {
-      requiredCountingSumScorer = countingConjunctionSumScorer(disableCoord, similarity, optionalScorers);
-    }
-    return addProhibitedScorers(requiredCountingSumScorer);
-  }
-
-  private Scorer makeCountingSumScorerSomeReq(boolean disableCoord, Similarity similarity) throws IOException { // At least one required scorer.
-    if (optionalScorers.size() == minNrShouldMatch) { // all optional scorers also required.
-      ArrayList<Scorer> allReq = new ArrayList<Scorer>(requiredScorers);
-      allReq.addAll(optionalScorers);
-      return addProhibitedScorers(countingConjunctionSumScorer(disableCoord, similarity, allReq));
-    } else { // optionalScorers.size() > minNrShouldMatch, and at least one required scorer
-      Scorer requiredCountingSumScorer =
-            requiredScorers.size() == 1
-            ? new SingleMatchScorer(requiredScorers.get(0))
-            : countingConjunctionSumScorer(disableCoord, similarity, requiredScorers);
-      if (minNrShouldMatch > 0) { // use a required disjunction scorer over the optional scorers
-        return addProhibitedScorers( 
-                      dualConjunctionSumScorer( // non counting
-                              disableCoord,
-                              similarity,
-                              requiredCountingSumScorer,
-                              countingDisjunctionSumScorer(
-                                      optionalScorers,
-                                      minNrShouldMatch)));
-      } else { // minNrShouldMatch == 0
-        return new ReqOptSumScorer(
-                      addProhibitedScorers(requiredCountingSumScorer),
-                      optionalScorers.size() == 1
-                        ? new SingleMatchScorer(optionalScorers.get(0))
-                        // require 1 in combined, optional scorer.
-                        : countingDisjunctionSumScorer(optionalScorers, 1));
+        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", forceNewDir);
+        log.info("New IndexWriter is ready to be used.");
+        // we need to null this so it picks up the new writer next get call
+        refCntWriter = null;
+      } finally {
+        
+        pauseWriter = false;
+        writerPauseLock.notifyAll();
       }
     }
   }
-  
-  /** Returns the scorer to be used for match counting and score summing.
-   * Uses the given required scorer and the prohibitedScorers.
-   * @param requiredCountingSumScorer A required scorer already built.
-   */
-  private Scorer addProhibitedScorers(Scorer requiredCountingSumScorer) throws IOException
-  {
-    return (prohibitedScorers.size() == 0)
-          ? requiredCountingSumScorer // no prohibited
-          : new ReqExclScorer(requiredCountingSumScorer,
-                              ((prohibitedScorers.size() == 1)
-                                ? prohibitedScorers.get(0)
-                                : new DisjunctionSumScorer(prohibitedScorers)));
-  }
 
-  /** Scores and collects all matching documents.
-   * @param collector The collector to which all matching documents are passed through.
-   */
   @Override
-  public void score(Collector collector) throws IOException {
-    collector.setScorer(this);
-    while ((doc = countingSumScorer.nextDoc()) != NO_MORE_DOCS) {
-      collector.collect(doc);
-    }
+  public synchronized void rollbackIndexWriter(SolrCore core) throws IOException {
+    newIndexWriter(core, true, true);
   }
   
-  @Override
-  protected boolean score(Collector collector, int max, int firstDocID) throws IOException {
-    doc = firstDocID;
-    collector.setScorer(this);
-    while (doc < max) {
-      collector.collect(doc);
-      doc = countingSumScorer.nextDoc();
-    }
-    return doc != NO_MORE_DOCS;
+  protected SolrIndexWriter createMainIndexWriter(SolrCore core, String name, boolean forceNewDirectory) throws IOException {
+    return SolrIndexWriter.create(name, core.getNewIndexDir(),
+        core.getDirectoryFactory(), false, core.getSchema(),
+        core.getSolrConfig().indexConfig, core.getDeletionPolicy(), core.getCodec(), forceNewDirectory);
   }
 
   @Override
-  public int docID() {
-    return doc;
+  public DirectoryFactory getDirectoryFactory() {
+    return directoryFactory;
+  }
+
+  @Override
+  public void doRecovery(CoreContainer cc, CoreDescriptor cd) {
+    if (SKIP_AUTO_RECOVERY) {
+      log.warn("Skipping recovery according to sys prop solrcloud.skip.autorecovery");
+      return;
+    }
+    
+    // check before we grab the lock
+    if (cc.isShutDown()) {
+      log.warn("Skipping recovery because Solr is shutdown");
+      return;
+    }
+    
+    synchronized (recoveryLock) {
+      // to be air tight we must also check after lock
+      if (cc.isShutDown()) {
+        log.warn("Skipping recovery because Solr is shutdown");
+        return;
+      }
+      log.info("Running recovery - first canceling any ongoing recovery");
+      cancelRecovery();
+      
+      while (recoveryRunning) {
+        try {
+          recoveryLock.wait(1000);
+        } catch (InterruptedException e) {
+
+        }
+        // check again for those that were waiting
+        if (cc.isShutDown()) {
+          log.warn("Skipping recovery because Solr is shutdown");
+          return;
+        }
+        if (closed) return;
+      }
+
+      // if true, we are recovering after startup and shouldn't have (or be receiving) additional updates (except for local tlog recovery)
+      boolean recoveringAfterStartup = recoveryStrat == null;
+
+      recoveryStrat = new RecoveryStrategy(cc, cd, this);
+      recoveryStrat.setRecoveringAfterStartup(recoveringAfterStartup);
+      recoveryStrat.start();
+      recoveryRunning = true;
+    }
+    
   }
   
   @Override
-  public int nextDoc() throws IOException {
-    return doc = countingSumScorer.nextDoc();
+  public void cancelRecovery() {
+    synchronized (recoveryLock) {
+      if (recoveryStrat != null && recoveryRunning) {
+        recoveryStrat.close();
+        while (true) {
+          try {
+            recoveryStrat.join();
+          } catch (InterruptedException e) {
+            // not interruptible - keep waiting
+            continue;
+          }
+          break;
+        }
+        
+        recoveryRunning = false;
+        recoveryLock.notifyAll();
+      }
+    }
+  }
+
+  @Override
+  public void recovered() {
+    recoveryRunning = false;
+  }
+
+  @Override
+  public void failed() {
+    recoveryRunning = false;
+  }
+
+  @Override
+  public synchronized void close(IndexWriterCloser closer) {
+    closed = true;
+    cancelRecovery();
+    closeIndexWriter(closer);
   }
   
   @Override
-  public float score() throws IOException {
-    coordinator.nrMatchers = 0;
-    float sum = countingSumScorer.score();
-    return sum * coordinator.coordFactors[coordinator.nrMatchers];
+  public Lock getCommitLock() {
+    return commitLock;
   }
-
-  @Override
-  public float freq() {
-    return coordinator.nrMatchers;
-  }
-
-  @Override
-  public int advance(int target) throws IOException {
-    return doc = countingSumScorer.advance(target);
-  }
-
-  @Override
-  protected void visitSubScorers(Query parent, Occur relationship, ScorerVisitor<Query, Query, Scorer> visitor) {
-    super.visitSubScorers(parent, relationship, visitor);
-    final Query q = weight.getQuery();
-    for (Scorer s : optionalScorers) {
-      s.visitSubScorers(q, Occur.SHOULD, visitor);
-    }
-    for (Scorer s : prohibitedScorers) {
-      s.visitSubScorers(q, Occur.MUST_NOT, visitor);
-    }
-    for (Scorer s : requiredScorers) {
-      s.visitSubScorers(q, Occur.MUST, visitor);
-    }
-  }
+  
 }

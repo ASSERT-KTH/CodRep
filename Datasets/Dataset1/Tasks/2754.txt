@@ -1,13 +1,14 @@
-double probability = seeds_.size() / (double)( liveEndpoints_.size() + unreachableEndpoints_.size() );
+import org.apache.lucene.search.suggest.Sort;
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.search.suggest.analyzing;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,1105 +19,791 @@ double probability = seeds_.size() / (double)( liveEndpoints_.size() + unreachab
  * limitations under the License.
  */
 
-package org.apache.cassandra.gms;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
-import java.io.*;
-import java.util.*;
-import java.net.InetAddress;
-
-import org.apache.cassandra.concurrent.SingleThreadedStage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.net.EndPoint;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.LogUtil;
-import org.apache.log4j.Logger;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.TokenStreamToAutomaton;
+import org.apache.lucene.search.spell.TermFreqIterator;
+import org.apache.lucene.search.suggest.Lookup;
+import org.apache.lucene.search.suggest.fst.Sort;
+import org.apache.lucene.store.ByteArrayDataInput;
+import org.apache.lucene.store.ByteArrayDataOutput;
+import org.apache.lucene.store.DataInput;
+import org.apache.lucene.store.DataOutput;
+import org.apache.lucene.store.InputStreamDataInput;
+import org.apache.lucene.store.OutputStreamDataOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.IntsRef;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.util.automaton.Automaton;
+import org.apache.lucene.util.automaton.BasicOperations;
+import org.apache.lucene.util.automaton.SpecialOperations;
+import org.apache.lucene.util.automaton.State;
+import org.apache.lucene.util.automaton.Transition;
+import org.apache.lucene.util.fst.Builder;
+import org.apache.lucene.util.fst.ByteSequenceOutputs;
+import org.apache.lucene.util.fst.FST.BytesReader;
+import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.fst.PairOutputs.Pair;
+import org.apache.lucene.util.fst.PairOutputs;
+import org.apache.lucene.util.fst.PositiveIntOutputs;
+import org.apache.lucene.util.fst.Util.MinResult;
+import org.apache.lucene.util.fst.Util;
 
 /**
- * This module is responsible for Gossiping information for the local endpoint. This abstraction
- * maintains the list of live and dead endpoints. Periodically i.e. every 1 second this module
- * chooses a random node and initiates a round of Gossip with it. A round of Gossip involves 3
- * rounds of messaging. For instance if node A wants to initiate a round of Gossip with node B
- * it starts off by sending node B a GossipDigestSynMessage. Node B on receipt of this message
- * sends node A a GossipDigestAckMessage. On receipt of this message node A sends node B a
- * GossipDigestAck2Message which completes a round of Gossip. This module as and when it hears one
- * of the three above mentioned messages updates the Failure Detector with the liveness information.
+ * Suggester that first analyzes the surface form, adds the
+ * analyzed form to a weighted FST, and then does the same
+ * thing at lookup time.  This means lookup is based on the
+ * analyzed form while suggestions are still the surface
+ * form(s).
  *
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ * <p>
+ * This can result in powerful suggester functionality.  For
+ * example, if you use an analyzer removing stop words, 
+ * then the partial text "ghost chr..." could see the
+ * suggestion "The Ghost of Christmas Past". Note that
+ * your {@code StopFilter} instance must NOT preserve
+ * position increments for this example to work, so you should call
+ * {@code setEnablePositionIncrements(false)} on it.
+ *
+ * <p>
+ * If SynonymFilter is used to map wifi and wireless network to
+ * hotspot then the partial text "wirele..." could suggest
+ * "wifi router".  Token normalization like stemmers, accent
+ * removal, etc., would allow suggestions to ignore such
+ * variations.
+ *
+ * <p>
+ * When two matching suggestions have the same weight, they
+ * are tie-broken by the analyzed form.  If their analyzed
+ * form is the same then the order is undefined.
+ *
+ * <p>
+ * There are some limitations:
+ * <ul>
+ *
+ *   <li> A lookup from a query like "net" in English won't
+ *        be any different than "net " (ie, user added a
+ *        trailing space) because analyzers don't reflect
+ *        when they've seen a token separator and when they
+ *        haven't.
+ *
+ *   <li> If you're using {@code StopFilter}, and the user will
+ *        type "fast apple", but so far all they've typed is
+ *        "fast a", again because the analyzer doesn't convey whether
+ *        it's seen a token separator after the "a",
+ *        {@code StopFilter} will remove that "a" causing
+ *        far more matches than you'd expect.
+ *
+ *   <li> Lookups with the empty string return no results
+ *        instead of all results.
+ * </ul>
+ * 
+ * @lucene.experimental
  */
+public class AnalyzingSuggester extends Lookup {
+ 
+  /**
+   * FST<Weight,Surface>: 
+   *  input is the analyzed form, with a null byte between terms
+   *  weights are encoded as costs: (Integer.MAX_VALUE-weight)
+   *  surface is the original, unanalyzed form.
+   */
+  private FST<Pair<Long,BytesRef>> fst = null;
+  
+  /** 
+   * Analyzer that will be used for analyzing suggestions at
+   * index time.
+   */
+  private final Analyzer indexAnalyzer;
 
-public class Gossiper implements IFailureDetectionEventListener, IEndPointStateChangePublisher
-{
-    private class GossipTimerTask extends TimerTask
-    {
-        public void run()
-        {
-            try
-            {
-                synchronized( Gossiper.instance() )
-                {
-                	/* Update the local heartbeat counter. */
-                    endPointStateMap_.get(localEndPoint_).getHeartBeatState().updateHeartBeat();
-                    List<GossipDigest> gDigests = new ArrayList<GossipDigest>();
-                    Gossiper.instance().makeRandomGossipDigest(gDigests);
+  /** 
+   * Analyzer that will be used for analyzing suggestions at
+   * query time.
+   */
+  private final Analyzer queryAnalyzer;
+  
+  /** 
+   * True if exact match suggestions should always be returned first.
+   */
+  private final boolean exactFirst;
+  
+  /** 
+   * True if separator between tokens should be preserved.
+   */
+  private final boolean preserveSep;
 
-                    if ( gDigests.size() > 0 )
-                    {
-                        Message message = makeGossipDigestSynMessage(gDigests);
-                        /* Gossip to some random live member */
-                        boolean bVal = doGossipToLiveMember(message);
+  /** Include this flag in the options parameter to {@link
+   *  #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)} to always
+   *  return the exact match first, regardless of score.  This
+   *  has no performance impact but could result in
+   *  low-quality suggestions. */
+  public static final int EXACT_FIRST = 1;
 
-                        /* Gossip to some unreachable member with some probability to check if he is back up */
-                        doGossipToUnreachableMember(message);
+  /** Include this flag in the options parameter to {@link
+   *  #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)} to preserve
+   *  token separators when matching. */
+  public static final int PRESERVE_SEP = 2;
 
-                        /* Gossip to the seed. */
-                        if ( !bVal )
-                            doGossipToSeed(message);
+  /** Represents the separation between tokens, if
+   *  PRESERVE_SEP was specified */
+  private static final int SEP_LABEL = 0xff;
 
-                        if (logger_.isTraceEnabled())
-                            logger_.trace("Performing status check ...");
-                        doStatusCheck();
-                    }
-                }
-            }
-            catch ( Throwable th )
-            {
-                logger_.info( LogUtil.throwableToString(th) );
-            }
+  /** Marks end of the analyzed input and start of dedup
+   *  byte. */
+  private static final int END_BYTE = 0x0;
+
+  /** Maximum number of dup surface forms (different surface
+   *  forms for the same analyzed form). */
+  private final int maxSurfaceFormsPerAnalyzedForm;
+
+  /** Maximum graph paths to index for a single analyzed
+   *  surface form.  This only matters if your analyzer
+   *  makes lots of alternate paths (e.g. contains
+   *  SynonymFilter). */
+  private final int maxGraphExpansions;
+
+  /** Highest number of analyzed paths we saw for any single
+   *  input surface form.  For analyzers that never create
+   *  graphs this will always be 1. */
+  private int maxAnalyzedPathsForOneInput;
+
+  /**
+   * Calls {@link #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)
+   * AnalyzingSuggester(analyzer, analyzer, EXACT_FIRST |
+   * PRESERVE_SEP, 256, -1)}
+   */
+  public AnalyzingSuggester(Analyzer analyzer) {
+    this(analyzer, analyzer, EXACT_FIRST | PRESERVE_SEP, 256, -1);
+  }
+
+  /**
+   * Calls {@link #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)
+   * AnalyzingSuggester(indexAnalyzer, queryAnalyzer, EXACT_FIRST |
+   * PRESERVE_SEP, 256, -1)}
+   */
+  public AnalyzingSuggester(Analyzer indexAnalyzer, Analyzer queryAnalyzer) {
+    this(indexAnalyzer, queryAnalyzer, EXACT_FIRST | PRESERVE_SEP, 256, -1);
+  }
+
+  /**
+   * Creates a new suggester.
+   * 
+   * @param indexAnalyzer Analyzer that will be used for
+   *   analyzing suggestions while building the index.
+   * @param queryAnalyzer Analyzer that will be used for
+   *   analyzing query text during lookup
+   * @param options see {@link #EXACT_FIRST}, {@link #PRESERVE_SEP}
+   * @param maxSurfaceFormsPerAnalyzedForm Maximum number of
+   *   surface forms to keep for a single analyzed form.
+   *   When there are too many surface forms we discard the
+   *   lowest weighted ones.
+   * @param maxGraphExpansions Maximum number of graph paths
+   *   to expand from the analyzed form.  Set this to -1 for
+   *   no limit.
+   */
+  public AnalyzingSuggester(Analyzer indexAnalyzer, Analyzer queryAnalyzer, int options, int maxSurfaceFormsPerAnalyzedForm, int maxGraphExpansions) {
+    this.indexAnalyzer = indexAnalyzer;
+    this.queryAnalyzer = queryAnalyzer;
+    if ((options & ~(EXACT_FIRST | PRESERVE_SEP)) != 0) {
+      throw new IllegalArgumentException("options should only contain EXACT_FIRST and PRESERVE_SEP; got " + options);
+    }
+    this.exactFirst = (options & EXACT_FIRST) != 0;
+    this.preserveSep = (options & PRESERVE_SEP) != 0;
+
+    // NOTE: this is just an implementation limitation; if
+    // somehow this is a problem we could fix it by using
+    // more than one byte to disambiguate ... but 256 seems
+    // like it should be way more then enough.
+    if (maxSurfaceFormsPerAnalyzedForm <= 0 || maxSurfaceFormsPerAnalyzedForm > 256) {
+      throw new IllegalArgumentException("maxSurfaceFormsPerAnalyzedForm must be > 0 and < 256 (got: " + maxSurfaceFormsPerAnalyzedForm + ")");
+    }
+    this.maxSurfaceFormsPerAnalyzedForm = maxSurfaceFormsPerAnalyzedForm;
+
+    if (maxGraphExpansions < 1 && maxGraphExpansions != -1) {
+      throw new IllegalArgumentException("maxGraphExpansions must -1 (no limit) or > 0 (got: " + maxGraphExpansions + ")");
+    }
+    this.maxGraphExpansions = maxGraphExpansions;
+  }
+
+  /** Returns byte size of the underlying FST. */
+  public long sizeInBytes() {
+    return fst == null ? 0 : fst.sizeInBytes();
+  }
+
+  private void copyDestTransitions(State from, State to, List<Transition> transitions) {
+    if (to.isAccept()) {
+      from.setAccept(true);
+    }
+    for(Transition t : to.getTransitions()) {
+      transitions.add(t);
+    }
+  }
+
+  // Replaces SEP with epsilon or remaps them if
+  // we were asked to preserve them:
+  private void replaceSep(Automaton a) {
+
+    State[] states = a.getNumberedStates();
+
+    // Go in reverse topo sort so we know we only have to
+    // make one pass:
+    for(int stateNumber=states.length-1;stateNumber >=0;stateNumber--) {
+      final State state = states[stateNumber];
+      List<Transition> newTransitions = new ArrayList<Transition>();
+      for(Transition t : state.getTransitions()) {
+        assert t.getMin() == t.getMax();
+        if (t.getMin() == TokenStreamToAutomaton.POS_SEP) {
+          if (preserveSep) {
+            // Remap to SEP_LABEL:
+            newTransitions.add(new Transition(SEP_LABEL, t.getDest()));
+          } else {
+            copyDestTransitions(state, t.getDest(), newTransitions);
+            a.setDeterministic(false);
+          }
+        } else if (t.getMin() == TokenStreamToAutomaton.HOLE) {
+
+          // Just remove the hole: there will then be two
+          // SEP tokens next to each other, which will only
+          // match another hole at search time.  Note that
+          // it will also match an empty-string token ... if
+          // that's somehow a problem we can always map HOLE
+          // to a dedicated byte (and escape it in the
+          // input).
+          copyDestTransitions(state, t.getDest(), newTransitions);
+          a.setDeterministic(false);
+        } else {
+          newTransitions.add(t);
         }
+      }
+      state.setTransitions(newTransitions.toArray(new Transition[newTransitions.size()]));
     }
+  }
 
-    final static int MAX_GOSSIP_PACKET_SIZE = 1428;
-    /* GS - abbreviation for GOSSIPER_STAGE */
-    final static String GOSSIP_STAGE = "GS";
-    /* GSV - abbreviation for GOSSIP-DIGEST-SYN-VERB */
-    final static String JOIN_VERB_HANDLER = "JVH";
-    /* GSV - abbreviation for GOSSIP-DIGEST-SYN-VERB */
-    final static String GOSSIP_DIGEST_SYN_VERB = "GSV";
-    /* GAV - abbreviation for GOSSIP-DIGEST-ACK-VERB */
-    final static String GOSSIP_DIGEST_ACK_VERB = "GAV";
-    /* GA2V - abbreviation for GOSSIP-DIGEST-ACK2-VERB */
-    final static String GOSSIP_DIGEST_ACK2_VERB = "GA2V";
-    final static int intervalInMillis_ = 1000;
-    private static Logger logger_ = Logger.getLogger(Gossiper.class);
-    static Gossiper gossiper_;
+  /** Just escapes the 0xff byte (which we still for SEP). */
+  private static final class  EscapingTokenStreamToAutomaton extends TokenStreamToAutomaton {
 
-    public synchronized static Gossiper instance()
-    {
-        if ( gossiper_ == null )
-        {
-            gossiper_ = new Gossiper();
+    final BytesRef spare = new BytesRef();
+
+    @Override
+    protected BytesRef changeToken(BytesRef in) {
+      int upto = 0;
+      for(int i=0;i<in.length;i++) {
+        byte b = in.bytes[in.offset+i];
+        if (b == (byte) 0xff) {
+          if (spare.bytes.length == upto) {
+            spare.grow(upto+2);
+          }
+          spare.bytes[upto++] = (byte) 0xff;
+          spare.bytes[upto++] = b;
+        } else {
+          if (spare.bytes.length == upto) {
+            spare.grow(upto+1);
+          }
+          spare.bytes[upto++] = b;
         }
-        return gossiper_;
+      }
+      spare.offset = 0;
+      spare.length = upto;
+      return spare;
     }
+  }
 
-    private Timer gossipTimer_ = new Timer(false);
-    private EndPoint localEndPoint_;
-    private long aVeryLongTime_;
-    private Random random_ = new Random();
-    /* round robin index through live endpoint set */
-    private int rrIndex_ = 0;
-
-    /* subscribers for interest in EndPointState change */
-    private List<IEndPointStateChangeSubscriber> subscribers_ = new ArrayList<IEndPointStateChangeSubscriber>();
-
-    /* live member set */
-    private Set<EndPoint> liveEndpoints_ = new HashSet<EndPoint>();
-
-    /* unreachable member set */
-    private Set<EndPoint> unreachableEndpoints_ = new HashSet<EndPoint>();
-
-    /* initial seeds for joining the cluster */
-    private Set<EndPoint> seeds_ = new HashSet<EndPoint>();
-
-    /* map where key is the endpoint and value is the state associated with the endpoint */
-    Map<EndPoint, EndPointState> endPointStateMap_ = new Hashtable<EndPoint, EndPointState>();
-
-    /* private CTOR */
-    Gossiper()
-    {
-        aVeryLongTime_ = 259200 * 1000;
-        /* register with the Failure Detector for receiving Failure detector events */
-        FailureDetector.instance().registerFailureDetectionEventListener(this);
-        /* register the verbs */
-        MessagingService.getMessagingInstance().registerVerbHandlers(JOIN_VERB_HANDLER, new JoinVerbHandler());
-        MessagingService.getMessagingInstance().registerVerbHandlers(GOSSIP_DIGEST_SYN_VERB, new GossipDigestSynVerbHandler());
-        MessagingService.getMessagingInstance().registerVerbHandlers(GOSSIP_DIGEST_ACK_VERB, new GossipDigestAckVerbHandler());
-        MessagingService.getMessagingInstance().registerVerbHandlers(GOSSIP_DIGEST_ACK2_VERB, new GossipDigestAck2VerbHandler());
-        /* register the Gossip stage */
-        StageManager.registerStage( Gossiper.GOSSIP_STAGE, new SingleThreadedStage("GMFD") );
+  TokenStreamToAutomaton getTokenStreamToAutomaton() {
+    if (preserveSep) {
+      return new EscapingTokenStreamToAutomaton();
+    } else {
+      // When we're not preserving sep, we don't steal 0xff
+      // byte, so we don't need to do any escaping:
+      return new TokenStreamToAutomaton();
     }
+  }
 
-    public void register(IEndPointStateChangeSubscriber subscriber)
-    {
-        subscribers_.add(subscriber);
+  private  Comparator<BytesRef> sortComparator = new Comparator<BytesRef>() {
+    private final ByteArrayDataInput readerA = new ByteArrayDataInput();
+    private final ByteArrayDataInput readerB = new ByteArrayDataInput();
+    private final BytesRef scratchA = new BytesRef();
+    private final BytesRef scratchB = new BytesRef();
+
+    @Override
+    public int compare(BytesRef a, BytesRef b) {
+
+      // First by analyzed form:
+      readerA.reset(a.bytes, a.offset, a.length);
+      scratchA.length = readerA.readShort();
+      scratchA.bytes = a.bytes;
+      scratchA.offset = readerA.getPosition();
+
+      readerB.reset(b.bytes, b.offset, b.length);
+      scratchB.bytes = b.bytes;
+      scratchB.length = readerB.readShort();
+      scratchB.offset = readerB.getPosition();
+
+      int cmp = scratchA.compareTo(scratchB);
+      if (cmp != 0) {
+        return cmp;
+      }
+
+      // Next by cost:
+      long aCost = readerA.readInt();
+      long bCost = readerB.readInt();
+
+      if (aCost < bCost) {
+        return -1;
+      } else if (aCost > bCost) {
+        return 1;
+      }
+
+      // Finally by surface form:
+      scratchA.offset = readerA.getPosition();
+      scratchA.length = a.length - scratchA.offset;
+      scratchB.offset = readerB.getPosition();
+      scratchB.length = b.length - scratchB.offset;
+
+      cmp = scratchA.compareTo(scratchB);
+      if (cmp != 0) {
+        return cmp;
+      }
+
+      return 0;
     }
+  };
+  
+  @Override
+  public void build(TermFreqIterator iterator) throws IOException {
+    String prefix = getClass().getSimpleName();
+    File directory = Sort.defaultTempDir();
+    File tempInput = File.createTempFile(prefix, ".input", directory);
+    File tempSorted = File.createTempFile(prefix, ".sorted", directory);
+    
+    Sort.ByteSequencesWriter writer = new Sort.ByteSequencesWriter(tempInput);
+    Sort.ByteSequencesReader reader = null;
+    BytesRef scratch = new BytesRef();
 
-    public void unregister(IEndPointStateChangeSubscriber subscriber)
-    {
-        subscribers_.remove(subscriber);
-    }
+    TokenStreamToAutomaton ts2a = getTokenStreamToAutomaton();
 
-    public Set<EndPoint> getAllMembers()
-    {
-        Set<EndPoint> allMbrs = new HashSet<EndPoint>();
-        allMbrs.addAll(getLiveMembers());
-        allMbrs.addAll(getUnreachableMembers());
-        return allMbrs;
-    }
+    // analyzed sequence + 0(byte) + weight(int) + surface + analyzedLength(short) 
+    boolean success = false;
+    byte buffer[] = new byte[8];
+    try {
+      ByteArrayDataOutput output = new ByteArrayDataOutput(buffer);
+      BytesRef surfaceForm;
 
-    public Set<EndPoint> getLiveMembers()
-    {
-        Set<EndPoint> liveMbrs = new HashSet<EndPoint>(liveEndpoints_);
-        liveMbrs.add( new EndPoint( localEndPoint_.getHost(), localEndPoint_.getPort() ) );
-        return liveMbrs;
-    }
+      while ((surfaceForm = iterator.next()) != null) {
+        Set<IntsRef> paths = toFiniteStrings(surfaceForm, ts2a);
+        
+        maxAnalyzedPathsForOneInput = Math.max(maxAnalyzedPathsForOneInput, paths.size());
 
-    public Set<EndPoint> getUnreachableMembers()
-    {
-        return new HashSet<EndPoint>(unreachableEndpoints_);
-    }
+        for (IntsRef path : paths) {
 
-    /**
-     * This method is used to forcibly remove a node from the membership
-     * set. He is forgotten locally immediately.
-     *
-     * param@ ep the endpoint to be removed from membership.
-     */
-    public synchronized void removeFromMembership(EndPoint ep)
-    {
-        endPointStateMap_.remove(ep);
-        liveEndpoints_.remove(ep);
-        unreachableEndpoints_ .remove(ep);
-    }
+          Util.toBytesRef(path, scratch);
+          
+          // length of the analyzed text (FST input)
+          if (scratch.length > Short.MAX_VALUE-2) {
+            throw new IllegalArgumentException("cannot handle analyzed forms > " + (Short.MAX_VALUE-2) + " in length (got " + scratch.length + ")");
+          }
+          short analyzedLength = (short) scratch.length;
 
-    /**
-     * This method is part of IFailureDetectionEventListener interface. This is invoked
-     * by the Failure Detector when it convicts an end point.
-     *
-     * param @ endpoint end point that is convicted.
-    */
+          // compute the required length:
+          // analyzed sequence + weight (4) + surface + analyzedLength (short)
+          int requiredLength = analyzedLength + 4 + surfaceForm.length + 2;
+          
+          buffer = ArrayUtil.grow(buffer, requiredLength);
+          
+          output.reset(buffer);
 
-    public void convict(EndPoint endpoint)
-    {
-        EndPointState epState = endPointStateMap_.get(endpoint);
-        if ( epState != null )
-        {
-            if ( !epState.isAlive() && epState.isAGossiper() )
-            {
-                /*
-                 * just to be sure - is invoked just to make sure that
-                 * it was called at least once.
-                */
-                if ( liveEndpoints_.contains(endpoint) )
-                {
-                    logger_.info("EndPoint " + endpoint + " is now dead.");
-                    isAlive(endpoint, epState, false);
+          output.writeShort(analyzedLength);
 
-                    /* Notify an endpoint is dead to interested parties. */
-                    EndPointState deltaState = new EndPointState(epState.getHeartBeatState());
-                    doNotifications(endpoint, deltaState);
-                }
-                epState.isAGossiper(false);
-            }
+          output.writeBytes(scratch.bytes, scratch.offset, scratch.length);
+
+          output.writeInt(encodeWeight(iterator.weight()));
+
+          output.writeBytes(surfaceForm.bytes, surfaceForm.offset, surfaceForm.length);
+
+          assert output.getPosition() == requiredLength: output.getPosition() + " vs " + requiredLength;
+
+          writer.write(buffer, 0, output.getPosition());
         }
-    }
+      }
+      writer.close();
 
-    /**
-     * This method is part of IFailureDetectionEventListener interface. This is invoked
-     * by the Failure Detector when it suspects an end point.
-     *
-     * param @ endpoint end point that is suspected.
-    */
-    public void suspect(EndPoint endpoint)
-    {
-        EndPointState epState = endPointStateMap_.get(endpoint);
-        if ( epState.isAlive() )
-        {
-            logger_.info("EndPoint " + endpoint + " is now dead.");
-            isAlive(endpoint, epState, false);
+      // Sort all input/output pairs (required by FST.Builder):
+      new Sort(sortComparator).sort(tempInput, tempSorted);
 
-            /* Notify an endpoint is dead to interested parties. */
-            EndPointState deltaState = new EndPointState(epState.getHeartBeatState());
-            doNotifications(endpoint, deltaState);
-        }
-    }
+      // Free disk space:
+      tempInput.delete();
 
-    int getMaxEndPointStateVersion(EndPointState epState)
-    {
-        List<Integer> versions = new ArrayList<Integer>();
-        versions.add( epState.getHeartBeatState().getHeartBeatVersion() );
-        Map<String, ApplicationState> appStateMap = epState.getApplicationState();
+      reader = new Sort.ByteSequencesReader(tempSorted);
+     
+      PairOutputs<Long,BytesRef> outputs = new PairOutputs<Long,BytesRef>(PositiveIntOutputs.getSingleton(true), ByteSequenceOutputs.getSingleton());
+      Builder<Pair<Long,BytesRef>> builder = new Builder<Pair<Long,BytesRef>>(FST.INPUT_TYPE.BYTE1, outputs);
 
-        Set<String> keys = appStateMap.keySet();
-        for ( String key : keys )
-        {
-            int stateVersion = appStateMap.get(key).getStateVersion();
-            versions.add( stateVersion );
-        }
+      // Build FST:
+      BytesRef previousAnalyzed = null;
+      BytesRef analyzed = new BytesRef();
+      BytesRef surface = new BytesRef();
+      IntsRef scratchInts = new IntsRef();
+      ByteArrayDataInput input = new ByteArrayDataInput();
 
-        /* sort to get the max version to build GossipDigest for this endpoint */
-        Collections.sort(versions);
-        int maxVersion = versions.get(versions.size() - 1);
-        versions.clear();
-        return maxVersion;
-    }
+      // Used to remove duplicate surface forms (but we
+      // still index the hightest-weight one).  We clear
+      // this when we see a new analyzed form, so it cannot
+      // grow unbounded (at most 256 entries):
+      Set<BytesRef> seenSurfaceForms = new HashSet<BytesRef>();
 
-    /**
-     * Removes the endpoint from unreachable endpoint set
-     *
-     * @param endpoint endpoint to be removed from the current membership.
-    */
-    void evictFromMembership(EndPoint endpoint)
-    {
-        unreachableEndpoints_.remove(endpoint);
-    }
+      int dedup = 0;
+      while (reader.read(scratch)) {
+        input.reset(scratch.bytes, scratch.offset, scratch.length);
+        short analyzedLength = input.readShort();
+        analyzed.grow(analyzedLength+2);
+        input.readBytes(analyzed.bytes, 0, analyzedLength);
+        analyzed.length = analyzedLength;
 
-    /* No locking required since it is called from a method that already has acquired a lock */
-    @Deprecated
-    void makeGossipDigest(List<GossipDigest> gDigests)
-    {
-        /* Add the local endpoint state */
-        EndPointState epState = endPointStateMap_.get(localEndPoint_);
-        int generation = epState.getHeartBeatState().getGeneration();
-        int maxVersion = getMaxEndPointStateVersion(epState);
-        gDigests.add( new GossipDigest(localEndPoint_, generation, maxVersion) );
+        long cost = input.readInt();
 
-        for ( EndPoint liveEndPoint : liveEndpoints_ )
-        {
-            epState = endPointStateMap_.get(liveEndPoint);
-            if ( epState != null )
-            {
-                generation = epState.getHeartBeatState().getGeneration();
-                maxVersion = getMaxEndPointStateVersion(epState);
-                gDigests.add( new GossipDigest(liveEndPoint, generation, maxVersion) );
-            }
-            else
-            {
-            	gDigests.add( new GossipDigest(liveEndPoint, 0, 0) );
-            }
-        }
-    }
-
-    /**
-     * No locking required since it is called from a method that already
-     * has acquired a lock. The gossip digest is built based on randomization
-     * rather than just looping through the collection of live endpoints.
-     *
-     * @param gDigests list of Gossip Digests.
-    */
-    void makeRandomGossipDigest(List<GossipDigest> gDigests)
-    {
-        /* Add the local endpoint state */
-        EndPointState epState = endPointStateMap_.get(localEndPoint_);
-        int generation = epState.getHeartBeatState().getGeneration();
-        int maxVersion = getMaxEndPointStateVersion(epState);
-        gDigests.add( new GossipDigest(localEndPoint_, generation, maxVersion) );
-
-        List<EndPoint> endpoints = new ArrayList<EndPoint>( liveEndpoints_ );
-        Collections.shuffle(endpoints, random_);
-        for ( EndPoint liveEndPoint : endpoints )
-        {
-            epState = endPointStateMap_.get(liveEndPoint);
-            if ( epState != null )
-            {
-                generation = epState.getHeartBeatState().getGeneration();
-                maxVersion = getMaxEndPointStateVersion(epState);
-                gDigests.add( new GossipDigest(liveEndPoint, generation, maxVersion) );
-            }
-            else
-            {
-            	gDigests.add( new GossipDigest(liveEndPoint, 0, 0) );
-            }
+        surface.bytes = scratch.bytes;
+        surface.offset = input.getPosition();
+        surface.length = scratch.length - surface.offset;
+        
+        if (previousAnalyzed == null) {
+          previousAnalyzed = new BytesRef();
+          previousAnalyzed.copyBytes(analyzed);
+          seenSurfaceForms.add(BytesRef.deepCopyOf(surface));
+        } else if (analyzed.equals(previousAnalyzed)) {
+          dedup++;
+          if (dedup >= maxSurfaceFormsPerAnalyzedForm) {
+            // More than maxSurfaceFormsPerAnalyzedForm
+            // dups: skip the rest:
+            continue;
+          }
+          if (seenSurfaceForms.contains(surface)) {
+            continue;
+          }
+          seenSurfaceForms.add(BytesRef.deepCopyOf(surface));
+        } else {
+          dedup = 0;
+          previousAnalyzed.copyBytes(analyzed);
+          seenSurfaceForms.clear();
+          seenSurfaceForms.add(BytesRef.deepCopyOf(surface));
         }
 
-        /* FOR DEBUG ONLY - remove later */
-        StringBuilder sb = new StringBuilder();
-        for ( GossipDigest gDigest : gDigests )
-        {
-            sb.append(gDigest);
-            sb.append(" ");
+        // TODO: I think we can avoid the extra 2 bytes when
+        // there is no dup (dedup==0), but we'd have to fix
+        // the exactFirst logic ... which would be sort of
+        // hairy because we'd need to special case the two
+        // (dup/not dup)...
+
+        // NOTE: must be byte 0 so we sort before whatever
+        // is next
+        analyzed.bytes[analyzed.offset+analyzed.length] = 0;
+        analyzed.bytes[analyzed.offset+analyzed.length+1] = (byte) dedup;
+        analyzed.length += 2;
+
+        Util.toIntsRef(analyzed, scratchInts);
+        //System.out.println("ADD: " + scratchInts + " -> " + cost + ": " + surface.utf8ToString());
+        builder.add(scratchInts, outputs.newPair(cost, BytesRef.deepCopyOf(surface)));
+      }
+      fst = builder.finish();
+
+      //Util.dotToFile(fst, "/tmp/suggest.dot");
+      
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(reader, writer);
+      } else {
+        IOUtils.closeWhileHandlingException(reader, writer);
+      }
+      
+      tempInput.delete();
+      tempSorted.delete();
+    }
+  }
+
+  @Override
+  public boolean store(OutputStream output) throws IOException {
+    DataOutput dataOut = new OutputStreamDataOutput(output);
+    try {
+      if (fst == null) {
+        return false;
+      }
+
+      fst.save(dataOut);
+      dataOut.writeVInt(maxAnalyzedPathsForOneInput);
+    } finally {
+      IOUtils.close(output);
+    }
+    return true;
+  }
+
+  @Override
+  public boolean load(InputStream input) throws IOException {
+    DataInput dataIn = new InputStreamDataInput(input);
+    try {
+      this.fst = new FST<Pair<Long,BytesRef>>(dataIn, new PairOutputs<Long,BytesRef>(PositiveIntOutputs.getSingleton(true), ByteSequenceOutputs.getSingleton()));
+      maxAnalyzedPathsForOneInput = dataIn.readVInt();
+    } finally {
+      IOUtils.close(input);
+    }
+    return true;
+  }
+
+  @Override
+  public List<LookupResult> lookup(final CharSequence key, boolean onlyMorePopular, int num) {
+    assert num > 0;
+
+    if (onlyMorePopular) {
+      throw new IllegalArgumentException("this suggester only works with onlyMorePopular=false");
+    }
+    if (fst == null) {
+      return Collections.emptyList();
+    }
+
+    //System.out.println("lookup key=" + key + " num=" + num);
+    final BytesRef utf8Key = new BytesRef(key);
+    try {
+
+      Automaton lookupAutomaton = toLookupAutomaton(key);
+
+      final CharsRef spare = new CharsRef();
+
+      //System.out.println("  now intersect exactFirst=" + exactFirst);
+    
+      // Intersect automaton w/ suggest wFST and get all
+      // prefix starting nodes & their outputs:
+      //final PathIntersector intersector = getPathIntersector(lookupAutomaton, fst);
+
+      //System.out.println("  prefixPaths: " + prefixPaths.size());
+
+      BytesReader bytesReader = fst.getBytesReader();
+
+      FST.Arc<Pair<Long,BytesRef>> scratchArc = new FST.Arc<Pair<Long,BytesRef>>();
+
+      final List<LookupResult> results = new ArrayList<LookupResult>();
+
+      List<FSTUtil.Path<Pair<Long,BytesRef>>> prefixPaths = FSTUtil.intersectPrefixPaths(lookupAutomaton, fst);
+
+      if (exactFirst) {
+
+        int count = 0;
+        for (FSTUtil.Path<Pair<Long,BytesRef>> path : prefixPaths) {
+          if (fst.findTargetArc(END_BYTE, path.fstNode, scratchArc, bytesReader) != null) {
+            // This node has END_BYTE arc leaving, meaning it's an
+            // "exact" match:
+            count++;
+          }
         }
-        if (logger_.isTraceEnabled())
-            logger_.trace("Gossip Digests are : " + sb.toString());
-    }
 
-    public int getCurrentGenerationNumber(EndPoint endpoint)
-    {
-    	return endPointStateMap_.get(endpoint).getHeartBeatState().getGeneration();
-    }
+        // Searcher just to find the single exact only
+        // match, if present:
+        Util.TopNSearcher<Pair<Long,BytesRef>> searcher;
+        searcher = new Util.TopNSearcher<Pair<Long,BytesRef>>(fst, count * maxSurfaceFormsPerAnalyzedForm, count * maxSurfaceFormsPerAnalyzedForm, weightComparator);
 
-    Message makeGossipDigestSynMessage(List<GossipDigest> gDigests) throws IOException
-    {
-        GossipDigestSynMessage gDigestMessage = new GossipDigestSynMessage(DatabaseDescriptor.getClusterName(), gDigests);
-        ByteArrayOutputStream bos = new ByteArrayOutputStream(Gossiper.MAX_GOSSIP_PACKET_SIZE);
-        DataOutputStream dos = new DataOutputStream( bos );
-        GossipDigestSynMessage.serializer().serialize(gDigestMessage, dos);
-        Message message = new Message(localEndPoint_, Gossiper.GOSSIP_STAGE, GOSSIP_DIGEST_SYN_VERB, bos.toByteArray());
-        return message;
-    }
-
-    Message makeGossipDigestAckMessage(GossipDigestAckMessage gDigestAckMessage) throws IOException
-    {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream(Gossiper.MAX_GOSSIP_PACKET_SIZE);
-        DataOutputStream dos = new DataOutputStream(bos);
-        GossipDigestAckMessage.serializer().serialize(gDigestAckMessage, dos);
-        if (logger_.isTraceEnabled())
-            logger_.trace("@@@@ Size of GossipDigestAckMessage is " + bos.toByteArray().length);
-        Message message = new Message(localEndPoint_, Gossiper.GOSSIP_STAGE, GOSSIP_DIGEST_ACK_VERB, bos.toByteArray());
-        return message;
-    }
-
-    Message makeGossipDigestAck2Message(GossipDigestAck2Message gDigestAck2Message) throws IOException
-    {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream(Gossiper.MAX_GOSSIP_PACKET_SIZE);
-        DataOutputStream dos = new DataOutputStream(bos);
-        GossipDigestAck2Message.serializer().serialize(gDigestAck2Message, dos);
-        Message message = new Message(localEndPoint_, Gossiper.GOSSIP_STAGE, GOSSIP_DIGEST_ACK2_VERB, bos.toByteArray());
-        return message;
-    }
-
-    boolean sendGossipToLiveNode(Message message)
-    {
-        int size = liveEndpoints_.size();
-        List<EndPoint> eps = new ArrayList<EndPoint>(liveEndpoints_);
-
-        if ( rrIndex_ >= size )
-        {
-            rrIndex_ = -1;
+        // NOTE: we could almost get away with only using
+        // the first start node.  The only catch is if
+        // maxSurfaceFormsPerAnalyzedForm had kicked in and
+        // pruned our exact match from one of these nodes
+        // ...:
+        for (FSTUtil.Path<Pair<Long,BytesRef>> path : prefixPaths) {
+          if (fst.findTargetArc(END_BYTE, path.fstNode, scratchArc, bytesReader) != null) {
+            // This node has END_BYTE arc leaving, meaning it's an
+            // "exact" match:
+            searcher.addStartPaths(scratchArc, fst.outputs.add(path.output, scratchArc.output), false, path.input);
+          }
         }
 
-        EndPoint to = eps.get(++rrIndex_);
-        if (logger_.isTraceEnabled())
-            logger_.trace("Sending a GossipDigestSynMessage to " + to + " ...");
-        MessagingService.getMessagingInstance().sendUdpOneWay(message, to);
-        return seeds_.contains(to);
-    }
+        MinResult<Pair<Long,BytesRef>> completions[] = searcher.search();
 
-    /**
-     * Returns true if the chosen target was also a seed. False otherwise
-     *
-     *  @param message message to sent
-     *  @param epSet a set of endpoint from which a random endpoint is chosen.
-     *  @return true if the chosen endpoint is also a seed.
-     */
-    boolean sendGossip(Message message, Set<EndPoint> epSet)
-    {
-        int size = epSet.size();
-        /* Generate a random number from 0 -> size */
-        List<EndPoint> liveEndPoints = new ArrayList<EndPoint>(epSet);
-        int index = (size == 1) ? 0 : random_.nextInt(size);
-        EndPoint to = liveEndPoints.get(index);
-        if (logger_.isTraceEnabled())
-            logger_.trace("Sending a GossipDigestSynMessage to " + to + " ...");
-        MessagingService.getMessagingInstance().sendUdpOneWay(message, to);
-        return seeds_.contains(to);
-    }
+        // NOTE: this is rather inefficient: we enumerate
+        // every matching "exactly the same analyzed form"
+        // path, and then do linear scan to see if one of
+        // these exactly matches the input.  It should be
+        // possible (though hairy) to do something similar
+        // to getByOutput, since the surface form is encoded
+        // into the FST output, so we more efficiently hone
+        // in on the exact surface-form match.  Still, I
+        // suspect very little time is spent in this linear
+        // seach: it's bounded by how many prefix start
+        // nodes we have and the
+        // maxSurfaceFormsPerAnalyzedForm:
+        for(MinResult<Pair<Long,BytesRef>> completion : completions) {
+          if (utf8Key.bytesEquals(completion.output.output2)) {
+            spare.grow(completion.output.output2.length);
+            UnicodeUtil.UTF8toUTF16(completion.output.output2, spare);
+            results.add(new LookupResult(spare.toString(), decodeWeight(completion.output.output1)));
+            break;
+          }
+        }
 
-    /* Sends a Gossip message to a live member and returns a reference to the member */
-    boolean doGossipToLiveMember(Message message)
-    {
-        int size = liveEndpoints_.size();
-        if ( size == 0 )
+        if (results.size() == num) {
+          // That was quick:
+          return results;
+        }
+      }
+
+      Util.TopNSearcher<Pair<Long,BytesRef>> searcher;
+      searcher = new Util.TopNSearcher<Pair<Long,BytesRef>>(fst,
+                                                            num - results.size(),
+                                                            num * maxAnalyzedPathsForOneInput,
+                                                            weightComparator) {
+        private final Set<BytesRef> seen = new HashSet<BytesRef>();
+
+        @Override
+        protected boolean acceptResult(IntsRef input, Pair<Long,BytesRef> output) {
+
+          // Dedup: when the input analyzes to a graph we
+          // can get duplicate surface forms:
+          if (seen.contains(output.output2)) {
             return false;
-        // return sendGossipToLiveNode(message);
-        /* Use this for a cluster size >= 30 */
-        return sendGossip(message, liveEndpoints_);
-    }
-
-    /* Sends a Gossip message to an unreachable member */
-    void doGossipToUnreachableMember(Message message)
-    {
-        double liveEndPoints = liveEndpoints_.size();
-        double unreachableEndPoints = unreachableEndpoints_.size();
-        if ( unreachableEndPoints > 0 )
-        {
-            /* based on some probability */
-            double prob = unreachableEndPoints / (liveEndPoints + 1);
-            double randDbl = random_.nextDouble();
-            if ( randDbl < prob )
-                sendGossip(message, unreachableEndpoints_);
-        }
-    }
-
-    /* Gossip to a seed for facilitating partition healing */
-    void doGossipToSeed(Message message)
-    {
-        int size = seeds_.size();
-        if ( size > 0 )
-        {
-            if ( size == 1 && seeds_.contains(localEndPoint_) )
-            {
-                return;
+          }
+          seen.add(output.output2);
+          
+          if (!exactFirst) {
+            return true;
+          } else {
+            // In exactFirst mode, don't accept any paths
+            // matching the surface form since that will
+            // create duplicate results:
+            if (utf8Key.bytesEquals(output.output2)) {
+              // We found exact match, which means we should
+              // have already found it in the first search:
+              assert results.size() == 1;
+              return false;
+            } else {
+              return true;
             }
-
-            if ( liveEndpoints_.size() == 0 )
-            {
-                sendGossip(message, seeds_);
-            }
-            else
-            {
-                /* Gossip with the seed with some probability. */
-                double probability = seeds_.size() / ( liveEndpoints_.size() + unreachableEndpoints_.size() );
-                double randDbl = random_.nextDouble();
-                if ( randDbl <= probability )
-                    sendGossip(message, seeds_);
-            }
+          }
         }
+      };
+
+      prefixPaths = getFullPrefixPaths(prefixPaths, lookupAutomaton, fst);
+      
+      for (FSTUtil.Path<Pair<Long,BytesRef>> path : prefixPaths) {
+        searcher.addStartPaths(path.fstNode, path.output, true, path.input);
+      }
+
+      MinResult<Pair<Long,BytesRef>> completions[] = searcher.search();
+
+      for(MinResult<Pair<Long,BytesRef>> completion : completions) {
+        spare.grow(completion.output.output2.length);
+        UnicodeUtil.UTF8toUTF16(completion.output.output2, spare);
+        LookupResult result = new LookupResult(spare.toString(), decodeWeight(completion.output.output1));
+
+        // TODO: for fuzzy case would be nice to return
+        // how many edits were required
+
+        //System.out.println("    result=" + result);
+        results.add(result);
+
+        if (results.size() == num) {
+          // In the exactFirst=true case the search may
+          // produce one extra path
+          break;
+        }
+      }
+
+      return results;
+    } catch (IOException bogus) {
+      throw new RuntimeException(bogus);
     }
+  }
 
-    void doStatusCheck()
-    {
-        Set<EndPoint> eps = endPointStateMap_.keySet();
+  /** Returns all prefix paths to initialize the search. */
+  protected List<FSTUtil.Path<Pair<Long,BytesRef>>> getFullPrefixPaths(List<FSTUtil.Path<Pair<Long,BytesRef>>> prefixPaths,
+                                                                       Automaton lookupAutomaton,
+                                                                       FST<Pair<Long,BytesRef>> fst)
+    throws IOException {
+    return prefixPaths;
+  }
+  
+  final Set<IntsRef> toFiniteStrings(final BytesRef surfaceForm, final TokenStreamToAutomaton ts2a) throws IOException {
+ // Analyze surface form:
+    TokenStream ts = indexAnalyzer.tokenStream("", new StringReader(surfaceForm.utf8ToString()));
 
-        for ( EndPoint endpoint : eps )
-        {
-            if ( endpoint.equals(localEndPoint_) )
-                continue;
+    // Create corresponding automaton: labels are bytes
+    // from each analyzed token, with byte 0 used as
+    // separator between tokens:
+    Automaton automaton = ts2a.toAutomaton(ts);
+    ts.end();
+    ts.close();
 
-            FailureDetector.instance().interpret(endpoint);
-            EndPointState epState = endPointStateMap_.get(endpoint);
-            if ( epState != null )
-            {
-                long duration = System.currentTimeMillis() - epState.getUpdateTimestamp();
-                if ( !epState.isAlive() && (duration > aVeryLongTime_) )
-                {
-                    evictFromMembership(endpoint);
-                }
-            }
-        }
+    replaceSep(automaton);
+
+    assert SpecialOperations.isFinite(automaton);
+
+    // Get all paths from the automaton (there can be
+    // more than one path, eg if the analyzer created a
+    // graph using SynFilter or WDF):
+
+    // TODO: we could walk & add simultaneously, so we
+    // don't have to alloc [possibly biggish]
+    // intermediate HashSet in RAM:
+    return SpecialOperations.getFiniteStrings(automaton, maxGraphExpansions);
+  }
+
+  final Automaton toLookupAutomaton(final CharSequence key) throws IOException {
+    // TODO: is there a Reader from a CharSequence?
+    // Turn tokenstream into automaton:
+    TokenStream ts = queryAnalyzer.tokenStream("", new StringReader(key.toString()));
+    Automaton automaton = (getTokenStreamToAutomaton()).toAutomaton(ts);
+    ts.end();
+    ts.close();
+
+    // TODO: we could use the end offset to "guess"
+    // whether the final token was a partial token; this
+    // would only be a heuristic ... but maybe an OK one.
+    // This way we could eg differentiate "net" from "net ",
+    // which we can't today...
+
+    replaceSep(automaton);
+
+    // TODO: we can optimize this somewhat by determinizing
+    // while we convert
+    BasicOperations.determinize(automaton);
+    return automaton;
+  }
+  
+  
+
+  /**
+   * Returns the weight associated with an input string,
+   * or null if it does not exist.
+   */
+  public Object get(CharSequence key) {
+    throw new UnsupportedOperationException();
+  }
+  
+  /** cost -> weight */
+  private static int decodeWeight(long encoded) {
+    return (int)(Integer.MAX_VALUE - encoded);
+  }
+  
+  /** weight -> cost */
+  private static int encodeWeight(long value) {
+    if (value < 0 || value > Integer.MAX_VALUE) {
+      throw new UnsupportedOperationException("cannot encode value: " + value);
     }
-
-    EndPointState getEndPointStateForEndPoint(EndPoint ep)
-    {
-        return endPointStateMap_.get(ep);
+    return Integer.MAX_VALUE - (int)value;
+  }
+   
+  static final Comparator<Pair<Long,BytesRef>> weightComparator = new Comparator<Pair<Long,BytesRef>> () {
+    @Override
+    public int compare(Pair<Long,BytesRef> left, Pair<Long,BytesRef> right) {
+      return left.output1.compareTo(right.output1);
     }
-
-    synchronized EndPointState getStateForVersionBiggerThan(EndPoint forEndpoint, int version)
-    {
-        EndPointState epState = endPointStateMap_.get(forEndpoint);
-        EndPointState reqdEndPointState = null;
-
-        if ( epState != null )
-        {
-            /*
-             * Here we try to include the Heart Beat state only if it is
-             * greater than the version passed in. It might happen that
-             * the heart beat version maybe lesser than the version passed
-             * in and some application state has a version that is greater
-             * than the version passed in. In this case we also send the old
-             * heart beat and throw it away on the receiver if it is redundant.
-            */
-            int localHbVersion = epState.getHeartBeatState().getHeartBeatVersion();
-            if ( localHbVersion > version )
-            {
-                reqdEndPointState = new EndPointState(epState.getHeartBeatState());
-            }
-            Map<String, ApplicationState> appStateMap = epState.getApplicationState();
-            /* Accumulate all application states whose versions are greater than "version" variable */
-            Set<String> keys = appStateMap.keySet();
-            for ( String key : keys )
-            {
-                ApplicationState appState = appStateMap.get(key);
-                if ( appState.getStateVersion() > version )
-                {
-                    if ( reqdEndPointState == null )
-                    {
-                        reqdEndPointState = new EndPointState(epState.getHeartBeatState());
-                    }
-                    reqdEndPointState.addApplicationState(key, appState);
-                }
-            }
-        }
-        return reqdEndPointState;
-    }
-
-    /*
-     * This method is called only from the JoinVerbHandler. This happens
-     * when a new node coming up multicasts the JoinMessage. Here we need
-     * to add the endPoint to the list of live endpoints.
-    */
-    synchronized void join(EndPoint from)
-    {
-        if ( !from.equals( localEndPoint_ ) )
-        {
-            /* Mark this endpoint as "live" */
-        	liveEndpoints_.add(from);
-            unreachableEndpoints_.remove(from);
-        }
-    }
-
-    void notifyFailureDetector(List<GossipDigest> gDigests)
-    {
-        IFailureDetector fd = FailureDetector.instance();
-        for ( GossipDigest gDigest : gDigests )
-        {
-            EndPointState localEndPointState = endPointStateMap_.get(gDigest.endPoint_);
-            /*
-             * If the local endpoint state exists then report to the FD only
-             * if the versions workout.
-            */
-            if ( localEndPointState != null )
-            {
-                int localGeneration = endPointStateMap_.get(gDigest.endPoint_).getHeartBeatState().generation_;
-                int remoteGeneration = gDigest.generation_;
-                if ( remoteGeneration > localGeneration )
-                {
-                    fd.report(gDigest.endPoint_);
-                    continue;
-                }
-
-                if ( remoteGeneration == localGeneration )
-                {
-                    int localVersion = getMaxEndPointStateVersion(localEndPointState);
-                    //int localVersion = endPointStateMap_.get(gDigest.endPoint_).getHeartBeatState().getHeartBeatVersion();
-                    int remoteVersion = gDigest.maxVersion_;
-                    if ( remoteVersion > localVersion )
-                    {
-                        fd.report(gDigest.endPoint_);
-                    }
-                }
-            }
-        }
-    }
-
-    void notifyFailureDetector(Map<EndPoint, EndPointState> remoteEpStateMap)
-    {
-        IFailureDetector fd = FailureDetector.instance();
-        Set<EndPoint> endpoints = remoteEpStateMap.keySet();
-        for ( EndPoint endpoint : endpoints )
-        {
-            EndPointState remoteEndPointState = remoteEpStateMap.get(endpoint);
-            EndPointState localEndPointState = endPointStateMap_.get(endpoint);
-            /*
-             * If the local endpoint state exists then report to the FD only
-             * if the versions workout.
-            */
-            if ( localEndPointState != null )
-            {
-                int localGeneration = localEndPointState.getHeartBeatState().generation_;
-                int remoteGeneration = remoteEndPointState.getHeartBeatState().generation_;
-                if ( remoteGeneration > localGeneration )
-                {
-                    fd.report(endpoint);
-                    continue;
-                }
-
-                if ( remoteGeneration == localGeneration )
-                {
-                    int localVersion = getMaxEndPointStateVersion(localEndPointState);
-                    //int localVersion = localEndPointState.getHeartBeatState().getHeartBeatVersion();
-                    int remoteVersion = remoteEndPointState.getHeartBeatState().getHeartBeatVersion();
-                    if ( remoteVersion > localVersion )
-                    {
-                        fd.report(endpoint);
-                    }
-                }
-            }
-        }
-    }
-
-    void markAlive(EndPoint addr, EndPointState localState)
-    {
-        if (logger_.isTraceEnabled())
-            logger_.trace("marking as alive " + addr);
-        if ( !localState.isAlive() )
-        {
-            isAlive(addr, localState, true);
-            logger_.info("EndPoint " + addr + " is now UP");
-        }
-    }
-
-    private void handleNewJoin(EndPoint ep, EndPointState epState)
-    {
-    	logger_.info("Node " + ep + " has now joined.");
-        /* Mark this endpoint as "live" */
-        endPointStateMap_.put(ep, epState);
-        isAlive(ep, epState, true);
-        /* Notify interested parties about endpoint state change */
-        doNotifications(ep, epState);
-    }
-
-    synchronized void applyStateLocally(Map<EndPoint, EndPointState> epStateMap)
-    {
-        Set<EndPoint> eps = epStateMap.keySet();
-        for( EndPoint ep : eps )
-        {
-            if ( ep.equals( localEndPoint_ ) )
-                continue;
-
-            EndPointState localEpStatePtr = endPointStateMap_.get(ep);
-            EndPointState remoteState = epStateMap.get(ep);
-            /*
-                If state does not exist just add it. If it does then add it only if the version
-                of the remote copy is greater than the local copy.
-            */
-            if ( localEpStatePtr != null )
-            {
-            	int localGeneration = localEpStatePtr.getHeartBeatState().getGeneration();
-            	int remoteGeneration = remoteState.getHeartBeatState().getGeneration();
-
-            	if (remoteGeneration > localGeneration)
-            	{
-            		handleNewJoin(ep, remoteState);
-            	}
-            	else if ( remoteGeneration == localGeneration )
-            	{
-	                /* manage the membership state */
-	                int localMaxVersion = getMaxEndPointStateVersion(localEpStatePtr);
-	                int remoteMaxVersion = getMaxEndPointStateVersion(remoteState);
-	                if ( remoteMaxVersion > localMaxVersion )
-	                {
-	                    markAlive(ep, localEpStatePtr);
-	                    applyHeartBeatStateLocally(ep, localEpStatePtr, remoteState);
-	                    /* apply ApplicationState */
-	                    applyApplicationStateLocally(ep, localEpStatePtr, remoteState);
-	                }
-            	}
-            }
-            else
-            {
-            	handleNewJoin(ep, remoteState);
-            }
-        }
-    }
-
-    void applyHeartBeatStateLocally(EndPoint addr, EndPointState localState, EndPointState remoteState)
-    {
-        HeartBeatState localHbState = localState.getHeartBeatState();
-        HeartBeatState remoteHbState = remoteState.getHeartBeatState();
-
-        if ( remoteHbState.getGeneration() > localHbState.getGeneration() )
-        {
-            markAlive(addr, localState);
-            localState.setHeartBeatState(remoteHbState);
-        }
-        if ( localHbState.getGeneration() == remoteHbState.getGeneration() )
-        {
-            if ( remoteHbState.getHeartBeatVersion() > localHbState.getHeartBeatVersion() )
-            {
-                int oldVersion = localHbState.getHeartBeatVersion();
-                localState.setHeartBeatState(remoteHbState);
-                if (logger_.isTraceEnabled())
-                    logger_.trace("Updating heartbeat state version to " + localState.getHeartBeatState().getHeartBeatVersion() + " from " + oldVersion + " for " + addr + " ...");
-            }
-        }
-    }
-
-    void applyApplicationStateLocally(EndPoint addr, EndPointState localStatePtr, EndPointState remoteStatePtr)
-    {
-        Map<String, ApplicationState> localAppStateMap = localStatePtr.getApplicationState();
-        Map<String, ApplicationState> remoteAppStateMap = remoteStatePtr.getApplicationState();
-
-        Set<String> remoteKeys = remoteAppStateMap.keySet();
-        for ( String remoteKey : remoteKeys )
-        {
-            ApplicationState remoteAppState = remoteAppStateMap.get(remoteKey);
-            ApplicationState localAppState = localAppStateMap.get(remoteKey);
-
-            /* If state doesn't exist locally for this key then just apply it */
-            if ( localAppState == null )
-            {
-                localStatePtr.addApplicationState(remoteKey, remoteAppState);
-                /* notify interested parties of endpoint state change */
-                EndPointState deltaState = new EndPointState(localStatePtr.getHeartBeatState());
-                deltaState.addApplicationState(remoteKey, remoteAppState);
-                doNotifications(addr, deltaState);
-                continue;
-            }
-
-            int remoteGeneration = remoteStatePtr.getHeartBeatState().getGeneration();
-            int localGeneration = localStatePtr.getHeartBeatState().getGeneration();
-
-            /* If the remoteGeneration is greater than localGeneration then apply state blindly */
-            if ( remoteGeneration > localGeneration )
-            {
-                localStatePtr.addApplicationState(remoteKey, remoteAppState);
-                /* notify interested parties of endpoint state change */
-                EndPointState deltaState = new EndPointState(localStatePtr.getHeartBeatState());
-                deltaState.addApplicationState(remoteKey, remoteAppState);
-                doNotifications(addr, deltaState);
-                continue;
-            }
-
-            /* If the generations are the same then apply state if the remote version is greater than local version. */
-            if ( remoteGeneration == localGeneration )
-            {
-                int remoteVersion = remoteAppState.getStateVersion();
-                int localVersion = localAppState.getStateVersion();
-
-                if ( remoteVersion > localVersion )
-                {
-                    localStatePtr.addApplicationState(remoteKey, remoteAppState);
-                    /* notify interested parties of endpoint state change */
-                    EndPointState deltaState = new EndPointState(localStatePtr.getHeartBeatState());
-                    deltaState.addApplicationState(remoteKey, remoteAppState);
-                    doNotifications(addr, deltaState);
-                }
-            }
-        }
-    }
-
-    void doNotifications(EndPoint addr, EndPointState epState)
-    {
-        for ( IEndPointStateChangeSubscriber subscriber : subscribers_ )
-        {
-            subscriber.onChange(addr, epState);
-        }
-    }
-
-    synchronized void isAlive(EndPoint addr, EndPointState epState, boolean value)
-    {
-        epState.isAlive(value);
-        if ( value )
-        {
-            liveEndpoints_.add(addr);
-            unreachableEndpoints_.remove(addr);
-        }
-        else
-        {
-            liveEndpoints_.remove(addr);
-            unreachableEndpoints_.add(addr);
-        }
-        if ( epState.isAGossiper() )
-            return;
-        epState.isAGossiper(true);
-    }
-
-    /* These are helper methods used from GossipDigestSynVerbHandler */
-    Map<EndPoint, GossipDigest> getEndPointGossipDigestMap(List<GossipDigest> gDigestList)
-    {
-        Map<EndPoint, GossipDigest> epMap = new HashMap<EndPoint, GossipDigest>();
-        for( GossipDigest gDigest : gDigestList )
-        {
-            epMap.put( gDigest.getEndPoint(), gDigest );
-        }
-        return epMap;
-    }
-
-    /* This is a helper method to get all EndPoints from a list of GossipDigests */
-    EndPoint[] getEndPointsFromGossipDigest(List<GossipDigest> gDigestList)
-    {
-        Set<EndPoint> set = new HashSet<EndPoint>();
-        for ( GossipDigest gDigest : gDigestList )
-        {
-            set.add( gDigest.getEndPoint() );
-        }
-        return set.toArray( new EndPoint[0] );
-    }
-
-    /* Request all the state for the endpoint in the gDigest */
-    void requestAll(GossipDigest gDigest, List<GossipDigest> deltaGossipDigestList, int remoteGeneration)
-    {
-        /* We are here since we have no data for this endpoint locally so request everthing. */
-        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndPoint(), remoteGeneration, 0) );
-    }
-
-    /* Send all the data with version greater than maxRemoteVersion */
-    void sendAll(GossipDigest gDigest, Map<EndPoint, EndPointState> deltaEpStateMap, int maxRemoteVersion)
-    {
-        EndPointState localEpStatePtr = getStateForVersionBiggerThan(gDigest.getEndPoint(), maxRemoteVersion) ;
-        if ( localEpStatePtr != null )
-            deltaEpStateMap.put(gDigest.getEndPoint(), localEpStatePtr);
-    }
-
-    /*
-        This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
-        and the delta state are built up.
-    */
-    synchronized void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<EndPoint, EndPointState> deltaEpStateMap)
-    {
-        for ( GossipDigest gDigest : gDigestList )
-        {
-            int remoteGeneration = gDigest.getGeneration();
-            int maxRemoteVersion = gDigest.getMaxVersion();
-            /* Get state associated with the end point in digest */
-            EndPointState epStatePtr = endPointStateMap_.get(gDigest.getEndPoint());
-            /*
-                Here we need to fire a GossipDigestAckMessage. If we have some data associated with this endpoint locally
-                then we follow the "if" path of the logic. If we have absolutely nothing for this endpoint we need to
-                request all the data for this endpoint.
-            */
-            if ( epStatePtr != null )
-            {
-                int localGeneration = epStatePtr.getHeartBeatState().getGeneration();
-                /* get the max version of all keys in the state associated with this endpoint */
-                int maxLocalVersion = getMaxEndPointStateVersion(epStatePtr);
-                if ( remoteGeneration == localGeneration && maxRemoteVersion == maxLocalVersion )
-                    continue;
-
-                if ( remoteGeneration > localGeneration )
-                {
-                    /* we request everything from the gossiper */
-                    requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
-                }
-                if ( remoteGeneration < localGeneration )
-                {
-                    /* send all data with generation = localgeneration and version > 0 */
-                    sendAll(gDigest, deltaEpStateMap, 0);
-                }
-                if ( remoteGeneration == localGeneration )
-                {
-                    /*
-                        If the max remote version is greater then we request the remote endpoint send us all the data
-                        for this endpoint with version greater than the max version number we have locally for this
-                        endpoint.
-                        If the max remote version is lesser, then we send all the data we have locally for this endpoint
-                        with version greater than the max remote version.
-                    */
-                    if ( maxRemoteVersion > maxLocalVersion )
-                    {
-                        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndPoint(), remoteGeneration, maxLocalVersion) );
-                    }
-                    if ( maxRemoteVersion < maxLocalVersion )
-                    {
-                        /* send all data with generation = localgeneration and version > maxRemoteVersion */
-                        sendAll(gDigest, deltaEpStateMap, maxRemoteVersion);
-                    }
-                }
-            }
-            else
-            {
-                /* We are here since we have no data for this endpoint locally so request everything. */
-                requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
-            }
-        }
-    }
-
-    public void start(EndPoint localEndPoint, int generationNbr) throws IOException
-    {
-        localEndPoint_ = localEndPoint;
-        /* Get the seeds from the config and initialize them. */
-        Set<String> seedHosts = DatabaseDescriptor.getSeeds();
-        for( String seedHost : seedHosts )
-        {
-            EndPoint seed = new EndPoint(InetAddress.getByName(seedHost).getHostAddress(),
-                                         DatabaseDescriptor.getControlPort());
-            if ( seed.equals(localEndPoint) )
-                continue;
-            seeds_.add(seed);
-        }
-
-        /* initialize the heartbeat state for this localEndPoint */
-        EndPointState localState = endPointStateMap_.get(localEndPoint_);
-        if ( localState == null )
-        {
-            HeartBeatState hbState = new HeartBeatState(generationNbr, 0);
-            localState = new EndPointState(hbState);
-            localState.isAlive(true);
-            localState.isAGossiper(true);
-            endPointStateMap_.put(localEndPoint_, localState);
-        }
-
-        /* starts a timer thread */
-        gossipTimer_.schedule( new GossipTimerTask(), Gossiper.intervalInMillis_, Gossiper.intervalInMillis_);
-    }
-
-    public synchronized void addApplicationState(String key, ApplicationState appState)
-    {
-        EndPointState epState = endPointStateMap_.get(localEndPoint_);
-        if ( epState != null )
-        {
-            epState.addApplicationState(key, appState);
-        }
-    }
-
-    public void stop()
-    {
-        gossipTimer_.cancel();
-    }
-}
-
-class JoinVerbHandler implements IVerbHandler
-{
-    private static Logger logger_ = Logger.getLogger( JoinVerbHandler.class);
-
-    public void doVerb(Message message)
-    {
-        EndPoint from = message.getFrom();
-        if (logger_.isDebugEnabled())
-          logger_.debug("Received a JoinMessage from " + from);
-
-        byte[] bytes = message.getMessageBody();
-        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
-
-        JoinMessage joinMessage = null;
-        try
-        {
-            joinMessage = JoinMessage.serializer().deserialize(dis);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        if ( joinMessage.clusterId_.equals( DatabaseDescriptor.getClusterName() ) )
-        {
-            Gossiper.instance().join(from);
-        }
-    }
-}
-
-class GossipDigestSynVerbHandler implements IVerbHandler
-{
-    private static Logger logger_ = Logger.getLogger( GossipDigestSynVerbHandler.class);
-
-    public void doVerb(Message message)
-    {
-        EndPoint from = message.getFrom();
-        if (logger_.isTraceEnabled())
-            logger_.trace("Received a GossipDigestSynMessage from " + from);
-
-        byte[] bytes = message.getMessageBody();
-        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
-
-        try
-        {
-            GossipDigestSynMessage gDigestMessage = GossipDigestSynMessage.serializer().deserialize(dis);
-            /* If the message is from a different cluster throw it away. */
-            if ( !gDigestMessage.clusterId_.equals(DatabaseDescriptor.getClusterName()) )
-                return;
-
-            List<GossipDigest> gDigestList = gDigestMessage.getGossipDigests();
-            /* Notify the Failure Detector */
-            Gossiper.instance().notifyFailureDetector(gDigestList);
-
-            doSort(gDigestList);
-
-            List<GossipDigest> deltaGossipDigestList = new ArrayList<GossipDigest>();
-            Map<EndPoint, EndPointState> deltaEpStateMap = new HashMap<EndPoint, EndPointState>();
-            Gossiper.instance().examineGossiper(gDigestList, deltaGossipDigestList, deltaEpStateMap);
-
-            GossipDigestAckMessage gDigestAck = new GossipDigestAckMessage(deltaGossipDigestList, deltaEpStateMap);
-            Message gDigestAckMessage = Gossiper.instance().makeGossipDigestAckMessage(gDigestAck);
-            if (logger_.isTraceEnabled())
-                logger_.trace("Sending a GossipDigestAckMessage to " + from);
-            MessagingService.getMessagingInstance().sendUdpOneWay(gDigestAckMessage, from);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /*
-     * First construct a map whose key is the endpoint in the GossipDigest and the value is the
-     * GossipDigest itself. Then build a list of version differences i.e difference between the
-     * version in the GossipDigest and the version in the local state for a given EndPoint.
-     * Sort this list. Now loop through the sorted list and retrieve the GossipDigest corresponding
-     * to the endpoint from the map that was initially constructed.
-    */
-    private void doSort(List<GossipDigest> gDigestList)
-    {
-        /* Construct a map of endpoint to GossipDigest. */
-        Map<EndPoint, GossipDigest> epToDigestMap = new HashMap<EndPoint, GossipDigest>();
-        for ( GossipDigest gDigest : gDigestList )
-        {
-            epToDigestMap.put(gDigest.getEndPoint(), gDigest);
-        }
-
-        /*
-         * These digests have their maxVersion set to the difference of the version
-         * of the local EndPointState and the version found in the GossipDigest.
-        */
-        List<GossipDigest> diffDigests = new ArrayList<GossipDigest>();
-        for ( GossipDigest gDigest : gDigestList )
-        {
-            EndPoint ep = gDigest.getEndPoint();
-            EndPointState epState = Gossiper.instance().getEndPointStateForEndPoint(ep);
-            int version = (epState != null) ? Gossiper.instance().getMaxEndPointStateVersion( epState ) : 0;
-            int diffVersion = Math.abs(version - gDigest.getMaxVersion() );
-            diffDigests.add( new GossipDigest(ep, gDigest.getGeneration(), diffVersion) );
-        }
-
-        gDigestList.clear();
-        Collections.sort(diffDigests);
-        int size = diffDigests.size();
-        /*
-         * Report the digests in descending order. This takes care of the endpoints
-         * that are far behind w.r.t this local endpoint
-        */
-        for ( int i = size - 1; i >= 0; --i )
-        {
-            gDigestList.add( epToDigestMap.get(diffDigests.get(i).getEndPoint()) );
-        }
-    }
-}
-
-class GossipDigestAckVerbHandler implements IVerbHandler
-{
-    private static Logger logger_ = Logger.getLogger(GossipDigestAckVerbHandler.class);
-
-    public void doVerb(Message message)
-    {
-        EndPoint from = message.getFrom();
-        if (logger_.isTraceEnabled())
-            logger_.trace("Received a GossipDigestAckMessage from " + from);
-
-        byte[] bytes = message.getMessageBody();
-        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
-
-        try
-        {
-            GossipDigestAckMessage gDigestAckMessage = GossipDigestAckMessage.serializer().deserialize(dis);
-            List<GossipDigest> gDigestList = gDigestAckMessage.getGossipDigestList();
-            Map<EndPoint, EndPointState> epStateMap = gDigestAckMessage.getEndPointStateMap();
-
-            if ( epStateMap.size() > 0 )
-            {
-                /* Notify the Failure Detector */
-                Gossiper.instance().notifyFailureDetector(epStateMap);
-                Gossiper.instance().applyStateLocally(epStateMap);
-            }
-
-            /* Get the state required to send to this gossipee - construct GossipDigestAck2Message */
-            Map<EndPoint, EndPointState> deltaEpStateMap = new HashMap<EndPoint, EndPointState>();
-            for( GossipDigest gDigest : gDigestList )
-            {
-                EndPoint addr = gDigest.getEndPoint();
-                EndPointState localEpStatePtr = Gossiper.instance().getStateForVersionBiggerThan(addr, gDigest.getMaxVersion());
-                if ( localEpStatePtr != null )
-                    deltaEpStateMap.put(addr, localEpStatePtr);
-            }
-
-            GossipDigestAck2Message gDigestAck2 = new GossipDigestAck2Message(deltaEpStateMap);
-            Message gDigestAck2Message = Gossiper.instance().makeGossipDigestAck2Message(gDigestAck2);
-            if (logger_.isTraceEnabled())
-                logger_.trace("Sending a GossipDigestAck2Message to " + from);
-            MessagingService.getMessagingInstance().sendUdpOneWay(gDigestAck2Message, from);
-        }
-        catch ( IOException e )
-        {
-            throw new RuntimeException(e);
-        }
-    }
-}
-
-class GossipDigestAck2VerbHandler implements IVerbHandler
-{
-    private static Logger logger_ = Logger.getLogger(GossipDigestAck2VerbHandler.class);
-
-    public void doVerb(Message message)
-    {
-        EndPoint from = message.getFrom();
-        if (logger_.isTraceEnabled())
-            logger_.trace("Received a GossipDigestAck2Message from " + from);
-
-        byte[] bytes = message.getMessageBody();
-        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
-        GossipDigestAck2Message gDigestAck2Message = null;
-        try
-        {
-            gDigestAck2Message = GossipDigestAck2Message.serializer().deserialize(dis);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        Map<EndPoint, EndPointState> remoteEpStateMap = gDigestAck2Message.getEndPointStateMap();
-        /* Notify the Failure Detector */
-        Gossiper.instance().notifyFailureDetector(remoteEpStateMap);
-        Gossiper.instance().applyStateLocally(remoteEpStateMap);
-    }
+  };
 }

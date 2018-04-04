@@ -1,6 +1,8 @@
-public static final int version_ = 1;
+public static final int RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
 
-/**
+package org.apache.cassandra.io;
+/*
+ * 
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -8,580 +10,362 @@ public static final int version_ = 1;
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-package org.apache.cassandra.net;
 
-import java.io.IOError;
-import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.net.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.AsynchronousCloseException;
-import java.nio.channels.ServerSocketChannel;
-import java.security.MessageDigest;
+import java.net.InetAddress;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+import java.io.IOException;
+import java.io.File;
+import java.io.IOError;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
-import com.google.common.base.Function;
-import com.google.common.collect.ArrayListMultimap;
-import com.google.common.collect.Multimap;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.log4j.Logger;
+import org.apache.commons.lang.StringUtils;
 
-import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.StreamInitiateMessage;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.locator.ILatencySubscriber;
-import org.apache.cassandra.net.io.SerializerType;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.service.GCInspector;
-import org.apache.cassandra.service.ReadCallback;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.net.io.StreamContextManager;
+import org.apache.cassandra.net.io.IStreamComplete;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.service.StreamManager;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.streaming.FileStreamTask;
-import org.apache.cassandra.streaming.StreamHeader;
-import org.apache.cassandra.utils.ExpiringMap;
-import org.apache.cassandra.utils.GuidGenerator;
-import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.utils.SimpleCondition;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-import org.cliffc.high_scale_lib.NonBlockingHashSet;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.LogUtil;
 
-public final class MessagingService implements MessagingServiceMBean
+public class Streaming
 {
-    private static final int version_ = 1;
-    //TODO: make this parameter dynamic somehow.  Not sure if config is appropriate.
-    private SerializerType serializerType_ = SerializerType.BINARY;
-
-    /** we preface every message with this number so the recipient can validate the sender is sane */
-    private static final int PROTOCOL_MAGIC = 0xCA552DFA;
-
-    /* This records all the results mapped by message Id */
-    private final ExpiringMap<String, Pair<InetAddress, IMessageCallback>> callbacks;
-
-    /* Lookup table for registering message handlers based on the verb. */
-    private final Map<StorageService.Verb, IVerbHandler> verbHandlers_;
-
-    /* Thread pool to handle messaging write activities */
-    private final ExecutorService streamExecutor_;
-    
-    private final NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool> connectionManagers_ = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
-    
-    private static final Logger logger_ = LoggerFactory.getLogger(MessagingService.class);
-    private static final int LOG_DROPPED_INTERVAL_IN_MS = 5000;
-
-    private SocketThread socketThread;
-    private final SimpleCondition listenGate;
-    private final Map<StorageService.Verb, AtomicInteger> droppedMessages = new EnumMap<StorageService.Verb, AtomicInteger>(StorageService.Verb.class);
-    private final List<ILatencySubscriber> subscribers = new ArrayList<ILatencySubscriber>();
-
-    {
-        for (StorageService.Verb verb : StorageService.Verb.values())
-            droppedMessages.put(verb, new AtomicInteger());
-    }
-
-    private static class MSHandle
-    {
-        public static final MessagingService instance = new MessagingService();
-    }
-    public static MessagingService instance()
-    {
-        return MSHandle.instance;
-    }
-
-    private MessagingService()
-    {
-        listenGate = new SimpleCondition();
-        verbHandlers_ = new EnumMap<StorageService.Verb, IVerbHandler>(StorageService.Verb.class);
-        streamExecutor_ = new DebuggableThreadPoolExecutor("Streaming", DatabaseDescriptor.getCompactionThreadPriority());
-        Runnable logDropped = new Runnable()
-        {
-            public void run()
-            {
-                logDroppedMessages();
-            }
-        };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(logDropped, LOG_DROPPED_INTERVAL_IN_MS, LOG_DROPPED_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
-
-        Function<Pair<String, Pair<InetAddress, IMessageCallback>>, ?> timeoutReporter = new Function<Pair<String, Pair<InetAddress, IMessageCallback>>, Object>()
-        {
-            public Object apply(Pair<String, Pair<InetAddress, IMessageCallback>> pair)
-            {
-                Pair<InetAddress, IMessageCallback> expiredValue = pair.right;
-                maybeAddLatency(expiredValue.right, expiredValue.left, (double) DatabaseDescriptor.getRpcTimeout());
-                return null;
-            }
-        };
-        callbacks = new ExpiringMap<String, Pair<InetAddress, IMessageCallback>>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()), timeoutReporter);
-
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.net:type=MessagingService"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
+    private static Logger logger = Logger.getLogger(Streaming.class);
+    private static String TABLE_NAME = "STREAMING-TABLE-NAME";
+    public static final long RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
 
     /**
-     * Track latency information for the dynamic snitch
-     * @param cb: the callback associated with this message -- this lets us know if it's a message type we're interested in
-     * @param address: the host that replied to the message
-     * @param latency
-     */
-    public void maybeAddLatency(IMessageCallback cb, InetAddress address, double latency)
-    {
-        if (cb instanceof ReadCallback || cb instanceof AsyncResult)
-            addLatency(address, latency);
-    }
-
-    public void addLatency(InetAddress address, double latency)
-    {
-        for (ILatencySubscriber subscriber : subscribers)
-            subscriber.receiveTiming(address, latency);
-    }
-
-    public static byte[] hash(String type, byte data[])
-    {
-        byte result[];
-        try
-        {
-            MessageDigest messageDigest = MessageDigest.getInstance(type);
-            result = messageDigest.digest(data);
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-        return result;
-    }
-
-    /** called from gossiper when it notices a node is not responding. */
-    public void convict(InetAddress ep)
-    {
-        logger_.debug("Resetting pool for " + ep);
-        getConnectionPool(ep).reset();
-    }
-
-    /**
-     * Listen on the specified port.
-     * @param localEp InetAddress whose port to listen on.
-     */
-    public void listen(InetAddress localEp) throws IOException, ConfigurationException
-    {        
-        ServerSocketChannel serverChannel = ServerSocketChannel.open();
-        final ServerSocket ss = serverChannel.socket();
-        ss.setReuseAddress(true);
-        InetSocketAddress address = new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort());
-        try
-        {
-            ss.bind(address);
-        }
-        catch (BindException e)
-        {
-            if (e.getMessage().contains("in use"))
-                throw new ConfigurationException(address + " is in use by another process.  Change listen_address:storage_port in cassandra.yaml to values that do not conflict with other services");
-            else if (e.getMessage().contains("Cannot assign requested address"))
-                throw new ConfigurationException("Unable to bind to address " + address + ". Set listen_address in cassandra.yaml to an interface you can bind to, e.g., your private IP address on EC2");
-            else
-                throw e;
-        }
-        socketThread = new SocketThread(ss, "ACCEPT-" + localEp);
-        socketThread.start();
-        listenGate.signalAll();
-    }
-
-    public void waitUntilListening()
-    {
-        try
-        {
-            listenGate.await();
-        }
-        catch (InterruptedException ie)
-        {
-            logger_.debug("await interrupted");
-        }
-    }
-
-    public OutboundTcpConnectionPool getConnectionPool(InetAddress to)
-    {
-        OutboundTcpConnectionPool cp = connectionManagers_.get(to);
-        if (cp == null)
-        {
-            connectionManagers_.putIfAbsent(to, new OutboundTcpConnectionPool(to));
-            cp = connectionManagers_.get(to);
-        }
-        return cp;
-    }
-
-    public OutboundTcpConnection getConnection(InetAddress to, Message msg)
-    {
-        return getConnectionPool(to).getConnection(msg);
-    }
-        
-    /**
-     * Register a verb and the corresponding verb handler with the
-     * Messaging Service.
-     * @param verb
-     * @param verbHandler handler for the specified verb
-     */
-    public void registerVerbHandlers(StorageService.Verb verb, IVerbHandler verbHandler)
-    {
-    	assert !verbHandlers_.containsKey(verb);
-    	verbHandlers_.put(verb, verbHandler);
-    }
-        
-    /**
-     * This method returns the verb handler associated with the registered
-     * verb. If no handler has been registered then null is returned.
-     * @param type for which the verb handler is sought
-     * @return a reference to IVerbHandler which is the handler for the specified verb
-     */
-    public IVerbHandler getVerbHandler(StorageService.Verb type)
-    {
-        return verbHandlers_.get(type);
-    }
-
-    private void addCallback(IMessageCallback cb, String messageId, InetAddress to)
-    {
-        callbacks.put(messageId, new Pair<InetAddress, IMessageCallback>(to, cb));
-    }
-
-    /**
-     * Send a message to a given endpoint. This method specifies a callback
-     * which is invoked with the actual response.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occurred to the invoker of the send().
-     *           suggest that a timeout occurred to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message message, InetAddress to, IAsyncCallback cb)
-    {        
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId, to);
-        sendOneWay(message, to);
-        return messageId;
-    }
-
-    /**
-     * Send a message to a given endpoint. This method adheres to the fire and forget
-     * style messaging.
-     * @param message messages to be sent.
-     * @param to endpoint to which the message needs to be sent
-     */
-    public void sendOneWay(Message message, InetAddress to)
-    {
-        // do local deliveries
-        if ( message.getFrom().equals(to) )
-        {
-            receive(message);
-            return;
-        }
-
-        // message sinks are a testing hook
-        Message processedMessage = SinkManager.processClientMessage(message, to);
-        if (processedMessage == null)
-        {
-            return;
-        }
-
-        // get pooled connection (really, connection queue)
-        OutboundTcpConnection connection = getConnection(to, message);
-
-        // pack message with header in a bytebuffer
-        byte[] data;
-        try
-        {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            Message.serializer().serialize(message, buffer);
-            data = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert data.length > 0;
-        ByteBuffer buffer = packIt(data , false);
-
-        // write it
-        connection.write(buffer);
-    }
-    
-    public IAsyncResult sendRR(Message message, InetAddress to)
-    {
-        IAsyncResult iar = new AsyncResult();
-        addCallback(iar, message.getMessageId(), to);
-        sendOneWay(message, to);
-        return iar;
-    }
-    
-    /**
-     * Stream a file from source to destination. This is highly optimized
-     * to not hold any of the contents of the file in memory.
-     * @param header Header contains file to stream and other metadata.
-     * @param to endpoint to which we need to stream the file.
+     * Split out files for all tables on disk locally for each range and then stream them to the target endpoint.
     */
-
-    public void stream(StreamHeader header, InetAddress to)
+    public static void transferRanges(InetAddress target, Collection<Range> ranges, Runnable callback)
     {
-        /* Streaming asynchronously on streamExector_ threads. */
-        streamExecutor_.execute(new FileStreamTask(header, to));
-    }
-    
-    public void register(ILatencySubscriber subcriber)
-    {
-        subscribers.add(subcriber);
-    }
+        assert ranges.size() > 0;
 
-    /** blocks until the processing pools are empty and done. */
-    public void waitFor() throws InterruptedException
-    {
-        while (!streamExecutor_.isTerminated())
-            streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
-    }
+        if (logger.isDebugEnabled())
+            logger.debug("Beginning transfer process to " + target + " for ranges " + StringUtils.join(ranges, ", "));
 
-    public void shutdown()
-    {
-        logger_.info("Shutting down MessageService...");
-
-        try
+        /*
+         * (1) dump all the memtables to disk.
+         * (2) anticompaction -- split out the keys in the range specified
+         * (3) transfer the data.
+        */
+        List<String> tables = DatabaseDescriptor.getTables();
+        for (String tName : tables)
         {
-            socketThread.close();
+            try
+            {
+                Table table = Table.open(tName);
+                if (logger.isDebugEnabled())
+                  logger.debug("Flushing memtables ...");
+                for (Future f : table.flush())
+                {
+                    try
+                    {
+                        f.get();
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                    catch (ExecutionException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                }
+                if (logger.isDebugEnabled())
+                  logger.debug("Performing anticompaction ...");
+                /* Get the list of files that need to be streamed */
+                transferSSTables(target, table.forceAntiCompaction(ranges, target), tName); // SSTR GC deletes the file when done
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
         }
-        catch (IOException e)
+        if (callback != null)
+            callback.run();
+    }
+
+    /**
+     * Transfers a group of sstables from a single table to the target endpoint
+     * and then marks them as ready for local deletion.
+     */
+    public static void transferSSTables(InetAddress target, List<SSTableReader> sstables, String table) throws IOException
+    {
+        StreamContextManager.StreamContext[] streamContexts = new StreamContextManager.StreamContext[SSTable.FILES_ON_DISK * sstables.size()];
+        int i = 0;
+        for (SSTableReader sstable : sstables)
         {
-            throw new IOError(e);
+            for (String filename : sstable.getAllFilenames())
+            {
+                File file = new File(filename);
+                streamContexts[i++] = new StreamContextManager.StreamContext(file.getAbsolutePath(), file.length(), table);
+            }
         }
+        if (logger.isDebugEnabled())
+          logger.debug("Stream context metadata " + StringUtils.join(streamContexts, ", "));
 
-        streamExecutor_.shutdownNow();
-        callbacks.shutdown();
+        StreamManager.instance(target).addFilesToStream(streamContexts);
+        StreamInitiateMessage biMessage = new StreamInitiateMessage(streamContexts);
+        Message message = StreamInitiateMessage.makeStreamInitiateMessage(biMessage);
+        message.addHeader(Streaming.TABLE_NAME, table.getBytes());
+        if (logger.isDebugEnabled())
+          logger.debug("Sending a stream initiate message to " + target + " ...");
+        MessagingService.instance().sendOneWay(message, target);
 
-        logger_.info("Shutdown complete (no further commands will be processed)");
+        if (streamContexts.length > 0)
+        {
+            logger.info("Waiting for transfer to " + target + " to complete");
+            StreamManager.instance(target).waitForStreamCompletion();
+            // (StreamManager will delete the streamed file on completion.)
+            logger.info("Done with transfer to " + target);
+        }
     }
 
-    public void receive(Message message)
+    /**
+     * Request ranges to be transferred
+     */
+    public static void requestRanges(InetAddress source, Collection<Range> ranges)
     {
-        message = SinkManager.processServerMessage(message);
-        if (message == null)
-            return;
-
-        Runnable runnable = new MessageDeliveryTask(message);
-        ExecutorService stage = StageManager.getStage(message.getMessageType());
-        assert stage != null : "No stage for message type " + message.getMessageType();
-        stage.execute(runnable);
+        StreamRequestMetadata streamRequestMetadata = new StreamRequestMetadata(FBUtilities.getLocalAddress(), ranges);
+        Message message = StreamRequestMessage.makeStreamRequestMessage(new StreamRequestMessage(streamRequestMetadata));
+        MessagingService.instance().sendOneWay(message, source);
     }
 
-    public Pair<InetAddress, IMessageCallback> removeRegisteredCallback(String messageId)
-    {
-        return callbacks.remove(messageId);
-    }
-
-    public long getRegisteredCallbackAge(String messageId)
-    {
-        return callbacks.getAge(messageId);
-    }
-
-    public static void validateMagic(int magic) throws IOException
-    {
-        if (magic != PROTOCOL_MAGIC)
-            throw new IOException("invalid protocol header");
-    }
-
-    public static int getBits(int x, int p, int n)
-    {
-        return x >>> (p + 1) - n & ~(-1 << n);
-    }
-        
-    public ByteBuffer packIt(byte[] bytes, boolean compress)
+    public static class StreamInitiateVerbHandler implements IVerbHandler
     {
         /*
-             Setting up the protocol header. This is 4 bytes long
-             represented as an integer. The first 2 bits indicate
-             the serializer type. The 3rd bit indicates if compression
-             is turned on or off. It is turned off by default. The 4th
-             bit indicates if we are in streaming mode. It is turned off
-             by default. The 5th-8th bits are reserved for future use.
-             The next 8 bits indicate a version number. Remaining 15 bits 
-             are not used currently.            
+         * Here we handle the StreamInitiateMessage. Here we get the
+         * array of StreamContexts. We get file names for the column
+         * families associated with the files and replace them with the
+         * file names as obtained from the column family store on the
+         * receiving end.
         */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if (compress)
-            header |= 4;
-        // Setting up the version bit
-        header |= (version_ << 8);
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-        
-    public ByteBuffer constructStreamHeader(StreamHeader streamHeader, boolean compress)
-    {
-        /* 
-        Setting up the protocol header. This is 4 bytes long
-        represented as an integer. The first 2 bits indicate
-        the serializer type. The 3rd bit indicates if compression
-        is turned on or off. It is turned off by default. The 4th
-        bit indicates if we are in streaming mode. It is turned off
-        by default. The following 4 bits are reserved for future use. 
-        The next 8 bits indicate a version number. Remaining 15 bits 
-        are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if ( compress )
-            header |= 4;
-        // set streaming bit
-        header |= 8;
-        // Setting up the version bit
-        header |= (version_ << 8);
-        /* Finished the protocol header setup */
-
-        /* Adding the StreamHeader which contains the session Id along
-         * with the pendingfile info for the stream.
-         * | Session Id | Pending File Size | Pending File | Bool more files |
-         * | No. of Pending files | Pending Files ... |
-         */
-        byte[] bytes;
-        try
+        public void doVerb(Message message)
         {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            StreamHeader.serializer().serialize(streamHeader, buffer);
-            bytes = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert bytes.length > 0;
+            byte[] body = message.getMessageBody();
+            DataInputBuffer bufIn = new DataInputBuffer();
+            bufIn.reset(body, body.length);
+            if (logger.isDebugEnabled())
+                logger.debug(String.format("StreamInitiateVerbeHandler.doVerb %s %s %s", message.getVerb(), message.getMessageId(), message.getMessageType()));
 
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-
-    public int incrementDroppedMessages(StorageService.Verb verb)
-    {
-        return droppedMessages.get(verb).incrementAndGet();
-    }
-               
-    private void logDroppedMessages()
-    {
-        boolean logTpstats = false;
-        for (Map.Entry<StorageService.Verb, AtomicInteger> entry : droppedMessages.entrySet())
-        {
-            AtomicInteger dropped = entry.getValue();
-            if (dropped.get() > 0)
+            try
             {
-                logTpstats = true;
-                logger_.warn("Dropped {} {} messages in the last {}ms",
-                             new Object[] {dropped, entry.getKey(), LOG_DROPPED_INTERVAL_IN_MS});
+                StreamInitiateMessage biMsg = StreamInitiateMessage.serializer().deserialize(bufIn);
+                StreamContextManager.StreamContext[] streamContexts = biMsg.getStreamContext();
+
+                if (streamContexts.length == 0)
+                {
+                    if (logger.isDebugEnabled())
+                        logger.debug("no data needed from " + message.getFrom());
+                    if (StorageService.instance().isBootstrapMode())
+                        StorageService.instance().removeBootstrapSource(message.getFrom(), new String(message.getHeader(Streaming.TABLE_NAME)));
+                    return;
+                }
+
+                Map<String, String> fileNames = getNewNames(streamContexts);
+                Map<String, String> pathNames = new HashMap<String, String>();
+                for (String ssName : fileNames.keySet())
+                    pathNames.put(ssName, DatabaseDescriptor.getNextAvailableDataLocation());
+                /*
+                 * For each of stream context's in the incoming message
+                 * generate the new file names and store the new file names
+                 * in the StreamContextManager.
+                */
+                for (StreamContextManager.StreamContext streamContext : streamContexts )
+                {
+                    StreamContextManager.StreamStatus streamStatus = new StreamContextManager.StreamStatus(streamContext.getTargetFile(), streamContext.getExpectedBytes() );
+                    String file = getNewFileNameFromOldContextAndNames(fileNames, pathNames, streamContext);
+
+                    if (logger.isDebugEnabled())
+                      logger.debug("Received Data from  : " + message.getFrom() + " " + streamContext.getTargetFile() + " " + file);
+                    streamContext.setTargetFile(file);
+                    addStreamContext(message.getFrom(), streamContext, streamStatus);
+                }
+
+                StreamContextManager.registerStreamCompletionHandler(message.getFrom(), new StreamCompletionHandler());
+                if (logger.isDebugEnabled())
+                  logger.debug("Sending a stream initiate done message ...");
+                Message doneMessage = new Message(FBUtilities.getLocalAddress(), "", StorageService.streamInitiateDoneVerbHandler_, new byte[0] );
+                MessagingService.instance().sendOneWay(doneMessage, message.getFrom());
             }
-            dropped.set(0);
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
         }
 
-        if (logTpstats)
-            GCInspector.instance.logStats();
+        public String getNewFileNameFromOldContextAndNames(Map<String, String> fileNames,
+                                                           Map<String, String> pathNames,
+                StreamContextManager.StreamContext streamContext)
+        {
+            File sourceFile = new File( streamContext.getTargetFile() );
+            String[] piece = FBUtilities.strip(sourceFile.getName(), "-");
+            String cfName = piece[0];
+            String ssTableNum = piece[1];
+            String typeOfFile = piece[2];
+
+            String newFileNameExpanded = fileNames.get(streamContext.getTable() + "-" + cfName + "-" + ssTableNum);
+            String path = pathNames.get(streamContext.getTable() + "-" + cfName + "-" + ssTableNum);
+            //Drop type (Data.db) from new FileName
+            String newFileName = newFileNameExpanded.replace("Data.db", typeOfFile);
+            return path + File.separator + streamContext.getTable() + File.separator + newFileName;
+        }
+
+        // todo: this method needs to be private, or package at the very least for easy unit testing.
+        public Map<String, String> getNewNames(StreamContextManager.StreamContext[] streamContexts) throws IOException
+        {
+            /*
+             * Mapping for each file with unique CF-i ---> new file name. For eg.
+             * for a file with name <CF>-<i>-Data.db there is a corresponding
+             * <CF>-<i>-Index.db. We maintain a mapping from <CF>-<i> to a newly
+             * generated file name.
+            */
+            Map<String, String> fileNames = new HashMap<String, String>();
+            /* Get the distinct entries from StreamContexts i.e have one entry per Data/Index/Filter file set */
+            Set<String> distinctEntries = new HashSet<String>();
+            for ( StreamContextManager.StreamContext streamContext : streamContexts )
+            {
+                String[] pieces = FBUtilities.strip(new File(streamContext.getTargetFile()).getName(), "-");
+                distinctEntries.add(streamContext.getTable() + "-" + pieces[0] + "-" + pieces[1] );
+            }
+
+            /* Generate unique file names per entry */
+            for ( String distinctEntry : distinctEntries )
+            {
+                String tableName;
+                String[] pieces = FBUtilities.strip(distinctEntry, "-");
+                tableName = pieces[0];
+                Table table = Table.open( tableName );
+
+                ColumnFamilyStore cfStore = table.getColumnFamilyStore(pieces[1]);
+                if (logger.isDebugEnabled())
+                  logger.debug("Generating file name for " + distinctEntry + " ...");
+                fileNames.put(distinctEntry, cfStore.getTempSSTableFileName());
+            }
+
+            return fileNames;
+        }
+
+        private void addStreamContext(InetAddress host, StreamContextManager.StreamContext streamContext, StreamContextManager.StreamStatus streamStatus)
+        {
+            if (logger.isDebugEnabled())
+              logger.debug("Adding stream context " + streamContext + " for " + host + " ...");
+            StreamContextManager.addStreamContext(host, streamContext, streamStatus);
+        }
     }
 
-    private static class SocketThread extends Thread
+    public static class StreamInitiateDoneVerbHandler implements IVerbHandler
     {
-        private final ServerSocket server;
-        
-        SocketThread(ServerSocket server, String name)
+        public void doVerb(Message message)
         {
-            super(name);
-            this.server = server;
+            if (logger.isDebugEnabled())
+              logger.debug("Received a stream initiate done message ...");
+            StreamManager.instance(message.getFrom()).start();
         }
+    }
 
-        public void run()
+    /**
+     * This is the callback handler that is invoked when we have
+     * completely received a single file from a remote host.
+     *
+     * TODO if we move this into CFS we could make addSSTables private, improving encapsulation.
+    */
+    private static class StreamCompletionHandler implements IStreamComplete
+    {
+        public void onStreamCompletion(InetAddress host, StreamContextManager.StreamContext streamContext, StreamContextManager.StreamStatus streamStatus) throws IOException
         {
-            while (true)
+            /* Parse the stream context and the file to the list of SSTables in the associated Column Family Store. */
+            if (streamContext.getTargetFile().contains("-Data.db"))
             {
+                String tableName = streamContext.getTable();
+                File file = new File( streamContext.getTargetFile() );
+                String fileName = file.getName();
+                String [] temp = fileName.split("-");
+
+                //Open the file to see if all parts are now here
                 try
                 {
-                    Socket socket = server.accept();
-                    new IncomingTcpConnection(socket).start();
-                }
-                catch (AsynchronousCloseException e)
-                {
-                    // this happens when another thread calls close().
-                    logger_.info("MessagingService shutting down server thread.");
-                    break;
+                    SSTableReader sstable = SSTableWriter.renameAndOpen(streamContext.getTargetFile());
+                    //TODO add a sanity check that this sstable has all its parts and is ok
+                    Table.open(tableName).getColumnFamilyStore(temp[0]).addSSTable(sstable);
+                    logger.info("Streaming added " + sstable.getFilename());
                 }
                 catch (IOException e)
                 {
-                    throw new RuntimeException(e);
+                    throw new RuntimeException("Not able to add streamed file " + streamContext.getTargetFile(), e);
                 }
             }
+
+            if (logger.isDebugEnabled())
+              logger.debug("Sending a streaming finished message with " + streamStatus + " to " + host);
+            /* Send a StreamStatusMessage object which may require the source node to re-stream certain files. */
+            StreamContextManager.StreamStatusMessage streamStatusMessage = new StreamContextManager.StreamStatusMessage(streamStatus);
+            Message message = StreamContextManager.StreamStatusMessage.makeStreamStatusMessage(streamStatusMessage);
+            MessagingService.instance().sendOneWay(message, host);
+
+            /* If we're done with everything for this host, remove from bootstrap sources */
+            if (StreamContextManager.isDone(host) && StorageService.instance().isBootstrapMode())
+            {
+                StorageService.instance().removeBootstrapSource(host, streamContext.getTable());
+            }
         }
-        
-        void close() throws IOException
+    }
+
+    public static class StreamFinishedVerbHandler implements IVerbHandler
+    {
+        public void doVerb(Message message)
         {
-            server.close();
+            byte[] body = message.getMessageBody();
+            DataInputBuffer bufIn = new DataInputBuffer();
+            bufIn.reset(body, body.length);
+
+            try
+            {
+                StreamContextManager.StreamStatusMessage streamStatusMessage = StreamContextManager.StreamStatusMessage.serializer().deserialize(bufIn);
+                StreamContextManager.StreamStatus streamStatus = streamStatusMessage.getStreamStatus();
+
+                switch (streamStatus.getAction())
+                {
+                    case DELETE:
+                        StreamManager.instance(message.getFrom()).finish(streamStatus.getFile());
+                        break;
+
+                    case STREAM:
+                        if (logger.isDebugEnabled())
+                            logger.debug("Need to re-stream file " + streamStatus.getFile());
+                        StreamManager.instance(message.getFrom()).repeat();
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
         }
-    }
-
-    public Map<String, Integer> getCommandPendingTasks()
-    {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getPendingMessages());
-        return pendingTasks;
-    }
-
-    public Map<String, Long> getCommandCompletedTasks()
-    {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getCompletedMesssages());
-        return completedTasks;
-    }
-
-    public Map<String, Integer> getResponsePendingTasks()
-    {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getPendingMessages());
-        return pendingTasks;
-    }
-
-    public Map<String, Long> getResponseCompletedTasks()
-    {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getCompletedMesssages());
-        return completedTasks;
     }
 }

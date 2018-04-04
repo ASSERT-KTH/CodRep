@@ -1,4 +1,4 @@
-writer.shutdown();
+w.shutdown();
 
 package org.apache.lucene.search;
 
@@ -19,65 +19,197 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.util.Locale;
-import java.text.DecimalFormat;
-import java.text.DecimalFormatSymbols;
+import java.io.*;
+import java.util.*;
 
 import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.IntField;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.TestUtil;
-import org.apache.lucene.util.TestUtil;
+import org.apache.lucene.document.*;
+import org.apache.lucene.index.*;
+import org.apache.lucene.search.BooleanClause.Occur;
+import org.apache.lucene.search.Scorer.ChildScorer;
+import org.apache.lucene.store.*;
+import org.apache.lucene.util.*;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
-public class TestMultiValuedNumericRangeQuery extends LuceneTestCase {
+public class TestSubScorerFreqs extends LuceneTestCase {
 
-  /** Tests NumericRangeQuery on a multi-valued field (multiple numeric values per document).
-   * This test ensures, that a classical TermRangeQuery returns exactly the same document numbers as
-   * NumericRangeQuery (see SOLR-1322 for discussion) and the multiple precision terms per numeric value
-   * do not interfere with multiple numeric values.
-   */
-  public void testMultiValuedNRQ() throws Exception {
-    Directory directory = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), directory,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))
-        .setMaxBufferedDocs(TestUtil.nextInt(random(), 50, 1000)));
-    
-    DecimalFormat format = new DecimalFormat("00000000000", new DecimalFormatSymbols(Locale.ROOT));
-    
-    int num = atLeast(500);
-    for (int l = 0; l < num; l++) {
-      Document doc = new Document();
-      for (int m=0, c=random().nextInt(10); m<=c; m++) {
-        int value = random().nextInt(Integer.MAX_VALUE);
-        doc.add(newStringField("asc", format.format(value), Field.Store.NO));
-        doc.add(new IntField("trie", value, Field.Store.NO));
-      }
-      writer.addDocument(doc);
-    }
-    IndexReader reader = writer.getReader();
-    writer.close();
-    
-    IndexSearcher searcher=newSearcher(reader);
-    num = atLeast(50);
+  private static Directory dir;
+  private static IndexSearcher s;
+
+  @BeforeClass
+  public static void makeIndex() throws Exception {
+    dir = new RAMDirectory();
+    RandomIndexWriter w = new RandomIndexWriter(
+        random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergePolicy(newLogMergePolicy()));
+    // make sure we have more than one segment occationally
+    int num = atLeast(31);
     for (int i = 0; i < num; i++) {
-      int lower=random().nextInt(Integer.MAX_VALUE);
-      int upper=random().nextInt(Integer.MAX_VALUE);
-      if (lower>upper) {
-        int a=lower; lower=upper; upper=a;
-      }
-      TermRangeQuery cq=TermRangeQuery.newStringRange("asc", format.format(lower), format.format(upper), true, true);
-      NumericRangeQuery<Integer> tq=NumericRangeQuery.newIntRange("trie", lower, upper, true, true);
-      TopDocs trTopDocs = searcher.search(cq, 1);
-      TopDocs nrTopDocs = searcher.search(tq, 1);
-      assertEquals("Returned count for NumericRangeQuery and TermRangeQuery must be equal", trTopDocs.totalHits, nrTopDocs.totalHits );
+      Document doc = new Document();
+      doc.add(newTextField("f", "a b c d b c d c d d", Field.Store.NO));
+      w.addDocument(doc);
+
+      doc = new Document();
+      doc.add(newTextField("f", "a b c d", Field.Store.NO));
+      w.addDocument(doc);
     }
-    reader.close();
-    directory.close();
+
+    s = newSearcher(w.getReader());
+    w.close();
   }
-  
+
+  @AfterClass
+  public static void finish() throws Exception {
+    s.getIndexReader().close();
+    s = null;
+    dir.close();
+    dir = null;
+  }
+
+  private static class CountingCollector extends FilterCollector {
+    public final Map<Integer, Map<Query, Float>> docCounts = new HashMap<>();
+
+    private final Map<Query, Scorer> subScorers = new HashMap<>();
+    private final Set<String> relationships;
+
+    public CountingCollector(Collector other) {
+      this(other, new HashSet<>(Arrays.asList("MUST", "SHOULD", "MUST_NOT")));
+    }
+
+    public CountingCollector(Collector other, Set<String> relationships) {
+      super(other);
+      this.relationships = relationships;
+    }
+    
+    public void setSubScorers(Scorer scorer, String relationship) {
+      for (ChildScorer child : scorer.getChildren()) {
+        if (scorer instanceof AssertingScorer || relationships.contains(child.relationship)) {
+          setSubScorers(child.child, child.relationship);
+        }
+      }
+      subScorers.put(scorer.getWeight().getQuery(), scorer);
+    }
+    
+    public LeafCollector getLeafCollector(AtomicReaderContext context)
+        throws IOException {
+      final int docBase = context.docBase;
+      return new FilterLeafCollector(super.getLeafCollector(context)) {
+        
+        @Override
+        public void collect(int doc) throws IOException {
+          final Map<Query, Float> freqs = new HashMap<Query, Float>();
+          for (Map.Entry<Query, Scorer> ent : subScorers.entrySet()) {
+            Scorer value = ent.getValue();
+            int matchId = value.docID();
+            freqs.put(ent.getKey(), matchId == doc ? value.freq() : 0.0f);
+          }
+          docCounts.put(doc + docBase, freqs);
+          super.collect(doc);
+        }
+        
+        @Override
+        public void setScorer(Scorer scorer) throws IOException {
+          super.setScorer(scorer);
+          subScorers.clear();
+          setSubScorers(scorer, "TOP");
+        }
+        
+      };
+    }
+
+  }
+
+  private static final float FLOAT_TOLERANCE = 0.00001F;
+
+  @Test
+  public void testTermQuery() throws Exception {
+    TermQuery q = new TermQuery(new Term("f", "d"));
+    CountingCollector c = new CountingCollector(TopScoreDocCollector.create(10,
+        true));
+    s.search(q, null, c);
+    final int maxDocs = s.getIndexReader().maxDoc();
+    assertEquals(maxDocs, c.docCounts.size());
+    for (int i = 0; i < maxDocs; i++) {
+      Map<Query, Float> doc0 = c.docCounts.get(i);
+      assertEquals(1, doc0.size());
+      assertEquals(4.0F, doc0.get(q), FLOAT_TOLERANCE);
+
+      Map<Query, Float> doc1 = c.docCounts.get(++i);
+      assertEquals(1, doc1.size());
+      assertEquals(1.0F, doc1.get(q), FLOAT_TOLERANCE);
+    }
+  }
+
+  @Test
+  public void testBooleanQuery() throws Exception {
+    TermQuery aQuery = new TermQuery(new Term("f", "a"));
+    TermQuery dQuery = new TermQuery(new Term("f", "d"));
+    TermQuery cQuery = new TermQuery(new Term("f", "c"));
+    TermQuery yQuery = new TermQuery(new Term("f", "y"));
+
+    BooleanQuery query = new BooleanQuery();
+    BooleanQuery inner = new BooleanQuery();
+
+    inner.add(cQuery, Occur.SHOULD);
+    inner.add(yQuery, Occur.MUST_NOT);
+    query.add(inner, Occur.MUST);
+    query.add(aQuery, Occur.MUST);
+    query.add(dQuery, Occur.MUST);
+    
+    // Only needed in Java6; Java7+ has a @SafeVarargs annotated Arrays#asList()!
+    // see http://docs.oracle.com/javase/7/docs/api/java/lang/SafeVarargs.html
+    @SuppressWarnings("unchecked") final Iterable<Set<String>> occurList = Arrays.asList(
+        Collections.singleton("MUST"), 
+        new HashSet<>(Arrays.asList("MUST", "SHOULD"))
+    );
+    
+    for (final Set<String> occur : occurList) {
+      CountingCollector c = new CountingCollector(TopScoreDocCollector.create(
+          10, true), occur);
+      s.search(query, null, c);
+      final int maxDocs = s.getIndexReader().maxDoc();
+      assertEquals(maxDocs, c.docCounts.size());
+      boolean includeOptional = occur.contains("SHOULD");
+      for (int i = 0; i < maxDocs; i++) {
+        Map<Query, Float> doc0 = c.docCounts.get(i);
+        assertEquals(includeOptional ? 5 : 4, doc0.size());
+        assertEquals(1.0F, doc0.get(aQuery), FLOAT_TOLERANCE);
+        assertEquals(4.0F, doc0.get(dQuery), FLOAT_TOLERANCE);
+        if (includeOptional) {
+          assertEquals(3.0F, doc0.get(cQuery), FLOAT_TOLERANCE);
+        }
+
+        Map<Query, Float> doc1 = c.docCounts.get(++i);
+        assertEquals(includeOptional ? 5 : 4, doc1.size());
+        assertEquals(1.0F, doc1.get(aQuery), FLOAT_TOLERANCE);
+        assertEquals(1.0F, doc1.get(dQuery), FLOAT_TOLERANCE);
+        if (includeOptional) {
+          assertEquals(1.0F, doc1.get(cQuery), FLOAT_TOLERANCE);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testPhraseQuery() throws Exception {
+    PhraseQuery q = new PhraseQuery();
+    q.add(new Term("f", "b"));
+    q.add(new Term("f", "c"));
+    CountingCollector c = new CountingCollector(TopScoreDocCollector.create(10,
+        true));
+    s.search(q, null, c);
+    final int maxDocs = s.getIndexReader().maxDoc();
+    assertEquals(maxDocs, c.docCounts.size());
+    for (int i = 0; i < maxDocs; i++) {
+      Map<Query, Float> doc0 = c.docCounts.get(i);
+      assertEquals(1, doc0.size());
+      assertEquals(2.0F, doc0.get(q), FLOAT_TOLERANCE);
+
+      Map<Query, Float> doc1 = c.docCounts.get(++i);
+      assertEquals(1, doc1.size());
+      assertEquals(1.0F, doc1.get(q), FLOAT_TOLERANCE);
+    }
+
+  }
 }

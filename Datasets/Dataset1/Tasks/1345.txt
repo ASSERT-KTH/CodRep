@@ -1,13 +1,12 @@
-public Column(byte[] name, byte[] value)
+if(queryShape.relate(cShape) == SpatialRelation.DISJOINT)
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,203 +17,180 @@ public Column(byte[] name, byte[] value)
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.lucene.spatial.prefix;
 
-import java.util.Collection;
-import java.nio.ByteBuffer;
-import java.security.MessageDigest;
+import com.spatial4j.core.shape.Shape;
+import com.spatial4j.core.shape.SpatialRelation;
+import org.apache.lucene.index.*;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.spatial.prefix.tree.Node;
+import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.OpenBitSet;
+import org.apache.lucene.util.StringHelper;
+
 import java.io.IOException;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.apache.commons.lang.ArrayUtils;
-
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-
+import java.util.LinkedList;
 
 /**
- * Column is immutable, which prevents all kinds of confusion in a multithreaded environment.
- * (TODO: look at making SuperColumn immutable too.  This is trickier but is probably doable
- *  with something like PCollections -- http://code.google.com
+ * Performs a spatial intersection filter against a field indexed with {@link SpatialPrefixTree}, a Trie.
+ * SPT yields terms (grids) at length 1 and at greater lengths corresponding to greater precisions.
+ * This filter recursively traverses each grid length and uses methods on {@link Shape} to efficiently know
+ * that all points at a prefix fit in the shape or not to either short-circuit unnecessary traversals or to efficiently
+ * load all enclosed points.
+ *
+ * @lucene.internal
  */
+public class RecursivePrefixTreeFilter extends Filter {
 
-public class Column implements IColumn
-{
-    private static Logger logger_ = LoggerFactory.getLogger(Column.class);
+  /* TODOs for future:
 
-    private static ColumnSerializer serializer_ = new ColumnSerializer();
+Can a polygon query shape be optimized / made-simpler at recursive depths (e.g. intersection of shape + cell box)
 
-    public static ColumnSerializer serializer()
-    {
-        return serializer_;
-    }
+RE "scan" threshold:
+  // IF configured to do so, we could use term.freq() as an estimate on the number of places at this depth.  OR, perhaps
+  //  make estimates based on the total known term count at this level?
+  if (!scan) {
+    //Make some estimations on how many points there are at this level and how few there would need to be to set
+    // !scan to false.
+    long termsThreshold = (long) estimateNumberIndexedTerms(cell.length(),queryShape.getDocFreqExpenseThreshold(cell));
+    long thisOrd = termsEnum.ord();
+    scan = (termsEnum.seek(thisOrd+termsThreshold+1) == TermsEnum.SeekStatus.END
+            || !cell.contains(termsEnum.term()));
+    termsEnum.seek(thisOrd);//return to last position
+  }
 
-    private final byte[] name;
-    private final byte[] value;
-    private final long timestamp;
-    private final boolean isMarkedForDelete;
+  */
 
-    Column(byte[] name)
-    {
-        this(name, ArrayUtils.EMPTY_BYTE_ARRAY);
-    }
+  private final String fieldName;
+  private final SpatialPrefixTree grid;
+  private final Shape queryShape;
+  private final int prefixGridScanLevel;//at least one less than grid.getMaxLevels()
+  private final int detailLevel;
 
-    Column(byte[] name, byte[] value)
-    {
-        this(name, value, 0);
-    }
+  public RecursivePrefixTreeFilter(String fieldName, SpatialPrefixTree grid, Shape queryShape, int prefixGridScanLevel,
+                             int detailLevel) {
+    this.fieldName = fieldName;
+    this.grid = grid;
+    this.queryShape = queryShape;
+    this.prefixGridScanLevel = Math.max(1,Math.min(prefixGridScanLevel,grid.getMaxLevels()-1));
+    this.detailLevel = detailLevel;
+    assert detailLevel <= grid.getMaxLevels();
+  }
 
-    public Column(byte[] name, byte[] value, long timestamp)
-    {
-        this(name, value, timestamp, false);
-    }
+  @Override
+  public DocIdSet getDocIdSet(AtomicReaderContext ctx, Bits acceptDocs) throws IOException {
+    AtomicReader reader = ctx.reader();
+    OpenBitSet bits = new OpenBitSet(reader.maxDoc());
+    Terms terms = reader.terms(fieldName);
+    if (terms == null)
+      return null;
+    TermsEnum termsEnum = terms.iterator(null);
+    DocsEnum docsEnum = null;//cached for termsEnum.docs() calls
+    Node scanCell = null;
 
-    public Column(byte[] name, byte[] value, long timestamp, boolean isDeleted)
-    {
-        assert name != null;
-        assert value != null;
-        assert name.length <= IColumn.MAX_NAME_LENGTH;
-        this.name = name;
-        this.value = value;
-        this.timestamp = timestamp;
-        isMarkedForDelete = isDeleted;
-    }
+    //cells is treated like a stack. LinkedList conveniently has bulk add to beginning. It's in sorted order so that we
+    //  always advance forward through the termsEnum index.
+    LinkedList<Node> cells = new LinkedList<Node>(
+        grid.getWorldNode().getSubCells(queryShape) );
 
-    public byte[] name()
-    {
-        return name;
-    }
-
-    public Column getSubColumn(byte[] columnName)
-    {
-        throw new UnsupportedOperationException("This operation is unsupported on simple columns.");
-    }
-
-    public byte[] value()
-    {
-        return value;
-    }
-
-    public Collection<IColumn> getSubColumns()
-    {
-        throw new UnsupportedOperationException("This operation is unsupported on simple columns.");
-    }
-
-    public int getObjectCount()
-    {
-        return 1;
-    }
-
-    public long timestamp()
-    {
-        return timestamp;
-    }
-
-    public boolean isMarkedForDelete()
-    {
-        return isMarkedForDelete;
-    }
-
-    public long getMarkedForDeleteAt()
-    {
-        if (!isMarkedForDelete())
-        {
-            throw new IllegalStateException("column is not marked for delete");
+    //This is a recursive algorithm that starts with one or more "big" cells, and then recursively dives down into the
+    // first such cell that intersects with the query shape.  It's a depth first traversal because we don't move onto
+    // the next big cell (breadth) until we're completely done considering all smaller cells beneath it. For a given
+    // cell, if it's *within* the query shape then we can conveniently short-circuit the depth traversal and
+    // grab all documents assigned to this cell/term.  For an intersection of the cell and query shape, we either
+    // recursively step down another grid level or we decide heuristically (via prefixGridScanLevel) that there aren't
+    // that many points, and so we scan through all terms within this cell (i.e. the term starts with the cell's term),
+    // seeing which ones are within the query shape.
+    while(!cells.isEmpty()) {
+      final Node cell = cells.removeFirst();
+      final BytesRef cellTerm = new BytesRef(cell.getTokenBytes());
+      TermsEnum.SeekStatus seekStat = termsEnum.seekCeil(cellTerm);
+      if (seekStat == TermsEnum.SeekStatus.END)
+        break;
+      if (seekStat == TermsEnum.SeekStatus.NOT_FOUND)
+        continue;
+      if (cell.getLevel() == detailLevel || cell.isLeaf()) {
+        docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+        addDocs(docsEnum,bits);
+      } else {//any other intersection
+        //If the next indexed term is the leaf marker, then add all of them
+        BytesRef nextCellTerm = termsEnum.next();
+        assert StringHelper.startsWith(nextCellTerm, cellTerm);
+        scanCell = grid.getNode(nextCellTerm.bytes, nextCellTerm.offset, nextCellTerm.length, scanCell);
+        if (scanCell.isLeaf()) {
+          docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+          addDocs(docsEnum,bits);
+          termsEnum.next();//move pointer to avoid potential redundant addDocs() below
         }
-        return timestamp;
-    }
 
-    public long mostRecentLiveChangeAt()
-    {
-        return timestamp;
-    }
+        //Decide whether to continue to divide & conquer, or whether it's time to scan through terms beneath this cell.
+        // Scanning is a performance optimization trade-off.
+        boolean scan = cell.getLevel() >= prefixGridScanLevel;//simple heuristic
 
-    public int size()
-    {
-        /*
-         * Size of a column is =
-         *   size of a name (UtfPrefix + length of the string)
-         * + 1 byte to indicate if the column has been deleted
-         * + 8 bytes for timestamp
-         * + 4 bytes which basically indicates the size of the byte array
-         * + entire byte array.
-        */
+        if (!scan) {
+          //Divide & conquer
+          cells.addAll(0, cell.getSubCells(queryShape));//add to beginning
+        } else {
+          //Scan through all terms within this cell to see if they are within the queryShape. No seek()s.
+          for(BytesRef term = termsEnum.term(); term != null && StringHelper.startsWith(term,cellTerm); term = termsEnum.next()) {
+            scanCell = grid.getNode(term.bytes, term.offset, term.length, scanCell);
+            int termLevel = scanCell.getLevel();
+            if (termLevel > detailLevel)
+              continue;
+            if (termLevel == detailLevel || scanCell.isLeaf()) {
+              //TODO should put more thought into implications of box vs point
+              Shape cShape = termLevel == grid.getMaxLevels() ? scanCell.getCenter() : scanCell.getShape();
+              if(queryShape.relate(cShape, grid.getSpatialContext()) == SpatialRelation.DISJOINT)
+                continue;
 
-        /*
-           * We store the string as UTF-8 encoded, so when we calculate the length, it
-           * should be converted to UTF-8.
-           */
-        return IColumn.UtfPrefix_ + name.length + DBConstants.boolSize_ + DBConstants.tsSize_ + DBConstants.intSize_ + value.length;
-    }
-
-    /*
-     * This returns the size of the column when serialized.
-     * @see com.facebook.infrastructure.db.IColumn#serializedSize()
-    */
-    public int serializedSize()
-    {
-        return size();
-    }
-
-    public void addColumn(IColumn column)
-    {
-        throw new UnsupportedOperationException("This operation is not supported for simple columns.");
-    }
-
-    public IColumn diff(IColumn column)
-    {
-        if (timestamp() < column.timestamp())
-        {
-            return column;
+              docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+              addDocs(docsEnum,bits);
+            }
+          }//term loop
         }
-        return null;
-    }
+      }
+    }//cell loop
 
-    public void updateDigest(MessageDigest digest)
-    {
-        digest.update(name);
-        digest.update(value);
-        DataOutputBuffer buffer = new DataOutputBuffer();
-        try
-        {
-            buffer.writeLong(timestamp);
-            buffer.writeBoolean(isMarkedForDelete);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        digest.update(buffer.getData(), 0, buffer.getLength());
-    }
+    return bits;
+  }
 
-    public int getLocalDeletionTime()
-    {
-        assert isMarkedForDelete;
-        return ByteBuffer.wrap(value).getInt();
+  private void addDocs(DocsEnum docsEnum, OpenBitSet bits) throws IOException {
+    int docid;
+    while ((docid = docsEnum.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      bits.fastSet(docid);
     }
+  }
 
-    // note that we do not call this simply compareTo since it also makes sense to compare Columns by name
-    public long comparePriority(Column o)
-    {
-        if (isMarkedForDelete)
-        {
-            // tombstone always wins ties.
-            return timestamp < o.timestamp ? -1 : 1;
-        }
-        return timestamp - o.timestamp;
-    }
+  @Override
+  public String toString() {
+    return "GeoFilter{fieldName='" + fieldName + '\'' + ", shape=" + queryShape + '}';
+  }
 
-    public String getString(AbstractType comparator)
-    {
-        StringBuilder sb = new StringBuilder();
-        sb.append(comparator.getString(name));
-        sb.append(":");
-        sb.append(isMarkedForDelete());
-        sb.append(":");
-        sb.append(value.length);
-        sb.append("@");
-        sb.append(timestamp());
-        return sb.toString();
-    }
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+
+    RecursivePrefixTreeFilter that = (RecursivePrefixTreeFilter) o;
+
+    if (!fieldName.equals(that.fieldName)) return false;
+    //note that we don't need to look at grid since for the same field it should be the same
+    if (prefixGridScanLevel != that.prefixGridScanLevel) return false;
+    if (detailLevel != that.detailLevel) return false;
+    if (!queryShape.equals(that.queryShape)) return false;
+
+    return true;
+  }
+
+  @Override
+  public int hashCode() {
+    int result = fieldName.hashCode();
+    result = 31 * result + queryShape.hashCode();
+    result = 31 * result + detailLevel;
+    return result;
+  }
 }

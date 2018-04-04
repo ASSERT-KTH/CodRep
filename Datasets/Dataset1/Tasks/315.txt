@@ -1,4 +1,6 @@
-h = (h << 1) | (h >>> 63); // rotate left
+void incRef(Collection<String> files) throws IOException {
+
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,758 +19,664 @@ h = (h << 1) | (h >>> 63); // rotate left
  * limitations under the License.
  */
 
-package org.apache.lucene.util;
+import org.apache.lucene.store.Directory;
 
-import java.util.Arrays;
-import java.io.Serializable;
+import java.io.IOException;
+import java.io.FileNotFoundException;
+import java.io.PrintStream;
+import java.util.Map;
+import java.util.HashMap;
 
-import org.apache.lucene.search.DocIdSet;
-import org.apache.lucene.search.DocIdSetIterator;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Collection;
 
-/** An "open" BitSet implementation that allows direct access to the array of words
- * storing the bits.
- * <p/>
- * Unlike java.util.bitet, the fact that bits are packed into an array of longs
- * is part of the interface.  This allows efficient implementation of other algorithms
- * by someone other than the author.  It also allows one to efficiently implement
- * alternate serialization or interchange formats.
- * <p/>
- * <code>OpenBitSet</code> is faster than <code>java.util.BitSet</code> in most operations
- * and *much* faster at calculating cardinality of sets and results of set operations.
- * It can also handle sets of larger cardinality (up to 64 * 2**32-1)
- * <p/>
- * The goals of <code>OpenBitSet</code> are the fastest implementation possible, and
- * maximum code reuse.  Extra safety and encapsulation
- * may always be built on top, but if that's built in, the cost can never be removed (and
- * hence people re-implement their own version in order to get better performance).
- * If you want a "safe", totally encapsulated (and slower and limited) BitSet
- * class, use <code>java.util.BitSet</code>.
- * <p/>
- * <h3>Performance Results</h3>
+import org.apache.lucene.store.NoSuchDirectoryException;
+
+/*
+ * This class keeps track of each SegmentInfos instance that
+ * is still "live", either because it corresponds to a
+ * segments_N file in the Directory (a "commit", i.e. a
+ * committed SegmentInfos) or because it's an in-memory
+ * SegmentInfos that a writer is actively updating but has
+ * not yet committed.  This class uses simple reference
+ * counting to map the live SegmentInfos instances to
+ * individual files in the Directory.
  *
- Test system: Pentium 4, Sun Java 1.5_06 -server -Xbatch -Xmx64M
-<br/>BitSet size = 1,000,000
-<br/>Results are java.util.BitSet time divided by OpenBitSet time.
-<table border="1">
- <tr>
-  <th></th> <th>cardinality</th> <th>intersect_count</th> <th>union</th> <th>nextSetBit</th> <th>get</th> <th>iterator</th>
- </tr>
- <tr>
-  <th>50% full</th> <td>3.36</td> <td>3.96</td> <td>1.44</td> <td>1.46</td> <td>1.99</td> <td>1.58</td>
- </tr>
- <tr>
-   <th>1% full</th> <td>3.31</td> <td>3.90</td> <td>&nbsp;</td> <td>1.04</td> <td>&nbsp;</td> <td>0.99</td>
- </tr>
-</table>
-<br/>
-Test system: AMD Opteron, 64 bit linux, Sun Java 1.5_06 -server -Xbatch -Xmx64M
-<br/>BitSet size = 1,000,000
-<br/>Results are java.util.BitSet time divided by OpenBitSet time.
-<table border="1">
- <tr>
-  <th></th> <th>cardinality</th> <th>intersect_count</th> <th>union</th> <th>nextSetBit</th> <th>get</th> <th>iterator</th>
- </tr>
- <tr>
-  <th>50% full</th> <td>2.50</td> <td>3.50</td> <td>1.00</td> <td>1.03</td> <td>1.12</td> <td>1.25</td>
- </tr>
- <tr>
-   <th>1% full</th> <td>2.51</td> <td>3.49</td> <td>&nbsp;</td> <td>1.00</td> <td>&nbsp;</td> <td>1.02</td>
- </tr>
-</table>
-
- * @version $Id$
+ * The same directory file may be referenced by more than
+ * one IndexCommit, i.e. more than one SegmentInfos.
+ * Therefore we count how many commits reference each file.
+ * When all the commits referencing a certain file have been
+ * deleted, the refcount for that file becomes zero, and the
+ * file is deleted.
+ *
+ * A separate deletion policy interface
+ * (IndexDeletionPolicy) is consulted on creation (onInit)
+ * and once per commit (onCommit), to decide when a commit
+ * should be removed.
+ * 
+ * It is the business of the IndexDeletionPolicy to choose
+ * when to delete commit points.  The actual mechanics of
+ * file deletion, retrying, etc, derived from the deletion
+ * of commit points is the business of the IndexFileDeleter.
+ * 
+ * The current default deletion policy is {@link
+ * KeepOnlyLastCommitDeletionPolicy}, which removes all
+ * prior commits when a new commit has completed.  This
+ * matches the behavior before 2.2.
+ *
+ * Note that you must hold the write.lock before
+ * instantiating this class.  It opens segments_N file(s)
+ * directly with no retry logic.
  */
 
-public class OpenBitSet extends DocIdSet implements Cloneable, Serializable {
-  protected long[] bits;
-  protected int wlen;   // number of words (elements) used in the array
+final class IndexFileDeleter {
 
-  /** Constructs an OpenBitSet large enough to hold numBits.
-   *
-   * @param numBits
-   */
-  public OpenBitSet(long numBits) {
-    bits = new long[bits2words(numBits)];
-    wlen = bits.length;
-  }
+  /* Files that we tried to delete but failed (likely
+   * because they are open and we are running on Windows),
+   * so we will retry them again later: */
+  private List<String> deletable;
 
-  public OpenBitSet() {
-    this(64);
-  }
+  /* Reference count for all files in the index.  
+   * Counts how many existing commits reference a file.
+   **/
+  private Map<String, RefCount> refCounts = new HashMap<String, RefCount>();
 
-  /** Constructs an OpenBitSet from an existing long[].
-   * <br/>
-   * The first 64 bits are in long[0],
-   * with bit index 0 at the least significant bit, and bit index 63 at the most significant.
-   * Given a bit index,
-   * the word containing it is long[index/64], and it is at bit number index%64 within that word.
-   * <p>
-   * numWords are the number of elements in the array that contain
-   * set bits (non-zero longs).
-   * numWords should be &lt= bits.length, and
-   * any existing words in the array at position &gt= numWords should be zero.
-   *
-   */
-  public OpenBitSet(long[] bits, int numWords) {
-    this.bits = bits;
-    this.wlen = numWords;
+  /* Holds all commits (segments_N) currently in the index.
+   * This will have just 1 commit if you are using the
+   * default delete policy (KeepOnlyLastCommitDeletionPolicy).
+   * Other policies may leave commit points live for longer
+   * in which case this list would be longer than 1: */
+  private List<CommitPoint> commits = new ArrayList<CommitPoint>();
+
+  /* Holds files we had incref'd from the previous
+   * non-commit checkpoint: */
+  private List<Collection<String>> lastFiles = new ArrayList<Collection<String>>();
+
+  /* Commits that the IndexDeletionPolicy have decided to delete: */ 
+  private List<CommitPoint> commitsToDelete = new ArrayList<CommitPoint>();
+
+  private PrintStream infoStream;
+  private Directory directory;
+  private IndexDeletionPolicy policy;
+  private DocumentsWriter docWriter;
+
+  final boolean startingCommitDeleted;
+
+  /** Change to true to see details of reference counts when
+   *  infoStream != null */
+  public static boolean VERBOSE_REF_COUNTS = false;
+
+  void setInfoStream(PrintStream infoStream) {
+    this.infoStream = infoStream;
+    if (infoStream != null)
+      message("setInfoStream deletionPolicy=" + policy);
   }
   
-  public DocIdSetIterator iterator() {
-    return new OpenBitSetIterator(bits, wlen);
+  private void message(String message) {
+    infoStream.println("IFD [" + Thread.currentThread().getName() + "]: " + message);
   }
 
-  /** Returns the current capacity in bits (1 greater than the index of the last bit) */
-  public long capacity() { return bits.length << 6; }
-
- /**
-  * Returns the current capacity of this set.  Included for
-  * compatibility.  This is *not* equal to {@link #cardinality}
-  */
-  public long size() {
-      return capacity();
-  }
-
-  /** Returns true if there are no set bits */
-  public boolean isEmpty() { return cardinality()==0; }
-
-  /** Expert: returns the long[] storing the bits */
-  public long[] getBits() { return bits; }
-
-  /** Expert: sets a new long[] to use as the bit storage */
-  public void setBits(long[] bits) { this.bits = bits; }
-
-  /** Expert: gets the number of longs in the array that are in use */
-  public int getNumWords() { return wlen; }
-
-  /** Expert: sets the number of longs in the array that are in use */
-  public void setNumWords(int nWords) { this.wlen=nWords; }
-
-
-
-  /** Returns true or false for the specified bit index. */
-  public boolean get(int index) {
-    int i = index >> 6;               // div 64
-    // signed shift will keep a negative index and force an
-    // array-index-out-of-bounds-exception, removing the need for an explicit check.
-    if (i>=bits.length) return false;
-
-    int bit = index & 0x3f;           // mod 64
-    long bitmask = 1L << bit;
-    return (bits[i] & bitmask) != 0;
-  }
-
-
- /** Returns true or false for the specified bit index.
-   * The index should be less than the OpenBitSet size
+  /**
+   * Initialize the deleter: find all previous commits in
+   * the Directory, incref the files they reference, call
+   * the policy to let it delete commits.  This will remove
+   * any files not referenced by any of the commits.
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
    */
-  public boolean fastGet(int index) {
-    int i = index >> 6;               // div 64
-    // signed shift will keep a negative index and force an
-    // array-index-out-of-bounds-exception, removing the need for an explicit check.
-    int bit = index & 0x3f;           // mod 64
-    long bitmask = 1L << bit;
-    return (bits[i] & bitmask) != 0;
-  }
+  public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, SegmentInfos segmentInfos, PrintStream infoStream, DocumentsWriter docWriter)
+    throws CorruptIndexException, IOException {
 
+    this.docWriter = docWriter;
+    this.infoStream = infoStream;
 
+    if (infoStream != null)
+      message("init: current segments file is \"" + segmentInfos.getCurrentSegmentFileName() + "\"; deletionPolicy=" + policy);
 
- /** Returns true or false for the specified bit index
-  * The index should be less than the OpenBitSet size
-  */
-  public boolean get(long index) {
-    int i = (int)(index >> 6);             // div 64
-    if (i>=bits.length) return false;
-    int bit = (int)index & 0x3f;           // mod 64
-    long bitmask = 1L << bit;
-    return (bits[i] & bitmask) != 0;
-  }
+    this.policy = policy;
+    this.directory = directory;
 
-  /** Returns true or false for the specified bit index.  Allows specifying
-   * an index outside the current size. */
-  public boolean fastGet(long index) {
-    int i = (int)(index >> 6);               // div 64
-    int bit = (int)index & 0x3f;           // mod 64
-    long bitmask = 1L << bit;
-    return (bits[i] & bitmask) != 0;
-  }
+    // First pass: walk the files and initialize our ref
+    // counts:
+    long currentGen = segmentInfos.getGeneration();
+    IndexFileNameFilter filter = IndexFileNameFilter.getFilter();
 
-  /*
-  // alternate implementation of get()
-  public boolean get1(int index) {
-    int i = index >> 6;                // div 64
-    int bit = index & 0x3f;            // mod 64
-    return ((bits[i]>>>bit) & 0x01) != 0;
-    // this does a long shift and a bittest (on x86) vs
-    // a long shift, and a long AND, (the test for zero is prob a no-op)
-    // testing on a P4 indicates this is slower than (bits[i] & bitmask) != 0;
-  }
-  */
-
-
-  /** returns 1 if the bit is set, 0 if not.
-   * The index should be less than the OpenBitSet size
-   */
-  public int getBit(int index) {
-    int i = index >> 6;                // div 64
-    int bit = index & 0x3f;            // mod 64
-    return ((int)(bits[i]>>>bit)) & 0x01;
-  }
-
-
-  /*
-  public boolean get2(int index) {
-    int word = index >> 6;            // div 64
-    int bit = index & 0x0000003f;     // mod 64
-    return (bits[word] << bit) < 0;   // hmmm, this would work if bit order were reversed
-    // we could right shift and check for parity bit, if it was available to us.
-  }
-  */
-
-  /** sets a bit, expanding the set size if necessary */
-  public void set(long index) {
-    int wordNum = expandingWordNum(index);
-    int bit = (int)index & 0x3f;
-    long bitmask = 1L << bit;
-    bits[wordNum] |= bitmask;
-  }
-
-
- /** Sets the bit at the specified index.
-  * The index should be less than the OpenBitSet size.
-  */
-  public void fastSet(int index) {
-    int wordNum = index >> 6;      // div 64
-    int bit = index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] |= bitmask;
-  }
-
- /** Sets the bit at the specified index.
-  * The index should be less than the OpenBitSet size.
-  */
-  public void fastSet(long index) {
-    int wordNum = (int)(index >> 6);
-    int bit = (int)index & 0x3f;
-    long bitmask = 1L << bit;
-    bits[wordNum] |= bitmask;
-  }
-
-  /** Sets a range of bits, expanding the set size if necessary
-   *
-   * @param startIndex lower index
-   * @param endIndex one-past the last bit to set
-   */
-  public void set(long startIndex, long endIndex) {
-    if (endIndex <= startIndex) return;
-
-    int startWord = (int)(startIndex>>6);
-
-    // since endIndex is one past the end, this is index of the last
-    // word to be changed.
-    int endWord   = expandingWordNum(endIndex-1);
-
-    long startmask = -1L << startIndex;
-    long endmask = -1L >>> -endIndex;  // 64-(endIndex&0x3f) is the same as -endIndex due to wrap
-
-    if (startWord == endWord) {
-      bits[startWord] |= (startmask & endmask);
-      return;
-    }
-
-    bits[startWord] |= startmask;
-    Arrays.fill(bits, startWord+1, endWord, -1L);
-    bits[endWord] |= endmask;
-  }
-
-
-
-  protected int expandingWordNum(long index) {
-    int wordNum = (int)(index >> 6);
-    if (wordNum>=wlen) {
-      ensureCapacity(index+1);
-      wlen = wordNum+1;
-    }
-    return wordNum;
-  }
-
-
-  /** clears a bit.
-   * The index should be less than the OpenBitSet size.
-   */
-  public void fastClear(int index) {
-    int wordNum = index >> 6;
-    int bit = index & 0x03f;
-    long bitmask = 1L << bit;
-    bits[wordNum] &= ~bitmask;
-    // hmmm, it takes one more instruction to clear than it does to set... any
-    // way to work around this?  If there were only 63 bits per word, we could
-    // use a right shift of 10111111...111 in binary to position the 0 in the
-    // correct place (using sign extension).
-    // Could also use Long.rotateRight() or rotateLeft() *if* they were converted
-    // by the JVM into a native instruction.
-    // bits[word] &= Long.rotateLeft(0xfffffffe,bit);
-  }
-
-  /** clears a bit.
-   * The index should be less than the OpenBitSet size.
-   */
-  public void fastClear(long index) {
-    int wordNum = (int)(index >> 6); // div 64
-    int bit = (int)index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] &= ~bitmask;
-  }
-
-  /** clears a bit, allowing access beyond the current set size without changing the size.*/
-  public void clear(long index) {
-    int wordNum = (int)(index >> 6); // div 64
-    if (wordNum>=wlen) return;
-    int bit = (int)index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] &= ~bitmask;
-  }
-
-  /** Clears a range of bits.  Clearing past the end does not change the size of the set.
-   *
-   * @param startIndex lower index
-   * @param endIndex one-past the last bit to clear
-   */
-  public void clear(long startIndex, long endIndex) {
-    if (endIndex <= startIndex) return;
-
-    int startWord = (int)(startIndex>>6);
-    if (startWord >= wlen) return;
-
-    // since endIndex is one past the end, this is index of the last
-    // word to be changed.
-    int endWord   = (int)((endIndex-1)>>6);
-
-    long startmask = -1L << startIndex;
-    long endmask = -1L >>> -endIndex;  // 64-(endIndex&0x3f) is the same as -endIndex due to wrap
-
-    // invert masks since we are clearing
-    startmask = ~startmask;
-    endmask = ~endmask;
-
-    if (startWord == endWord) {
-      bits[startWord] &= (startmask | endmask);
-      return;
-    }
-
-    bits[startWord] &= startmask;
-
-    int middle = Math.min(wlen, endWord);
-    Arrays.fill(bits, startWord+1, middle, 0L);
-    if (endWord < wlen) {
-      bits[endWord] &= endmask;
-    }
-  }
-
-
-
-  /** Sets a bit and returns the previous value.
-   * The index should be less than the OpenBitSet size.
-   */
-  public boolean getAndSet(int index) {
-    int wordNum = index >> 6;      // div 64
-    int bit = index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    boolean val = (bits[wordNum] & bitmask) != 0;
-    bits[wordNum] |= bitmask;
-    return val;
-  }
-
-  /** Sets a bit and returns the previous value.
-   * The index should be less than the OpenBitSet size.
-   */
-  public boolean getAndSet(long index) {
-    int wordNum = (int)(index >> 6);      // div 64
-    int bit = (int)index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    boolean val = (bits[wordNum] & bitmask) != 0;
-    bits[wordNum] |= bitmask;
-    return val;
-  }
-
-  /** flips a bit.
-   * The index should be less than the OpenBitSet size.
-   */
-  public void fastFlip(int index) {
-    int wordNum = index >> 6;      // div 64
-    int bit = index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] ^= bitmask;
-  }
-
-  /** flips a bit.
-   * The index should be less than the OpenBitSet size.
-   */
-  public void fastFlip(long index) {
-    int wordNum = (int)(index >> 6);   // div 64
-    int bit = (int)index & 0x3f;       // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] ^= bitmask;
-  }
-
-  /** flips a bit, expanding the set size if necessary */
-  public void flip(long index) {
-    int wordNum = expandingWordNum(index);
-    int bit = (int)index & 0x3f;       // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] ^= bitmask;
-  }
-
-  /** flips a bit and returns the resulting bit value.
-   * The index should be less than the OpenBitSet size.
-   */
-  public boolean flipAndGet(int index) {
-    int wordNum = index >> 6;      // div 64
-    int bit = index & 0x3f;     // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] ^= bitmask;
-    return (bits[wordNum] & bitmask) != 0;
-  }
-
-  /** flips a bit and returns the resulting bit value.
-   * The index should be less than the OpenBitSet size.
-   */
-  public boolean flipAndGet(long index) {
-    int wordNum = (int)(index >> 6);   // div 64
-    int bit = (int)index & 0x3f;       // mod 64
-    long bitmask = 1L << bit;
-    bits[wordNum] ^= bitmask;
-    return (bits[wordNum] & bitmask) != 0;
-  }
-
-  /** Flips a range of bits, expanding the set size if necessary
-   *
-   * @param startIndex lower index
-   * @param endIndex one-past the last bit to flip
-   */
-  public void flip(long startIndex, long endIndex) {
-    if (endIndex <= startIndex) return;
-    int oldlen = wlen;
-    int startWord = (int)(startIndex>>6);
-
-    // since endIndex is one past the end, this is index of the last
-    // word to be changed.
-    int endWord   = expandingWordNum(endIndex-1);
-
-    /*** Grrr, java shifting wraps around so -1L>>>64 == -1
-     * for that reason, make sure not to use endmask if the bits to flip will
-     * be zero in the last word (redefine endWord to be the last changed...)
-    long startmask = -1L << (startIndex & 0x3f);     // example: 11111...111000
-    long endmask = -1L >>> (64-(endIndex & 0x3f));   // example: 00111...111111
-    ***/
-
-    long startmask = -1L << startIndex;
-    long endmask = -1L >>> -endIndex;  // 64-(endIndex&0x3f) is the same as -endIndex due to wrap
-
-    if (startWord == endWord) {
-      bits[startWord] ^= (startmask & endmask);
-      return;
-    }
-
-    bits[startWord] ^= startmask;
-
-    for (int i=startWord+1; i<endWord; i++) {
-      bits[i] = ~bits[i];
-    }
-
-    bits[endWord] ^= endmask;
-  }
-
-
-  /*
-  public static int pop(long v0, long v1, long v2, long v3) {
-    // derived from pop_array by setting last four elems to 0.
-    // exchanges one pop() call for 10 elementary operations
-    // saving about 7 instructions... is there a better way?
-      long twosA=v0 & v1;
-      long ones=v0^v1;
-
-      long u2=ones^v2;
-      long twosB =(ones&v2)|(u2&v3);
-      ones=u2^v3;
-
-      long fours=(twosA&twosB);
-      long twos=twosA^twosB;
-
-      return (pop(fours)<<2)
-             + (pop(twos)<<1)
-             + pop(ones);
-
-  }
-  */
-
-
-  /** @return the number of set bits */
-  public long cardinality() {
-    return BitUtil.pop_array(bits,0,wlen);
-  }
-
- /** Returns the popcount or cardinality of the intersection of the two sets.
-   * Neither set is modified.
-   */
-  public static long intersectionCount(OpenBitSet a, OpenBitSet b) {
-    return BitUtil.pop_intersect(a.bits, b.bits, 0, Math.min(a.wlen, b.wlen));
- }
-
-  /** Returns the popcount or cardinality of the union of the two sets.
-    * Neither set is modified.
-    */
-  public static long unionCount(OpenBitSet a, OpenBitSet b) {
-    long tot = BitUtil.pop_union(a.bits, b.bits, 0, Math.min(a.wlen, b.wlen));
-    if (a.wlen < b.wlen) {
-      tot += BitUtil.pop_array(b.bits, a.wlen, b.wlen-a.wlen);
-    } else if (a.wlen > b.wlen) {
-      tot += BitUtil.pop_array(a.bits, b.wlen, a.wlen-b.wlen);
-    }
-    return tot;
-  }
-
-  /** Returns the popcount or cardinality of "a and not b"
-   * or "intersection(a, not(b))".
-   * Neither set is modified.
-   */
-  public static long andNotCount(OpenBitSet a, OpenBitSet b) {
-    long tot = BitUtil.pop_andnot(a.bits, b.bits, 0, Math.min(a.wlen, b.wlen));
-    if (a.wlen > b.wlen) {
-      tot += BitUtil.pop_array(a.bits, b.wlen, a.wlen-b.wlen);
-    }
-    return tot;
-  }
-
- /** Returns the popcount or cardinality of the exclusive-or of the two sets.
-  * Neither set is modified.
-  */
-  public static long xorCount(OpenBitSet a, OpenBitSet b) {
-    long tot = BitUtil.pop_xor(a.bits, b.bits, 0, Math.min(a.wlen, b.wlen));
-    if (a.wlen < b.wlen) {
-      tot += BitUtil.pop_array(b.bits, a.wlen, b.wlen-a.wlen);
-    } else if (a.wlen > b.wlen) {
-      tot += BitUtil.pop_array(a.bits, b.wlen, a.wlen-b.wlen);
-    }
-    return tot;
-  }
-
-
-  /** Returns the index of the first set bit starting at the index specified.
-   *  -1 is returned if there are no more set bits.
-   */
-  public int nextSetBit(int index) {
-    int i = index>>6;
-    if (i>=wlen) return -1;
-    int subIndex = index & 0x3f;      // index within the word
-    long word = bits[i] >> subIndex;  // skip all the bits to the right of index
-
-    if (word!=0) {
-      return (i<<6) + subIndex + BitUtil.ntz(word);
-    }
-
-    while(++i < wlen) {
-      word = bits[i];
-      if (word!=0) return (i<<6) + BitUtil.ntz(word);
-    }
-
-    return -1;
-  }
-
-  /** Returns the index of the first set bit starting at the index specified.
-   *  -1 is returned if there are no more set bits.
-   */
-  public long nextSetBit(long index) {
-    int i = (int)(index>>>6);
-    if (i>=wlen) return -1;
-    int subIndex = (int)index & 0x3f; // index within the word
-    long word = bits[i] >>> subIndex;  // skip all the bits to the right of index
-
-    if (word!=0) {
-      return (((long)i)<<6) + (subIndex + BitUtil.ntz(word));
-    }
-
-    while(++i < wlen) {
-      word = bits[i];
-      if (word!=0) return (((long)i)<<6) + BitUtil.ntz(word);
-    }
-
-    return -1;
-  }
-
-
-
-
-  public Object clone() {
+    CommitPoint currentCommitPoint = null;
+    boolean seenIndexFiles = false;
+    String[] files = null;
     try {
-      OpenBitSet obs = (OpenBitSet)super.clone();
-      obs.bits = (long[]) obs.bits.clone();  // hopefully an array clone is as fast(er) than arraycopy
-      return obs;
-    } catch (CloneNotSupportedException e) {
-      throw new RuntimeException(e);
+      files = directory.listAll();
+    } catch (NoSuchDirectoryException e) {  
+      // it means the directory is empty, so ignore it.
+      files = new String[0];
     }
+
+    for (String fileName : files) {
+
+      if (filter.accept(null, fileName) && !fileName.equals(IndexFileNames.SEGMENTS_GEN)) {
+        seenIndexFiles = true;
+        
+        // Add this file to refCounts with initial count 0:
+        getRefCount(fileName);
+
+        if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
+
+          // This is a commit (segments or segments_N), and
+          // it's valid (<= the max gen).  Load it, then
+          // incref all files it refers to:
+          if (SegmentInfos.generationFromSegmentsFileName(fileName) <= currentGen) {
+            if (infoStream != null) {
+              message("init: load commit \"" + fileName + "\"");
+            }
+            SegmentInfos sis = new SegmentInfos();
+            try {
+              sis.read(directory, fileName);
+            } catch (FileNotFoundException e) {
+              // LUCENE-948: on NFS (and maybe others), if
+              // you have writers switching back and forth
+              // between machines, it's very likely that the
+              // dir listing will be stale and will claim a
+              // file segments_X exists when in fact it
+              // doesn't.  So, we catch this and handle it
+              // as if the file does not exist
+              if (infoStream != null) {
+                message("init: hit FileNotFoundException when loading commit \"" + fileName + "\"; skipping this commit point");
+              }
+              sis = null;
+            }
+            if (sis != null) {
+              CommitPoint commitPoint = new CommitPoint(commitsToDelete, directory, sis);
+              if (sis.getGeneration() == segmentInfos.getGeneration()) {
+                currentCommitPoint = commitPoint;
+              }
+              commits.add(commitPoint);
+              incRef(sis, true);
+            }
+          }
+        }
+      }
+    }
+
+    // If we haven't seen any Lucene files, then currentCommitPoint is expected
+    // to be null, because it means it's a fresh Directory. Therefore it cannot
+    // be any NFS cache issues - so just ignore.
+    if (currentCommitPoint == null && seenIndexFiles) {
+      // We did not in fact see the segments_N file
+      // corresponding to the segmentInfos that was passed
+      // in.  Yet, it must exist, because our caller holds
+      // the write lock.  This can happen when the directory
+      // listing was stale (eg when index accessed via NFS
+      // client with stale directory listing cache).  So we
+      // try now to explicitly open this commit point:
+      SegmentInfos sis = new SegmentInfos();
+      try {
+        sis.read(directory, segmentInfos.getCurrentSegmentFileName());
+      } catch (IOException e) {
+        throw new CorruptIndexException("failed to locate current segments_N file");
+      }
+      if (infoStream != null)
+        message("forced open of current segments file " + segmentInfos.getCurrentSegmentFileName());
+      currentCommitPoint = new CommitPoint(commitsToDelete, directory, sis);
+      commits.add(currentCommitPoint);
+      incRef(sis, true);
+    }
+
+    // We keep commits list in sorted order (oldest to newest):
+    Collections.sort(commits);
+
+    // Now delete anything with ref count at 0.  These are
+    // presumably abandoned files eg due to crash of
+    // IndexWriter.
+    for(Map.Entry<String, RefCount> entry : refCounts.entrySet() ) {  
+      RefCount rc = entry.getValue();
+      final String fileName = entry.getKey();
+      if (0 == rc.count) {
+        if (infoStream != null) {
+          message("init: removing unreferenced file \"" + fileName + "\"");
+        }
+        deleteFile(fileName);
+      }
+    }
+
+    // Finally, give policy a chance to remove things on
+    // startup:
+    if (seenIndexFiles) {
+      policy.onInit(commits);
+    }
+
+    // Always protect the incoming segmentInfos since
+    // sometime it may not be the most recent commit
+    checkpoint(segmentInfos, false);
+    
+    startingCommitDeleted = currentCommitPoint == null ? false : currentCommitPoint.isDeleted();
+
+    deleteCommits();
   }
 
-  /** this = this AND other */
-  public void intersect(OpenBitSet other) {
-    int newLen= Math.min(this.wlen,other.wlen);
-    long[] thisArr = this.bits;
-    long[] otherArr = other.bits;
-    // testing against zero can be more efficient
-    int pos=newLen;
-    while(--pos>=0) {
-      thisArr[pos] &= otherArr[pos];
-    }
-    if (this.wlen > newLen) {
-      // fill zeros from the new shorter length to the old length
-      Arrays.fill(bits,newLen,this.wlen,0);
-    }
-    this.wlen = newLen;
-  }
-
-  /** this = this OR other */
-  public void union(OpenBitSet other) {
-    int newLen = Math.max(wlen,other.wlen);
-    ensureCapacityWords(newLen);
-
-    long[] thisArr = this.bits;
-    long[] otherArr = other.bits;
-    int pos=Math.min(wlen,other.wlen);
-    while(--pos>=0) {
-      thisArr[pos] |= otherArr[pos];
-    }
-    if (this.wlen < newLen) {
-      System.arraycopy(otherArr, this.wlen, thisArr, this.wlen, newLen-this.wlen);
-    }
-    this.wlen = newLen;
-  }
-
-
-  /** Remove all elements set in other. this = this AND_NOT other */
-  public void remove(OpenBitSet other) {
-    int idx = Math.min(wlen,other.wlen);
-    long[] thisArr = this.bits;
-    long[] otherArr = other.bits;
-    while(--idx>=0) {
-      thisArr[idx] &= ~otherArr[idx];
-    }
-  }
-
-  /** this = this XOR other */
-  public void xor(OpenBitSet other) {
-    int newLen = Math.max(wlen,other.wlen);
-    ensureCapacityWords(newLen);
-
-    long[] thisArr = this.bits;
-    long[] otherArr = other.bits;
-    int pos=Math.min(wlen,other.wlen);
-    while(--pos>=0) {
-      thisArr[pos] ^= otherArr[pos];
-    }
-    if (this.wlen < newLen) {
-      System.arraycopy(otherArr, this.wlen, thisArr, this.wlen, newLen-this.wlen);
-    }
-    this.wlen = newLen;
-  }
-
-
-  // some BitSet compatability methods
-
-  //** see {@link intersect} */
-  public void and(OpenBitSet other) {
-    intersect(other);
-  }
-
-  //** see {@link union} */
-  public void or(OpenBitSet other) {
-    union(other);
-  }
-
-  //** see {@link andNot} */
-  public void andNot(OpenBitSet other) {
-    remove(other);
-  }
-
-  /** returns true if the sets have any elements in common */
-  public boolean intersects(OpenBitSet other) {
-    int pos = Math.min(this.wlen, other.wlen);
-    long[] thisArr = this.bits;
-    long[] otherArr = other.bits;
-    while (--pos>=0) {
-      if ((thisArr[pos] & otherArr[pos])!=0) return true;
-    }
-    return false;
-  }
-
-
-
-  /** Expand the long[] with the size given as a number of words (64 bit longs).
-   * getNumWords() is unchanged by this call.
+  /**
+   * Remove the CommitPoints in the commitsToDelete List by
+   * DecRef'ing all files from each SegmentInfos.
    */
-  public void ensureCapacityWords(int numWords) {
-    if (bits.length < numWords) {
-      long[] newBits = new long[numWords];
-      System.arraycopy(bits,0,newBits,0,wlen);
-      bits = newBits;
+  private void deleteCommits() throws IOException {
+
+    int size = commitsToDelete.size();
+
+    if (size > 0) {
+
+      // First decref all files that had been referred to by
+      // the now-deleted commits:
+      for(int i=0;i<size;i++) {
+        CommitPoint commit = commitsToDelete.get(i);
+        if (infoStream != null) {
+          message("deleteCommits: now decRef commit \"" + commit.getSegmentsFileName() + "\"");
+        }
+        for (final String file : commit.files) {
+          decRef(file);
+        }
+      }
+      commitsToDelete.clear();
+
+      // Now compact commits to remove deleted ones (preserving the sort):
+      size = commits.size();
+      int readFrom = 0;
+      int writeTo = 0;
+      while(readFrom < size) {
+        CommitPoint commit = commits.get(readFrom);
+        if (!commit.deleted) {
+          if (writeTo != readFrom) {
+            commits.set(writeTo, commits.get(readFrom));
+          }
+          writeTo++;
+        }
+        readFrom++;
+      }
+
+      while(size > writeTo) {
+        commits.remove(size-1);
+        size--;
+      }
     }
   }
 
-  /** Ensure that the long[] is big enough to hold numBits, expanding it if necessary.
-   * getNumWords() is unchanged by this call.
+  /**
+   * Writer calls this when it has hit an error and had to
+   * roll back, to tell us that there may now be
+   * unreferenced files in the filesystem.  So we re-list
+   * the filesystem and delete such files.  If segmentName
+   * is non-null, we will only delete files corresponding to
+   * that segment.
    */
-  public void ensureCapacity(long numBits) {
-    ensureCapacityWords(bits2words(numBits));
-  }
-
-  /** Lowers numWords, the number of words in use,
-   * by checking for trailing zero words.
-   */
-  public void trimTrailingZeros() {
-    int idx = wlen-1;
-    while (idx>=0 && bits[idx]==0) idx--;
-    wlen = idx+1;
-  }
-
-  /** returns the number of 64 bit words it would take to hold numBits */
-  public static int bits2words(long numBits) {
-   return (int)(((numBits-1)>>>6)+1);
-  }
-
-
-  /** returns true if both sets have the same bits set */
-  public boolean equals(Object o) {
-    if (this == o) return true;
-    if (!(o instanceof OpenBitSet)) return false;
-    OpenBitSet a;
-    OpenBitSet b = (OpenBitSet)o;
-    // make a the larger set.
-    if (b.wlen > this.wlen) {
-      a = b; b=this;
+  public void refresh(String segmentName) throws IOException {
+    String[] files = directory.listAll();
+    IndexFileNameFilter filter = IndexFileNameFilter.getFilter();
+    String segmentPrefix1;
+    String segmentPrefix2;
+    if (segmentName != null) {
+      segmentPrefix1 = segmentName + ".";
+      segmentPrefix2 = segmentName + "_";
     } else {
-      a=this;
+      segmentPrefix1 = null;
+      segmentPrefix2 = null;
     }
-
-    // check for any set bits out of the range of b
-    for (int i=a.wlen-1; i>=b.wlen; i--) {
-      if (a.bits[i]!=0) return false;
+    
+    for(int i=0;i<files.length;i++) {
+      String fileName = files[i];
+      if (filter.accept(null, fileName) &&
+          (segmentName == null || fileName.startsWith(segmentPrefix1) || fileName.startsWith(segmentPrefix2)) &&
+          !refCounts.containsKey(fileName) &&
+          !fileName.equals(IndexFileNames.SEGMENTS_GEN)) {
+        // Unreferenced file, so remove it
+        if (infoStream != null) {
+          message("refresh [prefix=" + segmentName + "]: removing newly created unreferenced file \"" + fileName + "\"");
+        }
+        deleteFile(fileName);
+      }
     }
-
-    for (int i=b.wlen-1; i>=0; i--) {
-      if (a.bits[i] != b.bits[i]) return false;
-    }
-
-    return true;
   }
 
-
-  public int hashCode() {
-      long h = 0x98761234;  // something non-zero for length==0
-      for (int i = bits.length; --i>=0;) {
-      h ^= bits[i];
-      h = (h << 1) | (h >>> 31); // rotate left
-    }
-    return (int)((h>>32) ^ h);  // fold leftmost bits into right
+  public void refresh() throws IOException {
+    refresh(null);
   }
 
+  public void close() throws IOException {
+    // DecRef old files from the last checkpoint, if any:
+    int size = lastFiles.size();
+    if (size > 0) {
+      for(int i=0;i<size;i++)
+        decRef(lastFiles.get(i));
+      lastFiles.clear();
+    }
+
+    deletePendingFiles();
+  }
+
+  /**
+   * Revisits the {@link IndexDeletionPolicy} by calling its
+   * {@link IndexDeletionPolicy#onCommit(List)} again with the known commits.
+   * This is useful in cases where a deletion policy which holds onto index
+   * commits is used. The application may know that some commits are not held by
+   * the deletion policy anymore and call
+   * {@link IndexWriter#deleteUnusedFiles()}, which will attempt to delete the
+   * unused commits again.
+   */
+  void revisitPolicy() throws IOException {
+    if (infoStream != null) {
+      message("now revisitPolicy");
+    }
+
+    if (commits.size() > 0) {
+      policy.onCommit(commits);
+      deleteCommits();
+    }
+  }
+  
+  public void deletePendingFiles() throws IOException {
+    if (deletable != null) {
+      List<String> oldDeletable = deletable;
+      deletable = null;
+      int size = oldDeletable.size();
+      for(int i=0;i<size;i++) {
+        if (infoStream != null)
+          message("delete pending file " + oldDeletable.get(i));
+        deleteFile(oldDeletable.get(i));
+      }
+    }
+  }
+
+  /**
+   * For definition of "check point" see IndexWriter comments:
+   * "Clarification: Check Points (and commits)".
+   * 
+   * Writer calls this when it has made a "consistent
+   * change" to the index, meaning new files are written to
+   * the index and the in-memory SegmentInfos have been
+   * modified to point to those files.
+   *
+   * This may or may not be a commit (segments_N may or may
+   * not have been written).
+   *
+   * We simply incref the files referenced by the new
+   * SegmentInfos and decref the files we had previously
+   * seen (if any).
+   *
+   * If this is a commit, we also call the policy to give it
+   * a chance to remove other commits.  If any commits are
+   * removed, we decref their files as well.
+   */
+  public void checkpoint(SegmentInfos segmentInfos, boolean isCommit) throws IOException {
+
+    if (infoStream != null) {
+      message("now checkpoint \"" + segmentInfos.getCurrentSegmentFileName() + "\" [" + segmentInfos.size() + " segments " + "; isCommit = " + isCommit + "]");
+    }
+
+    // Try again now to delete any previously un-deletable
+    // files (because they were in use, on Windows):
+    deletePendingFiles();
+
+    // Incref the files:
+    incRef(segmentInfos, isCommit);
+
+    if (isCommit) {
+      // Append to our commits list:
+      commits.add(new CommitPoint(commitsToDelete, directory, segmentInfos));
+
+      // Tell policy so it can remove commits:
+      policy.onCommit(commits);
+
+      // Decref files for commits that were deleted by the policy:
+      deleteCommits();
+    } else {
+
+      final List<String> docWriterFiles;
+      if (docWriter != null) {
+        docWriterFiles = docWriter.openFiles();
+        if (docWriterFiles != null)
+          // We must incRef these files before decRef'ing
+          // last files to make sure we don't accidentally
+          // delete them:
+          incRef(docWriterFiles);
+      } else
+        docWriterFiles = null;
+
+      // DecRef old files from the last checkpoint, if any:
+      int size = lastFiles.size();
+      if (size > 0) {
+        for(int i=0;i<size;i++)
+          decRef(lastFiles.get(i));
+        lastFiles.clear();
+      }
+
+      // Save files so we can decr on next checkpoint/commit:
+      lastFiles.add(segmentInfos.files(directory, false));
+
+      if (docWriterFiles != null)
+        lastFiles.add(docWriterFiles);
+    }
+  }
+
+  void incRef(SegmentInfos segmentInfos, boolean isCommit) throws IOException {
+     // If this is a commit point, also incRef the
+     // segments_N file:
+    for( final String fileName: segmentInfos.files(directory, isCommit) ) {
+      incRef(fileName);
+    }
+  }
+
+  void incRef(List<String> files) throws IOException {
+    for(final String file : files) {
+      incRef(file);
+    }
+  }
+
+  void incRef(String fileName) throws IOException {
+    RefCount rc = getRefCount(fileName);
+    if (infoStream != null && VERBOSE_REF_COUNTS) {
+      message("  IncRef \"" + fileName + "\": pre-incr count is " + rc.count);
+    }
+    rc.IncRef();
+  }
+
+  void decRef(Collection<String> files) throws IOException {
+    for(final String file : files) {
+      decRef(file);
+    }
+  }
+
+  void decRef(String fileName) throws IOException {
+    RefCount rc = getRefCount(fileName);
+    if (infoStream != null && VERBOSE_REF_COUNTS) {
+      message("  DecRef \"" + fileName + "\": pre-decr count is " + rc.count);
+    }
+    if (0 == rc.DecRef()) {
+      // This file is no longer referenced by any past
+      // commit points nor by the in-memory SegmentInfos:
+      deleteFile(fileName);
+      refCounts.remove(fileName);
+    }
+  }
+
+  void decRef(SegmentInfos segmentInfos) throws IOException {
+    for (final String file : segmentInfos.files(directory, false)) {
+      decRef(file);
+    }
+  }
+
+  private RefCount getRefCount(String fileName) {
+    RefCount rc;
+    if (!refCounts.containsKey(fileName)) {
+      rc = new RefCount(fileName);
+      refCounts.put(fileName, rc);
+    } else {
+      rc = refCounts.get(fileName);
+    }
+    return rc;
+  }
+
+  void deleteFiles(List<String> files) throws IOException {
+    for(final String file: files)
+      deleteFile(file);
+  }
+
+  /** Deletes the specified files, but only if they are new
+   *  (have not yet been incref'd). */
+  void deleteNewFiles(Collection<String> files) throws IOException {
+    for (final String fileName: files) {
+      if (!refCounts.containsKey(fileName))
+        deleteFile(fileName);
+    }
+  }
+
+  void deleteFile(String fileName)
+       throws IOException {
+    try {
+      if (infoStream != null) {
+        message("delete \"" + fileName + "\"");
+      }
+      directory.deleteFile(fileName);
+    } catch (IOException e) {			  // if delete fails
+      if (directory.fileExists(fileName)) {
+
+        // Some operating systems (e.g. Windows) don't
+        // permit a file to be deleted while it is opened
+        // for read (e.g. by another process or thread). So
+        // we assume that when a delete fails it is because
+        // the file is open in another process, and queue
+        // the file for subsequent deletion.
+
+        if (infoStream != null) {
+          message("unable to remove file \"" + fileName + "\": " + e.toString() + "; Will re-try later.");
+        }
+        if (deletable == null) {
+          deletable = new ArrayList<String>();
+        }
+        deletable.add(fileName);                  // add to deletable
+      }
+    }
+  }
+
+  /**
+   * Tracks the reference count for a single index file:
+   */
+  final private static class RefCount {
+
+    // fileName used only for better assert error messages
+    final String fileName;
+    boolean initDone;
+    RefCount(String fileName) {
+      this.fileName = fileName;
+    }
+
+    int count;
+
+    public int IncRef() {
+      if (!initDone) {
+        initDone = true;
+      } else {
+        assert count > 0: "RefCount is 0 pre-increment for file \"" + fileName + "\"";
+      }
+      return ++count;
+    }
+
+    public int DecRef() {
+      assert count > 0: "RefCount is 0 pre-decrement for file \"" + fileName + "\"";
+      return --count;
+    }
+  }
+
+  /**
+   * Holds details for each commit point.  This class is
+   * also passed to the deletion policy.  Note: this class
+   * has a natural ordering that is inconsistent with
+   * equals.
+   */
+
+  final private static class CommitPoint extends IndexCommit implements Comparable<CommitPoint> {
+
+    long gen;
+    Collection<String> files;
+    String segmentsFileName;
+    boolean deleted;
+    Directory directory;
+    Collection<CommitPoint> commitsToDelete;
+    long version;
+    long generation;
+    final boolean isOptimized;
+    final Map<String,String> userData;
+
+    public CommitPoint(Collection<CommitPoint> commitsToDelete, Directory directory, SegmentInfos segmentInfos) throws IOException {
+      this.directory = directory;
+      this.commitsToDelete = commitsToDelete;
+      userData = segmentInfos.getUserData();
+      segmentsFileName = segmentInfos.getCurrentSegmentFileName();
+      version = segmentInfos.getVersion();
+      generation = segmentInfos.getGeneration();
+      files = Collections.unmodifiableCollection(segmentInfos.files(directory, true));
+      gen = segmentInfos.getGeneration();
+      isOptimized = segmentInfos.size() == 1 && !segmentInfos.info(0).hasDeletions();
+    }
+
+    @Override
+    public boolean isOptimized() {
+      return isOptimized;
+    }
+
+    @Override
+    public String getSegmentsFileName() {
+      return segmentsFileName;
+    }
+
+    @Override
+    public Collection<String> getFileNames() throws IOException {
+      return files;
+    }
+
+    @Override
+    public Directory getDirectory() {
+      return directory;
+    }
+
+    @Override
+    public long getVersion() {
+      return version;
+    }
+
+    @Override
+    public long getGeneration() {
+      return generation;
+    }
+
+    @Override
+    public Map<String,String> getUserData() {
+      return userData;
+    }
+
+    /**
+     * Called only be the deletion policy, to remove this
+     * commit point from the index.
+     */
+    @Override
+    public void delete() {
+      if (!deleted) {
+        deleted = true;
+        commitsToDelete.add(this);
+      }
+    }
+
+    @Override
+    public boolean isDeleted() {
+      return deleted;
+    }
+
+    public int compareTo(CommitPoint commit) {
+      if (gen < commit.gen) {
+        return -1;
+      } else if (gen > commit.gen) {
+        return 1;
+      } else {
+        return 0;
+      }
+    }
+  }
 }
-

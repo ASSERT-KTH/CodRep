@@ -1,13 +1,14 @@
-Message reply = message.getInternalReply(new byte[] {(byte)(isMoveable_.get() ? 1 : 0)}, message.getVersion());
+abort();
+
+package org.apache.lucene.index.codecs;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,359 +19,360 @@ Message reply = message.getInternalReply(new byte[] {(byte)(isMoveable_.get() ? 
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
+import java.io.IOException;
 
-import java.net.InetAddress;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.Fields;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.MergePolicy.MergeAbortedException;
+import org.apache.lucene.index.MergeState;
+import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.store.DataInput;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.StringHelper;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+// TODO: make a new 4.0 TV format that encodes better
+//   - use startOffset (not endOffset) as base for delta on
+//     next startOffset because today for syns or ngrams or
+//     WDF or shingles etc. we are encoding negative vints
+//     (= slow, 5 bytes per)
+//   - if doc has no term vectors, write 0 into the tvx
+//     file; saves a seek to tvd only to read a 0 vint (and
+//     saves a byte in tvd)
 
-import org.apache.cassandra.gms.*;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.FBUtilities;
+public final class DefaultTermVectorsWriter extends TermVectorsWriter {
+  private final Directory directory;
+  private final String segment;
+  private IndexOutput tvx = null, tvd = null, tvf = null;
 
-/*
- * The load balancing algorithm here is an implementation of
- * the algorithm as described in the paper "Scalable range query
- * processing for large-scale distributed database applications".
- * This class keeps track of load information across the system.
- * It registers itself with the Gossiper for ApplicationState namely
- * load information i.e number of requests processed w.r.t distinct
- * keys at an Endpoint. Monitor load information for a 5 minute
- * interval and then do load balancing operations if necessary.
- */
-public class StorageLoadBalancer implements IEndpointStateChangeSubscriber
-{
-    class LoadBalancer implements Runnable
-    {
-        LoadBalancer()
-        {
-            /* Copy the entries in loadInfo_ into loadInfo2_ and use it for all calculations */
-            loadInfo2_.putAll(loadInfo_);
+  public DefaultTermVectorsWriter(Directory directory, String segment, IOContext context) throws IOException {
+    this.directory = directory;
+    this.segment = segment;
+    boolean success = false;
+    try {
+      // Open files for TermVector storage
+      tvx = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_INDEX_EXTENSION), context);
+      tvx.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      tvd = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_DOCUMENTS_EXTENSION), context);
+      tvd.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      tvf = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_FIELDS_EXTENSION), context);
+      tvf.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(tvx, tvd, tvf);
+      }
+    }
+  }
+ 
+  @Override
+  public void startDocument(int numVectorFields) throws IOException {
+    lastFieldName = null;
+    this.numVectorFields = numVectorFields;
+    tvx.writeLong(tvd.getFilePointer());
+    tvx.writeLong(tvf.getFilePointer());
+    tvd.writeVInt(numVectorFields);
+    fieldCount = 0;
+    fps = ArrayUtil.grow(fps, numVectorFields);
+  }
+  
+  private long fps[] = new long[10]; // pointers to the tvf before writing each field 
+  private int fieldCount = 0;        // number of fields we have written so far for this document
+  private int numVectorFields = 0;   // total number of fields we will write for this document
+  private String lastFieldName;
+
+  @Override
+  public void startField(FieldInfo info, int numTerms, boolean positions, boolean offsets) throws IOException {
+    assert lastFieldName == null || info.name.compareTo(lastFieldName) > 0: "fieldName=" + info.name + " lastFieldName=" + lastFieldName;
+    lastFieldName = info.name;
+    this.positions = positions;
+    this.offsets = offsets;
+    lastTerm.length = 0;
+    fps[fieldCount++] = tvf.getFilePointer();
+    tvd.writeVInt(info.number);
+    tvf.writeVInt(numTerms);
+    byte bits = 0x0;
+    if (positions)
+      bits |= DefaultTermVectorsReader.STORE_POSITIONS_WITH_TERMVECTOR;
+    if (offsets)
+      bits |= DefaultTermVectorsReader.STORE_OFFSET_WITH_TERMVECTOR;
+    tvf.writeByte(bits);
+    
+    assert fieldCount <= numVectorFields;
+    if (fieldCount == numVectorFields) {
+      // last field of the document
+      // this is crazy because the file format is crazy!
+      for (int i = 1; i < fieldCount; i++) {
+        tvd.writeVLong(fps[i] - fps[i-1]);
+      }
+    }
+  }
+  
+  private final BytesRef lastTerm = new BytesRef(10);
+
+  // NOTE: we override addProx, so we don't need to buffer when indexing.
+  // we also don't buffer during bulk merges.
+  private int offsetStartBuffer[] = new int[10];
+  private int offsetEndBuffer[] = new int[10];
+  private int offsetIndex = 0;
+  private int offsetFreq = 0;
+  private boolean positions = false;
+  private boolean offsets = false;
+
+  @Override
+  public void startTerm(BytesRef term, int freq) throws IOException {
+    final int prefix = StringHelper.bytesDifference(lastTerm.bytes, lastTerm.offset, lastTerm.length, 
+                                                    term.bytes, term.offset, term.length);
+    final int suffix = term.length - prefix;
+    tvf.writeVInt(prefix);
+    tvf.writeVInt(suffix);
+    tvf.writeBytes(term.bytes, term.offset + prefix, suffix);
+    tvf.writeVInt(freq);
+    lastTerm.copyBytes(term);
+    lastPosition = lastOffset = 0;
+    
+    if (offsets && positions) {
+      // we might need to buffer if its a non-bulk merge
+      offsetStartBuffer = ArrayUtil.grow(offsetStartBuffer, freq);
+      offsetEndBuffer = ArrayUtil.grow(offsetEndBuffer, freq);
+      offsetIndex = 0;
+      offsetFreq = freq;
+    }
+  }
+
+  int lastPosition = 0;
+  int lastOffset = 0;
+
+  @Override
+  public void addProx(int numProx, DataInput positions, DataInput offsets) throws IOException {
+    // TODO: technically we could just copy bytes and not re-encode if we knew the length...
+    if (positions != null) {
+      for (int i = 0; i < numProx; i++) {
+        tvf.writeVInt(positions.readVInt());
+      }
+    }
+    
+    if (offsets != null) {
+      for (int i = 0; i < numProx; i++) {
+        tvf.writeVInt(offsets.readVInt());
+        tvf.writeVInt(offsets.readVInt());
+      }
+    }
+  }
+
+  @Override
+  public void addPosition(int position, int startOffset, int endOffset) throws IOException {
+    if (positions && offsets) {
+      // write position delta
+      tvf.writeVInt(position - lastPosition);
+      lastPosition = position;
+      
+      // buffer offsets
+      offsetStartBuffer[offsetIndex] = startOffset;
+      offsetEndBuffer[offsetIndex] = endOffset;
+      offsetIndex++;
+      
+      // dump buffer if we are done
+      if (offsetIndex == offsetFreq) {
+        for (int i = 0; i < offsetIndex; i++) {
+          tvf.writeVInt(offsetStartBuffer[i] - lastOffset);
+          tvf.writeVInt(offsetEndBuffer[i] - offsetStartBuffer[i]);
+          lastOffset = offsetEndBuffer[i];
         }
+      }
+    } else if (positions) {
+      // write position delta
+      tvf.writeVInt(position - lastPosition);
+      lastPosition = position;
+    } else if (offsets) {
+      // write offset deltas
+      tvf.writeVInt(startOffset - lastOffset);
+      tvf.writeVInt(endOffset - startOffset);
+      lastOffset = endOffset;
+    }
+  }
 
-        /**
-         * Obtain a node which is a potential target. Start with
-         * the neighbours i.e either successor or predecessor.
-         * Send the target a MoveMessage. If the node cannot be
-         * relocated on the ring then we pick another candidate for
-         * relocation.
-        */        
-        public void run()
-        {
-            /*
-            int threshold = (int)(StorageLoadBalancer.TOPHEAVY_RATIO * averageSystemLoad());
-            int myLoad = localLoad();            
-            InetAddress predecessor = StorageService.instance.getPredecessor(StorageService.getLocalStorageEndpoint());
-            if (logger_.isDebugEnabled())
-              logger_.debug("Trying to relocate the predecessor {}", predecessor);
-            boolean value = tryThisNode(myLoad, threshold, predecessor);
-            if ( !value )
-            {
-                loadInfo2_.remove(predecessor);
-                InetAddress successor = StorageService.instance.getSuccessor(StorageService.getLocalStorageEndpoint());
-                if (logger_.isDebugEnabled())
-                  logger_.debug("Trying to relocate the successor {}", successor);
-                value = tryThisNode(myLoad, threshold, successor);
-                if ( !value )
-                {
-                    loadInfo2_.remove(successor);
-                    while ( !loadInfo2_.isEmpty() )
-                    {
-                        InetAddress target = findARandomLightNode();
-                        if ( target != null )
-                        {
-                            if (logger_.isDebugEnabled())
-                              logger_.debug("Trying to relocate the random node {}", target);
-                            value = tryThisNode(myLoad, threshold, target);
-                            if ( !value )
-                            {
-                                loadInfo2_.remove(target);
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            // No light nodes available - this is NOT good.
-                            logger_.warn("Not even a single lightly loaded node is available ...");
-                            break;
-                        }
-                    }
+  @Override
+  public void abort() {
+    try {
+      close();
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_INDEX_EXTENSION));
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_DOCUMENTS_EXTENSION));
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_FIELDS_EXTENSION));
+    } catch (IOException ignored) {}
+  }
 
-                    loadInfo2_.clear();                    
-                     // If we are here and no node was available to
-                     // perform load balance with we need to report and bail.                    
-                    if ( !value )
-                    {
-                        logger_.warn("Load Balancing operations weren't performed for this node");
-                    }
-                }                
-            }
-            */        
+  /**
+   * Do a bulk copy of numDocs documents from reader to our
+   * streams.  This is used to expedite merging, if the
+   * field numbers are congruent.
+   */
+  private void addRawDocuments(DefaultTermVectorsReader reader, int[] tvdLengths, int[] tvfLengths, int numDocs) throws IOException {
+    long tvdPosition = tvd.getFilePointer();
+    long tvfPosition = tvf.getFilePointer();
+    long tvdStart = tvdPosition;
+    long tvfStart = tvfPosition;
+    for(int i=0;i<numDocs;i++) {
+      tvx.writeLong(tvdPosition);
+      tvdPosition += tvdLengths[i];
+      tvx.writeLong(tvfPosition);
+      tvfPosition += tvfLengths[i];
+    }
+    tvd.copyBytes(reader.getTvdStream(), tvdPosition-tvdStart);
+    tvf.copyBytes(reader.getTvfStream(), tvfPosition-tvfStart);
+    assert tvd.getFilePointer() == tvdPosition;
+    assert tvf.getFilePointer() == tvfPosition;
+  }
+
+  @Override
+  public final int merge(MergeState mergeState) throws IOException {
+    // Used for bulk-reading raw bytes for term vectors
+    int rawDocLengths[] = new int[MAX_RAW_MERGE_DOCS];
+    int rawDocLengths2[] = new int[MAX_RAW_MERGE_DOCS];
+
+    int idx = 0;
+    int numDocs = 0;
+    for (final MergeState.IndexReaderAndLiveDocs reader : mergeState.readers) {
+      final SegmentReader matchingSegmentReader = mergeState.matchingSegmentReaders[idx++];
+      DefaultTermVectorsReader matchingVectorsReader = null;
+      if (matchingSegmentReader != null) {
+        TermVectorsReader vectorsReader = matchingSegmentReader.getTermVectorsReader();
+
+        if (vectorsReader != null && vectorsReader instanceof DefaultTermVectorsReader) {
+          // If the TV* files are an older format then they cannot read raw docs:
+          if (((DefaultTermVectorsReader)vectorsReader).canReadRawDocs()) {
+            matchingVectorsReader = (DefaultTermVectorsReader) vectorsReader;
+          }
         }
+      }
+      if (reader.liveDocs != null) {
+        numDocs += copyVectorsWithDeletions(mergeState, matchingVectorsReader, reader, rawDocLengths, rawDocLengths2);
+      } else {
+        numDocs += copyVectorsNoDeletions(mergeState, matchingVectorsReader, reader, rawDocLengths, rawDocLengths2);
+      }
+    }
+    finish(numDocs);
+    return numDocs;
+  }
 
-        /*
-        private boolean tryThisNode(int myLoad, int threshold, InetAddress target)
-        {
-            boolean value = false;
-            LoadInfo li = loadInfo2_.get(target);
-            int pLoad = li.count();
-            if ( ((myLoad + pLoad) >> 1) <= threshold )
-            {
-                //calculate the number of keys to be transferred
-                int keyCount = ( (myLoad - pLoad) >> 1 );
-                if (logger_.isDebugEnabled())
-                  logger_.debug("Number of keys we attempt to transfer to " + target + " " + keyCount);
-                // Determine the token that the target should join at.         
-                BigInteger targetToken = BootstrapAndLbHelper.getTokenBasedOnPrimaryCount(keyCount);
-                // Send a MoveMessage and see if this node is relocateable
-                MoveMessage moveMessage = new MoveMessage(targetToken);
-                Message message = new Message(StorageService.getLocalStorageEndpoint(), StorageLoadBalancer.lbStage_, StorageLoadBalancer.moveMessageVerbHandler_, new Object[]{moveMessage});
-                if (logger_.isDebugEnabled())
-                  logger_.debug("Sending a move message to {}", target);
-                IAsyncResult result = MessagingService.getMessagingInstance().sendRR(message, target);
-                value = (Boolean)result.get()[0];
-                if (logger_.isDebugEnabled())
-                  logger_.debug("Response for query to relocate " + target + " is " + value);
-            }
-            return value;
+  /** Maximum number of contiguous documents to bulk-copy
+      when merging term vectors */
+  private final static int MAX_RAW_MERGE_DOCS = 4192;
+
+  private int copyVectorsWithDeletions(MergeState mergeState,
+                                        final DefaultTermVectorsReader matchingVectorsReader,
+                                        final MergeState.IndexReaderAndLiveDocs reader,
+                                        int rawDocLengths[],
+                                        int rawDocLengths2[])
+          throws IOException, MergeAbortedException {
+    final int maxDoc = reader.reader.maxDoc();
+    final Bits liveDocs = reader.liveDocs;
+    int totalNumDocs = 0;
+    if (matchingVectorsReader != null) {
+      // We can bulk-copy because the fieldInfos are "congruent"
+      for (int docNum = 0; docNum < maxDoc;) {
+        if (!liveDocs.get(docNum)) {
+          // skip deleted docs
+          ++docNum;
+          continue;
         }
-        */
-    }
-
-    class MoveMessageVerbHandler implements IVerbHandler
-    {
-        public void doVerb(Message message)
-        {
-            Message reply = message.getInternalReply(new byte[] {(byte)(isMoveable_.get() ? 1 : 0)});
-            MessagingService.instance().sendOneWay(reply, message.getFrom());
-            if ( isMoveable_.get() )
-            {
-                // MoveMessage moveMessage = (MoveMessage)message.getMessageBody()[0];
-                /* Start the leave operation and join the ring at the position specified */
-                isMoveable_.set(false);
-            }
+        // We can optimize this case (doing a bulk byte copy) since the field
+        // numbers are identical
+        int start = docNum, numDocs = 0;
+        do {
+          docNum++;
+          numDocs++;
+          if (docNum >= maxDoc) break;
+          if (!liveDocs.get(docNum)) {
+            docNum++;
+            break;
+          }
+        } while(numDocs < MAX_RAW_MERGE_DOCS);
+        
+        matchingVectorsReader.rawDocs(rawDocLengths, rawDocLengths2, start, numDocs);
+        addRawDocuments(matchingVectorsReader, rawDocLengths, rawDocLengths2, numDocs);
+        totalNumDocs += numDocs;
+        mergeState.checkAbort.work(300 * numDocs);
+      }
+    } else {
+      for (int docNum = 0; docNum < maxDoc; docNum++) {
+        if (!liveDocs.get(docNum)) {
+          // skip deleted docs
+          continue;
         }
+        
+        // NOTE: it's very important to first assign to vectors then pass it to
+        // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+        Fields vectors = reader.reader.getTermVectors(docNum);
+        addAllDocVectors(vectors, mergeState.fieldInfos);
+        totalNumDocs++;
+        mergeState.checkAbort.work(300);
+      }
     }
-
-    private static final int BROADCAST_INTERVAL = 60 * 1000;
-
-    public static final StorageLoadBalancer instance = new StorageLoadBalancer();
-
-    private static final Logger logger_ = LoggerFactory.getLogger(StorageLoadBalancer.class);
-    /* time to delay in minutes the actual load balance procedure if heavily loaded */
-    private static final int delay_ = 5;
-    /* If a node's load is this factor more than the average, it is considered Heavy */
-    private static final double TOPHEAVY_RATIO = 1.5;
-
-    /* this indicates whether this node is already helping someone else */
-    private AtomicBoolean isMoveable_ = new AtomicBoolean(false);
-    private Map<InetAddress, Double> loadInfo_ = new HashMap<InetAddress, Double>();
-    /* This map is a clone of the one above and is used for various calculations during LB operation */
-    private Map<InetAddress, Double> loadInfo2_ = new HashMap<InetAddress, Double>();
-
-    private StorageLoadBalancer()
-    {
-        Gossiper.instance.register(this);
+    return totalNumDocs;
+  }
+  
+  private int copyVectorsNoDeletions(MergeState mergeState,
+                                      final DefaultTermVectorsReader matchingVectorsReader,
+                                      final MergeState.IndexReaderAndLiveDocs reader,
+                                      int rawDocLengths[],
+                                      int rawDocLengths2[])
+          throws IOException, MergeAbortedException {
+    final int maxDoc = reader.reader.maxDoc();
+    if (matchingVectorsReader != null) {
+      // We can bulk-copy because the fieldInfos are "congruent"
+      int docCount = 0;
+      while (docCount < maxDoc) {
+        int len = Math.min(MAX_RAW_MERGE_DOCS, maxDoc - docCount);
+        matchingVectorsReader.rawDocs(rawDocLengths, rawDocLengths2, docCount, len);
+        addRawDocuments(matchingVectorsReader, rawDocLengths, rawDocLengths2, len);
+        docCount += len;
+        mergeState.checkAbort.work(300 * len);
+      }
+    } else {
+      for (int docNum = 0; docNum < maxDoc; docNum++) {
+        // NOTE: it's very important to first assign to vectors then pass it to
+        // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+        Fields vectors = reader.reader.getTermVectors(docNum);
+        addAllDocVectors(vectors, mergeState.fieldInfos);
+        mergeState.checkAbort.work(300);
+      }
     }
+    return maxDoc;
+  }
+  
+  @Override
+  public void finish(int numDocs) throws IOException {
+    if (4+((long) numDocs)*16 != tvx.getFilePointer())
+      // This is most likely a bug in Sun JRE 1.6.0_04/_05;
+      // we detect that the bug has struck, here, and
+      // throw an exception to prevent the corruption from
+      // entering the index.  See LUCENE-1282 for
+      // details.
+      throw new RuntimeException("mergeVectors produced an invalid result: mergedDocs is " + numDocs + " but tvx size is " + tvx.getFilePointer() + " file=" + tvx.toString() + "; now aborting this merge to prevent index corruption");
+  }
 
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value)
-    {
-        if (state != ApplicationState.LOAD)
-            return;
-        loadInfo_.put(endpoint, Double.valueOf(value.value));
-
-        /*
-        // clone load information to perform calculations
-        loadInfo2_.putAll(loadInfo_);
-        // Perform the analysis for load balance operations
-        if ( isHeavyNode() )
-        {
-            if (logger_.isDebugEnabled())
-              logger_.debug(StorageService.getLocalStorageEndpoint() + " is a heavy node with load " + localLoad());
-            // lb_.schedule( new LoadBalancer(), StorageLoadBalancer.delay_, TimeUnit.MINUTES );
-        }
-        */
-    }
-
-    public void onJoin(InetAddress endpoint, EndpointState epState)
-    {
-        VersionedValue localValue = epState.getApplicationState(ApplicationState.LOAD);
-        if (localValue != null)
-        {
-            onChange(endpoint, ApplicationState.LOAD, localValue);
-        }
-    }
-
-    public void onAlive(InetAddress endpoint, EndpointState state) {}
-
-    public void onDead(InetAddress endpoint, EndpointState state) {}
-
-    public void onRemove(InetAddress endpoint) {}
-
-/*
-    private boolean isMoveable()
-    {
-        if ( !isMoveable_.get() )
-            return false;
-        int myload = localLoad();
-        InetAddress successor = StorageService.instance.getSuccessor(StorageService.getLocalStorageEndpoint());
-        LoadInfo li = loadInfo2_.get(successor);
-        // "load" is NULL means that the successor node has not
-        // yet gossiped its load information. We should return
-        // false in this case since we want to err on the side
-        // of caution.
-        if ( li == null )
-            return false;
-        else
-        {            
-            return ( ( myload + li.count() ) <= StorageLoadBalancer.TOPHEAVY_RATIO*averageSystemLoad() );
-        }
-    }
-    */
-
-    private double localLoad()
-    {
-        Double load = loadInfo2_.get(FBUtilities.getLocalAddress());
-        return load == null ? 0 : load;
-    }
-
-    private double averageSystemLoad()
-    {
-        int nodeCount = loadInfo2_.size();
-        Set<InetAddress> nodes = loadInfo2_.keySet();
-
-        double systemLoad = 0;
-        for (InetAddress node : nodes)
-        {
-            systemLoad += loadInfo2_.get(node);
-        }
-        double averageLoad = (nodeCount > 0) ? (systemLoad / nodeCount) : 0;
-        if (logger_.isDebugEnabled())
-            logger_.debug("Average system load is {}", averageLoad);
-        return averageLoad;
-    }
-
-    private boolean isHeavyNode()
-    {
-        return ( localLoad() > ( StorageLoadBalancer.TOPHEAVY_RATIO * averageSystemLoad() ) );
-    }
-
-    private boolean isMoveable(InetAddress target)
-    {
-        double threshold = StorageLoadBalancer.TOPHEAVY_RATIO * averageSystemLoad();
-        if (isANeighbour(target))
-        {
-            // If the target is a neighbour then it is
-            // moveable if its
-            Double load = loadInfo2_.get(target);
-            if (load == null)
-            {
-                return false;
-            }
-            else
-            {
-                double myload = localLoad();
-                double avgLoad = (load + myload) / 2;
-                return avgLoad <= threshold;
-            }
-        }
-        else
-        {
-            InetAddress successor = StorageService.instance.getSuccessor(target);
-            double sLoad = loadInfo2_.get(successor);
-            double targetLoad = loadInfo2_.get(target);
-            return (sLoad + targetLoad) <= threshold;
-        }
-    }
-
-    private boolean isANeighbour(InetAddress neighbour)
-    {
-        InetAddress predecessor = StorageService.instance.getPredecessor(FBUtilities.getLocalAddress());
-        if ( predecessor.equals(neighbour) )
-            return true;
-
-        InetAddress successor = StorageService.instance.getSuccessor(FBUtilities.getLocalAddress());
-        if ( successor.equals(neighbour) )
-            return true;
-
-        return false;
-    }
-
-    /*
-     * Determine the nodes that are lightly loaded. Choose at
-     * random one of the lightly loaded nodes and use them as
-     * a potential target for load balance.
-    */
-    private InetAddress findARandomLightNode()
-    {
-        List<InetAddress> potentialCandidates = new ArrayList<InetAddress>();
-        Set<InetAddress> allTargets = loadInfo2_.keySet();
-        double avgLoad = averageSystemLoad();
-
-        for (InetAddress target : allTargets)
-        {
-            double load = loadInfo2_.get(target);
-            if (load < avgLoad)
-            {
-                potentialCandidates.add(target);
-            }
-        }
-
-        if (potentialCandidates.size() > 0)
-        {
-            Random random = new Random();
-            int index = random.nextInt(potentialCandidates.size());
-            return potentialCandidates.get(index);
-        }
-        return null;
-    }
-
-    public Map<InetAddress, Double> getLoadInfo()
-    {
-        return loadInfo_;
-    }
-
-    public void startBroadcasting()
-    {
-        // send the first broadcast "right away" (i.e., in 2 gossip heartbeats, when we should have someone to talk to);
-        // after that send every BROADCAST_INTERVAL.
-        Runnable runnable = new Runnable()
-        {
-            public void run()
-            {
-                if (logger_.isDebugEnabled())
-                    logger_.debug("Disseminating load info ...");
-                Gossiper.instance.addLocalApplicationState(ApplicationState.LOAD,
-                                                           StorageService.instance.valueFactory.load(StorageService.instance.getLoad()));
-            }
-        };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(runnable, 2 * Gossiper.intervalInMillis, BROADCAST_INTERVAL, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * Wait for at least BROADCAST_INTERVAL ms, to give all nodes enough time to
-     * report in.
-     */
-    public void waitForLoadInfo()
-    {
-        int duration = BROADCAST_INTERVAL + StorageService.RING_DELAY;
-        try
-        {
-            logger_.info("Sleeping {} ms to wait for load information...", duration);
-            Thread.sleep(duration);
-        }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
-    }
+  /** Close all streams. */
+  @Override
+  public void close() throws IOException {
+    // make an effort to close all streams we can but remember and re-throw
+    // the first exception encountered in this process
+    IOUtils.close(tvx, tvd, tvf);
+    tvx = tvd = tvf = null;
+  }
 }

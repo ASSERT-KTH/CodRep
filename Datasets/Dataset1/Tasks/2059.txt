@@ -1,13 +1,14 @@
-input.readInt(); // Read total size
+newIndexWriter(core, true, false);
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.solr.update;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,252 +19,277 @@ input.readInt(); // Read total size
  * limitations under the License.
  */
 
-package org.apache.cassandra.streaming;
+import java.io.IOException;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import java.io.*;
-import java.net.InetAddress;
-import java.net.Socket;
-import java.nio.ByteBuffer;
-
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.io.compress.CompressedRandomAccessReader;
-import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.net.Header;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.net.OutboundTcpConnection;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.utils.Throttle;
-import org.apache.cassandra.utils.WrappedRunnable;
-
-import com.ning.compress.lzf.LZFOutputStream;
-
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.solr.cloud.RecoveryStrategy;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.CoreDescriptor;
+import org.apache.solr.core.DirectoryFactory;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.util.RefCounted;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class FileStreamTask extends WrappedRunnable
-{
-    private static Logger logger = LoggerFactory.getLogger(FileStreamTask.class);
+public final class DefaultSolrCoreState extends SolrCoreState implements RecoveryStrategy.RecoveryListener {
+  public static Logger log = LoggerFactory.getLogger(DefaultSolrCoreState.class);
+  
+  private final boolean SKIP_AUTO_RECOVERY = Boolean.getBoolean("solrcloud.skip.autorecovery");
+  
+  private final Object recoveryLock = new Object();
+  
+  // protects pauseWriter and writerFree
+  private final Object writerPauseLock = new Object();
+  
+  private SolrIndexWriter indexWriter = null;
+  private DirectoryFactory directoryFactory;
+
+  private volatile boolean recoveryRunning;
+  private RecoveryStrategy recoveryStrat;
+  private volatile boolean closed = false;
+
+  private RefCounted<IndexWriter> refCntWriter;
+
+  private boolean pauseWriter;
+  private boolean writerFree = true;
+  
+  protected final ReentrantLock commitLock = new ReentrantLock();
+
+  public DefaultSolrCoreState(DirectoryFactory directoryFactory) {
+    this.directoryFactory = directoryFactory;
+  }
+  
+  private void closeIndexWriter(IndexWriterCloser closer) {
+    try {
+      log.info("SolrCoreState ref count has reached 0 - closing IndexWriter");
+      if (closer != null) {
+        log.info("closing IndexWriter with IndexWriterCloser");
+        closer.closeWriter(indexWriter);
+      } else if (indexWriter != null) {
+        log.info("closing IndexWriter...");
+        indexWriter.close();
+      }
+    } catch (Throwable t) {
+      log.error("Error during shutdown of writer.", t);
+    } 
+  }
+  
+  @Override
+  public RefCounted<IndexWriter> getIndexWriter(SolrCore core)
+      throws IOException {
     
-    public static final int CHUNK_SIZE = 64 * 1024;
-    // around 10 minutes at the default rpctimeout
-    public static final int MAX_CONNECT_ATTEMPTS = 8;
-
-    protected final StreamHeader header;
-    protected final InetAddress to;
-
-    // communication socket
-    private Socket socket;
-    // socket's output/input stream
-    private OutputStream output;
-    private OutputStream compressedoutput;
-    private DataInputStream input;
-    // allocate buffer to use for transfers only once
-    private final byte[] transferBuffer = new byte[CHUNK_SIZE];
-    // outbound global throughput limiter
-    private final Throttle throttle;
-    private final StreamReplyVerbHandler handler = new StreamReplyVerbHandler();
-
-    public FileStreamTask(StreamHeader header, InetAddress to)
-    {
-        this.header = header;
-        this.to = to;
-        this.throttle = new Throttle(toString(), new Throttle.ThroughputFunction()
-        {
-            /** @return Instantaneous throughput target in bytes per millisecond. */
-            public int targetThroughput()
-            {
-                if (DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() < 1)
-                    // throttling disabled
-                    return 0;
-                // total throughput
-                int totalBytesPerMS = DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() * 1024 * 1024 / 8 / 1000;
-                // per stream throughput (target bytes per MS)
-                return totalBytesPerMS / Math.max(1, MessagingService.instance().getActiveStreamsOutbound());
-            }
-        });
+    if (closed) {
+      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
     }
     
-    public void runMayThrow() throws IOException
-    {
-        try
-        {
-            connectAttempt();
-            // successfully connected: stream.
-            // (at this point, if we fail, it is the receiver's job to re-request)
-            stream();
-            if (StreamOutSession.get(to, header.sessionId).getFiles().size() == 0)
-            {
-                // we are the last of our kind, receive the final confirmation before closing
-                receiveReply();
-                logger.info("Finished streaming session to {}", to);
-            }
+    synchronized (writerPauseLock) {
+      if (core == null) {
+        // core == null is a signal to just return the current writer, or null
+        // if none.
+        if (refCntWriter != null) refCntWriter.incref();
+        return refCntWriter;
+      }
+      
+      while (pauseWriter) {
+        try {
+          writerPauseLock.wait(100);
+        } catch (InterruptedException e) {}
+        
+        if (closed) {
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
         }
-        finally
-        {
-            try
-            {
-                close();
-            }
-            catch (IOException e)
-            {
-                if (logger.isDebugEnabled())
-                    logger.debug("error closing socket", e);
-            }
+      }
+      
+      if (indexWriter == null) {
+        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false);
+      }
+      initRefCntWriter();
+      writerFree = false;
+      writerPauseLock.notifyAll();
+      refCntWriter.incref();
+      return refCntWriter;
+    }
+  }
+
+  private void initRefCntWriter() {
+    if (refCntWriter == null) {
+      refCntWriter = new RefCounted<IndexWriter>(indexWriter) {
+        @Override
+        public void close() {
+          synchronized (writerPauseLock) {
+            writerFree = true;
+            writerPauseLock.notifyAll();
+          }
         }
-        if (logger.isDebugEnabled())
-            logger.debug("Done streaming " + header.file);
+      };
     }
+  }
 
-    /**
-     * Stream file by it's sections specified by this.header
-     * @throws IOException on any I/O error
-     */
-    private void stream() throws IOException
-    {
-        ByteBuffer HeaderBuffer = MessagingService.instance().constructStreamHeader(header, false, Gossiper.instance.getVersion(to));
-        // write header (this should not be compressed for compatibility with other messages)
-        output.write(ByteBufferUtil.getArray(HeaderBuffer));
-
-        if (header.file == null)
-            return;
-
-        // TODO just use a raw RandomAccessFile since we're managing our own buffer here
-        RandomAccessReader file = (header.file.sstable.compression) // try to skip kernel page cache if possible
-                                ? CompressedRandomAccessReader.open(header.file.getFilename(), header.file.sstable.getCompressionMetadata(), true)
-                                : RandomAccessReader.open(new File(header.file.getFilename()), true);
-
-        // setting up data compression stream
-        compressedoutput = new LZFOutputStream(output);
-
-        MessagingService.instance().incrementActiveStreamsOutbound();
-        try
-        {
-            // stream each of the required sections of the file
-            for (Pair<Long, Long> section : header.file.sections)
-            {
-                // seek to the beginning of the section
-                file.seek(section.left);
-
-                // length of the section to stream
-                long length = section.right - section.left;
-                // tracks write progress
-                long bytesTransferred = 0;
-
-                while (bytesTransferred < length)
-                {
-                    long lastWrite = write(file, length, bytesTransferred);
-                    bytesTransferred += lastWrite;
-                    // store streaming progress
-                    header.file.progress += lastWrite;
-                }
-
-                // make sure that current section is send
-                compressedoutput.flush();
-
-                if (logger.isDebugEnabled())
-                    logger.debug("Bytes transferred " + bytesTransferred + "/" + header.file.size);
-            }
-            // receive reply confirmation
-            receiveReply();
+  @Override
+  public synchronized void newIndexWriter(SolrCore core, boolean rollback, boolean forceNewDir) throws IOException {
+    if (closed) {
+      throw new AlreadyClosedException("SolrCoreState already closed");
+    }
+    log.info("Creating new IndexWriter...");
+    String coreName = core.getName();
+    synchronized (writerPauseLock) {
+      // we need to wait for the Writer to fall out of use
+      // first lets stop it from being lent out
+      pauseWriter = true;
+      // then lets wait until its out of use
+      log.info("Waiting until IndexWriter is unused... core=" + coreName);
+      
+      while (!writerFree) {
+        try {
+          writerPauseLock.wait(100);
+        } catch (InterruptedException e) {}
+        
+        if (closed) {
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
         }
-        finally
-        {
-            MessagingService.instance().decrementActiveStreamsOutbound();
+      }
 
-            // no matter what happens close file
-            FileUtils.closeQuietly(file);
-        }
-    }
-
-    private void receiveReply() throws IOException
-    {
-        MessagingService.validateMagic(input.readInt());
-        int msheader = input.readInt();
-        assert MessagingService.getBits(msheader, 3, 1) == 0 : "Stream received before stream reply";
-        int version = MessagingService.getBits(msheader, 15, 8);
-
-        int totalSize = input.readInt();
-        String id = input.readUTF();
-        Header header = Header.serializer().deserialize(input, version);
-
-        int bodySize = input.readInt();
-        byte[] body = new byte[bodySize];
-        input.readFully(body);
-        Message message = new Message(header, body, version);
-        assert message.getVerb() == StorageService.Verb.STREAM_REPLY : "Non-reply message received on stream socket";
-        handler.doVerb(message, id);
-    }
-
-    /**
-     * Sequentially read bytes from the file and write them to the output stream
-     *
-     * @param reader The file reader to read from
-     * @param length The full length that should be transferred
-     * @param bytesTransferred Number of bytes remaining to transfer
-     *
-     * @return Number of bytes transferred
-     *
-     * @throws IOException on any I/O error
-     */
-    protected long write(RandomAccessReader reader, long length, long bytesTransferred) throws IOException
-    {
-        int toTransfer = (int) Math.min(CHUNK_SIZE, length - bytesTransferred);
-
-        reader.readFully(transferBuffer, 0, toTransfer);
-        compressedoutput.write(transferBuffer, 0, toTransfer);
-        throttle.throttleDelta(toTransfer);
-
-        return toTransfer;
-    }
-
-    /**
-     * Connects to the destination, with backoff for failed attempts.
-     * TODO: all nodes on a cluster must currently use the same storage port
-     * @throws IOException If all attempts fail.
-     */
-    private void connectAttempt() throws IOException
-    {
-        int attempts = 0;
-        while (true)
-        {
-            try
-            {
-                socket = MessagingService.instance().getConnectionPool(to).newSocket();
-                output = socket.getOutputStream();
-                input = new DataInputStream(socket.getInputStream());
-                break;
+      try {
+        if (indexWriter != null) {
+          if (!rollback) {
+            try {
+              log.info("Closing old IndexWriter... core=" + coreName);
+              indexWriter.close();
+            } catch (Throwable t) {
+              SolrException.log(log, "Error closing old IndexWriter. core="
+                  + coreName, t);
             }
-            catch (IOException e)
-            {
-                if (++attempts >= MAX_CONNECT_ATTEMPTS)
-                    throw e;
-
-                long waitms = DatabaseDescriptor.getRpcTimeout() * (long)Math.pow(2, attempts);
-                logger.warn("Failed attempt " + attempts + " to connect to " + to + " to stream " + header.file + ". Retrying in " + waitms + " ms. (" + e + ")");
-                try
-                {
-                    Thread.sleep(waitms);
-                }
-                catch (InterruptedException wtf)
-                {
-                    throw new RuntimeException(wtf);
-                }
+          } else {
+            try {
+              log.info("Rollback old IndexWriter... core=" + coreName);
+              indexWriter.rollback();
+            } catch (Throwable t) {
+              SolrException.log(log, "Error rolling back old IndexWriter. core="
+                  + coreName, t);
             }
+          }
         }
+        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", forceNewDir);
+        log.info("New IndexWriter is ready to be used.");
+        // we need to null this so it picks up the new writer next get call
+        refCntWriter = null;
+      } finally {
+        
+        pauseWriter = false;
+        writerPauseLock.notifyAll();
+      }
     }
+  }
 
-    protected void close() throws IOException
-    {
-        output.close();
-    }
+  @Override
+  public synchronized void rollbackIndexWriter(SolrCore core) throws IOException {
+    newIndexWriter(core, true, true);
+  }
+  
+  protected SolrIndexWriter createMainIndexWriter(SolrCore core, String name, boolean forceNewDirectory) throws IOException {
+    return SolrIndexWriter.create(name, core.getNewIndexDir(),
+        core.getDirectoryFactory(), false, core.getSchema(),
+        core.getSolrConfig().indexConfig, core.getDeletionPolicy(), core.getCodec(), forceNewDirectory);
+  }
 
-    public String toString()
-    {
-        return String.format("FileStreamTask(session=%s, to=%s)", header.sessionId, to);
+  @Override
+  public DirectoryFactory getDirectoryFactory() {
+    return directoryFactory;
+  }
+
+  @Override
+  public void doRecovery(CoreContainer cc, CoreDescriptor cd) {
+    if (SKIP_AUTO_RECOVERY) {
+      log.warn("Skipping recovery according to sys prop solrcloud.skip.autorecovery");
+      return;
     }
+    
+    // check before we grab the lock
+    if (cc.isShutDown()) {
+      log.warn("Skipping recovery because Solr is shutdown");
+      return;
+    }
+    
+    synchronized (recoveryLock) {
+      // to be air tight we must also check after lock
+      if (cc.isShutDown()) {
+        log.warn("Skipping recovery because Solr is shutdown");
+        return;
+      }
+      log.info("Running recovery - first canceling any ongoing recovery");
+      cancelRecovery();
+      
+      while (recoveryRunning) {
+        try {
+          recoveryLock.wait(1000);
+        } catch (InterruptedException e) {
+
+        }
+        // check again for those that were waiting
+        if (cc.isShutDown()) {
+          log.warn("Skipping recovery because Solr is shutdown");
+          return;
+        }
+        if (closed) return;
+      }
+
+      // if true, we are recovering after startup and shouldn't have (or be receiving) additional updates (except for local tlog recovery)
+      boolean recoveringAfterStartup = recoveryStrat == null;
+
+      recoveryStrat = new RecoveryStrategy(cc, cd, this);
+      recoveryStrat.setRecoveringAfterStartup(recoveringAfterStartup);
+      recoveryStrat.start();
+      recoveryRunning = true;
+    }
+    
+  }
+  
+  @Override
+  public void cancelRecovery() {
+    synchronized (recoveryLock) {
+      if (recoveryStrat != null && recoveryRunning) {
+        recoveryStrat.close();
+        while (true) {
+          try {
+            recoveryStrat.join();
+          } catch (InterruptedException e) {
+            // not interruptible - keep waiting
+            continue;
+          }
+          break;
+        }
+        
+        recoveryRunning = false;
+        recoveryLock.notifyAll();
+      }
+    }
+  }
+
+  @Override
+  public void recovered() {
+    recoveryRunning = false;
+  }
+
+  @Override
+  public void failed() {
+    recoveryRunning = false;
+  }
+
+  @Override
+  public synchronized void close(IndexWriterCloser closer) {
+    closed = true;
+    cancelRecovery();
+    closeIndexWriter(closer);
+  }
+  
+  @Override
+  public Lock getCommitLock() {
+    return commitLock;
+  }
+  
 }

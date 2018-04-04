@@ -1,8 +1,8 @@
-SQLState.FILE_CANNOT_REMOVE_ENCRYPT_FILE,
+@exception StandardException Standard Derby error policy
 
 /*
 
-   Derby - Class org.apache.derby.impl.store.raw.data.EncryptOrDecryptData
+   Derby - Class org.apache.derby.impl.store.raw.log.FlushedScan
 
    Licensed to the Apache Software Foundation (ASF) under one or more
    contributor license agreements.  See the NOTICE file distributed with
@@ -21,401 +21,486 @@ SQLState.FILE_CANNOT_REMOVE_ENCRYPT_FILE,
 
  */
 
-package org.apache.derby.impl.store.raw.data;
+package org.apache.derby.impl.store.raw.log;
 
 import org.apache.derby.iapi.reference.SQLState;
+import org.apache.derby.iapi.reference.MessageId;
+
+import org.apache.derby.impl.store.raw.log.LogCounter;
+import org.apache.derby.impl.store.raw.log.LogRecord;
+import org.apache.derby.impl.store.raw.log.StreamLogScan;
+
 import org.apache.derby.iapi.services.sanity.SanityManager;
 import org.apache.derby.iapi.error.StandardException;
-import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
-import org.apache.derby.iapi.store.raw.ContainerKey;
-import org.apache.derby.iapi.store.raw.LockingPolicy;
-import org.apache.derby.iapi.store.raw.xact.RawTransaction;
-import org.apache.derby.iapi.store.raw.ContainerHandle;
-import org.apache.derby.iapi.store.access.TransactionController;
+import org.apache.derby.iapi.services.i18n.MessageService;
+import org.apache.derby.iapi.store.raw.log.LogInstant;
+import org.apache.derby.iapi.store.raw.log.LogFactory;
+import org.apache.derby.iapi.store.raw.xact.TransactionId;
+import org.apache.derby.iapi.services.io.ArrayInputStream;
 
-import org.apache.derby.io.StorageFactory;
-import org.apache.derby.io.StorageFile;
-import org.apache.derby.iapi.util.ReuseFactory;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
+import org.apache.derby.io.StorageRandomAccessFile;
 
+import java.io.IOException;
 
 /**
- * This class is used to encrypt all the containers in the data segment with a
- * new encryption key when password/key is changed or when an existing database
- * is reconfigured for encryption.
- *
- * Encryption of existing data in the data segments is done by doing the
- * following:
- *  Find all the containers in data segment (seg0) and encrypt all of them
- *  with the new  encryption key, the process for each container is:
- *   1.Write a log record to indicate that the container is getting encrypted.
- *   2.Read all the pages of the container through the page cache and
- *       encrypt each page with new encryption key and then write to a
- *       temporary file(n<cid>.dat) in the data segment itself.
- *   3. Rename the current container file (c<cid>.dat) to
- *                                         another file (o<cid>.dat)
- *   4. Rename the new encrypted version of the file (n<cid).dat) to be
- *                                    the current container file (c<cid>.dat).
- *   5. All the old version of  the container (o<cid>.dat) files are removed
- *      after a successful checkpoint with a new key or on a rollback.
- */
 
-public class EncryptOrDecryptData implements PrivilegedAction {
+	Scan the the log which is implemented by a series of log files.n
+	This log scan knows how to move across log file if it is positioned at
+	the boundary of a log file and needs to getNextRecord.
 
-    private BaseDataFileFactory dataFactory;
-    private StorageFactory storageFactory;
+	<PRE>
+	4 bytes - length of user data, i.e. N
+	8 bytes - long representing log instant
+	N bytes of supplied data
+	4 bytes - length of user data, i.e. N
+	</PRE>
 
-    /* privileged actions */
-    private static final int STORAGE_FILE_EXISTS_ACTION = 1;
-    private static final int STORAGE_FILE_DELETE_ACTION = 2;
-    private static final int STORAGE_FILE_RENAME_ACTION = 3;
-    private int actionCode;
-    private StorageFile actionStorageFile;
-    private StorageFile actionDestStorageFile;
+*/
+public class FlushedScan implements StreamLogScan {
 
-    public EncryptOrDecryptData(BaseDataFileFactory dataFactory) {
-        this.dataFactory = dataFactory;
-        this.storageFactory = dataFactory.getStorageFactory();
-    }
+	private StorageRandomAccessFile scan;		// an output stream to the log file
+	LogToFile logFactory; 				// log factory knows how to to skip
+										// from log file to log file
 
-    /**
-     * Finds all the all the containers stored in the data directory and
-     * decrypts them.
-     *
-     * @param t the transaction that is used for the decryption operation
-     * @throws StandardException Standard Derby error policy
-     */
-    public void decryptAllContainers(RawTransaction t)
-            throws StandardException {
-        encryptOrDecryptAllContainers(t, false);
-    }
+	boolean open;						// true if the scan is open
 
-    /**
-     * Find all the all the containers stored in the data directory and
-     * encrypt them.
-     *
-     * @param t the transaction that is used for the encryption operation
-     * @exception StandardException Standard Derby error policy
-     */
-    public void encryptAllContainers(RawTransaction t)
-            throws StandardException {
-        encryptOrDecryptAllContainers(t, true);
-    }
+	long currentLogFileNumber; 			// the log file the scan is currently on
 
-    /**
-     * Encrypts or decrypts all containers in the database data directory.
-     *
-     * @param t transaction used for the cryptographic operation
-     * @param doEncrypt tells whether to encrypt or decrypt
-     * @exception StandardException Standard Derby error policy
-     */
-    private void encryptOrDecryptAllContainers(RawTransaction t,
-                                               boolean doEncrypt)
-            throws StandardException {
-        // List of containers that need to be transformed are identified by
-        // simply reading the list of files in seg0.
-        String[] files = dataFactory.getContainerNames();
-        if (files != null) {
-            long segmentId = 0;
+	long currentLogFileFirstUnflushedPosition;
+	                                    // The length of the unflushed portion
+										// of the current log file. This is the
+										// length of the file for all but the
+										// last log file.
 
-            // Loop through all the files in seg0 and
-            // encrypt/decrypt all valid containers.
-            for (int f = files.length-1; f >= 0 ; f--) {
-                long containerId;
-                try {
-                    containerId =
-                        Long.parseLong(files[f].substring(1,
-                                       (files[f].length() -4)), 16);
-                }
-                catch (Throwable th)
-                {
-                    // ignore errors from parse, it just means
-                    // that someone put a file in seg0 that we
-                    // didn't expect.  Continue with the next one.
-                    continue;
-                }
+	long currentInstant;				// the log instant the scan is
+										// currently on - only valid after a
+										// successful getNextRecord
 
-                ContainerKey ckey = new ContainerKey(segmentId,
-                                                     containerId);
-                encryptOrDecryptContainer(t, ckey, doEncrypt);
-            }
+	long firstUnflushed = -1;			// scan until we reach the first
+										// unflushed byte in the log.
+	long firstUnflushedFileNumber;
+	long firstUnflushedFilePosition;
 
-            // Old versions of the container files will
-            // be removed after the (re)encryption of database
-            // is completed.
-        } else {
-            if (SanityManager.DEBUG) {
-                SanityManager.THROWASSERT(
-                        (doEncrypt ? "encryption" : "decryption") +
-                        " process is unable to read container names in seg0");
-            }
-        }
+	//RESOLVE: This belongs in a shared place.
+	static final int LOG_REC_LEN_BYTE_LENGTH = 4;
 
-    }
-
-
-    /**
-     * Encrypts or decrypts the specified container.
-     *
-     * @param t transaction that used to perform the cryptographic operation
-     * @param ckey the key of the container that is being encrypted/decrypted
-     * @param doEncrypt tells whether to encrypt or decrypt
-     * @exception StandardException Standard Derby error policy
-     */
-    private void encryptOrDecryptContainer(RawTransaction t,
-                                           ContainerKey ckey,
-                                           boolean doEncrypt)
-        throws StandardException
-    {
-
-        LockingPolicy cl =
-            t.newLockingPolicy(
-                               LockingPolicy.MODE_CONTAINER,
-                               TransactionController.ISOLATION_SERIALIZABLE,
-                               true);
-
-        if (SanityManager.DEBUG )
-            SanityManager.ASSERT(cl != null);
-
-        RawContainerHandle containerHdl = (RawContainerHandle)
-            t.openContainer(ckey, cl, ContainerHandle.MODE_FORUPDATE);
-
-        if (SanityManager.DEBUG )
-            SanityManager.ASSERT(containerHdl != null);
-
-        EncryptContainerOperation lop =
-            new EncryptContainerOperation(containerHdl);
-        t.logAndDo(lop);
-
-        // flush the log to reduce the window between where
-        // the encrypted container is created & synced and the
-        // log record for it makes it to disk. if we fail during
-        // encryption of the container, log record will make sure
-        // container is restored to the original state and
-        // any temporary files are cleaned up.
-        dataFactory.flush(t.getLastLogInstant());
-
-        // encrypt the container.
-        String newFilePath = getFilePath(ckey, false);
-        StorageFile newFile = storageFactory.newStorageFile(newFilePath);
-        containerHdl.encryptOrDecryptContainer(newFilePath, doEncrypt);
-        containerHdl.close();
-
-
-        /*
-         * Replace the current container file with the new container file after
-         * keeping a copy of the current container file, it will be removed on
-         * after a checkpoint with new key or on a rollback this copy will be
-         * replace the container file to bring the database back to the
-         * state before encryption process started.
-         */
-
-        // discard pages in the cache related to this container.
-        if (!dataFactory.getPageCache().discard(ckey)) {
-            if (SanityManager.DEBUG )
-                SanityManager.THROWASSERT("unable to discard pages releated to " +
-                                          "container " + ckey  +
-                                          " from the page cache");
-        }
-
-
-        // get rid of the container entry from conatainer cache
-        if (!dataFactory.getContainerCache().discard(ckey)) {
-            if (SanityManager.DEBUG )
-                SanityManager.THROWASSERT("unable to discard a container " +
-                                          ckey + " from the container cache");
-        }
-
-        StorageFile currentFile =  dataFactory.getContainerPath(ckey , false);
-        StorageFile oldFile = getFile(ckey, true);
-
-        if (!privRename(currentFile, oldFile)) {
-                throw StandardException.
-                    newException(SQLState.RAWSTORE_ERROR_RENAMING_FILE,
-                                 currentFile, oldFile);
-            }
-
-        // now replace current container file with the new file.
-        if (!privRename(newFile, currentFile)) {
-            throw StandardException.
-                newException(SQLState.RAWSTORE_ERROR_RENAMING_FILE,
-                             newFile, currentFile);
-
-        }
-    }
-
-
-    /**
-     * Get file handle to a container file that is used to keep
-     * temporary versions of the container file.
-     */
-    private StorageFile getFile(ContainerKey containerId, boolean old) {
-        return storageFactory.newStorageFile(getFilePath(containerId,
-                                                         old));
-    }
-
-    /**
-     * Get path to a container file that is used to keep temporary versions of
-     * the container file.
-     */
-    private String getFilePath(ContainerKey containerId, boolean old) {
-        StringBuffer sb = new StringBuffer("seg");
-        sb.append(containerId.getSegmentId());
-        sb.append(storageFactory.getSeparator());
-        sb.append(old ? 'o' : 'n');
-        sb.append(Long.toHexString(containerId.getContainerId()));
-        sb.append(".dat");
-        return sb.toString();
-    }
-
-    private boolean isOldContainerFile(String fileName) {
-        // Old versions start with prefix "o" and ends with ".dat".
-        return (fileName.startsWith("o") && fileName.endsWith(".dat"));
-    }
-
-    private StorageFile getFile(String ctrFileName)
-    {
-        long segmentId = 0;
-        StringBuffer sb = new StringBuffer("seg");
-        sb.append(segmentId);
-        sb.append(storageFactory.getSeparator());
-        sb.append(ctrFileName);
-        return storageFactory.newStorageFile(sb.toString());
-    }
-
-    /* Restore the contaier to the state it was before
-     * it was encrypted with new encryption key. This function is
-     * called during undo of the EncryptContainerOperation log record
-     * incase of a error/crash before database was successfuly configured with
-     * new encryption properties.
-     * @param ckey the key of the container that needs to be restored.
-     * @exception StandardException Standard Derby error policy
-     */
-    void restoreContainer(ContainerKey containerId)
-        throws StandardException
-    {
-
-        // get rid of the container entry from conatainer cache,
-        // this will make sure there are no file opens on the current
-        // container file.
-
-        if (!dataFactory.getContainerCache().discard(containerId)) {
-            if (SanityManager.DEBUG )
-                SanityManager.THROWASSERT(
-                  "unable to discard  container from cache:" +
-                  containerId);
-        }
-
-        StorageFile currentFile = dataFactory.getContainerPath(containerId,
-                                                               false);
-        StorageFile oldFile = getFile(containerId, true);
-        StorageFile newFile = getFile(containerId, false);
-
-        // if backup of the original container file exists, replace the
-        // container with the backup copy.
-        if (privExists(oldFile)) {
-            if (privExists(currentFile)) {
-                // rename the current container file to be the new file.
-                if (!privRename(currentFile, newFile)) {
-                    throw StandardException.
-                        newException(SQLState.RAWSTORE_ERROR_RENAMING_FILE,
-                                     currentFile, newFile);
-                }
-            }
-
-            if (!privRename(oldFile, currentFile)) {
-                throw StandardException.
-                    newException(SQLState.RAWSTORE_ERROR_RENAMING_FILE,
-                                 oldFile, currentFile);
-            }
-        }
-
-        // if the new copy of the container file exists, remove it.
-        if (privExists(newFile)) {
-
-            if (!privDelete(newFile))
-                throw StandardException.newException(
-                                                 SQLState.UNABLE_TO_DELETE_FILE,
-                                                 newFile);
-        }
-    }
-
-
-    /**
-     * Removes old versions of the containers after a cryptographic operation
-     * on the database.
-     */
-    public void removeOldVersionOfContainers()
-            throws StandardException {
-        // Find the old version of the container files and delete them.
-        String[] files = dataFactory.getContainerNames();
-        if (files != null) {
-            // Loop through all the files in seg0 and
-            // delete all old copies of the containers.
-            for (int i = files.length-1; i >= 0 ; i--) {
-                if (isOldContainerFile(files[i])) {
-                    StorageFile oldFile = getFile(files[i]);
-                    if (!privDelete(oldFile)) {
-                        throw StandardException.newException(
-                                      SQLState.FILE_CANNOT_REMOVE_FILE,
-                                      oldFile);
-                    }
-                }
-            }
-        }
-    }
-
-    private synchronized boolean privExists(StorageFile file)
-    {
-        actionCode = STORAGE_FILE_EXISTS_ACTION;
-        actionStorageFile = file;
-        Object ret = AccessController.doPrivileged(this);
-        actionStorageFile = null;
-        return ((Boolean) ret).booleanValue();
-
-    }
-
-
-    private synchronized boolean privDelete(StorageFile file)
-    {
-        actionCode = STORAGE_FILE_DELETE_ACTION;
-        actionStorageFile = file;
-        Object ret = AccessController.doPrivileged(this);
-        actionStorageFile = null;
-        return ((Boolean) ret).booleanValue();
-
-    }
-
-    private synchronized boolean privRename(StorageFile fromFile,
-                                            StorageFile destFile)
-    {
-        actionCode = STORAGE_FILE_RENAME_ACTION;
-        actionStorageFile = fromFile;
-        actionDestStorageFile = destFile;
-        Object ret = AccessController.doPrivileged(this);
-        actionStorageFile = null;
-        actionDestStorageFile = null;
-        return ((Boolean) ret).booleanValue();
-
-    }
-
-
-
-    // PrivilegedAction method
-    public Object run()
-    {
-        switch(actionCode)
+	public FlushedScan(LogToFile logFactory, long startAt)
+		 throws StandardException
+	{
+        if (SanityManager.DEBUG)
         {
-        case STORAGE_FILE_EXISTS_ACTION:
-            return ReuseFactory.getBoolean(actionStorageFile.exists());
-        case STORAGE_FILE_DELETE_ACTION:
-            return ReuseFactory.getBoolean(actionStorageFile.delete());
-        case STORAGE_FILE_RENAME_ACTION:
-            return ReuseFactory.getBoolean(
-                       actionStorageFile.renameTo(actionDestStorageFile));
-        }
+    		SanityManager.ASSERT(startAt != LogCounter.INVALID_LOG_INSTANT,
+	    						 "cannot start scan on an invalid log instant");
+	    }
 
-        return null;
-    }
+		try
+		{
+			currentLogFileNumber = LogCounter.getLogFileNumber(startAt);
+			this.logFactory = logFactory;
+			scan =  logFactory.getLogFileAtPosition(startAt);
+			setFirstUnflushed();
+			open = true;
+			currentInstant = LogCounter.INVALID_LOG_INSTANT; // set at getNextRecord
+		}
+
+		catch (IOException ioe)
+		{
+			throw logFactory.markCorrupt(
+                    StandardException.newException(SQLState.LOG_IO_ERROR, ioe));
+		}
+	}
+
+	/*
+	** Methods of LogScan
+	*/
+
+	/**
+		Read a log record into the byte array provided.  Resize the input
+		stream byte array if necessary.
+
+		@return the length of the data written into data, or -1 if the end of the
+		scan has been reached.
+
+		@exception StandardException Standard Cloudscape error policy
+	*/
+	public LogRecord getNextRecord(ArrayInputStream input, 
+								   TransactionId tranId, 
+								   int groupmask)
+		 throws StandardException
+	{
+		try
+		{
+			boolean candidate;
+			int peekAmount = LogRecord.formatOverhead() + LogRecord.maxGroupStoredSize();
+			if (tranId != null)
+				peekAmount += LogRecord.maxTransactionIdStoredSize(tranId);
+			int readAmount;		// the number of bytes actually read
+
+			LogRecord lr;
+
+			do
+			{
+				if (!open || !positionToNextRecord()) 
+					return null;
+
+				int checkLength;
+
+				// this log record is a candidate unless proven otherwise
+				lr = null;
+				candidate = true;
+				readAmount = -1;
+
+				currentInstant = scan.readLong();
+				byte[] data = input.getData();
+				if (data.length < nextRecordLength)
+				{
+					// make a new array of sufficient size and reset the arrary
+					// in the input stream
+					data = new byte[nextRecordLength];
+					input.setData(data);
+				}
+
+				if (logFactory.databaseEncrypted())
+				{
+					scan.readFully(data, 0, nextRecordLength);
+					int len = logFactory.decrypt(data, 0, nextRecordLength, data, 0);
+					if (SanityManager.DEBUG)
+						SanityManager.ASSERT(len == nextRecordLength);
+					input.setLimit(0, len);
+
+				}
+				else // no need to decrypt, only get the group and tid if we filter 
+				{
+					if (groupmask == 0 && tranId == null)
+					{
+						// no filter, get the whole thing
+						scan.readFully(data, 0, nextRecordLength);
+						input.setLimit(0, nextRecordLength);
+					}
+					else
+					{
+						// Read only enough so that group and the tran id is in
+						// the data buffer.  Group is stored as compressed int
+						// and tran id is stored as who knows what.  read min
+						// of peekAmount or nextRecordLength
+						readAmount = (nextRecordLength > peekAmount) ?
+							peekAmount : nextRecordLength; 
+
+						// in the data buffer, we now have enough to peek
+						scan.readFully(data, 0, readAmount);
+						input.setLimit(0, readAmount);
+
+					}
+				}
+
+				lr = (LogRecord) input.readObject();
+
+				if (groupmask != 0 || tranId != null)
+				{
+					if (groupmask != 0 && (groupmask & lr.group()) == 0)
+						candidate = false; // no match, throw this log record out 
+
+					if (candidate && tranId != null)
+					{
+						TransactionId tid = lr.getTransactionId();
+						if (!tid.equals(tranId)) // nomatch
+							candidate = false; // throw this log record out
+					}
+
+					// if this log record is not filtered out, we need to read
+					// in the rest of the log record to the input buffer.
+					// Except if it is an encrypted database, in which case the
+					// entire log record have already be read in for
+					// decryption.
+
+					if (candidate && !logFactory.databaseEncrypted())
+					{
+						// read the rest of the log into the buffer
+						if (SanityManager.DEBUG)
+							SanityManager.ASSERT(readAmount > 0);
+
+						if (readAmount < nextRecordLength)
+						{
+							// Need to remember where we are because the log
+							// record may have read part of it off the input
+							// stream already and that position is lost when we
+							// set limit again.
+							int inputPosition = input.getPosition();
+
+							scan.readFully(data, readAmount,
+										   nextRecordLength-readAmount); 
+
+							input.setLimit(0, nextRecordLength);
+							input.setPosition(inputPosition);
+						}
+					}
+				}
+
+				if (candidate || logFactory.databaseEncrypted())
+				{
+					checkLength = scan.readInt();
+
+					if (SanityManager.DEBUG)
+					{
+						SanityManager.ASSERT(checkLength == nextRecordLength, "log currupted");
+					}
+				}
+				else // chances are, we haven't read all of the log record, skip it
+				{
+					// the starting record position is in the currentInstant,
+					// calculate the next record starting position using that
+					// and the nextRecordLength
+					long nextRecordStartPosition =
+						LogCounter.getLogFilePosition(currentInstant) +
+						nextRecordLength + LogToFile.LOG_RECORD_OVERHEAD;
+
+					scan.seek(nextRecordStartPosition);
+				}
+
+			} while (candidate == false);
+
+			return lr;
+		}
+		catch (ClassNotFoundException cnfe)
+		{
+			throw logFactory.markCorrupt(
+                StandardException.newException(SQLState.LOG_CORRUPTED, cnfe));
+		}
+		catch (IOException ioe)
+		{
+			throw logFactory.markCorrupt(
+                StandardException.newException(SQLState.LOG_IO_ERROR, ioe));
+		}
+	}
+
+	/**
+		Reset the scan to the given LogInstant.
+
+		@param instant the position to reset to
+		@exception IOException scan cannot access the log at the new position.
+	*/
+	public void resetPosition(LogInstant instant) throws IOException
+	{
+        if (SanityManager.DEBUG)
+        {
+    		SanityManager.THROWASSERT("Unsupported feature");
+    	}
+	}
+
+	/**
+		Get the log instant that is right after the record just retrived
+		@return INVALID_LOG_INSTANT if this is not a FORWARD scan or, no
+		record have been returned yet or the scan has completed.
+	*/
+	public long getLogRecordEnd()
+	{
+        if (SanityManager.DEBUG)
+        {
+    		SanityManager.THROWASSERT("Unsupported feature");
+    	}
+		return LogCounter.INVALID_LOG_INSTANT;
+	}
+
+	
+	/**
+	   returns true if there is partially writen log records before the crash 
+	   in the last log file. Partiall wrires are identified during forward 
+	   scans for log recovery.
+	 */
+	public boolean isLogEndFuzzy()
+	{
+		if (SanityManager.DEBUG)
+        {
+    		SanityManager.THROWASSERT("Unsupported feature");
+    	}
+		return false;
+	}
+
+	/**
+		Return the log instant (as an integer) the scan is currently on - this is the log
+		instant of the log record that was returned by getNextRecord.
+	*/
+	public long getInstant()
+	{
+		return currentInstant;
+	}
+
+	/**
+		Return the log instant the scan is currently on - this is the log
+		instant of the log record that was returned by getNextRecord.
+	*/
+	public LogInstant getLogInstant()
+	{
+		if (currentInstant == LogCounter.INVALID_LOG_INSTANT)
+			return null;
+		else
+			return new LogCounter(currentInstant);
+	}
+
+	/**
+		Close the scan.
+	*/
+	public void close()
+	{
+		if (scan != null)
+		{
+			try
+			{
+				scan.close();
+			}
+			catch (IOException ioe)
+			{}
+
+			scan = null;
+		}
+		currentInstant = LogCounter.INVALID_LOG_INSTANT;
+		open = false;
+	}
+
+	/*
+	  Private methods.
+	  */
+	private void setFirstUnflushed()
+		 throws StandardException, IOException
+	{
+		LogInstant firstUnflushedInstant =
+			logFactory.getFirstUnflushedInstant();
+		firstUnflushed = ((LogCounter)firstUnflushedInstant).getValueAsLong();
+		firstUnflushedFileNumber = LogCounter.getLogFileNumber(firstUnflushed);
+		firstUnflushedFilePosition = LogCounter.getLogFilePosition(firstUnflushed);
+
+		setCurrentLogFileFirstUnflushedPosition();
+	}
+
+	private void setCurrentLogFileFirstUnflushedPosition()
+		 throws IOException
+	{
+		/*
+		  Note we get the currentLogFileLength without synchronization.
+		  This is safe because one of the following cases apply:
+
+		  <OL>
+		  <LI> The end of the flushed section of the log is in another file.
+		  In this case the end of the current file will not change.
+		  <LI> The end of the log is in this file. In this case we
+		  end our scan at the firstUnflushedInstant and do not use
+		  currentLogFileLength.
+		  </OL>
+		  */
+		if (currentLogFileNumber == firstUnflushedFileNumber)
+			currentLogFileFirstUnflushedPosition = firstUnflushedFilePosition;
+		else if (currentLogFileNumber < firstUnflushedFileNumber)
+			currentLogFileFirstUnflushedPosition = scan.length();
+		else
+        {
+			// RESOLVE 
+		   	throw new IOException(
+                MessageService.getTextMessage(MessageId.LOG_BAD_START_INSTANT));
+		}
+	}
+
+	private void switchLogFile()
+		 throws StandardException
+	{
+		try
+		{
+			readNextRecordLength = false;
+			scan.close();
+			scan = null;
+			scan = logFactory.getLogFileAtBeginning(++currentLogFileNumber);
+			setCurrentLogFileFirstUnflushedPosition();
+		}
+
+		catch (IOException ioe)
+		{
+			throw logFactory.markCorrupt(
+                StandardException.newException(SQLState.LOG_IO_ERROR, ioe));
+		}
+	}
+
+	/**
+	  The length of the next record. Read from scan and set by
+	  currentLogFileHasUnflushedRecord. This is used to retain the length of a
+	  log record in the case currentLogFileHasUnflushedRecord reads the length
+	  and determines that some bytes in the log record are not yet flushed.
+	  */
+	int nextRecordLength;
+
+	/**
+	  Flag to indicate that the length of the next log record has been read by
+	  currentLogFileHasUnflushedRecord.
+
+	  This flag gets reset in two ways:
+
+	  <OL>
+	  <LI> currentLogFileHasUnflushedRecord determines that the entire log
+	  record is flushed and returns true. In this case getNextRecord reads and
+	  returns the log record.
+	  <LI> we switch log files --due to a partial log record at the end of an
+	  old log file.
+	  </OL>
+	  */
+	boolean readNextRecordLength;
+
+	private boolean currentLogFileHasUnflushedRecord()
+		 throws IOException
+	{
+		if (SanityManager.DEBUG)
+			SanityManager.ASSERT(scan != null, "scan is null");
+		long curPos = scan.getFilePointer();
+
+		if (!readNextRecordLength)
+		{
+			if (curPos + LOG_REC_LEN_BYTE_LENGTH >
+				                 currentLogFileFirstUnflushedPosition)
+				return false;
+
+			nextRecordLength = scan.readInt();
+			curPos+=4;
+			readNextRecordLength = true;
+		}
+
+		if (nextRecordLength==0) return false;
+
+		int bytesNeeded =
+			nextRecordLength + LOG_REC_LEN_BYTE_LENGTH;
+
+		if (curPos + bytesNeeded > currentLogFileFirstUnflushedPosition)
+		{
+			return false;
+		}
+		else
+		{
+			readNextRecordLength = false;
+			return true;
+		}
+	}
+
+	private boolean positionToNextRecord()
+		 throws StandardException, IOException
+	{
+		//If the flushed section of the current log file contains our record we
+		//simply return.
+		if (currentLogFileHasUnflushedRecord()) return true;
+
+		//Update our cached copy of the first unflushed instant.
+		setFirstUnflushed();
+
+		//In the call to setFirstUnflushed, we may have noticed that the current
+		//log file really does contain our record. If so we simply return.
+		if (currentLogFileHasUnflushedRecord()) return true;
+
+		//Our final chance of finding a record is if we are not scanning the log
+		//file with the last flushed instant we can switch logfiles. Note that
+		//we do this in a loop to cope with empty log files.
+		while(currentLogFileNumber < firstUnflushedFileNumber)
+		{
+			  switchLogFile();
+		      if (currentLogFileHasUnflushedRecord()) return true;
+		}
+
+		//The log contains no more flushed log records so we return false.
+		currentInstant = LogCounter.INVALID_LOG_INSTANT;
+		return false;
+	}
 }

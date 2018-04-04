@@ -1,6 +1,6 @@
-zkClientTimeout);
+s += " " + numTermDeletes.get() + " deleted terms (unique count=" + terms.size() + ")";
 
-package org.apache.solr.client.solrj.impl;
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,164 +19,145 @@ package org.apache.solr.client.solrj.impl;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.net.MalformedURLException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
-import java.util.Set;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.solr.client.solrj.SolrRequest;
-import org.apache.solr.client.solrj.SolrServer;
-import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.cloud.CloudState;
-import org.apache.solr.common.cloud.Slice;
-import org.apache.solr.common.cloud.ZkNodeProps;
-import org.apache.solr.common.cloud.ZkStateReader;
-import org.apache.solr.common.cloud.ZooKeeperException;
-import org.apache.solr.common.util.NamedList;
-import org.apache.zookeeper.KeeperException;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.util.RamUsageEstimator;
 
-public class CloudSolrServer extends SolrServer {
-  private volatile ZkStateReader zkStateReader;
-  private String zkHost; // the zk server address
-  private int zkConnectTimeout = 10000;
-  private int zkClientTimeout = 10000;
-  private String defaultCollection;
-  private LBHttpSolrServer lbServer;
-  Random rand = new Random();
+/* Holds buffered deletes, by docID, term or query for a
+ * single segment. This is used to hold buffered pending
+ * deletes against the to-be-flushed segment.  Once the
+ * deletes are pushed (on flush in DocumentsWriter), these
+ * deletes are converted to a FrozenDeletes instance. */
 
-  /**
-   * @param zkHost The address of the zookeeper quorum containing the cloud state
-   */
-  public CloudSolrServer(String zkHost) throws MalformedURLException {
-      this(zkHost, new LBHttpSolrServer());
+// NOTE: we are sync'd by BufferedDeletes, ie, all access to
+// instances of this class is via sync'd methods on
+// BufferedDeletes
+
+class BufferedDeletes {
+
+  /* Rough logic: HashMap has an array[Entry] w/ varying
+     load factor (say 2 * POINTER).  Entry is object w/ Term
+     key, Integer val, int hash, Entry next
+     (OBJ_HEADER + 3*POINTER + INT).  Term is object w/
+     String field and String text (OBJ_HEADER + 2*POINTER).
+     Term's field is String (OBJ_HEADER + 4*INT + POINTER +
+     OBJ_HEADER + string.length*CHAR).
+     Term's text is String (OBJ_HEADER + 4*INT + POINTER +
+     OBJ_HEADER + string.length*CHAR).  Integer is
+     OBJ_HEADER + INT. */
+  final static int BYTES_PER_DEL_TERM = 9*RamUsageEstimator.NUM_BYTES_OBJECT_REF + 7*RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + 10*RamUsageEstimator.NUM_BYTES_INT;
+
+  /* Rough logic: del docIDs are List<Integer>.  Say list
+     allocates ~2X size (2*POINTER).  Integer is OBJ_HEADER
+     + int */
+  final static int BYTES_PER_DEL_DOCID = 2*RamUsageEstimator.NUM_BYTES_OBJECT_REF + RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + RamUsageEstimator.NUM_BYTES_INT;
+
+  /* Rough logic: HashMap has an array[Entry] w/ varying
+     load factor (say 2 * POINTER).  Entry is object w/
+     Query key, Integer val, int hash, Entry next
+     (OBJ_HEADER + 3*POINTER + INT).  Query we often
+     undercount (say 24 bytes).  Integer is OBJ_HEADER + INT. */
+  final static int BYTES_PER_DEL_QUERY = 5*RamUsageEstimator.NUM_BYTES_OBJECT_REF + 2*RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + 2*RamUsageEstimator.NUM_BYTES_INT + 24;
+
+  final AtomicInteger numTermDeletes = new AtomicInteger();
+  final Map<Term,Integer> terms = new HashMap<Term,Integer>();
+  final Map<Query,Integer> queries = new HashMap<Query,Integer>();
+  final List<Integer> docIDs = new ArrayList<Integer>();
+
+  public static final Integer MAX_INT = Integer.valueOf(Integer.MAX_VALUE);
+
+  final AtomicLong bytesUsed;
+
+  private final static boolean VERBOSE_DELETES = false;
+
+  long gen;
+  public BufferedDeletes() {
+    this(new AtomicLong());
   }
 
-  /**
-   * @param zkHost The address of the zookeeper quorum containing the cloud state
-   */
-  public CloudSolrServer(String zkHost, LBHttpSolrServer lbServer) {
-    System.out.println("new cloud server");
-    this.zkHost = zkHost;
-    this.lbServer = lbServer;
+  BufferedDeletes(AtomicLong bytesUsed) {
+    assert bytesUsed != null;
+    this.bytesUsed = bytesUsed;
   }
-
-  /** Sets the default collection for request */
-  public void setDefaultCollection(String collection) {
-    this.defaultCollection = collection;
-  }
-
-  /** Set the connect timeout to the zookeeper ensemble in ms */
-  public void setZkConnectTimeout(int zkConnectTimeout) {
-    this.zkConnectTimeout = zkConnectTimeout;
-  }
-
-  /** Set the timeout to the zookeeper ensemble in ms */
-  public void setZkClientTimeout(int zkClientTimeout) {
-    this.zkClientTimeout = zkClientTimeout;
-  }
-
-  /**
-   * Connect to the zookeeper ensemble.
-   * This is an optional method that may be used to force a connect before any other requests are sent.
-   *
-   * @throws IOException
-   * @throws TimeoutException
-   * @throws InterruptedException
-   */
-  public void connect() {
-    if (zkStateReader == null) {
-      synchronized (this) {
-        if (zkStateReader == null) {
-          try {
-            ZkStateReader zk = new ZkStateReader(zkHost, zkConnectTimeout,
-                zkClientTimeout, true);
-            zk.createClusterStateWatchersAndUpdate();
-            zkStateReader = zk;
-          } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                "", e);
-          } catch (KeeperException e) {
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                "", e);
-          } catch (IOException e) {
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                "", e);
-          } catch (TimeoutException e) {
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                "", e);
-          }
-        }
-      }
-    }
-  }
-
 
   @Override
-  public NamedList<Object> request(SolrRequest request) throws SolrServerException, IOException {
-    connect();
-
-    // TODO: if you can hash here, you could favor the shard leader
-    
-    CloudState cloudState = zkStateReader.getCloudState();
-
-    String collection = request.getParams().get("collection", defaultCollection);
-
-    // TODO: allow multiple collections to be specified via comma separated list
-
-    Map<String,Slice> slices = cloudState.getSlices(collection);
-    
-    if (slices == null) {
-      throw new RuntimeException("Could not find collection in zk: " + cloudState);
-    }
-    
-    Set<String> liveNodes = cloudState.getLiveNodes();
-
-    // IDEA: have versions on various things... like a global cloudState version
-    // or shardAddressVersion (which only changes when the shards change)
-    // to allow caching.
-
-    // build a map of unique nodes
-    // TODO: allow filtering by group, role, etc
-    Map<String,ZkNodeProps> nodes = new HashMap<String,ZkNodeProps>();
-    List<String> urlList = new ArrayList<String>();
-    for (Slice slice : slices.values()) {
-      for (ZkNodeProps nodeProps : slice.getShards().values()) {
-        String node = nodeProps.get(ZkStateReader.NODE_NAME_PROP);
-        if (!liveNodes.contains(nodeProps
-            .get(ZkStateReader.NODE_NAME_PROP))
-            && !nodeProps.get(ZkStateReader.STATE_PROP).equals(
-                ZkStateReader.RECOVERING)) continue;
-        if (nodes.put(node, nodeProps) == null) {
-          String url = nodeProps.get(ZkStateReader.URL_PROP);
-          urlList.add(url);
-        }
+  public String toString() {
+    if (VERBOSE_DELETES) {
+      return "gen=" + gen + " numTerms=" + numTermDeletes + ", terms=" + terms
+        + ", queries=" + queries + ", docIDs=" + docIDs + ", bytesUsed="
+        + bytesUsed;
+    } else {
+      String s = "gen=" + gen;
+      if (numTermDeletes.get() != 0) {
+        s += " " + numTermDeletes.get() + " deleted terms (unique count=" + terms.size() + ") terms=" + terms.keySet();
       }
-    }
+      if (queries.size() != 0) {
+        s += " " + queries.size() + " deleted queries";
+      }
+      if (docIDs.size() != 0) {
+        s += " " + docIDs.size() + " deleted docIDs";
+      }
+      if (bytesUsed.get() != 0) {
+        s += " bytesUsed=" + bytesUsed.get();
+      }
 
-    Collections.shuffle(urlList, rand);
-    // System.out.println("########################## MAKING REQUEST TO " + urlList);
-    // TODO: set distrib=true if we detected more than one shard?
-    LBHttpSolrServer.Req req = new LBHttpSolrServer.Req(request, urlList);
-    LBHttpSolrServer.Rsp rsp = lbServer.request(req);
-    return rsp.getResponse();
+      return s;
+    }
   }
 
-  public void close() {
-    if (zkStateReader != null) {
-      synchronized(this) {
-        if (zkStateReader!= null)
-          zkStateReader.close();
-        zkStateReader = null;
-      }
+  public void addQuery(Query query, int docIDUpto) {
+    Integer current = queries.put(query, docIDUpto);
+    // increment bytes used only if the query wasn't added so far.
+    if (current == null) {
+      bytesUsed.addAndGet(BYTES_PER_DEL_QUERY);
     }
+  }
+
+  public void addDocID(int docID) {
+    docIDs.add(Integer.valueOf(docID));
+    bytesUsed.addAndGet(BYTES_PER_DEL_DOCID);
+  }
+
+  public void addTerm(Term term, int docIDUpto) {
+    Integer current = terms.get(term);
+    if (current != null && docIDUpto < current) {
+      // Only record the new number if it's greater than the
+      // current one.  This is important because if multiple
+      // threads are replacing the same doc at nearly the
+      // same time, it's possible that one thread that got a
+      // higher docID is scheduled before the other
+      // threads.  If we blindly replace than we can
+      // incorrectly get both docs indexed.
+      return;
+    }
+
+    terms.put(term, Integer.valueOf(docIDUpto));
+    numTermDeletes.incrementAndGet();
+    if (current == null) {
+      bytesUsed.addAndGet(BYTES_PER_DEL_TERM + term.bytes.length + (RamUsageEstimator.NUM_BYTES_CHAR * term.field().length()));
+    }
+  }
+ 
+  void clear() {
+    terms.clear();
+    queries.clear();
+    docIDs.clear();
+    numTermDeletes.set(0);
+    bytesUsed.set(0);
+  }
+  
+  void clearDocIDs() {
+    bytesUsed.addAndGet(-docIDs.size()*BYTES_PER_DEL_DOCID);
+    docIDs.clear();
+  }
+  
+  boolean any() {
+    return terms.size() > 0 || docIDs.size() > 0 || queries.size() > 0;
   }
 }

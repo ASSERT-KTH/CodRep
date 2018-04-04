@@ -1,4 +1,4 @@
-TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory(true,
+ObjectName query = new ObjectName("org.apache.cassandra.db:type=ColumnFamilies,*");
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,212 +18,467 @@ TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory(true,
  * limitations under the License.
  */
 
-package org.apache.cassandra.thrift;
+package org.apache.cassandra.tools;
 
 import java.io.IOException;
+import java.io.PrintStream;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
+import java.lang.management.RuntimeMXBean;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import javax.management.JMX;
+import javax.management.MBeanServerConnection;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
+import javax.management.remote.JMXConnector;
+import javax.management.remote.JMXConnectorFactory;
+import javax.management.remote.JMXServiceURL;
 
+import org.apache.cassandra.cache.JMXInstrumentedCacheMBean;
+import org.apache.cassandra.concurrent.IExecutorMBean;
 import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStoreMBean;
 import org.apache.cassandra.db.CompactionManager;
-import org.apache.cassandra.db.SystemTable;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.db.migration.Migration;
-import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Mx4jTool;
-import org.apache.thrift.TProcessorFactory;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.protocol.TProtocolFactory;
-import org.apache.thrift.server.TServer;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TServerSocket;
-import org.apache.thrift.transport.TTransportException;
-import org.apache.thrift.transport.TTransportFactory;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.db.CompactionManagerMBean;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.StorageServiceMBean;
+import org.apache.cassandra.streaming.StreamingService;
+import org.apache.cassandra.streaming.StreamingServiceMBean;
+import org.apache.cassandra.thrift.UnavailableException;
+
+import static com.google.common.base.Charsets.UTF_8;
 
 /**
- * This class supports two methods for creating a Cassandra node daemon, 
- * invoking the class's main method, and using the jsvc wrapper from 
- * commons-daemon, (for more information on using this class with the 
- * jsvc wrapper, see the 
- * <a href="http://commons.apache.org/daemon/jsvc.html">Commons Daemon</a>
- * documentation).
+ * JMX client operations for Cassandra.
  */
-
-public class CassandraDaemon extends org.apache.cassandra.service.AbstractCassandraDaemon
+public class NodeProbe
 {
-    private static Logger logger = LoggerFactory.getLogger(CassandraDaemon.class);
-    private TServer serverEngine;
+    private static final String fmtUrl = "service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi";
+    private static final String ssObjName = "org.apache.cassandra.service:type=StorageService";
+    private static final int defaultPort = 8080;
+    private String host;
+    private int port;
 
-    protected void setup() throws IOException
+    private MBeanServerConnection mbeanServerConn;
+    private StorageServiceMBean ssProxy;
+    private MemoryMXBean memProxy;
+    private RuntimeMXBean runtimeProxy;
+    private CompactionManagerMBean mcmProxy;
+    private StreamingServiceMBean streamProxy;
+    
+    /**
+     * Creates a NodeProbe using the specified JMX host and port.
+     * 
+     * @param host hostname or IP address of the JMX agent
+     * @param port TCP port of the remote JMX agent
+     * @throws IOException on connection failures
+     */
+    public NodeProbe(String host, int port) throws IOException, InterruptedException
     {
-        int listenPort = DatabaseDescriptor.getRpcPort();
-        InetAddress listenAddr = DatabaseDescriptor.getRpcAddress();
+        this.host = host;
+        this.port = port;
+        connect();
+    }
+    
+    /**
+     * Creates a NodeProbe using the specified JMX host and default port.
+     * 
+     * @param host hostname or IP address of the JMX agent
+     * @throws IOException on connection failures
+     */
+    public NodeProbe(String host) throws IOException, InterruptedException
+    {
+        this.host = host;
+        this.port = defaultPort;
+        connect();
+    }
+    
+    /**
+     * Create a connection to the JMX agent and setup the M[X]Bean proxies.
+     * 
+     * @throws IOException on connection failures
+     */
+    private void connect() throws IOException
+    {
+        JMXServiceURL jmxUrl = new JMXServiceURL(String.format(fmtUrl, host, port));
+        JMXConnector jmxc = JMXConnectorFactory.connect(jmxUrl, null);
+        mbeanServerConn = jmxc.getMBeanServerConnection();
         
-        /* 
-         * If ThriftAddress was left completely unconfigured, then assume
-         * the same default as ListenAddress
-         */
-        if (listenAddr == null)
-            listenAddr = FBUtilities.getLocalAddress();
-        
-        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler()
-        {
-            public void uncaughtException(Thread t, Throwable e)
-            {
-                logger.error("Uncaught exception in thread " + t, e);
-                if (e instanceof OutOfMemoryError)
-                {
-                    System.exit(100);
-                }
-            }
-        });
-        
-        // check the system table for mismatched partitioner.
         try
         {
-            SystemTable.checkHealth();
-        }
-        catch (ConfigurationException e)
+            ObjectName name = new ObjectName(ssObjName);
+            ssProxy = JMX.newMBeanProxy(mbeanServerConn, name, StorageServiceMBean.class);
+            name = new ObjectName(CompactionManager.MBEAN_OBJECT_NAME);
+            mcmProxy = JMX.newMBeanProxy(mbeanServerConn, name, CompactionManagerMBean.class);
+            name = new ObjectName(StreamingService.MBEAN_OBJECT_NAME);
+            streamProxy = JMX.newMBeanProxy(mbeanServerConn, name, StreamingServiceMBean.class);
+        } catch (MalformedObjectNameException e)
         {
-            logger.error("Fatal exception during initialization", e);
-            System.exit(100);
+            throw new RuntimeException(
+                    "Invalid ObjectName? Please report this as a bug.", e);
         }
+        
+        memProxy = ManagementFactory.newPlatformMXBeanProxy(mbeanServerConn, 
+                ManagementFactory.MEMORY_MXBEAN_NAME, MemoryMXBean.class);
+        runtimeProxy = ManagementFactory.newPlatformMXBeanProxy(
+                mbeanServerConn, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+    }
 
+    public void forceTableCleanup() throws IOException
+    {
+        ssProxy.forceTableCleanup();
+    }
+    
+    public void forceTableCompaction() throws IOException
+    {
+        ssProxy.forceTableCompaction();
+    }
+
+    public void forceTableFlush(String tableName, String... columnFamilies) throws IOException
+    {
+        ssProxy.forceTableFlush(tableName, columnFamilies);
+    }
+
+    public void forceTableRepair(String tableName, String... columnFamilies) throws IOException
+    {
+        ssProxy.forceTableRepair(tableName, columnFamilies);
+    }
+    
+    public void drain() throws IOException, InterruptedException, ExecutionException
+    {
+        ssProxy.drain();	
+    }
+    
+    public Map<Token, String> getTokenToEndpointMap()
+    {
+        return ssProxy.getTokenToEndpointMap();
+    }
+
+    public Set<String> getLiveNodes()
+    {
+        return ssProxy.getLiveNodes();
+    }
+
+    public Set<String> getJoiningNodes()
+    {
+        return ssProxy.getJoiningNodes();
+    }
+
+    public Set<String> getLeavingNodes()
+    {
+        return ssProxy.getLeavingNodes();
+    }
+    
+    public Set<String> getUnreachableNodes()
+    {
+        return ssProxy.getUnreachableNodes();
+    }
+    
+    public Map<String, String> getLoadMap()
+    {
+        return ssProxy.getLoadMap();
+    }
+
+    public Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> getColumnFamilyStoreMBeanProxies()
+    {
         try
         {
-            DatabaseDescriptor.loadSchemas();
+            return new ColumnFamilyStoreMBeanIterator(mbeanServerConn);
+        }
+        catch (MalformedObjectNameException e)
+        {
+            throw new RuntimeException("Invalid ObjectName? Please report this as a bug.", e);
         }
         catch (IOException e)
         {
-            logger.error("Fatal exception during initialization", e);
-            System.exit(100);
+            throw new RuntimeException("Could not retrieve list of stat mbeans.", e);
         }
-        
-        // initialize keyspaces
-        for (String table : DatabaseDescriptor.getTables())
-        {
-            if (logger.isDebugEnabled())
-                logger.debug("opening keyspace " + table);
-            Table.open(table);
-        }
+    }
 
-        // replay the log if necessary and check for compaction candidates
-        CommitLog.recover();
-        CompactionManager.instance.checkAllColumnFamilies();
-        
-        // check to see if CL.recovery modified the lastMigrationId. if it did, we need to re apply migrations. this isn't
-        // the same as merely reloading the schema (which wouldn't perform file deletion after a DROP). The solution
-        // is to read those migrations from disk and apply them.
-        UUID currentMigration = DatabaseDescriptor.getDefsVersion();
-        UUID lastMigration = Migration.getLastMigrationId();
-        if ((lastMigration != null) && (lastMigration.timestamp() > currentMigration.timestamp()))
-        {
-            MigrationManager.applyMigrations(currentMigration, lastMigration);
-        }
-        
-        // start server internals
-        StorageService.instance.initServer();
-        
-        // now we start listening for clients
-        final CassandraServer cassandraServer = new CassandraServer();
-        Cassandra.Processor processor = new Cassandra.Processor(cassandraServer);
-
-        // Transport
-        TServerSocket tServerSocket = null;
-        
+    public JMXInstrumentedCacheMBean getKeyCacheMBean(String tableName, String cfName)
+    {
+        String keyCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "KeyCache";
         try
         {
-            tServerSocket = new TServerSocket(new InetSocketAddress(listenAddr, listenPort));
-        } catch (TTransportException e)
-        {
-            throw new IOException(String.format(
-                    "Unable to create thrift socket to %s:%s", listenAddr,
-                    listenPort), e);
+            return JMX.newMBeanProxy(mbeanServerConn, new ObjectName(keyCachePath), JMXInstrumentedCacheMBean.class);
         }
-        
-        logger.info(String.format("Binding thrift service to %s:%s", listenAddr, listenPort));
-
-        // Protocol factory
-        TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory(false, 
-                                                                        true, 
-                                                                        DatabaseDescriptor.getThriftMaxMessageLength());
-        
-        // Transport factory
-        TTransportFactory inTransportFactory, outTransportFactory;
-        if (DatabaseDescriptor.isThriftFramed())
+        catch (MalformedObjectNameException e)
         {
-            int tFramedTransportSize = DatabaseDescriptor.getThriftFramedTransportSize();
-            inTransportFactory = new TFramedTransport.Factory(tFramedTransportSize);
-            outTransportFactory = new TFramedTransport.Factory(tFramedTransportSize);
-            logger.info("Using TFramedTransport with a max frame size of {} bytes.", tFramedTransportSize);
-            
+            throw new RuntimeException(e);
         }
-        else
-        {
-            inTransportFactory = new TTransportFactory();
-            outTransportFactory = new TTransportFactory();
-        }
-
-
-        // ThreadPool Server
-        CustomTThreadPoolServer.Options options = new CustomTThreadPoolServer.Options();
-        options.minWorkerThreads = 64;
-
-        SynchronousQueue<Runnable> executorQueue = new SynchronousQueue<Runnable>();
-
-        ExecutorService executorService = new ThreadPoolExecutor(options.minWorkerThreads,
-                                                                 options.maxWorkerThreads,
-                                                                 60,
-                                                                 TimeUnit.SECONDS,
-                                                                 executorQueue)
-        {
-            @Override
-            protected void afterExecute(Runnable r, Throwable t)
-            {
-                super.afterExecute(r, t);
-                cassandraServer.logout();
-            }
-        };
-        serverEngine = new CustomTThreadPoolServer(new TProcessorFactory(processor),
-                                             tServerSocket,
-                                             inTransportFactory,
-                                             outTransportFactory,
-                                             tProtocolFactory,
-                                             tProtocolFactory,
-                                             options,
-                                             executorService);
-    }
-
-    /** hook for JSVC */
-    public void start()
-    {
-        logger.info("Listening for thrift clients...");
-        Mx4jTool.maybeLoad();
-        serverEngine.serve();
-    }
-
-    /** hook for JSVC */
-    public void stop()
-    {
-        // this doesn't entirely shut down Cassandra, just the Thrift server.
-        // jsvc takes care of taking the rest down
-        logger.info("Cassandra shutting down...");
-        serverEngine.stop();
     }
     
-    public static void main(String[] args)
+    public JMXInstrumentedCacheMBean getRowCacheMBean(String tableName, String cfName)
     {
-        new CassandraDaemon().activate();
+        String rowCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "RowCache";
+        try
+        {
+            return JMX.newMBeanProxy(mbeanServerConn, new ObjectName(rowCachePath), JMXInstrumentedCacheMBean.class);
+        }
+        catch (MalformedObjectNameException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
+
+    public String getToken()
+    {
+        return ssProxy.getToken();
+    }
+    
+    public String getLoadString()
+    {
+        return ssProxy.getLoadString();
+    }
+
+    public String getReleaseVersion()
+    {
+        return ssProxy.getReleaseVersion();
+    }
+
+    public int getCurrentGenerationNumber()
+    {
+        return ssProxy.getCurrentGenerationNumber();
+    }
+    
+    public long getUptime()
+    {
+        return runtimeProxy.getUptime();
+    }
+    
+    public MemoryUsage getHeapMemoryUsage()
+    {
+        return memProxy.getHeapMemoryUsage();
+    }
+    
+    /**
+     * Take a snapshot of all the tables.
+     * 
+     * @param snapshotName the name of the snapshot.
+     */
+    public void takeSnapshot(String snapshotName) throws IOException
+    {
+        ssProxy.takeAllSnapshot(snapshotName);
+    }
+
+    /**
+     * Remove all the existing snapshots.
+     */
+    public void clearSnapshot() throws IOException
+    {
+        ssProxy.clearSnapshot();
+    }
+
+    public void decommission() throws InterruptedException
+    {
+        ssProxy.decommission();
+    }
+
+    public void loadBalance() throws IOException, InterruptedException
+    {
+        ssProxy.loadBalance();
+    }
+
+    public void move(String newToken) throws IOException, InterruptedException
+    {
+        ssProxy.move(newToken);
+    }
+
+    public void removeToken(String token)
+    {
+        ssProxy.removeToken(token);
+    }
+  
+    public Iterator<Map.Entry<String, IExecutorMBean>> getThreadPoolMBeanProxies()
+    {
+        try
+        {
+            return new ThreadPoolProxyMBeanIterator(mbeanServerConn);
+        }
+        catch (MalformedObjectNameException e)
+        {
+            throw new RuntimeException("Invalid ObjectName? Please report this as a bug.", e);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Could not retrieve list of stat mbeans.", e);
+        }
+    }
+
+    /**
+     * Get the compaction threshold
+     *
+     * @param outs the stream to write to
+     */
+    public void getCompactionThreshold(PrintStream outs)
+    {
+        outs.println("Current compaction threshold: Min=" +  mcmProxy.getMinimumCompactionThreshold() +
+            ", Max=" +  mcmProxy.getMaximumCompactionThreshold());
+    }
+
+    /**
+     * Set the compaction threshold
+     *
+     * @param minimumCompactionThreshold minimum compaction threshold
+     * @param maximumCompactionThreshold maximum compaction threshold
+     */
+    public void setCompactionThreshold(int minimumCompactionThreshold, int maximumCompactionThreshold)
+    {
+        mcmProxy.setMinimumCompactionThreshold(minimumCompactionThreshold);
+        if (maximumCompactionThreshold >= 0)
+        {
+             mcmProxy.setMaximumCompactionThreshold(maximumCompactionThreshold);
+        }
+    }
+
+    public void setCacheCapacities(String tableName, String cfName, int keyCacheCapacity, int rowCacheCapacity)
+    {
+        try
+        {
+            String keyCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "KeyCache";
+            JMXInstrumentedCacheMBean keyCacheMBean = JMX.newMBeanProxy(mbeanServerConn, new ObjectName(keyCachePath), JMXInstrumentedCacheMBean.class);
+            keyCacheMBean.setCapacity(keyCacheCapacity);
+
+            String rowCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "RowCache";
+            JMXInstrumentedCacheMBean rowCacheMBean = null;
+            rowCacheMBean = JMX.newMBeanProxy(mbeanServerConn, new ObjectName(rowCachePath), JMXInstrumentedCacheMBean.class);
+            rowCacheMBean.setCapacity(rowCacheCapacity);
+        }
+        catch (MalformedObjectNameException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public List<InetAddress> getEndpoints(String keyspace, String key)
+    {
+        // FIXME: string key
+        return ssProxy.getNaturalEndpoints(keyspace, key.getBytes(UTF_8));
+    }
+
+    public Set<InetAddress> getStreamDestinations()
+    {
+        return streamProxy.getStreamDestinations();
+    }
+
+    public List<String> getFilesDestinedFor(InetAddress host) throws IOException
+    {
+        return streamProxy.getOutgoingFiles(host.getHostAddress());
+    }
+
+    public Set<InetAddress> getStreamSources()
+    {
+        return streamProxy.getStreamSources();
+    }
+
+    public List<String> getIncomingFiles(InetAddress host) throws IOException
+    {
+        return streamProxy.getIncomingFiles(host.getHostAddress());
+    }
+
+    public String getOperationMode()
+    {
+        return ssProxy.getOperationMode();
+    }
+
+    public void truncate(String tableName, String cfName)
+    {
+        try
+        {
+            ssProxy.truncate(tableName, cfName);
+        }
+        catch (UnavailableException e)
+        {
+            throw new RuntimeException("Error while executing truncate", e);
+        }
+        catch (TimeoutException e)
+        {
+            throw new RuntimeException("Error while executing truncate", e);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Error while executing truncate", e);
+        }
+    }
+    
+    @Deprecated
+    public void loadSchemaFromYAML() throws ConfigurationException, IOException
+    {
+        ssProxy.loadSchemaFromYAML();
+    }
+    
+    public String exportSchemaToYAML() throws IOException
+    {
+        return ssProxy.exportSchema();
+    }
+}
+
+class ColumnFamilyStoreMBeanIterator implements Iterator<Map.Entry<String, ColumnFamilyStoreMBean>>
+{
+    private Iterator<ObjectName> resIter;
+    private MBeanServerConnection mbeanServerConn;
+    
+    public ColumnFamilyStoreMBeanIterator(MBeanServerConnection mbeanServerConn)
+    throws MalformedObjectNameException, NullPointerException, IOException
+    {
+        ObjectName query = new ObjectName("org.apache.cassandra.db:type=ColumnFamilyStores,*");
+        resIter = mbeanServerConn.queryNames(query, null).iterator();
+        this.mbeanServerConn = mbeanServerConn;
+    }
+
+    public boolean hasNext()
+    {
+        return resIter.hasNext();
+    }
+
+    public Entry<String, ColumnFamilyStoreMBean> next()
+    {
+        ObjectName objectName = resIter.next();
+        String tableName = objectName.getKeyProperty("keyspace");
+        ColumnFamilyStoreMBean cfsProxy = JMX.newMBeanProxy(mbeanServerConn, objectName, ColumnFamilyStoreMBean.class);
+        return new AbstractMap.SimpleImmutableEntry<String, ColumnFamilyStoreMBean>(tableName, cfsProxy);
+    }
+
+    public void remove()
+    {
+        throw new UnsupportedOperationException();
+    }
+}
+
+class ThreadPoolProxyMBeanIterator implements Iterator<Map.Entry<String, IExecutorMBean>>
+{
+    private Iterator<ObjectName> resIter;
+    private MBeanServerConnection mbeanServerConn;
+    
+    public ThreadPoolProxyMBeanIterator(MBeanServerConnection mbeanServerConn) 
+    throws MalformedObjectNameException, NullPointerException, IOException
+    {
+        ObjectName query = new ObjectName("org.apache.cassandra.concurrent:type=*");
+        resIter = mbeanServerConn.queryNames(query, null).iterator();
+        this.mbeanServerConn = mbeanServerConn;
+    }
+    
+    public boolean hasNext()
+    {
+        return resIter.hasNext();
+    }
+
+    public Map.Entry<String, IExecutorMBean> next()
+    {
+        ObjectName objectName = resIter.next();
+        String poolName = objectName.getKeyProperty("type");
+        IExecutorMBean threadPoolProxy = JMX.newMBeanProxy(mbeanServerConn, objectName, IExecutorMBean.class);
+        return new AbstractMap.SimpleImmutableEntry<String, IExecutorMBean>(poolName, threadPoolProxy);
+    }
+
+    public void remove()
+    {
+        throw new UnsupportedOperationException();
+    }   
 }

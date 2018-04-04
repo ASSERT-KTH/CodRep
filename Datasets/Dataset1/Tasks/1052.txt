@@ -1,643 +1,530 @@
-return "http://" + hostAndPort + (path.isEmpty() ? "" : ("/" + path));
+if (header.isSafeToDelete() && iter.hasNext())
 
-package org.apache.solr.common.cloud;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements. See the NOTICE file distributed with this
- * work for additional information regarding copyright ownership. The ASF
- * licenses this file to You under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- * http://www.apache.org/licenses/LICENSE-2.0
- * 
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations under
- * the License.
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-import java.io.File;
-import java.io.IOException;
-import java.io.StringReader;
-import java.io.StringWriter;
-import java.io.UnsupportedEncodingException;
-import java.net.URLDecoder;
-import java.util.List;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
+package org.apache.cassandra.db.commitlog;
 
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Source;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.stream.StreamResult;
-import javax.xml.transform.stream.StreamSource;
-
-import org.apache.commons.io.FileUtils;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.cloud.ZkClientConnectionStrategy.ZkUpdate;
-import org.apache.zookeeper.CreateMode;
-import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.KeeperException.NoNodeException;
-import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.ZooDefs;
-import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.KeeperException.NodeExistsException;
-import org.apache.zookeeper.data.ACL;
-import org.apache.zookeeper.data.Stat;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.UnserializableColumnFamilyException;
+import org.apache.cassandra.io.DeletionService;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * 
- * All Solr ZooKeeper interactions should go through this class rather than
- * ZooKeeper. This class handles synchronous connects and reconnections.
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32;
+import java.util.zip.Checksum;
+
+/*
+ * Commit Log tracks every write operation into the system. The aim
+ * of the commit log is to be able to successfully recover data that was
+ * not stored to disk via the Memtable. Every Commit Log maintains a
+ * header represented by the abstraction CommitLogHeader. The header
+ * contains a bit array and an array of longs and both the arrays are
+ * of size, #column families for the Table, the Commit Log represents.
  *
+ * Whenever a ColumnFamily is written to, for the first time its bit flag
+ * is set to one in the CommitLogHeader. When it is flushed to disk by the
+ * Memtable its corresponding bit in the header is set to zero. This helps
+ * track which CommitLogs can be thrown away as a result of Memtable flushes.
+ * Additionally, when a ColumnFamily is flushed and written to disk, its
+ * entry in the array of longs is updated with the offset in the Commit Log
+ * file where it was written. This helps speed up recovery since we can seek
+ * to these offsets and start processing the commit log.
+ *
+ * Every Commit Log is rolled over everytime it reaches its threshold in size;
+ * the new log inherits the "dirty" bits from the old.
+ *
+ * Over time there could be a number of commit logs that would be generated.
+ * To allow cleaning up non-active commit logs, whenever we flush a column family and update its bit flag in
+ * the active CL, we take the dirty bit array and bitwise & it with the headers of the older logs.
+ * If the result is 0, then it is safe to remove the older file.  (Since the new CL
+ * inherited the old's dirty bitflags, getting a zero for any given bit in the anding
+ * means that either the CF was clean in the old CL or it has been flushed since the
+ * switch in the new.)
  */
-public class SolrZkClient {
-  // These should *only* be used for debugging or monitoring purposes
-  public static final AtomicLong numOpens = new AtomicLong();
-  public static final AtomicLong numCloses = new AtomicLong();
-  
-  static final String NEWL = System.getProperty("line.separator");
+public class CommitLog
+{
+    private static final int MAX_OUTSTANDING_REPLAY_COUNT = 1024;
+    private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
 
-  static final int DEFAULT_CLIENT_CONNECT_TIMEOUT = 30000;
+    static final Logger logger = LoggerFactory.getLogger(CommitLog.class);
 
-  private static final Logger log = LoggerFactory
-      .getLogger(SolrZkClient.class);
+    public static final CommitLog instance = new CommitLog();
 
-  private ConnectionManager connManager;
+    private final Deque<CommitLogSegment> segments = new ArrayDeque<CommitLogSegment>();
 
-  private volatile SolrZooKeeper keeper;
-  
-  private ZkCmdExecutor zkCmdExecutor;
+    public static void setSegmentSize(int size)
+    {
+        SEGMENT_SIZE = size;
+    }
 
-  private volatile boolean isClosed = false;
-  private ZkClientConnectionStrategy zkClientConnectionStrategy;
-  private int zkClientTimeout;
-  
-  public int getZkClientTimeout() {
-    return zkClientTimeout;
-  }
+    private final ICommitLogExecutorService executor;
 
-  public SolrZkClient(String zkServerAddress, int zkClientTimeout) {
-    this(zkServerAddress, zkClientTimeout, new DefaultConnectionStrategy(), null);
-  }
-  
-  public SolrZkClient(String zkServerAddress, int zkClientTimeout, int zkClientConnectTimeout, OnReconnect onReonnect) {
-    this(zkServerAddress, zkClientTimeout, new DefaultConnectionStrategy(), onReonnect, zkClientConnectTimeout);
-  }
+    /**
+     * param @ table - name of table for which we are maintaining
+     *                 this commit log.
+     * param @ recoverymode - is commit log being instantiated in
+     *                        in recovery mode.
+    */
+    private CommitLog()
+    {
+        try
+        {
+            DatabaseDescriptor.createAllDirectories();
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
 
-  public SolrZkClient(String zkServerAddress, int zkClientTimeout,
-      ZkClientConnectionStrategy strat, final OnReconnect onReconnect) {
-    this(zkServerAddress, zkClientTimeout, strat, onReconnect, DEFAULT_CLIENT_CONNECT_TIMEOUT);
-  }
+        // all old segments are recovered and deleted before CommitLog is instantiated.
+        // All we need to do is create a new one.
+        segments.add(new CommitLogSegment());
 
-  public SolrZkClient(String zkServerAddress, int zkClientTimeout,
-      ZkClientConnectionStrategy strat, final OnReconnect onReconnect, int clientConnectTimeout) {
-    this.zkClientConnectionStrategy = strat;
-    this.zkClientTimeout = zkClientTimeout;
-    // we must retry at least as long as the session timeout
-    zkCmdExecutor = new ZkCmdExecutor(zkClientTimeout);
-    connManager = new ConnectionManager("ZooKeeperConnection Watcher:"
-        + zkServerAddress, this, zkServerAddress, zkClientTimeout, strat, onReconnect);
-    try {
-      strat.connect(zkServerAddress, zkClientTimeout, connManager,
-          new ZkUpdate() {
-            @Override
-            public void update(SolrZooKeeper zooKeeper) {
-              SolrZooKeeper oldKeeper = keeper;
-              keeper = zooKeeper;
-              try {
-                closeKeeper(oldKeeper);
-              } finally {
-                if (isClosed) {
-                  // we may have been closed
-                  closeKeeper(SolrZkClient.this.keeper);
+        if (DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.periodic)
+        {
+            executor = new PeriodicCommitLogExecutorService();
+            final Callable syncer = new Callable()
+            {
+                public Object call() throws Exception
+                {
+                    sync();
+                    return null;
                 }
-              }
+            };
+
+            new Thread(new Runnable()
+            {
+                public void run()
+                {
+                    while (true)
+                    {
+                        try
+                        {
+                            executor.submit(syncer).get();
+                            Thread.sleep(DatabaseDescriptor.getCommitLogSyncPeriod());
+                        }
+                        catch (InterruptedException e)
+                        {
+                            throw new AssertionError(e);
+                        }
+                        catch (ExecutionException e)
+                        {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                }
+            }, "PERIODIC-COMMIT-LOG-SYNCER").start();
+        }
+        else
+        {
+            executor = new BatchCommitLogExecutorService();
+        }
+    }
+
+    public void resetUnsafe()
+    {
+        segments.clear();
+        segments.add(new CommitLogSegment());
+    }
+
+    private boolean manages(String name)
+    {
+        for (CommitLogSegment segment : segments)
+        {
+            if (segment.getPath().endsWith(name))
+                return true;
+        }
+        return false;
+    }
+
+    public static void recover() throws IOException
+    {
+        String directory = DatabaseDescriptor.getCommitLogLocation();
+        File[] files = new File(directory).listFiles(new FilenameFilter()
+        {
+            public boolean accept(File dir, String name)
+            {
+                // we used to try to avoid instantiating commitlog (thus creating an empty segment ready for writes)
+                // until after recover was finished.  this turns out to be fragile; it is less error-prone to go
+                // ahead and allow writes before recover(), and just skip active segments when we do.
+                return CommitLogSegment.possibleCommitLogFile(name) && !instance.manages(name);
             }
-          });
-    } catch (Throwable e) {
-      connManager.close();
-      throw new RuntimeException(e);
-    }
-    
-    try {
-      connManager.waitForConnected(clientConnectTimeout);
-    } catch (Throwable e) {
-      connManager.close();
-      throw new RuntimeException(e);
-    }
-    numOpens.incrementAndGet();
-  }
-
-  public ZkClientConnectionStrategy getZkClientConnectionStrategy() {
-    return zkClientConnectionStrategy;
-  }
-
-  /**
-   * Returns true if client is connected
-   */
-  public boolean isConnected() {
-    return keeper != null && keeper.getState() == ZooKeeper.States.CONNECTED;
-  }
-  
-  public void delete(final String path, final int version, boolean retryOnConnLoss)
-      throws InterruptedException, KeeperException {
-    if (retryOnConnLoss) {
-      zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public Stat execute() throws KeeperException, InterruptedException {
-          keeper.delete(path, version);
-          return null;
-        }
-      });
-    } else {
-      keeper.delete(path, version);
-    }
-  }
-
-  /**
-   * Return the stat of the node of the given path. Return null if no such a
-   * node exists.
-   * <p>
-   * If the watch is non-null and the call is successful (no exception is thrown),
-   * a watch will be left on the node with the given path. The watch will be
-   * triggered by a successful operation that creates/delete the node or sets
-   * the data on the node.
-   *
-   * @param path the node path
-   * @param watcher explicit watcher
-   * @return the stat of the node of the given path; return null if no such a
-   *         node exists.
-   * @throws KeeperException If the server signals an error
-   * @throws InterruptedException If the server transaction is interrupted.
-   * @throws IllegalArgumentException if an invalid path is specified
-   */
-  public Stat exists(final String path, final Watcher watcher, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public Stat execute() throws KeeperException, InterruptedException {
-          return keeper.exists(path, watcher);
-        }
-      });
-    } else {
-      return keeper.exists(path, watcher);
-    }
-  }
-  
-  /**
-   * Returns true if path exists
-   */
-  public Boolean exists(final String path, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public Boolean execute() throws KeeperException, InterruptedException {
-          return keeper.exists(path, null) != null;
-        }
-      });
-    } else {
-      return keeper.exists(path, null) != null;
-    }
-  }
-
-  /**
-   * Returns path of created node
-   */
-  public String create(final String path, final byte data[], final List<ACL> acl,
-      final CreateMode createMode, boolean retryOnConnLoss) throws KeeperException, InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public String execute() throws KeeperException, InterruptedException {
-          return keeper.create(path, data, acl, createMode);
-        }
-      });
-    } else {
-      return keeper.create(path, data, acl, createMode);
-    }
-  }
-
-  /**
-   * Returns children of the node at the path
-   */
-  public List<String> getChildren(final String path, final Watcher watcher, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public List<String> execute() throws KeeperException, InterruptedException {
-          return keeper.getChildren(path, watcher);
-        }
-      });
-    } else {
-      return keeper.getChildren(path, watcher);
-    }
-  }
-
-  /**
-   * Returns node's data
-   */
-  public byte[] getData(final String path, final Watcher watcher, final Stat stat, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public byte[] execute() throws KeeperException, InterruptedException {
-          return keeper.getData(path, watcher, stat);
-        }
-      });
-    } else {
-      return keeper.getData(path, watcher, stat);
-    }
-  }
-
-  /**
-   * Returns node's state
-   */
-  public Stat setData(final String path, final byte data[], final int version, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public Stat execute() throws KeeperException, InterruptedException {
-          return keeper.setData(path, data, version);
-        }
-      });
-    } else {
-      return keeper.setData(path, data, version);
-    }
-  }
-  
-  /**
-   * Returns path of created node
-   */
-  public String create(final String path, final byte[] data,
-      final CreateMode createMode, boolean retryOnConnLoss) throws KeeperException,
-      InterruptedException {
-    if (retryOnConnLoss) {
-      return zkCmdExecutor.retryOperation(new ZkOperation() {
-        @Override
-        public String execute() throws KeeperException, InterruptedException {
-          return keeper.create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE,
-              createMode);
-        }
-      });
-    } else {
-      return keeper.create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, createMode);
-    }
-  }
-
-  /**
-   * Creates the path in ZooKeeper, creating each node as necessary.
-   * 
-   * e.g. If <code>path=/solr/group/node</code> and none of the nodes, solr,
-   * group, node exist, each will be created.
-   */
-  public void makePath(String path, boolean retryOnConnLoss) throws KeeperException,
-      InterruptedException {
-    makePath(path, null, CreateMode.PERSISTENT, retryOnConnLoss);
-  }
-  
-  public void makePath(String path, boolean failOnExists, boolean retryOnConnLoss) throws KeeperException,
-      InterruptedException {
-    makePath(path, null, CreateMode.PERSISTENT, null, failOnExists, retryOnConnLoss);
-  }
-  
-  public void makePath(String path, File file, boolean failOnExists, boolean retryOnConnLoss)
-      throws IOException, KeeperException, InterruptedException {
-    makePath(path, FileUtils.readFileToString(file).getBytes("UTF-8"),
-        CreateMode.PERSISTENT, null, failOnExists, retryOnConnLoss);
-  }
-  
-  public void makePath(String path, File file, boolean retryOnConnLoss) throws IOException,
-      KeeperException, InterruptedException {
-    makePath(path, FileUtils.readFileToString(file).getBytes("UTF-8"), retryOnConnLoss);
-  }
-  
-  public void makePath(String path, CreateMode createMode, boolean retryOnConnLoss) throws KeeperException,
-      InterruptedException {
-    makePath(path, null, createMode, retryOnConnLoss);
-  }
-
-  /**
-   * Creates the path in ZooKeeper, creating each node as necessary.
-   * 
-   * @param data to set on the last zkNode
-   */
-  public void makePath(String path, byte[] data, boolean retryOnConnLoss) throws KeeperException,
-      InterruptedException {
-    makePath(path, data, CreateMode.PERSISTENT, retryOnConnLoss);
-  }
-
-  /**
-   * Creates the path in ZooKeeper, creating each node as necessary.
-   * 
-   * e.g. If <code>path=/solr/group/node</code> and none of the nodes, solr,
-   * group, node exist, each will be created.
-   * 
-   * @param data to set on the last zkNode
-   */
-  public void makePath(String path, byte[] data, CreateMode createMode, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    makePath(path, data, createMode, null, retryOnConnLoss);
-  }
-
-  /**
-   * Creates the path in ZooKeeper, creating each node as necessary.
-   * 
-   * e.g. If <code>path=/solr/group/node</code> and none of the nodes, solr,
-   * group, node exist, each will be created.
-   * 
-   * @param data to set on the last zkNode
-   */
-  public void makePath(String path, byte[] data, CreateMode createMode,
-      Watcher watcher, boolean retryOnConnLoss) throws KeeperException, InterruptedException {
-    makePath(path, data, createMode, watcher, true, retryOnConnLoss);
-  }
-  
-
-
-  /**
-   * Creates the path in ZooKeeper, creating each node as necessary.
-   * 
-   * e.g. If <code>path=/solr/group/node</code> and none of the nodes, solr,
-   * group, node exist, each will be created.
-   * 
-   * Note: retryOnConnLoss is only respected for the final node - nodes
-   * before that are always retried on connection loss.
-   */
-  public void makePath(String path, byte[] data, CreateMode createMode,
-      Watcher watcher, boolean failOnExists, boolean retryOnConnLoss) throws KeeperException, InterruptedException {
-    if (log.isInfoEnabled()) {
-      log.info("makePath: " + path);
-    }
-    boolean retry = true;
-    
-    if (path.startsWith("/")) {
-      path = path.substring(1, path.length());
-    }
-    String[] paths = path.split("/");
-    StringBuilder sbPath = new StringBuilder();
-    for (int i = 0; i < paths.length; i++) {
-      byte[] bytes = null;
-      String pathPiece = paths[i];
-      sbPath.append("/" + pathPiece);
-      final String currentPath = sbPath.toString();
-      Object exists = exists(currentPath, watcher, retryOnConnLoss);
-      if (exists == null || ((i == paths.length -1) && failOnExists)) {
-        CreateMode mode = CreateMode.PERSISTENT;
-        if (i == paths.length - 1) {
-          mode = createMode;
-          bytes = data;
-          if (!retryOnConnLoss) retry = false;
-        }
-        try {
-          if (retry) {
-            final CreateMode finalMode = mode;
-            final byte[] finalBytes = bytes;
-            zkCmdExecutor.retryOperation(new ZkOperation() {
-              @Override
-              public Object execute() throws KeeperException, InterruptedException {
-                keeper.create(currentPath, finalBytes, ZooDefs.Ids.OPEN_ACL_UNSAFE, finalMode);
-                return null;
-              }
-            });
-          } else {
-            keeper.create(currentPath, bytes, ZooDefs.Ids.OPEN_ACL_UNSAFE, mode);
-          }
-        } catch (NodeExistsException e) {
-          
-          if (!failOnExists) {
-            // TODO: version ? for now, don't worry about race
-            setData(currentPath, data, -1, retryOnConnLoss);
-            // set new watch
-            exists(currentPath, watcher, retryOnConnLoss);
+        });
+        if (files.length == 0)
+        {
+            logger.info("No commitlog files found; skipping replay");
             return;
-          }
-          
-          // ignore unless it's the last node in the path
-          if (i == paths.length - 1) {
-            throw e;
-          }
         }
-        if(i == paths.length -1) {
-          // set new watch
-          exists(currentPath, watcher, retryOnConnLoss);
+
+        Arrays.sort(files, new FileUtils.FileComparator());
+        logger.info("Replaying " + StringUtils.join(files, ", "));
+        recover(files);
+        for (File f : files)
+        {
+            FileUtils.delete(CommitLogHeader.getHeaderPathFromSegmentPath(f.getAbsolutePath())); // may not actually exist
+            if (!f.delete())
+                logger.error("Unable to remove " + f + "; you should remove it manually or next restart will replay it again (harmless, but time-consuming)");
         }
-      } else if (i == paths.length - 1) {
-        // TODO: version ? for now, don't worry about race
-        setData(currentPath, data, -1, retryOnConnLoss);
-        // set new watch
-        exists(currentPath, watcher, retryOnConnLoss);
-      }
-    }
-  }
-
-  public void makePath(String zkPath, CreateMode createMode, Watcher watcher, boolean retryOnConnLoss)
-      throws KeeperException, InterruptedException {
-    makePath(zkPath, null, createMode, watcher, retryOnConnLoss);
-  }
-
-  /**
-   * Write data to ZooKeeper.
-   */
-  public void setData(String path, byte[] data, boolean retryOnConnLoss) throws KeeperException,
-      InterruptedException {
-    setData(path, data, -1, retryOnConnLoss);
-  }
-
-  /**
-   * Write file to ZooKeeper - default system encoding used.
-   * 
-   * @param path path to upload file to e.g. /solr/conf/solrconfig.xml
-   * @param file path to file to be uploaded
-   */
-  public void setData(String path, File file, boolean retryOnConnLoss) throws IOException,
-      KeeperException, InterruptedException {
-    if (log.isInfoEnabled()) {
-      log.info("Write to ZooKeepeer " + file.getAbsolutePath() + " to " + path);
+        logger.info("Log replay complete");
     }
 
-    String data = FileUtils.readFileToString(file);
-    setData(path, data.getBytes("UTF-8"), retryOnConnLoss);
-  }
+    public static void recover(File[] clogs) throws IOException
+    {
+        Set<Table> tablesRecovered = new HashSet<Table>();
+        List<Future<?>> futures = new ArrayList<Future<?>>();
+        byte[] bytes = new byte[4096];
+        Map<Integer, AtomicInteger> invalidMutations = new HashMap<Integer, AtomicInteger>();
 
-  /**
-   * Returns the baseURL corrisponding to a given node's nodeName -- 
-   * NOTE: does not (currently) imply that the nodeName (or resulting 
-   * baseURL) exists in the cluster.
-   * @lucene.experimental
-   */
-  public String getBaseUrlForNodeName(final String nodeName) {
-    final int _offset = nodeName.indexOf("_");
-    if (_offset < 0) {
-      throw new IllegalArgumentException("nodeName does not contain expected '_' seperator: " + nodeName);
-    }
-    final String hostAndPort = nodeName.substring(0,_offset);
-    try {
-      final String path = URLDecoder.decode(nodeName.substring(1+_offset),
-                                            "UTF-8");
-      return "http://" + hostAndPort + "/" + path;
-    } catch (UnsupportedEncodingException e) {
-      throw new IllegalStateException("JVM Does not seem to support UTF-8", e);
-    }
-  }
+        for (File file : clogs)
+        {
+            int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
+            BufferedRandomAccessFile reader = new BufferedRandomAccessFile(file.getAbsolutePath(), "r", bufferSize);
 
+            try
+            {
+                CommitLogHeader clHeader = null;
+                int replayPosition = 0;
+                String headerPath = CommitLogHeader.getHeaderPathFromSegmentPath(file.getAbsolutePath());
+                try
+                {
+                    clHeader = CommitLogHeader.readCommitLogHeader(headerPath);
+                    replayPosition = clHeader.getReplayPosition();
+                }
+                catch (IOException ioe)
+                {
+                    logger.info(headerPath + " incomplete, missing or corrupt.  Everything is ok, don't panic.  CommitLog will be replayed from the beginning");
+                    logger.debug("exception was", ioe);
+                }
+                if (replayPosition < 0)
+                {
+                    logger.debug("skipping replay of fully-flushed {}", file);
+                    continue;
+                }
+                reader.seek(replayPosition);
 
-  /**
-   * Fills string with printout of current ZooKeeper layout.
-   */
-  public void printLayout(String path, int indent, StringBuilder string)
-      throws KeeperException, InterruptedException {
-    byte[] data = getData(path, null, null, true);
-    List<String> children = getChildren(path, null, true);
-    StringBuilder dent = new StringBuilder();
-    for (int i = 0; i < indent; i++) {
-      dent.append(" ");
-    }
-    string.append(dent + path + " (" + children.size() + ")" + NEWL);
-    if (data != null) {
-      try {
-        String dataString = new String(data, "UTF-8");
-        if ((!path.endsWith(".txt") && !path.endsWith(".xml")) || path.endsWith(ZkStateReader.CLUSTER_STATE)) {
-          if (path.endsWith(".xml")) {
-            // this is the cluster state in xml format - lets pretty print
-            dataString = prettyPrint(dataString);
-          }
-          
-          string.append(dent + "DATA:\n" + dent + "    "
-              + dataString.replaceAll("\n", "\n" + dent + "    ") + NEWL);
-        } else {
-          string.append(dent + "DATA: ...supressed..." + NEWL);
+                if (logger.isDebugEnabled())
+                    logger.debug("Replaying " + file + " starting at " + reader.getFilePointer());
+
+                /* read the logs populate RowMutation and apply */
+                while (!reader.isEOF())
+                {
+                    if (logger.isDebugEnabled())
+                        logger.debug("Reading mutation at " + reader.getFilePointer());
+
+                    long claimedCRC32;
+
+                    Checksum checksum = new CRC32();
+                    int serializedSize;
+                    try
+                    {
+                        // any of the reads may hit EOF
+                        serializedSize = reader.readInt();
+                        long claimedSizeChecksum = reader.readLong();
+                        checksum.update(serializedSize);
+                        if (checksum.getValue() != claimedSizeChecksum || serializedSize <= 0)
+                            break; // entry wasn't synced correctly/fully.  that's ok.
+
+                        if (serializedSize > bytes.length)
+                            bytes = new byte[(int) (1.2 * serializedSize)];
+                        reader.readFully(bytes, 0, serializedSize);
+                        claimedCRC32 = reader.readLong();
+                    }
+                    catch(EOFException eof)
+                    {
+                        break; // last CL entry didn't get completely written.  that's ok.
+                    }
+
+                    checksum.update(bytes, 0, serializedSize);
+                    if (claimedCRC32 != checksum.getValue())
+                    {
+                        // this entry must not have been fsynced.  probably the rest is bad too,
+                        // but just in case there is no harm in trying them (since we still read on an entry boundary)
+                        continue;
+                    }
+
+                    /* deserialize the commit log entry */
+                    ByteArrayInputStream bufIn = new ByteArrayInputStream(bytes, 0, serializedSize);
+                    RowMutation rm = null;
+                    try
+                    {
+                        rm = RowMutation.serializer().deserialize(new DataInputStream(bufIn));
+                    }
+                    catch (UnserializableColumnFamilyException ex)
+                    {
+                        AtomicInteger i = invalidMutations.get(ex.cfId);
+                        if (i == null)
+                        {
+                            i = new AtomicInteger(1);
+                            invalidMutations.put(ex.cfId, i);
+                        }
+                        else
+                            i.incrementAndGet();
+                        continue;
+                    }
+                    
+                    if (logger.isDebugEnabled())
+                        logger.debug(String.format("replaying mutation for %s.%s: %s",
+                                                    rm.getTable(),
+                                                    rm.key(),
+                                                    "{" + StringUtils.join(rm.getColumnFamilies(), ", ") + "}"));
+                    final Table table = Table.open(rm.getTable());
+                    tablesRecovered.add(table);
+                    final Collection<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>(rm.getColumnFamilies());
+                    final long entryLocation = reader.getFilePointer();
+                    final CommitLogHeader finalHeader = clHeader;
+                    final RowMutation frm = rm;
+                    Runnable runnable = new WrappedRunnable()
+                    {
+                        public void runMayThrow() throws IOException
+                        {
+                            RowMutation newRm = new RowMutation(frm.getTable(), frm.key());
+
+                            // Rebuild the row mutation, omitting column families that a) have already been flushed,
+                            // b) are part of a cf that was dropped. Keep in mind that the cf.name() is suspect. do every
+                            // thing based on the cfid instead.
+                            for (ColumnFamily columnFamily : columnFamilies)
+                            {
+                                if (CFMetaData.getCF(columnFamily.id()) == null)
+                                    // null means the cf has been dropped
+                                    continue;
+
+                                if (finalHeader == null || (finalHeader.isDirty(columnFamily.id()) && entryLocation > finalHeader.getPosition(columnFamily.id())))
+                                    newRm.add(columnFamily);
+                            }
+                            if (!newRm.isEmpty())
+                            {
+                                Table.open(newRm.getTable()).apply(newRm, null, false);
+                            }
+                        }
+                    };
+                    futures.add(StageManager.getStage(Stage.MUTATION).submit(runnable));
+                    if (futures.size() > MAX_OUTSTANDING_REPLAY_COUNT)
+                    {
+                        FBUtilities.waitOnFutures(futures);
+                        futures.clear();
+                    }
+                }
+            }
+            finally
+            {
+                reader.close();
+                logger.info("Finished reading " + file);
+            }
         }
-      } catch (UnsupportedEncodingException e) {
-        // can't happen - UTF-8
-        throw new RuntimeException(e);
-      }
+        
+        for (Map.Entry<Integer, AtomicInteger> entry : invalidMutations.entrySet())
+            logger.info(String.format("Skipped %d mutations from unknown (probably removed) CF with id %d", entry.getValue().intValue(), entry.getKey()));
+
+        // wait for all the writes to finish on the mutation stage
+        FBUtilities.waitOnFutures(futures);
+        logger.debug("Finished waiting on mutations from recovery");
+
+        // flush replayed tables
+        futures.clear();
+        for (Table table : tablesRecovered)
+            futures.addAll(table.flush());
+        FBUtilities.waitOnFutures(futures);
     }
 
-    for (String child : children) {
-      if (!child.equals("quota")) {
-        try {
-          printLayout(path + (path.equals("/") ? "" : "/") + child, indent + 1,
-              string);
-        } catch (NoNodeException e) {
-          // must have gone away
+    private CommitLogSegment currentSegment()
+    {
+        return segments.getLast();
+    }
+    
+    public CommitLogSegment.CommitLogContext getContext()
+    {
+        Callable<CommitLogSegment.CommitLogContext> task = new Callable<CommitLogSegment.CommitLogContext>()
+        {
+            public CommitLogSegment.CommitLogContext call() throws Exception
+            {
+                return currentSegment().getContext();
+            }
+        };
+        try
+        {
+            return executor.submit(task).get();
         }
-      }
+        catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
-  }
-
-  /**
-   * Prints current ZooKeeper layout to stdout.
-   */
-  public void printLayoutToStdOut() throws KeeperException,
-      InterruptedException {
-    StringBuilder sb = new StringBuilder();
-    printLayout("/", 0, sb);
-    System.out.println(sb.toString());
-  }
-  
-  public static String prettyPrint(String input, int indent) {
-    try {
-      Source xmlInput = new StreamSource(new StringReader(input));
-      StringWriter stringWriter = new StringWriter();
-      StreamResult xmlOutput = new StreamResult(stringWriter);
-      TransformerFactory transformerFactory = TransformerFactory.newInstance();
-      transformerFactory.setAttribute("indent-number", indent);
-      Transformer transformer = transformerFactory.newTransformer();
-      transformer.setOutputProperty(OutputKeys.INDENT, "yes");
-      transformer.transform(xmlInput, xmlOutput);
-      return xmlOutput.getWriter().toString();
-    } catch (Exception e) {
-      throw new RuntimeException("Problem pretty printing XML", e);
+    /*
+     * Adds the specified row to the commit log. This method will reset the
+     * file offset to what it is before the start of the operation in case
+     * of any problems. This way we can assume that the subsequent commit log
+     * entry will override the garbage left over by the previous write.
+    */
+    public void add(RowMutation rowMutation, Object serializedRow) throws IOException
+    {
+        executor.add(new LogRecordAdder(rowMutation, serializedRow));
     }
-  }
-  
-  private static String prettyPrint(String input) {
-    return prettyPrint(input, 2);
-  }
 
-  public void close() {
-    if (isClosed) return; // it's okay if we over close - same as solrcore
-    isClosed = true;
-    try {
-      closeKeeper(keeper);
-    } finally {
-      connManager.close();
+    /*
+     * This is called on Memtable flush to add to the commit log
+     * a token indicating that this column family has been flushed.
+     * The bit flag associated with this column family is set in the
+     * header and this is used to decide if the log file can be deleted.
+    */
+    public void discardCompletedSegments(final Integer cfId, final CommitLogSegment.CommitLogContext context) throws IOException
+    {
+        Callable task = new Callable()
+        {
+            public Object call() throws IOException
+            {
+                discardCompletedSegmentsInternal(context, cfId);
+                return null;
+            }
+        };
+        try
+        {
+            executor.submit(task).get();
+        }
+        catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
-    numCloses.incrementAndGet();
-  }
 
-  public boolean isClosed() {
-    return isClosed;
-  }
+    /**
+     * Delete log segments whose contents have been turned into SSTables. NOT threadsafe.
+     *
+     * param @ context The commitLog context .
+     * param @ id id of the columnFamily being flushed to disk.
+     *
+    */
+    private void discardCompletedSegmentsInternal(CommitLogSegment.CommitLogContext context, Integer id) throws IOException
+    {
+        if (logger.isDebugEnabled())
+            logger.debug("discard completed log segments for " + context + ", column family " + id + ".");
 
-  /**
-   * Allows package private classes to update volatile ZooKeeper.
-   */
-  void updateKeeper(SolrZooKeeper keeper) throws InterruptedException {
-   SolrZooKeeper oldKeeper = this.keeper;
-   this.keeper = keeper;
-   if (oldKeeper != null) {
-     oldKeeper.close();
-   }
-   // we might have been closed already
-   if (isClosed) this.keeper.close();
-  }
-  
-  public SolrZooKeeper getSolrZooKeeper() {
-    return keeper;
-  }
-  
-  private void closeKeeper(SolrZooKeeper keeper) {
-    if (keeper != null) {
-      try {
-        keeper.close();
-      } catch (InterruptedException e) {
-        // Restore the interrupted status
-        Thread.currentThread().interrupt();
-        log.error("", e);
-        throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR, "",
-            e);
-      }
-    }
-  }
+        /*
+         * Loop through all the commit log files in the history. Now process
+         * all files that are older than the one in the context. For each of
+         * these files the header needs to modified by resetting the dirty
+         * bit corresponding to the flushed CF.
+        */
+        Iterator<CommitLogSegment> iter = segments.iterator();
+        while (iter.hasNext())
+        {
+            CommitLogSegment segment = iter.next();
+            CommitLogHeader header = segment.getHeader();
+            if (segment.equals(context.getSegment()))
+            {
+                // we can't just mark the segment where the flush happened clean,
+                // since there may have been writes to it between when the flush
+                // started and when it finished. so mark the flush position as
+                // the replay point for this CF, instead.
+                if (logger.isDebugEnabled())
+                    logger.debug("Marking replay position " + context.position + " on commit log " + segment);
+                header.turnOn(id, context.position);
+                segment.writeHeader();
+                break;
+            }
 
-  // yeah, it's recursive :(
-  public void clean(String path) throws InterruptedException, KeeperException {
-    List<String> children;
-    try {
-      children = getChildren(path, null, true);
-    } catch (NoNodeException r) {
-      return;
+            header.turnOff(id);
+            if (header.isSafeToDelete())
+            {
+                logger.info("Discarding obsolete commit log:" + segment);
+                segment.close();
+                DeletionService.submitDelete(segment.getHeaderPath());
+                DeletionService.submitDelete(segment.getPath());
+                // usually this will be the first (remaining) segment, but not always, if segment A contains
+                // writes to a CF that is unflushed but is followed by segment B whose CFs are all flushed.
+                iter.remove();
+            }
+            else
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("Not safe to delete commit log " + segment + "; dirty is " + header.dirtyString());
+                segment.writeHeader();
+            }
+        }
     }
-    for (String string : children) {
-      // we can't clean the built-in zookeeper node
-      if (path.equals("/") && string.equals("zookeeper")) continue;
-      if (path.equals("/")) {
-        clean(path + string);
-      } else {
-        clean(path + "/" + string);
-      }
+    
+    void sync() throws IOException
+    {
+        currentSegment().sync();
     }
-    try {
-      if (!path.equals("/")) {
-        delete(path, -1, true);
-      }
-    } catch (NoNodeException r) {
-      return;
-    }
-  }
 
+    // TODO this should be a Runnable since it doesn't actually return anything, but it's difficult to do that
+    // without breaking the fragile CheaterFutureTask in BatchCLES.
+    class LogRecordAdder implements Callable, Runnable
+    {
+        final RowMutation rowMutation;
+        final Object serializedRow;
+
+        LogRecordAdder(RowMutation rm, Object serializedRow)
+        {
+            this.rowMutation = rm;
+            this.serializedRow = serializedRow;
+        }
+
+        public void run()
+        {
+            try
+            {
+                currentSegment().write(rowMutation, serializedRow);
+                // roll log if necessary
+                if (currentSegment().length() >= SEGMENT_SIZE)
+                {
+                    sync();
+                    segments.add(new CommitLogSegment());
+                }
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+
+        public Object call() throws Exception
+        {
+            run();
+            return null;
+        }
+    }
 }

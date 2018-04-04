@@ -1,4 +1,4 @@
-for (AtomicReaderContext ctx : r.leaves()) {
+for (final AtomicReaderContext ctx : reader.leaves()) {
 
 package org.apache.lucene.index;
 
@@ -20,319 +20,352 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Random;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldInfosWriter;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.PerDocConsumer;
+import org.apache.lucene.codecs.StoredFieldsWriter;
+import org.apache.lucene.codecs.TermVectorsWriter;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CharsRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.InfoStream;
 
-public class TestIndexWriterUnicode extends LuceneTestCase {
+/**
+ * The SegmentMerger class combines two or more Segments, represented by an IndexReader ({@link #add},
+ * into a single Segment.  After adding the appropriate readers, call the merge method to combine the
+ * segments.
+ *
+ * @see #merge
+ * @see #add
+ */
+final class SegmentMerger {
+  private final Directory directory;
+  private final int termIndexInterval;
 
-  final String[] utf8Data = new String[] {
-    // unpaired low surrogate
-    "ab\udc17cd", "ab\ufffdcd",
-    "\udc17abcd", "\ufffdabcd",
-    "\udc17", "\ufffd",
-    "ab\udc17\udc17cd", "ab\ufffd\ufffdcd",
-    "\udc17\udc17abcd", "\ufffd\ufffdabcd",
-    "\udc17\udc17", "\ufffd\ufffd",
-
-    // unpaired high surrogate
-    "ab\ud917cd", "ab\ufffdcd",
-    "\ud917abcd", "\ufffdabcd",
-    "\ud917", "\ufffd",
-    "ab\ud917\ud917cd", "ab\ufffd\ufffdcd",
-    "\ud917\ud917abcd", "\ufffd\ufffdabcd",
-    "\ud917\ud917", "\ufffd\ufffd",
-
-    // backwards surrogates
-    "ab\udc17\ud917cd", "ab\ufffd\ufffdcd",
-    "\udc17\ud917abcd", "\ufffd\ufffdabcd",
-    "\udc17\ud917", "\ufffd\ufffd",
-    "ab\udc17\ud917\udc17\ud917cd", "ab\ufffd\ud917\udc17\ufffdcd",
-    "\udc17\ud917\udc17\ud917abcd", "\ufffd\ud917\udc17\ufffdabcd",
-    "\udc17\ud917\udc17\ud917", "\ufffd\ud917\udc17\ufffd"
-  };
+  private final Codec codec;
   
-  private int nextInt(int lim) {
-    return random().nextInt(lim);
-  }
-
-  private int nextInt(int start, int end) {
-    return start + nextInt(end-start);
-  }
+  private final IOContext context;
   
-  private boolean fillUnicode(char[] buffer, char[] expected, int offset, int count) {
-    final int len = offset + count;
-    boolean hasIllegal = false;
+  private final MergeState mergeState = new MergeState();
+  private final FieldInfos.Builder fieldInfosBuilder;
 
-    if (offset > 0 && buffer[offset] >= 0xdc00 && buffer[offset] < 0xe000)
-      // Don't start in the middle of a valid surrogate pair
-      offset--;
-
-    for(int i=offset;i<len;i++) {
-      int t = nextInt(6);
-      if (0 == t && i < len-1) {
-        // Make a surrogate pair
-        // High surrogate
-        expected[i] = buffer[i++] = (char) nextInt(0xd800, 0xdc00);
-        // Low surrogate
-        expected[i] = buffer[i] = (char) nextInt(0xdc00, 0xe000);
-      } else if (t <= 1)
-        expected[i] = buffer[i] = (char) nextInt(0x80);
-      else if (2 == t)
-        expected[i] = buffer[i] = (char) nextInt(0x80, 0x800);
-      else if (3 == t)
-        expected[i] = buffer[i] = (char) nextInt(0x800, 0xd800);
-      else if (4 == t)
-        expected[i] = buffer[i] = (char) nextInt(0xe000, 0xffff);
-      else if (5 == t && i < len-1) {
-        // Illegal unpaired surrogate
-        if (nextInt(10) == 7) {
-          if (random().nextBoolean())
-            buffer[i] = (char) nextInt(0xd800, 0xdc00);
-          else
-            buffer[i] = (char) nextInt(0xdc00, 0xe000);
-          expected[i++] = 0xfffd;
-          expected[i] = buffer[i] = (char) nextInt(0x800, 0xd800);
-          hasIllegal = true;
-        } else
-          expected[i] = buffer[i] = (char) nextInt(0x800, 0xd800);
-      } else {
-        expected[i] = buffer[i] = ' ';
-      }
-    }
-
-    return hasIllegal;
-  }
-  
-  // both start & end are inclusive
-  private final int getInt(Random r, int start, int end) {
-    return start + r.nextInt(1+end-start);
+  // note, just like in codec apis Directory 'dir' is NOT the same as segmentInfo.dir!!
+  SegmentMerger(SegmentInfo segmentInfo, InfoStream infoStream, Directory dir, int termIndexInterval,
+                MergeState.CheckAbort checkAbort, PayloadProcessorProvider payloadProcessorProvider,
+                FieldInfos.FieldNumbers fieldNumbers, IOContext context) {
+    mergeState.segmentInfo = segmentInfo;
+    mergeState.infoStream = infoStream;
+    mergeState.readers = new ArrayList<AtomicReader>();
+    mergeState.checkAbort = checkAbort;
+    mergeState.payloadProcessorProvider = payloadProcessorProvider;
+    directory = dir;
+    this.termIndexInterval = termIndexInterval;
+    this.codec = segmentInfo.getCodec();
+    this.context = context;
+    this.fieldInfosBuilder = new FieldInfos.Builder(fieldNumbers);
   }
 
-  private final String asUnicodeChar(char c) {
-    return "U+" + Integer.toHexString(c);
-  }
-
-  private final String termDesc(String s) {
-    final String s0;
-    assertTrue(s.length() <= 2);
-    if (s.length() == 1) {
-      s0 = asUnicodeChar(s.charAt(0));
-    } else {
-      s0 = asUnicodeChar(s.charAt(0)) + "," + asUnicodeChar(s.charAt(1));
-    }
-    return s0;
-  }
-
-  private void checkTermsOrder(IndexReader r, Set<String> allTerms, boolean isTop) throws IOException {
-    TermsEnum terms = MultiFields.getFields(r).terms("f").iterator(null);
-
-    BytesRef last = new BytesRef();
-
-    Set<String> seenTerms = new HashSet<String>();
-
-    while(true) {
-      final BytesRef term = terms.next();
-      if (term == null) {
-        break;
-      }
-
-      assertTrue(last.compareTo(term) < 0);
-      last.copyBytes(term);
-
-      final String s = term.utf8ToString();
-      assertTrue("term " + termDesc(s) + " was not added to index (count=" + allTerms.size() + ")", allTerms.contains(s));
-      seenTerms.add(s);
-    }
-
-    if (isTop) {
-      assertTrue(allTerms.equals(seenTerms));
-    }
-
-    // Test seeking:
-    Iterator<String> it = seenTerms.iterator();
-    while(it.hasNext()) {
-      BytesRef tr = new BytesRef(it.next());
-      assertEquals("seek failed for term=" + termDesc(tr.utf8ToString()),
-                   TermsEnum.SeekStatus.FOUND,
-                   terms.seekCeil(tr));
+  /**
+   * Add an IndexReader to the collection of readers that are to be merged
+   * @param reader
+   */
+  final void add(IndexReader reader) {
+    for (final AtomicReaderContext ctx : reader.getTopReaderContext().leaves()) {
+      final AtomicReader r = ctx.reader();
+      mergeState.readers.add(r);
     }
   }
 
-  // LUCENE-510
-  public void testRandomUnicodeStrings() throws Throwable {
-    char[] buffer = new char[20];
-    char[] expected = new char[20];
+  final void add(SegmentReader reader) {
+    mergeState.readers.add(reader);
+  }
 
-    BytesRef utf8 = new BytesRef(20);
-    CharsRef utf16 = new CharsRef(20);
+  /**
+   * Merges the readers specified by the {@link #add} method into the directory passed to the constructor
+   * @return The number of documents that were merged
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  final MergeState merge() throws IOException {
+    // NOTE: it's important to add calls to
+    // checkAbort.work(...) if you make any changes to this
+    // method that will spend alot of time.  The frequency
+    // of this check impacts how long
+    // IndexWriter.close(false) takes to actually stop the
+    // threads.
+    
+    mergeState.segmentInfo.setDocCount(setDocMaps());
+    mergeDocValuesAndNormsFieldInfos();
+    setMatchingSegmentReaders();
+    int numMerged = mergeFields();
+    assert numMerged == mergeState.segmentInfo.getDocCount();
 
-    int num = atLeast(100000);
-    for (int iter = 0; iter < num; iter++) {
-      boolean hasIllegal = fillUnicode(buffer, expected, 0, 20);
-
-      UnicodeUtil.UTF16toUTF8(buffer, 0, 20, utf8);
-      if (!hasIllegal) {
-        byte[] b = new String(buffer, 0, 20).getBytes("UTF-8");
-        assertEquals(b.length, utf8.length);
-        for(int i=0;i<b.length;i++)
-          assertEquals(b[i], utf8.bytes[i]);
-      }
-
-      UnicodeUtil.UTF8toUTF16(utf8.bytes, 0, utf8.length, utf16);
-      assertEquals(utf16.length, 20);
-      for(int i=0;i<20;i++)
-        assertEquals(expected[i], utf16.chars[i]);
+    final SegmentWriteState segmentWriteState = new SegmentWriteState(mergeState.infoStream, directory, mergeState.segmentInfo,
+                                                                      mergeState.fieldInfos, termIndexInterval, null, context);
+    mergeTerms(segmentWriteState);
+    mergePerDoc(segmentWriteState);
+    
+    if (mergeState.fieldInfos.hasNorms()) {
+      mergeNorms(segmentWriteState);
     }
-  }
 
-  // LUCENE-510
-  public void testAllUnicodeChars() throws Throwable {
-
-    BytesRef utf8 = new BytesRef(10);
-    CharsRef utf16 = new CharsRef(10);
-    char[] chars = new char[2];
-    for(int ch=0;ch<0x0010FFFF;ch++) {
-
-      if (ch == 0xd800)
-        // Skip invalid code points
-        ch = 0xe000;
-
-      int len = 0;
-      if (ch <= 0xffff) {
-        chars[len++] = (char) ch;
-      } else {
-        chars[len++] = (char) (((ch-0x0010000) >> 10) + UnicodeUtil.UNI_SUR_HIGH_START);
-        chars[len++] = (char) (((ch-0x0010000) & 0x3FFL) + UnicodeUtil.UNI_SUR_LOW_START);
-      }
-
-      UnicodeUtil.UTF16toUTF8(chars, 0, len, utf8);
-
-      String s1 = new String(chars, 0, len);
-      String s2 = new String(utf8.bytes, 0, utf8.length, "UTF-8");
-      assertEquals("codepoint " + ch, s1, s2);
-
-      UnicodeUtil.UTF8toUTF16(utf8.bytes, 0, utf8.length, utf16);
-      assertEquals("codepoint " + ch, s1, new String(utf16.chars, 0, utf16.length));
-
-      byte[] b = s1.getBytes("UTF-8");
-      assertEquals(utf8.length, b.length);
-      for(int j=0;j<utf8.length;j++)
-        assertEquals(utf8.bytes[j], b[j]);
+    if (mergeState.fieldInfos.hasVectors()) {
+      numMerged = mergeVectors();
+      assert numMerged == mergeState.segmentInfo.getDocCount();
     }
-  }
-  
-  public void testEmbeddedFFFF() throws Throwable {
-    Directory d = newDirectory();
-    IndexWriter w = new IndexWriter(d, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-    Document doc = new Document();
-    doc.add(newTextField("field", "a a\uffffb", Field.Store.NO));
-    w.addDocument(doc);
-    doc = new Document();
-    doc.add(newTextField("field", "a", Field.Store.NO));
-    w.addDocument(doc);
-    IndexReader r = w.getReader();
-    assertEquals(1, r.docFreq(new Term("field", "a\uffffb")));
-    r.close();
-    w.close();
-    d.close();
+    
+    // write the merged infos
+    FieldInfosWriter fieldInfosWriter = codec.fieldInfosFormat().getFieldInfosWriter();
+    fieldInfosWriter.write(directory, mergeState.segmentInfo.name, mergeState.fieldInfos, context);
+
+    return mergeState;
   }
 
-  // LUCENE-510
-  public void testInvalidUTF16() throws Throwable {
-    Directory dir = newDirectory();
-    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new TestIndexWriter.StringSplitAnalyzer()));
-    Document doc = new Document();
+  private void setMatchingSegmentReaders() {
+    // If the i'th reader is a SegmentReader and has
+    // identical fieldName -> number mapping, then this
+    // array will be non-null at position i:
+    int numReaders = mergeState.readers.size();
+    mergeState.matchingSegmentReaders = new SegmentReader[numReaders];
 
-    final int count = utf8Data.length/2;
-    for(int i=0;i<count;i++)
-      doc.add(newTextField("f" + i, utf8Data[2*i], Field.Store.YES));
-    w.addDocument(doc);
-    w.close();
-
-    IndexReader ir = DirectoryReader.open(dir);
-    Document doc2 = ir.document(0);
-    for(int i=0;i<count;i++) {
-      assertEquals("field " + i + " was not indexed correctly", 1, ir.docFreq(new Term("f"+i, utf8Data[2*i+1])));
-      assertEquals("field " + i + " is incorrect", utf8Data[2*i+1], doc2.getField("f"+i).stringValue());
-    }
-    ir.close();
-    dir.close();
-  }
-  
-  // Make sure terms, including ones with surrogate pairs,
-  // sort in codepoint sort order by default
-  public void testTermUTF16SortOrder() throws Throwable {
-    Random rnd = random();
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(rnd, dir);
-    Document d = new Document();
-    // Single segment
-    Field f = newStringField("f", "", Field.Store.NO);
-    d.add(f);
-    char[] chars = new char[2];
-    final Set<String> allTerms = new HashSet<String>();
-
-    int num = atLeast(200);
-    for (int i = 0; i < num; i++) {
-
-      final String s;
-      if (rnd.nextBoolean()) {
-        // Single char
-        if (rnd.nextBoolean()) {
-          // Above surrogates
-          chars[0] = (char) getInt(rnd, 1+UnicodeUtil.UNI_SUR_LOW_END, 0xffff);
-        } else {
-          // Below surrogates
-          chars[0] = (char) getInt(rnd, 0, UnicodeUtil.UNI_SUR_HIGH_START-1);
+    // If this reader is a SegmentReader, and all of its
+    // field name -> number mappings match the "merged"
+    // FieldInfos, then we can do a bulk copy of the
+    // stored fields:
+    for (int i = 0; i < numReaders; i++) {
+      AtomicReader reader = mergeState.readers.get(i);
+      // TODO: we may be able to broaden this to
+      // non-SegmentReaders, since FieldInfos is now
+      // required?  But... this'd also require exposing
+      // bulk-copy (TVs and stored fields) API in foreign
+      // readers..
+      if (reader instanceof SegmentReader) {
+        SegmentReader segmentReader = (SegmentReader) reader;
+        boolean same = true;
+        FieldInfos segmentFieldInfos = segmentReader.getFieldInfos();
+        for (FieldInfo fi : segmentFieldInfos) {
+          FieldInfo other = mergeState.fieldInfos.fieldInfo(fi.number);
+          if (other == null || !other.name.equals(fi.name)) {
+            same = false;
+            break;
+          }
         }
-        s = new String(chars, 0, 1);
+        if (same) {
+          mergeState.matchingSegmentReaders[i] = segmentReader;
+          mergeState.matchedCount++;
+        }
+      }
+    }
+
+    if (mergeState.infoStream.isEnabled("SM")) {
+      mergeState.infoStream.message("SM", "merge store matchedCount=" + mergeState.matchedCount + " vs " + mergeState.readers.size());
+      if (mergeState.matchedCount != mergeState.readers.size()) {
+        mergeState.infoStream.message("SM", "" + (mergeState.readers.size() - mergeState.matchedCount) + " non-bulk merges");
+      }
+    }
+  }
+  
+  // returns an updated typepromoter (tracking type and size) given a previous one,
+  // and a newly encountered docvalues
+  private TypePromoter mergeDocValuesType(TypePromoter previous, DocValues docValues) {
+    TypePromoter incoming = TypePromoter.create(docValues.getType(),  docValues.getValueSize());
+    if (previous == null) {
+      previous = TypePromoter.getIdentityPromoter();
+    }
+    return previous.promote(incoming);
+  }
+
+  // NOTE: this is actually merging all the fieldinfos
+  public void mergeDocValuesAndNormsFieldInfos() throws IOException {
+    // mapping from all docvalues fields found to their promoted types
+    // this is because FieldInfos does not store the
+    // valueSize
+    Map<FieldInfo,TypePromoter> docValuesTypes = new HashMap<FieldInfo,TypePromoter>();
+    Map<FieldInfo,TypePromoter> normValuesTypes = new HashMap<FieldInfo,TypePromoter>();
+
+    for (AtomicReader reader : mergeState.readers) {
+      FieldInfos readerFieldInfos = reader.getFieldInfos();
+      for (FieldInfo fi : readerFieldInfos) {
+        FieldInfo merged = fieldInfosBuilder.add(fi);
+        // update the type promotion mapping for this reader
+        if (fi.hasDocValues()) {
+          TypePromoter previous = docValuesTypes.get(merged);
+          docValuesTypes.put(merged, mergeDocValuesType(previous, reader.docValues(fi.name))); 
+        }
+        if (fi.hasNorms()) {
+          TypePromoter previous = normValuesTypes.get(merged);
+          normValuesTypes.put(merged, mergeDocValuesType(previous, reader.normValues(fi.name))); 
+        }
+      }
+    }
+    updatePromoted(normValuesTypes, true);
+    updatePromoted(docValuesTypes, false);
+    mergeState.fieldInfos = fieldInfosBuilder.finish();
+  }
+  
+  protected void updatePromoted(Map<FieldInfo,TypePromoter> infoAndPromoter, boolean norms) {
+    // update any promoted doc values types:
+    for (Map.Entry<FieldInfo,TypePromoter> e : infoAndPromoter.entrySet()) {
+      FieldInfo fi = e.getKey();
+      TypePromoter promoter = e.getValue();
+      if (promoter == null) {
+        if (norms) {
+          fi.setNormValueType(null);
+        } else {
+          fi.setDocValuesType(null);
+        }
       } else {
-        // Surrogate pair
-        chars[0] = (char) getInt(rnd, UnicodeUtil.UNI_SUR_HIGH_START, UnicodeUtil.UNI_SUR_HIGH_END);
-        assertTrue(((int) chars[0]) >= UnicodeUtil.UNI_SUR_HIGH_START && ((int) chars[0]) <= UnicodeUtil.UNI_SUR_HIGH_END);
-        chars[1] = (char) getInt(rnd, UnicodeUtil.UNI_SUR_LOW_START, UnicodeUtil.UNI_SUR_LOW_END);
-        s = new String(chars, 0, 2);
-      }
-      allTerms.add(s);
-      f.setStringValue(s);
-
-      writer.addDocument(d);
-
-      if ((1+i) % 42 == 0) {
-        writer.commit();
+        assert promoter != TypePromoter.getIdentityPromoter();
+        if (norms) {
+          if (fi.getNormType() != promoter.type() && !fi.omitsNorms()) {
+            // reset the type if we got promoted
+            fi.setNormValueType(promoter.type());
+          }  
+        } else {
+          if (fi.getDocValuesType() != promoter.type()) {
+            // reset the type if we got promoted
+            fi.setDocValuesType(promoter.type());
+          }
+        }
       }
     }
+  }
 
-    IndexReader r = writer.getReader();
 
-    // Test each sub-segment
-    for (AtomicReaderContext ctx : r.getTopReaderContext().leaves()) {
-      checkTermsOrder(ctx.reader(), allTerms, false);
+  /**
+   *
+   * @return The number of documents in all of the readers
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  private int mergeFields() throws IOException {
+    final StoredFieldsWriter fieldsWriter = codec.storedFieldsFormat().fieldsWriter(directory, mergeState.segmentInfo, context);
+    
+    try {
+      return fieldsWriter.merge(mergeState);
+    } finally {
+      fieldsWriter.close();
     }
-    checkTermsOrder(r, allTerms, true);
+  }
 
-    // Test multi segment
-    r.close();
+  /**
+   * Merge the TermVectors from each of the segments into the new one.
+   * @throws IOException
+   */
+  private final int mergeVectors() throws IOException {
+    final TermVectorsWriter termVectorsWriter = codec.termVectorsFormat().vectorsWriter(directory, mergeState.segmentInfo, context);
+    
+    try {
+      return termVectorsWriter.merge(mergeState);
+    } finally {
+      termVectorsWriter.close();
+    }
+  }
 
-    writer.forceMerge(1);
+  // NOTE: removes any "all deleted" readers from mergeState.readers
+  private int setDocMaps() throws IOException {
+    final int numReaders = mergeState.readers.size();
 
-    // Test single segment
-    r = writer.getReader();
-    checkTermsOrder(r, allTerms, true);
-    r.close();
+    // Remap docIDs
+    mergeState.docMaps = new MergeState.DocMap[numReaders];
+    mergeState.docBase = new int[numReaders];
+    mergeState.readerPayloadProcessor = new PayloadProcessorProvider.ReaderPayloadProcessor[numReaders];
+    mergeState.currentPayloadProcessor = new PayloadProcessorProvider.PayloadProcessor[numReaders];
 
-    writer.close();
-    dir.close();
+    int docBase = 0;
+
+    int i = 0;
+    while(i < mergeState.readers.size()) {
+
+      final AtomicReader reader = mergeState.readers.get(i);
+
+      mergeState.docBase[i] = docBase;
+      final MergeState.DocMap docMap = MergeState.DocMap.build(reader);
+      mergeState.docMaps[i] = docMap;
+      docBase += docMap.numDocs();
+
+      if (mergeState.payloadProcessorProvider != null) {
+        mergeState.readerPayloadProcessor[i] = mergeState.payloadProcessorProvider.getReaderProcessor(reader);
+      }
+
+      i++;
+    }
+
+    return docBase;
+  }
+
+  private final void mergeTerms(SegmentWriteState segmentWriteState) throws IOException {
+    
+    final List<Fields> fields = new ArrayList<Fields>();
+    final List<ReaderSlice> slices = new ArrayList<ReaderSlice>();
+
+    int docBase = 0;
+
+    for(int readerIndex=0;readerIndex<mergeState.readers.size();readerIndex++) {
+      final AtomicReader reader = mergeState.readers.get(readerIndex);
+      final Fields f = reader.fields();
+      final int maxDoc = reader.maxDoc();
+      if (f != null) {
+        slices.add(new ReaderSlice(docBase, maxDoc, readerIndex));
+        fields.add(f);
+      }
+      docBase += maxDoc;
+    }
+
+    final FieldsConsumer consumer = codec.postingsFormat().fieldsConsumer(segmentWriteState);
+    boolean success = false;
+    try {
+      consumer.merge(mergeState,
+                     new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
+                                     slices.toArray(ReaderSlice.EMPTY_ARRAY)));
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(consumer);
+      } else {
+        IOUtils.closeWhileHandlingException(consumer);
+      }
+    }
+  }
+
+  private void mergePerDoc(SegmentWriteState segmentWriteState) throws IOException {
+      final PerDocConsumer docsConsumer = codec.docValuesFormat()
+          .docsConsumer(new PerDocWriteState(segmentWriteState));
+      assert docsConsumer != null;
+      boolean success = false;
+      try {
+        docsConsumer.merge(mergeState);
+        success = true;
+      } finally {
+        if (success) {
+          IOUtils.close(docsConsumer);
+        } else {
+          IOUtils.closeWhileHandlingException(docsConsumer);
+        }
+      }
+  }
+  
+  private void mergeNorms(SegmentWriteState segmentWriteState) throws IOException {
+    final PerDocConsumer docsConsumer = codec.normsFormat()
+        .docsConsumer(new PerDocWriteState(segmentWriteState));
+    assert docsConsumer != null;
+    boolean success = false;
+    try {
+      docsConsumer.merge(mergeState);
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(docsConsumer);
+      } else {
+        IOUtils.closeWhileHandlingException(docsConsumer);
+      }
+    }
   }
 }

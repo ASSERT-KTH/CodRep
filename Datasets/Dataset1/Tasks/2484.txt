@@ -1,14 +1,13 @@
-super(dir, id, CODEC_NAME, VERSION_CURRENT, bytesUsed, context, fasterButMoreRam, Type.BYTES_FIXED_SORTED);
-
-package org.apache.lucene.codecs.lucene40.values;
+private static volatile IFailureDetector failureDetector_;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,215 +18,294 @@ package org.apache.lucene.codecs.lucene40.values;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.Comparator;
-import java.util.List;
+package org.apache.cassandra.gms;
 
-import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
-import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSortedSourceBase;
-import org.apache.lucene.codecs.lucene40.values.Bytes.DerefBytesWriterBase;
-import org.apache.lucene.index.DocValues;
-import org.apache.lucene.index.SortedBytesMergeUtils;
-import org.apache.lucene.index.DocValues.SortedSource;
-import org.apache.lucene.index.DocValues.Type;
-import org.apache.lucene.index.SortedBytesMergeUtils.IndexOutputBytesRefConsumer;
-import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
-import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
-import org.apache.lucene.index.MergeState;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.Counter;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.packed.PackedInts;
+import java.io.FileOutputStream;
+import java.lang.management.ManagementFactory;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
-// Stores fixed-length byte[] by deref, ie when two docs
-// have the same value, they store only 1 byte[]
+import org.apache.commons.lang.StringUtils;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import java.net.InetAddress;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.cassandra.utils.BoundedStatsDeque;
+import org.apache.log4j.Logger;
 
 /**
- * @lucene.experimental
+ * This FailureDetector is an implementation of the paper titled
+ * "The Phi Accrual Failure Detector" by Hayashibara. 
+ * Check the paper and the <i>IFailureDetector</i> interface for details.
  */
-class FixedSortedBytesImpl {
-
-  static final String CODEC_NAME = "FixedSortedBytes";
-  static final int VERSION_START = 0;
-  static final int VERSION_CURRENT = VERSION_START;
-
-  static final class Writer extends DerefBytesWriterBase {
-    private final Comparator<BytesRef> comp;
-
-    public Writer(Directory dir, String id, Comparator<BytesRef> comp,
-        Counter bytesUsed, IOContext context, boolean fasterButMoreRam) throws IOException {
-      super(dir, id, CODEC_NAME, VERSION_CURRENT, bytesUsed, context, fasterButMoreRam);
-      this.comp = comp;
+public class FailureDetector implements IFailureDetector, FailureDetectorMBean
+{
+    private static Logger logger_ = Logger.getLogger(FailureDetector.class);
+    private static final int sampleSize_ = 1000;
+    private static final int phiSuspectThreshold_ = 5;
+    private static final int phiConvictThreshold_ = 8;
+    /* The Failure Detector has to have been up for at least 1 min. */
+    private static final long uptimeThreshold_ = 60000;
+    private static IFailureDetector failureDetector_;
+    /* Used to lock the factory for creation of FailureDetector instance */
+    private static Lock createLock_ = new ReentrantLock();
+    /* The time when the module was instantiated. */
+    private static long creationTime_;
+    
+    public static IFailureDetector instance()
+    {        
+        if ( failureDetector_ == null )
+        {
+            FailureDetector.createLock_.lock();
+            try
+            {
+                if ( failureDetector_ == null )
+                {
+                    failureDetector_ = new FailureDetector();
+                }
+            }
+            finally
+            {
+                createLock_.unlock();
+            }
+        }        
+        return failureDetector_;
     }
+    
+    private Map<InetAddress, ArrivalWindow> arrivalSamples_ = new Hashtable<InetAddress, ArrivalWindow>();
+    private List<IFailureDetectionEventListener> fdEvntListeners_ = new ArrayList<IFailureDetectionEventListener>();
+    
+    public FailureDetector()
+    {
+        creationTime_ = System.currentTimeMillis();
+        // Register this instance with JMX
+        try
+        {
+            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.gms:type=FailureDetector"));
+        }
+        catch (Exception e)
+        {
+            logger_.error(LogUtil.throwableToString(e));
+        }
+    }
+    
+    /**
+     * Dump the inter arrival times for examination if necessary.
+     */
+    public void dumpInterArrivalTimes()
+    {
+        try
+        {
+            FileOutputStream fos = new FileOutputStream("/var/tmp/output-" + System.currentTimeMillis() + ".dat", true);
+            fos.write(toString().getBytes());
+            fos.close();
+        }
+        catch(Throwable th)
+        {
+            logger_.warn(LogUtil.throwableToString(th));
+        }
+    }
+    
+    /**
+     * We dump the arrival window for any endpoint only if the 
+     * local Failure Detector module has been up for more than a 
+     * minute.
+     * 
+     * @param ep for which the arrival window needs to be dumped.
+     */
+    private void dumpInterArrivalTimes(InetAddress ep)
+    {
+        long now = System.currentTimeMillis();
+        if ( (now - FailureDetector.creationTime_) <= FailureDetector.uptimeThreshold_ )
+            return;
+        try
+        {
+            FileOutputStream fos = new FileOutputStream("/var/tmp/output-" + System.currentTimeMillis() + "-" + ep + ".dat", true);
+            ArrivalWindow hWnd = arrivalSamples_.get(ep);
+            fos.write(hWnd.toString().getBytes());
+            fos.close();
+        }
+        catch(Throwable th)
+        {
+            logger_.warn(LogUtil.throwableToString(th));
+        }
+    }
+    
+    public boolean isAlive(InetAddress ep)
+    {
+       /* If the endpoint in question is the local endpoint return true. */
+        InetAddress localHost = FBUtilities.getLocalAddress();
+        if (localHost.equals(ep))
+            return true;
 
-    @Override
-    public void merge(MergeState mergeState, DocValues[] docValues)
-        throws IOException {
-      boolean success = false;
-      try {
-        final MergeContext ctx = SortedBytesMergeUtils.init(Type.BYTES_FIXED_SORTED, docValues, comp, mergeState.mergedDocCount);
-        List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(mergeState.docBase, mergeState.docMaps, docValues, ctx);
-        final IndexOutput datOut = getOrCreateDataOut();
-        datOut.writeInt(ctx.sizePerValues);
-        final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, new IndexOutputBytesRefConsumer(datOut), slices);
+    	/* Incoming port is assumed to be the Storage port. We need to change it to the control port */
+        EndPointState epState = Gossiper.instance().getEndPointStateForEndPoint(ep);
+        return epState.isAlive();
+    }
+    
+    public void report(InetAddress ep)
+    {
+        if (logger_.isTraceEnabled())
+            logger_.trace("reporting " + ep);
+        long now = System.currentTimeMillis();
+        ArrivalWindow heartbeatWindow = arrivalSamples_.get(ep);
+        if ( heartbeatWindow == null )
+        {
+            heartbeatWindow = new ArrivalWindow(sampleSize_);
+            arrivalSamples_.put(ep, heartbeatWindow);
+        }
+        heartbeatWindow.add(now);
+    }
+    
+    public void interpret(InetAddress ep)
+    {
+        ArrivalWindow hbWnd = arrivalSamples_.get(ep);
+        if ( hbWnd == null )
+        {            
+            return;
+        }
+        long now = System.currentTimeMillis();
+        /* We need this so that we do not suspect a convict. */
+        boolean isConvicted = false;
+        double phi = hbWnd.phi(now);
+        if (logger_.isTraceEnabled())
+            logger_.trace("PHI for " + ep + " : " + phi);
         
-        final IndexOutput idxOut = getOrCreateIndexOut();
-        idxOut.writeInt(maxOrd);
-        final PackedInts.Writer ordsWriter = PackedInts.getWriter(idxOut, ctx.docToEntry.length,
-            PackedInts.bitsRequired(maxOrd));
-        for (SortedSourceSlice slice : slices) {
-          slice.writeOrds(ordsWriter);
+        /*
+        if ( phi > phiConvictThreshold_ )
+        {            
+            isConvicted = true;     
+            for ( IFailureDetectionEventListener listener : fdEvntListeners_ )
+            {
+                listener.convict(ep);                
+            }
         }
-        ordsWriter.finish();
-        success = true;
-      } finally {
-        releaseResources();
-        if (success) {
-          IOUtils.close(getIndexOut(), getDataOut());
-        } else {
-          IOUtils.closeWhileHandlingException(getIndexOut(), getDataOut());
+        */
+        if ( !isConvicted && phi > phiSuspectThreshold_ )
+        {     
+            for ( IFailureDetectionEventListener listener : fdEvntListeners_ )
+            {
+                listener.suspect(ep);
+            }
+        }        
+    }
+    
+    public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
+    {
+        fdEvntListeners_.add(listener);
+    }
+    
+    public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener)
+    {
+        fdEvntListeners_.remove(listener);
+    }
+    
+    public String toString()
+    {
+        StringBuilder sb = new StringBuilder();
+        Set<InetAddress> eps = arrivalSamples_.keySet();
+        
+        sb.append("-----------------------------------------------------------------------");
+        for ( InetAddress ep : eps )
+        {
+            ArrivalWindow hWnd = arrivalSamples_.get(ep);
+            sb.append(ep + " : ");
+            sb.append(hWnd.toString());
+            sb.append( System.getProperty("line.separator") );
         }
-
-      }
+        sb.append("-----------------------------------------------------------------------");
+        return sb.toString();
     }
+    
+    public static void main(String[] args) throws Throwable
+    {           
+    }
+}
 
-    // Important that we get docCount, in case there were
-    // some last docs that we didn't see
-    @Override
-    public void finishInternal(int docCount) throws IOException {
-      fillDefault(docCount);
-      final IndexOutput datOut = getOrCreateDataOut();
-      final int count = hash.size();
-      final int[] address = new int[count];
-      datOut.writeInt(size);
-      if (size != -1) {
-        final int[] sortedEntries = hash.sort(comp);
-        // first dump bytes data, recording address as we go
-        final BytesRef spare = new BytesRef(size);
-        for (int i = 0; i < count; i++) {
-          final int e = sortedEntries[i];
-          final BytesRef bytes = hash.get(e, spare);
-          assert bytes.length == size;
-          datOut.writeBytes(bytes.bytes, bytes.offset, bytes.length);
-          address[e] = i;
+class ArrivalWindow
+{
+    private static Logger logger_ = Logger.getLogger(ArrivalWindow.class);
+    private double tLast_ = 0L;
+    private BoundedStatsDeque arrivalIntervals_;
+
+    ArrivalWindow(int size)
+    {
+        arrivalIntervals_ = new BoundedStatsDeque(size);
+    }
+    
+    synchronized void add(double value)
+    {
+        double interArrivalTime;
+        if ( tLast_ > 0L )
+        {                        
+            interArrivalTime = (value - tLast_);            
         }
-      }
-      final IndexOutput idxOut = getOrCreateIndexOut();
-      idxOut.writeInt(count);
-      writeIndex(idxOut, docCount, count, address, docToEntry);
+        else
+        {
+            interArrivalTime = Gossiper.intervalInMillis_ / 2;
+        }
+        tLast_ = value;            
+        arrivalIntervals_.add(interArrivalTime);        
     }
-  }
-
-  static final class Reader extends BytesReaderBase {
-    private final int size;
-    private final int valueCount;
-    private final Comparator<BytesRef> comparator;
-
-    public Reader(Directory dir, String id, int maxDoc, IOContext context,
-        Type type, Comparator<BytesRef> comparator) throws IOException {
-      super(dir, id, CODEC_NAME, VERSION_START, true, context, type);
-      size = datIn.readInt();
-      valueCount = idxIn.readInt();
-      this.comparator = comparator;
+    
+    synchronized double sum()
+    {
+        return arrivalIntervals_.sum();
     }
-
-    @Override
-    public Source load() throws IOException {
-      return new FixedSortedSource(cloneData(), cloneIndex(), size, valueCount,
-          comparator);
+    
+    synchronized double sumOfDeviations()
+    {
+        return arrivalIntervals_.sumOfDeviations();
     }
-
-    @Override
-    public Source getDirectSource() throws IOException {
-      return new DirectFixedSortedSource(cloneData(), cloneIndex(), size,
-          valueCount, comparator, type);
+    
+    synchronized double mean()
+    {
+        return arrivalIntervals_.mean();
     }
-
-    @Override
-    public int getValueSize() {
-      return size;
+    
+    synchronized double variance()
+    {
+        return arrivalIntervals_.variance();
     }
-  }
-
-  static final class FixedSortedSource extends BytesSortedSourceBase {
-    private final int valueCount;
-    private final int size;
-
-    FixedSortedSource(IndexInput datIn, IndexInput idxIn, int size,
-        int numValues, Comparator<BytesRef> comp) throws IOException {
-      super(datIn, idxIn, comp, size * numValues, Type.BYTES_FIXED_SORTED,
-          false);
-      this.size = size;
-      this.valueCount = numValues;
-      closeIndexInput();
+    
+    double stdev()
+    {
+        return arrivalIntervals_.stdev();
     }
-
-    @Override
-    public int getValueCount() {
-      return valueCount;
+    
+    void clear()
+    {
+        arrivalIntervals_.clear();
     }
-
-    @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      return data.fillSlice(bytesRef, (ord * size), size);
+    
+    double p(double t)
+    {
+        double mean = mean();
+        double exponent = (-1)*(t)/mean;
+        return 1 - ( 1 - Math.pow(Math.E, exponent) );
     }
-  }
-
-  static final class DirectFixedSortedSource extends SortedSource {
-    final PackedInts.Reader docToOrdIndex;
-    private final IndexInput datIn;
-    private final long basePointer;
-    private final int size;
-    private final int valueCount;
-
-    DirectFixedSortedSource(IndexInput datIn, IndexInput idxIn, int size,
-        int valueCount, Comparator<BytesRef> comp, Type type)
-        throws IOException {
-      super(type, comp);
-      docToOrdIndex = PackedInts.getDirectReader(idxIn);
-      basePointer = datIn.getFilePointer();
-      this.datIn = datIn;
-      this.size = size;
-      this.valueCount = valueCount;
+    
+    double phi(long tnow)
+    {            
+        int size = arrivalIntervals_.size();
+        double log = 0d;
+        if ( size > 0 )
+        {
+            double t = tnow - tLast_;                
+            double probability = p(t);       
+            log = (-1) * Math.log10( probability );                                 
+        }
+        return log;           
+    } 
+    
+    public String toString()
+    {
+        return StringUtils.join(arrivalIntervals_.iterator(), " ");
     }
-
-    @Override
-    public int ord(int docID) {
-      return (int) docToOrdIndex.get(docID);
-    }
-
-    @Override
-    public boolean hasPackedDocToOrd() {
-      return true;
-    }
-
-    @Override
-    public PackedInts.Reader getDocToOrd() {
-      return docToOrdIndex;
-    }
-
-    @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      try {
-        datIn.seek(basePointer + size * ord);
-        bytesRef.grow(size);
-        datIn.readBytes(bytesRef.bytes, 0, size);
-        bytesRef.length = size;
-        bytesRef.offset = 0;
-        return bytesRef;
-      } catch (IOException ex) {
-        throw new IllegalStateException("failed to getByOrd", ex);
-      }
-    }
-
-    @Override
-    public int getValueCount() {
-      return valueCount;
-    }
-  }
-
 }

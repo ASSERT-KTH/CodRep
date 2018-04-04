@@ -1,6 +1,8 @@
-if ("org.slf4j.impl.Log4jLoggerFactory".equals(slf4jImpl)) {
+return liveDocs.cardinality();
 
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,172 +19,214 @@ if ("org.slf4j.impl.Log4jLoggerFactory".equals(slf4jImpl)) {
  * limitations under the License.
  */
 
-package org.apache.solr.logging;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
 
-import org.apache.solr.common.SolrDocument;
-import org.apache.solr.common.SolrDocumentList;
-import org.apache.solr.core.SolrResourceLoader;
-import org.apache.solr.logging.jul.JulWatcher;
-import org.apache.solr.logging.log4j.Log4jWatcher;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.slf4j.impl.StaticLoggerBinder;
-
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.lucene.index.IndexWriter; // javadoc
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.Version;
 
 /**
- * A Class to monitor Logging events and hold N events in memory
- * 
- * This is abstract so we can support both JUL and Log4j (and other logging platforms)
+ * This tool splits input index into multiple equal parts. The method employed
+ * here uses {@link IndexWriter#addIndexes(IndexReader[])} where the input data
+ * comes from the input index with artificially applied deletes to the document
+ * id-s that fall outside the selected partition.
+ * <p>Note 1: Deletes are only applied to a buffered list of deleted docs and
+ * don't affect the source index - this tool works also with read-only indexes.
+ * <p>Note 2: the disadvantage of this tool is that source index needs to be
+ * read as many times as there are parts to be created, hence the name of this
+ * tool.
+ *
+ * <p><b>NOTE</b>: this tool is unaware of documents added
+ * atomically via {@link IndexWriter#addDocuments} or {@link
+ * IndexWriter#updateDocuments}, which means it can easily
+ * break up such document groups.
  */
-public abstract class LogWatcher<E> {
-
-  private static final Logger log = LoggerFactory.getLogger(LogWatcher.class);
-  
-  protected CircularList<E> history;
-  protected long last = -1;
+public class MultiPassIndexSplitter {
   
   /**
-   * @return The implementation name
+   * Split source index into multiple parts.
+   * @param input source index, can be read-only, can have deletions, can have
+   * multiple segments (or multiple readers).
+   * @param outputs list of directories where the output parts will be stored.
+   * @param seq if true, then the source index will be split into equal
+   * increasing ranges of document id-s. If false, source document id-s will be
+   * assigned in a deterministic round-robin fashion to one of the output splits.
+   * @throws IOException
    */
-  public abstract String getName();
-  
-  /**
-   * @return The valid level names for this framework
-   */
-  public abstract List<String> getAllLevels();
-  
-  /**
-   * Sets the log level within this framework
-   */
-  public abstract void setLogLevel(String category, String level);
-  
-  /**
-   * @return all registered loggers
-   */
-  public abstract Collection<LoggerInfo> getAllLoggers();
-  
-  public abstract void setThreshold(String level);
-  public abstract String getThreshold();
-
-  public void add(E event, long timstamp) {
-    history.add(event);
-    last = timstamp;
-  }
-  
-  public long getLastEvent() {
-    return last;
-  }
-  
-  public int getHistorySize() {
-    return (history==null) ? -1 : history.getBufferSize();
-  }
-  
-  public SolrDocumentList getHistory(long since, AtomicBoolean found) {
-    if(history==null) {
-      return null;
+  public void split(Version version, IndexReader input, Directory[] outputs, boolean seq) throws IOException {
+    if (outputs == null || outputs.length < 2) {
+      throw new IOException("Invalid number of outputs.");
     }
-    
-    SolrDocumentList docs = new SolrDocumentList();
-    Iterator<E> iter = history.iterator();
-    while(iter.hasNext()) {
-      E e = iter.next();
-      long ts = getTimestamp(e);
-      if(ts == since) {
-        if(found!=null) {
-          found.set(true);
+    if (input == null || input.numDocs() < 2) {
+      throw new IOException("Not enough documents for splitting");
+    }
+    int numParts = outputs.length;
+    // wrap a potentially read-only input
+    // this way we don't have to preserve original deletions because neither
+    // deleteDocument(int) or undeleteAll() is applied to the wrapped input index.
+    input = new FakeDeleteIndexReader(input);
+    int maxDoc = input.maxDoc();
+    int partLen = maxDoc / numParts;
+    for (int i = 0; i < numParts; i++) {
+      input.undeleteAll();
+      if (seq) { // sequential range
+        int lo = partLen * i;
+        int hi = lo + partLen;
+        // below range
+        for (int j = 0; j < lo; j++) {
+          input.deleteDocument(j);
+        }
+        // above range - last part collects all id-s that remained due to
+        // integer rounding errors
+        if (i < numParts - 1) {
+          for (int j = hi; j < maxDoc; j++) {
+            input.deleteDocument(j);
+          }
+        }
+      } else {
+        // round-robin
+        for (int j = 0; j < maxDoc; j++) {
+          if ((j + numParts - i) % numParts != 0) {
+            input.deleteDocument(j);
+          }
         }
       }
-      if(ts>since) {
-        docs.add(toSolrDocument(e));
-      }
+      IndexWriter w = new IndexWriter(outputs[i], new IndexWriterConfig(
+          version,
+          null)
+          .setOpenMode(OpenMode.CREATE));
+      System.err.println("Writing part " + (i + 1) + " ...");
+      w.addIndexes(input);
+      w.close();
     }
-    docs.setNumFound(docs.size()); // make it not look too funny
-    return docs;
+    System.err.println("Done.");
   }
   
-  public abstract long getTimestamp(E event);
-  public abstract SolrDocument toSolrDocument(E event);
-  
-  public abstract void registerListener(ListenerConfig cfg);
-
-  public void reset() {
-    history.clear();
-    last = -1;
-  }
-
-  /**
-   * Create and register a LogWatcher.
-   *
-   * JUL and Log4j watchers are supported out-of-the-box.  You can register your own
-   * LogWatcher implementation via the plugins architecture
-   *
-   * @param config a LogWatcherConfig object, containing the configuration for this LogWatcher.
-   * @param loader a SolrResourceLoader, to be used to load plugin LogWatcher implementations.
-   *               Can be null if one of the built-in implementations is being used.
-   *
-   * @return a LogWatcher configured for the container's logging framework
-   */
-  public static LogWatcher newRegisteredLogWatcher(LogWatcherConfig config, SolrResourceLoader loader) {
-
-    if (!config.isEnabled()) {
-      log.info("A LogWatcher is not enabled");
-      return null;
+  @SuppressWarnings("deprecation")
+  public static void main(String[] args) throws Exception {
+    if (args.length < 5) {
+      System.err.println("Usage: MultiPassIndexSplitter -out <outputDir> -num <numParts> [-seq] <inputIndex1> [<inputIndex2 ...]");
+      System.err.println("\tinputIndex\tpath to input index, multiple values are ok");
+      System.err.println("\t-out ouputDir\tpath to output directory to contain partial indexes");
+      System.err.println("\t-num numParts\tnumber of parts to produce");
+      System.err.println("\t-seq\tsequential docid-range split (default is round-robin)");
+      System.exit(-1);
     }
-
-    LogWatcher logWatcher = createWatcher(config, loader);
-
-    if (logWatcher != null) {
-      if (config.getWatcherSize() > 0) {
-        log.info("Registering Log Listener [{}]", logWatcher.getName());
-        logWatcher.registerListener(config.asListenerConfig());
-      }
-    }
-
-    return logWatcher;
-  }
-
-  private static LogWatcher createWatcher(LogWatcherConfig config, SolrResourceLoader loader) {
-
-    String fname = config.getLoggingClass();
-    String slf4jImpl;
-
-    try {
-      slf4jImpl = StaticLoggerBinder.getSingleton().getLoggerFactoryClassStr();
-      log.info("SLF4J impl is " + slf4jImpl);
-      if (fname == null) {
-        if (slf4jImpl.indexOf("Log4j") > 0) {
-          fname = "Log4j";
-        } else if (slf4jImpl.indexOf("JDK") > 0) {
-          fname = "JUL";
+    ArrayList<IndexReader> indexes = new ArrayList<IndexReader>();
+    String outDir = null;
+    int numParts = -1;
+    boolean seq = false;
+    for (int i = 0; i < args.length; i++) {
+      if (args[i].equals("-out")) {
+        outDir = args[++i];
+      } else if (args[i].equals("-num")) {
+        numParts = Integer.parseInt(args[++i]);
+      } else if (args[i].equals("-seq")) {
+        seq = true;
+      } else {
+        File file = new File(args[i]);
+        if (!file.exists() || !file.isDirectory()) {
+          System.err.println("Invalid input path - skipping: " + file);
+          continue;
         }
+        Directory dir = FSDirectory.open(new File(args[i]));
+        try {
+          if (!IndexReader.indexExists(dir)) {
+            System.err.println("Invalid input index - skipping: " + file);
+            continue;
+          }
+        } catch (Exception e) {
+          System.err.println("Invalid input index - skipping: " + file);
+          continue;
+        }
+        indexes.add(IndexReader.open(dir, true));
       }
     }
-    catch (Throwable e) {
-      log.warn("Unable to read SLF4J version.  LogWatcher will be disabled: " + e);
-      return null;
+    if (outDir == null) {
+      throw new Exception("Required argument missing: -out outputDir");
+    }
+    if (numParts < 2) {
+      throw new Exception("Invalid value of required argument: -num numParts");
+    }
+    if (indexes.size() == 0) {
+      throw new Exception("No input indexes to process");
+    }
+    File out = new File(outDir);
+    if (!out.mkdirs()) {
+      throw new Exception("Can't create output directory: " + out);
+    }
+    Directory[] dirs = new Directory[numParts];
+    for (int i = 0; i < numParts; i++) {
+      dirs[i] = FSDirectory.open(new File(out, "part-" + i));
+    }
+    MultiPassIndexSplitter splitter = new MultiPassIndexSplitter();
+    IndexReader input;
+    if (indexes.size() == 1) {
+      input = indexes.get(0);
+    } else {
+      input = new MultiReader(indexes.toArray(new IndexReader[indexes.size()]));
+    }
+    splitter.split(Version.LUCENE_CURRENT, input, dirs, seq);
+  }
+  
+  /**
+   * This class pretends that it can write deletions to the underlying index.
+   * Instead, deletions are buffered in a bitset and overlaid with the original
+   * list of deletions.
+   */
+  public static final class FakeDeleteIndexReader extends FilterIndexReader {
+    FixedBitSet liveDocs;
+
+    public FakeDeleteIndexReader(IndexReader in) {
+      super(new SlowMultiReaderWrapper(in));
+      doUndeleteAll(); // initialize main bitset
     }
 
-    if (fname == null) {
-      log.info("No LogWatcher configured");
-      return null;
+    @Override
+    public int numDocs() {
+      return (int) liveDocs.cardinality();
     }
 
-    if ("JUL".equalsIgnoreCase(fname))
-      return new JulWatcher(slf4jImpl);
-    if ("Log4j".equals(fname))
-      return new Log4jWatcher(slf4jImpl);
-
-    try {
-      return loader != null ? loader.newInstance(fname, LogWatcher.class) : null;
+    /**
+     * Just removes our overlaid deletions - does not undelete the original
+     * deletions.
+     */
+    @Override
+    protected void doUndeleteAll()  {
+      final int maxDoc = in.maxDoc();
+      liveDocs = new FixedBitSet(in.maxDoc());
+      if (in.hasDeletions()) {
+        final Bits oldLiveDocs = in.getLiveDocs();
+        assert oldLiveDocs != null;
+        // this loop is a little bit ineffective, as Bits has no nextSetBit():
+        for (int i = 0; i < maxDoc; i++) {
+          if (oldLiveDocs.get(i)) liveDocs.set(i);
+        }
+      } else {
+        // mark all docs as valid
+        liveDocs.set(0, maxDoc);
+      }
     }
-    catch (Throwable e) {
-      log.warn("Unable to load LogWatcher {}: {}", fname, e);
+
+    @Override
+    protected void doDelete(int n) {
+      liveDocs.clear(n);
     }
 
-    return null;
+    @Override
+    public boolean hasDeletions() {
+      return (in.maxDoc() != this.numDocs());
+    }
+
+    @Override
+    public Bits getLiveDocs() {
+      return liveDocs;
+    }
   }
 }

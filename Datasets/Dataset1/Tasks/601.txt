@@ -1,13 +1,12 @@
-add(path, ArrayUtils.EMPTY_BYTE_ARRAY, new TimestampClock(System.currentTimeMillis()), DatabaseDescriptor.getGcGraceInSeconds());
+((HttpServletResponse)response).sendError( 503, "Server is shutting down" );
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,370 +17,503 @@ add(path, ArrayUtils.EMPTY_BYTE_ARRAY, new TimestampClock(System.currentTimeMill
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.solr.servlet;
 
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.ExecutionException;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.io.Writer;
+import java.nio.charset.Charset;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.WeakHashMap;
 
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.commons.lang.StringUtils;
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.ICompactSerializer;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.service.*;
-import org.apache.cassandra.thrift.ColumnOrSuperColumn;
-import org.apache.cassandra.thrift.Deletion;
-import org.apache.cassandra.thrift.Mutation;
-import org.apache.cassandra.thrift.Clock;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.concurrent.StageManager;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.cloud.ClusterState;
+import org.apache.solr.common.cloud.Slice;
+import org.apache.solr.common.cloud.ZkNodeProps;
+import org.apache.solr.common.cloud.ZkStateReader;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.util.ContentStreamBase;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.core.Config;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.SolrConfig;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.handler.ContentStreamHandlerBase;
+import org.apache.solr.request.ServletSolrParams;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.request.SolrQueryRequestBase;
+import org.apache.solr.request.SolrRequestHandler;
+import org.apache.solr.request.SolrRequestInfo;
+import org.apache.solr.response.BinaryQueryResponseWriter;
+import org.apache.solr.response.QueryResponseWriter;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.servlet.cache.HttpCacheHeaderUtil;
+import org.apache.solr.servlet.cache.Method;
+import org.apache.solr.util.FastWriter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xml.sax.InputSource;
 
-public class RowMutation
+/**
+ * This filter looks at the incoming URL maps them to handlers defined in solrconfig.xml
+ *
+ * @since solr 1.2
+ */
+public class SolrDispatchFilter implements Filter
 {
-    private static ICompactSerializer<RowMutation> serializer_;
-    public static final String HINT = "HINT";
+  final Logger log = LoggerFactory.getLogger(SolrDispatchFilter.class);
 
-    static
-    {
-        serializer_ = new RowMutationSerializer();
-    }   
+  protected volatile CoreContainer cores;
 
-    public static ICompactSerializer<RowMutation> serializer()
-    {
-        return serializer_;
+  protected String pathPrefix = null; // strip this from the beginning of a path
+  protected String abortErrorMessage = null;
+  protected final Map<SolrConfig, SolrRequestParsers> parsers = new WeakHashMap<SolrConfig, SolrRequestParsers>();
+  protected final SolrRequestParsers adminRequestParser;
+  
+  private static final Charset UTF8 = Charset.forName("UTF-8");
+
+  public SolrDispatchFilter() {
+    try {
+      adminRequestParser = new SolrRequestParsers(new Config(null,"solr",new InputSource(new ByteArrayInputStream("<root/>".getBytes("UTF-8"))),"") );
+    } catch (Exception e) {
+      //unlikely
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,e);
+    }
+  }
+
+  public void init(FilterConfig config) throws ServletException
+  {
+    log.info("SolrDispatchFilter.init()");
+
+    CoreContainer.Initializer init = createInitializer();
+    try {
+      // web.xml configuration
+      this.pathPrefix = config.getInitParameter( "path-prefix" );
+
+      this.cores = init.initialize();
+      log.info("user.dir=" + System.getProperty("user.dir"));
+    }
+    catch( Throwable t ) {
+      // catch this so our filter still works
+      log.error( "Could not start Solr. Check solr/home property and the logs");
+      SolrCore.log( t );
     }
 
-    private String table_;
-    private byte[] key_;
-    // map of column family id to mutations for that column family.
-    protected Map<Integer, ColumnFamily> modifications_ = new HashMap<Integer, ColumnFamily>();
+    log.info("SolrDispatchFilter.init() done");
+  }
+  
+  public CoreContainer getCores() {
+    return cores;
+  }
 
-    public RowMutation(String table, byte[] key)
-    {
-        table_ = table;
-        key_ = key;
-    }
+  /** Method to override to change how CoreContainer initialization is performed. */
+  protected CoreContainer.Initializer createInitializer() {
+    return new CoreContainer.Initializer();
+  }
+  
+  public void destroy() {
+    if (cores != null) {
+      cores.shutdown();
+      cores = null;
+    }    
+  }
 
-    public RowMutation(String table, Row row)
-    {
-        table_ = table;
-        key_ = row.key.key;
-        add(row.cf);
-    }
-
-    protected RowMutation(String table, byte[] key, Map<Integer, ColumnFamily> modifications)
-    {
-        table_ = table;
-        key_ = key;
-        modifications_ = modifications;
-    }
-
-    public String getTable()
-    {
-        return table_;
-    }
-
-    public byte[] key()
-    {
-        return key_;
-    }
-
-    public Collection<ColumnFamily> getColumnFamilies()
-    {
-        return modifications_.values();
-    }
-
-    void addHints(RowMutation rm) throws IOException
-    {
-        for (ColumnFamily cf : rm.getColumnFamilies())
-        {
-            byte[] combined = HintedHandOffManager.makeCombinedName(rm.getTable(), cf.metadata().cfName);
-            QueryPath path = new QueryPath(HintedHandOffManager.HINTS_CF, rm.key(), combined);
-            add(path, ArrayUtils.EMPTY_BYTE_ARRAY, new TimestampClock(System.currentTimeMillis()));
-        }
-    }
-
-    /*
-     * Specify a column family name and the corresponding column
-     * family object.
-     * param @ cf - column family name
-     * param @ columnFamily - the column family.
-    */
-    public void add(ColumnFamily columnFamily)
-    {
-        assert columnFamily != null;
-        ColumnFamily prev = modifications_.put(columnFamily.id(), columnFamily);
-        if (prev != null)
-            // developer error
-            throw new IllegalArgumentException("ColumnFamily " + columnFamily + " already has modifications in this mutation: " + prev);
-    }
-
-    public boolean isEmpty()
-    {
-        return modifications_.isEmpty();
-    }
-
-    /*
-     * Specify a column name and a corresponding value for
-     * the column. Column name is specified as <column family>:column.
-     * This will result in a ColumnFamily associated with
-     * <column family> as name and a Column with <column>
-     * as name. The column can be further broken up
-     * as super column name : columnname  in case of super columns
-     *
-     * param @ cf - column name as <column family>:<column>
-     * param @ value - value associated with the column
-     * param @ clock - clock associated with this data.
-     * param @ timeToLive - ttl for the column, 0 for standard (non expiring) columns
-    */
-    public void add(QueryPath path, byte[] value, IClock clock, int timeToLive)
-    {
-        Integer id = CFMetaData.getId(table_, path.columnFamilyName);
-        ColumnFamily columnFamily = modifications_.get(id);
-        if (columnFamily == null)
-        {
-            columnFamily = ColumnFamily.create(table_, path.columnFamilyName);
-            modifications_.put(id, columnFamily);
-        }
-        columnFamily.addColumn(path, value, clock, timeToLive);
-    }
-
-    public void add(QueryPath path, byte[] value, IClock clock)
-    {
-        add(path, value, clock, 0);
-    }
-
-    public void delete(QueryPath path, IClock clock)
-    {
-        Integer id = CFMetaData.getId(table_, path.columnFamilyName);
-
-        int localDeleteTime = (int) (System.currentTimeMillis() / 1000);
-
-        ColumnFamily columnFamily = modifications_.get(id);
-        if (columnFamily == null)
-        {
-            columnFamily = ColumnFamily.create(table_, path.columnFamilyName);
-            modifications_.put(id, columnFamily);
-        }
-
-        if (path.superColumnName == null && path.columnName == null)
-        {
-            columnFamily.delete(localDeleteTime, clock);
-        }
-        else if (path.columnName == null)
-        {
-            SuperColumn sc = new SuperColumn(path.superColumnName, columnFamily.getSubComparator(), 
-                    columnFamily.getClockType(), columnFamily.getReconciler());
-            sc.markForDeleteAt(localDeleteTime, clock);
-            columnFamily.addColumn(sc);
-        }
-        else
-        {
-            columnFamily.deleteColumn(path, localDeleteTime, clock);
-        }
-    }
-
-    /*
-     * This is equivalent to calling commit. Applies the changes to
-     * to the table that is obtained by calling Table.open().
-    */
-    public void apply() throws IOException
-    {
-        Table.open(table_).apply(this, getSerializedBuffer(), true);
-    }
-
-    /*
-     * This is equivalent to calling commit. Applies the changes to
-     * to the table that is obtained by calling Table.open().
-    */
-    void applyBinary() throws IOException, ExecutionException, InterruptedException
-    {
-        Table.open(table_).load(this);
-    }
-
-    public Message makeRowMutationMessage() throws IOException
-    {
-        return makeRowMutationMessage(StorageService.Verb.MUTATION);
-    }
-
-    public Message makeRowMutationMessage(StorageService.Verb verb) throws IOException
-    {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        DataOutputStream dos = new DataOutputStream(bos);
-        serializer().serialize(this, dos);
-        return new Message(FBUtilities.getLocalAddress(), StageManager.MUTATION_STAGE, verb, bos.toByteArray());
-    }
-
-    public static RowMutation getRowMutationFromMutations(String keyspace, byte[] key, Map<String, List<Mutation>> cfmap)
-    {
-        RowMutation rm = new RowMutation(keyspace, key);
-        for (Map.Entry<String, List<Mutation>> entry : cfmap.entrySet())
-        {
-            String cfName = entry.getKey();
-            for (Mutation mutation : entry.getValue())
-            {
-                if (mutation.deletion != null)
-                {
-                    deleteColumnOrSuperColumnToRowMutation(rm, cfName, mutation.deletion);
-                }
-                else
-                {
-                    addColumnOrSuperColumnToRowMutation(rm, cfName, mutation.column_or_supercolumn);
-                }
-            }
-        }
-        return rm;
+  public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+    if( abortErrorMessage != null ) {
+      ((HttpServletResponse)response).sendError( 500, abortErrorMessage );
+      return;
     }
     
-    public static RowMutation getRowMutation(String table, byte[] key, Map<String, List<ColumnOrSuperColumn>> cfmap)
-    {
-        RowMutation rm = new RowMutation(table, key);
-        for (Map.Entry<String, List<ColumnOrSuperColumn>> entry : cfmap.entrySet())
-        {
-            String cfName = entry.getKey();
-            for (ColumnOrSuperColumn cosc : entry.getValue())
-            {
-                if (cosc.column == null)
-                {
-                    assert cosc.super_column != null;
-                    for (org.apache.cassandra.thrift.Column column : cosc.super_column.columns)
-                    {
-                        rm.add(new QueryPath(cfName, cosc.super_column.name, column.name), column.value, unthriftifyClock(column.clock), column.ttl);
-                    }
-                }
-                else
-                {
-                    assert cosc.super_column == null;
-                    rm.add(new QueryPath(cfName, null, cosc.column.name), cosc.column.value, unthriftifyClock(cosc.column.clock), cosc.column.ttl);
-                }
-            }
+    if (this.cores == null) {
+      ((HttpServletResponse)response).sendError( 403, "Server is shutting down" );
+      return;
+    }
+    CoreContainer cores = this.cores;
+    SolrCore core = null;
+    SolrQueryRequest solrReq = null;
+    
+    if( request instanceof HttpServletRequest) {
+      HttpServletRequest req = (HttpServletRequest)request;
+      HttpServletResponse resp = (HttpServletResponse)response;
+      SolrRequestHandler handler = null;
+      String corename = "";
+      try {
+        // put the core container in request attribute
+        req.setAttribute("org.apache.solr.CoreContainer", cores);
+        String path = req.getServletPath();
+        if( req.getPathInfo() != null ) {
+          // this lets you handle /update/commit when /update is a servlet
+          path += req.getPathInfo();
         }
-        return rm;
+        if( pathPrefix != null && path.startsWith( pathPrefix ) ) {
+          path = path.substring( pathPrefix.length() );
+        }
+        // check for management path
+        String alternate = cores.getManagementPath();
+        if (alternate != null && path.startsWith(alternate)) {
+          path = path.substring(0, alternate.length());
+        }
+        // unused feature ?
+        int idx = path.indexOf( ':' );
+        if( idx > 0 ) {
+          // save the portion after the ':' for a 'handler' path parameter
+          path = path.substring( 0, idx );
+        }
+
+        // Check for the core admin page
+        if( path.equals( cores.getAdminPath() ) ) {
+          handler = cores.getMultiCoreHandler();
+          solrReq =  adminRequestParser.parse(null,path, req);
+          handleAdminRequest(req, response, handler, solrReq);
+          return;
+        }
+        // Check for the core admin collections url
+        if( path.equals( "/admin/collections" ) ) {
+          handler = cores.getCollectionsHandler();
+          solrReq =  adminRequestParser.parse(null,path, req);
+          handleAdminRequest(req, response, handler, solrReq);
+          return;
+        }
+        else {
+          //otherwise, we should find a core from the path
+          idx = path.indexOf( "/", 1 );
+          if( idx > 1 ) {
+            // try to get the corename as a request parameter first
+            corename = path.substring( 1, idx );
+            core = cores.getCore(corename);
+            if (core != null) {
+              path = path.substring( idx );
+            }
+          }
+          if (core == null) {
+            if (!cores.isZooKeeperAware() ) {
+              core = cores.getCore("");
+            }
+          }
+        }
+        
+        if (core == null && cores.isZooKeeperAware()) {
+          // we couldn't find the core - lets make sure a collection was not specified instead
+          core = getCoreByCollection(cores, corename, path);
+          
+          if (core != null) {
+            // we found a core, update the path
+            path = path.substring( idx );
+          } else {
+            // try the default core
+            core = cores.getCore("");
+          }
+          // TODO: if we couldn't find it locally, look on other nodes
+        }
+
+        // With a valid core...
+        if( core != null ) {
+          final SolrConfig config = core.getSolrConfig();
+          // get or create/cache the parser for the core
+          SolrRequestParsers parser = null;
+          parser = parsers.get(config);
+          if( parser == null ) {
+            parser = new SolrRequestParsers(config);
+            parsers.put(config, parser );
+          }
+
+          // Determine the handler from the url path if not set
+          // (we might already have selected the cores handler)
+          if( handler == null && path.length() > 1 ) { // don't match "" or "/" as valid path
+            handler = core.getRequestHandler( path );
+            // no handler yet but allowed to handle select; let's check
+            if( handler == null && parser.isHandleSelect() ) {
+              if( "/select".equals( path ) || "/select/".equals( path ) ) {
+                solrReq = parser.parse( core, path, req );
+                String qt = solrReq.getParams().get( CommonParams.QT );
+                handler = core.getRequestHandler( qt );
+                if( handler == null ) {
+                  throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "unknown handler: "+qt);
+                }
+                if( qt != null && qt.startsWith("/") && (handler instanceof ContentStreamHandlerBase)) {
+                  //For security reasons it's a bad idea to allow a leading '/', ex: /select?qt=/update see SOLR-3161
+                  //There was no restriction from Solr 1.4 thru 3.5 and it's not supported for update handlers.
+                  throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Invalid Request Handler ('qt').  Do not use /select to access: "+qt);
+                }
+              }
+            }
+          }
+
+          // With a valid handler and a valid core...
+          if( handler != null ) {
+            // if not a /select, create the request
+            if( solrReq == null ) {
+              solrReq = parser.parse( core, path, req );
+            }
+
+            final Method reqMethod = Method.getMethod(req.getMethod());
+            HttpCacheHeaderUtil.setCacheControlHeader(config, resp, reqMethod);
+            // unless we have been explicitly told not to, do cache validation
+            // if we fail cache validation, execute the query
+            if (config.getHttpCachingConfig().isNever304() ||
+                !HttpCacheHeaderUtil.doCacheHeaderValidation(solrReq, req, reqMethod, resp)) {
+                SolrQueryResponse solrRsp = new SolrQueryResponse();
+                /* even for HEAD requests, we need to execute the handler to
+                 * ensure we don't get an error (and to make sure the correct
+                 * QueryResponseWriter is selected and we get the correct
+                 * Content-Type)
+                 */
+                SolrRequestInfo.setRequestInfo(new SolrRequestInfo(solrReq, solrRsp));
+                this.execute( req, handler, solrReq, solrRsp );
+                HttpCacheHeaderUtil.checkHttpCachingVeto(solrRsp, resp, reqMethod);
+              // add info to http headers
+              //TODO: See SOLR-232 and SOLR-267.  
+                /*try {
+                  NamedList solrRspHeader = solrRsp.getResponseHeader();
+                 for (int i=0; i<solrRspHeader.size(); i++) {
+                   ((javax.servlet.http.HttpServletResponse) response).addHeader(("Solr-" + solrRspHeader.getName(i)), String.valueOf(solrRspHeader.getVal(i)));
+                 }
+                } catch (ClassCastException cce) {
+                  log.log(Level.WARNING, "exception adding response header log information", cce);
+                }*/
+               QueryResponseWriter responseWriter = core.getQueryResponseWriter(solrReq);
+               writeResponse(solrRsp, response, responseWriter, solrReq, reqMethod);
+            }
+            return; // we are done with a valid handler
+          }
+        }
+        log.debug("no handler or core retrieved for " + path + ", follow through...");
+      } 
+      catch (Throwable ex) {
+        sendError( core, solrReq, request, (HttpServletResponse)response, ex );
+        return;
+      } 
+      finally {
+        if( solrReq != null ) {
+          solrReq.close();
+        }
+        if (core != null) {
+          core.close();
+        }
+        SolrRequestInfo.clearRequestInfo();        
+      }
+    }
+
+    // Otherwise let the webapp handle the request
+    chain.doFilter(request, response);
+  }
+  
+  private SolrCore getCoreByCollection(CoreContainer cores, String corename, String path) {
+    String collection = corename;
+    ZkStateReader zkStateReader = cores.getZkController().getZkStateReader();
+    
+    ClusterState clusterState = zkStateReader.getClusterState();
+    Map<String,Slice> slices = clusterState.getSlices(collection);
+    if (slices == null) {
+      return null;
+    }
+    // look for a core on this node
+    Set<Entry<String,Slice>> entries = slices.entrySet();
+    SolrCore core = null;
+    done:
+    for (Entry<String,Slice> entry : entries) {
+      // first see if we have the leader
+      ZkNodeProps leaderProps = clusterState.getLeader(collection, entry.getKey());
+      if (leaderProps != null) {
+        core = checkProps(cores, path, leaderProps);
+      }
+      if (core != null) {
+        break done;
+      }
+      
+      // check everyone then
+      Map<String,ZkNodeProps> shards = entry.getValue().getShards();
+      Set<Entry<String,ZkNodeProps>> shardEntries = shards.entrySet();
+      for (Entry<String,ZkNodeProps> shardEntry : shardEntries) {
+        ZkNodeProps zkProps = shardEntry.getValue();
+        core = checkProps(cores, path, zkProps);
+        if (core != null) {
+          break done;
+        }
+      }
+    }
+    return core;
+  }
+
+  private SolrCore checkProps(CoreContainer cores, String path,
+      ZkNodeProps zkProps) {
+    String corename;
+    SolrCore core = null;
+    if (cores.getZkController().getNodeName().equals(zkProps.get(ZkStateReader.NODE_NAME_PROP))) {
+      corename = zkProps.get(ZkStateReader.CORE_NAME_PROP);
+      core = cores.getCore(corename);
+    }
+    return core;
+  }
+
+  private void handleAdminRequest(HttpServletRequest req, ServletResponse response, SolrRequestHandler handler,
+                                  SolrQueryRequest solrReq) throws IOException {
+    SolrQueryResponse solrResp = new SolrQueryResponse();
+    final NamedList<Object> responseHeader = new SimpleOrderedMap<Object>();
+    solrResp.add("responseHeader", responseHeader);
+    NamedList toLog = solrResp.getToLog();
+    toLog.add("webapp", req.getContextPath());
+    toLog.add("path", solrReq.getContext().get("path"));
+    toLog.add("params", "{" + solrReq.getParamString() + "}");
+    handler.handleRequest(solrReq, solrResp);
+    SolrCore.setResponseHeaderValues(handler, solrReq, solrResp);
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < toLog.size(); i++) {
+      String name = toLog.getName(i);
+      Object val = toLog.getVal(i);
+      sb.append(name).append("=").append(val).append(" ");
+    }
+    QueryResponseWriter respWriter = SolrCore.DEFAULT_RESPONSE_WRITERS.get(solrReq.getParams().get(CommonParams.WT));
+    if (respWriter == null) respWriter = SolrCore.DEFAULT_RESPONSE_WRITERS.get("standard");
+    writeResponse(solrResp, response, respWriter, solrReq, Method.getMethod(req.getMethod()));
+  }
+
+  private void writeResponse(SolrQueryResponse solrRsp, ServletResponse response,
+                             QueryResponseWriter responseWriter, SolrQueryRequest solrReq, Method reqMethod)
+          throws IOException {
+
+    // Now write it out
+    final String ct = responseWriter.getContentType(solrReq, solrRsp);
+    // don't call setContentType on null
+    if (null != ct) response.setContentType(ct); 
+
+    if (solrRsp.getException() != null) {
+      NamedList info = new SimpleOrderedMap();
+      int code = getErrorInfo(solrRsp.getException(),info);
+      solrRsp.add("error", info);
+      ((HttpServletResponse) response).setStatus(code);
     }
     
-    public DataOutputBuffer getSerializedBuffer() throws IOException
-    {
-        DataOutputBuffer buffer = new DataOutputBuffer();
-        RowMutation.serializer().serialize(this, buffer);
-        return buffer;
+    if (Method.HEAD != reqMethod) {
+      if (responseWriter instanceof BinaryQueryResponseWriter) {
+        BinaryQueryResponseWriter binWriter = (BinaryQueryResponseWriter) responseWriter;
+        binWriter.write(response.getOutputStream(), solrReq, solrRsp);
+      } else {
+        String charset = ContentStreamBase.getCharsetFromContentType(ct);
+        Writer out = (charset == null || charset.equalsIgnoreCase("UTF-8"))
+          ? new OutputStreamWriter(response.getOutputStream(), UTF8)
+          : new OutputStreamWriter(response.getOutputStream(), charset);
+        out = new FastWriter(out);
+        responseWriter.write(out, solrReq, solrRsp);
+        out.flush();
+      }
+    }
+    //else http HEAD request, nothing to write out, waited this long just to get ContentType
+  }
+  
+  protected int getErrorInfo(Throwable ex, NamedList info) {
+    int code=500;
+    if( ex instanceof SolrException ) {
+      code = ((SolrException)ex).code();
     }
 
-    public String toString()
-    {
-        return toString(false);
+    String msg = null;
+    for (Throwable th = ex; th != null; th = th.getCause()) {
+      msg = th.getMessage();
+      if (msg != null) break;
     }
-
-    public String toString(boolean shallow)
-    {
-        StringBuilder buff = new StringBuilder("RowMutation(");
-        buff.append("keyspace='").append(table_).append('\'');
-        buff.append(", key='").append(FBUtilities.bytesToHex(key_)).append('\'');
-        buff.append(", modifications=[");
-        if (shallow)
-        {
-            List<String> cfnames = new ArrayList<String>();
-            for (Integer cfid : modifications_.keySet())
-            {
-                CFMetaData cfm = DatabaseDescriptor.getCFMetaData(cfid);
-                cfnames.add(cfm == null ? "-dropped-" : cfm.cfName);
-            }
-            buff.append(StringUtils.join(cfnames, ", "));
-        }
-        else
-            buff.append(StringUtils.join(modifications_.values(), ", "));
-        return buff.append("])").toString();
+    if(msg != null) {
+      info.add("msg", msg);
     }
+    
+    // For any regular code, don't include the stack trace
+    if( code == 500 || code < 100 ) {
+      StringWriter sw = new StringWriter();
+      ex.printStackTrace(new PrintWriter(sw));
+      SolrException.log(log, null, ex);
+      info.add("trace", sw.toString());
 
-    private static void addColumnOrSuperColumnToRowMutation(RowMutation rm, String cfName, ColumnOrSuperColumn cosc)
-    {
-        if (cosc.column == null)
-        {
-            for (org.apache.cassandra.thrift.Column column : cosc.super_column.columns)
-            {
-                rm.add(new QueryPath(cfName, cosc.super_column.name, column.name), column.value, unthriftifyClock(column.clock), column.ttl);
-            }
-        }
-        else
-        {
-            rm.add(new QueryPath(cfName, null, cosc.column.name), cosc.column.value, unthriftifyClock(cosc.column.clock), cosc.column.ttl);
-        }
+      // non standard codes have undefined results with various servers
+      if( code < 100 ) {
+        log.warn( "invalid return code: "+code );
+        code = 500;
+      }
     }
+    info.add("code", new Integer(code));
+    return code;
+  }
 
-    private static void deleteColumnOrSuperColumnToRowMutation(RowMutation rm, String cfName, Deletion del)
-    {
-        if (del.predicate != null && del.predicate.column_names != null)
-        {
-            for(byte[] c : del.predicate.column_names)
-            {
-                if (del.super_column == null && DatabaseDescriptor.getColumnFamilyType(rm.table_, cfName) == ColumnFamilyType.Super)
-                    rm.delete(new QueryPath(cfName, c), unthriftifyClock(del.clock));
-                else
-                    rm.delete(new QueryPath(cfName, del.super_column, c), unthriftifyClock(del.clock));
-            }
-        }
-        else
-        {
-            rm.delete(new QueryPath(cfName, del.super_column), unthriftifyClock(del.clock));
-        }
+  protected void execute( HttpServletRequest req, SolrRequestHandler handler, SolrQueryRequest sreq, SolrQueryResponse rsp) {
+    // a custom filter could add more stuff to the request before passing it on.
+    // for example: sreq.getContext().put( "HttpServletRequest", req );
+    // used for logging query stats in SolrCore.execute()
+    sreq.getContext().put( "webapp", req.getContextPath() );
+    sreq.getCore().execute( handler, sreq, rsp );
+  }
+
+  protected void sendError(SolrCore core, 
+      SolrQueryRequest req, 
+      ServletRequest request, 
+      HttpServletResponse response, 
+      Throwable ex) throws IOException {
+    try {
+      SolrQueryResponse solrResp = new SolrQueryResponse();
+      if(ex instanceof Exception) {
+        solrResp.setException((Exception)ex);
+      }
+      else {
+        solrResp.setException(new RuntimeException(ex));
+      }
+      if(core==null) {
+        core = cores.getCore(""); // default core
+      }
+      if(req==null) {
+        req = new SolrQueryRequestBase(core,new ServletSolrParams(request)) {};
+      }
+      QueryResponseWriter writer = core.getQueryResponseWriter(req);
+      writeResponse(solrResp, response, writer, req, Method.GET);
     }
-
-    private static IClock unthriftifyClock(Clock clock)
-    {
-        return new TimestampClock(clock.getTimestamp());
+    catch( Throwable t ) { // This error really does not matter
+      SimpleOrderedMap info = new SimpleOrderedMap();
+      int code=getErrorInfo(ex, info);
+      response.sendError( code, info.toString() );
     }
-}
+  }
 
-class RowMutationSerializer implements ICompactSerializer<RowMutation>
-{
-    private void freezeTheMaps(Map<Integer, ColumnFamily> map, DataOutputStream dos) throws IOException
-    {
-        int size = map.size();
-        dos.writeInt(size);
-        if (size > 0)
-        {
-            for (Map.Entry<Integer,ColumnFamily> entry : map.entrySet())
-            {
-                dos.writeInt(entry.getKey());
-                ColumnFamily.serializer().serialize(entry.getValue(), dos);
-            }
-        }
-    }
+  //---------------------------------------------------------------------
+  //---------------------------------------------------------------------
 
-    public void serialize(RowMutation rm, DataOutputStream dos) throws IOException
-    {
-        dos.writeUTF(rm.getTable());
-        FBUtilities.writeShortByteArray(rm.key(), dos);
+  /**
+   * Set the prefix for all paths.  This is useful if you want to apply the
+   * filter to something other then /*, perhaps because you are merging this
+   * filter into a larger web application.
+   *
+   * For example, if web.xml specifies:
+   *
+   * <filter-mapping>
+   *  <filter-name>SolrRequestFilter</filter-name>
+   *  <url-pattern>/xxx/*</url-pattern>
+   * </filter-mapping>
+   *
+   * Make sure to set the PathPrefix to "/xxx" either with this function
+   * or in web.xml.
+   *
+   * <init-param>
+   *  <param-name>path-prefix</param-name>
+   *  <param-value>/xxx</param-value>
+   * </init-param>
+   *
+   */
+  public void setPathPrefix(String pathPrefix) {
+    this.pathPrefix = pathPrefix;
+  }
 
-        /* serialize the modifications_ in the mutation */
-        freezeTheMaps(rm.modifications_, dos);
-    }
-
-    private Map<Integer, ColumnFamily> defreezeTheMaps(DataInputStream dis) throws IOException
-    {
-        Map<Integer, ColumnFamily> map = new HashMap<Integer, ColumnFamily>();
-        int size = dis.readInt();
-        for (int i = 0; i < size; ++i)
-        {
-            Integer cfid = Integer.valueOf(dis.readInt());
-            ColumnFamily cf = ColumnFamily.serializer().deserialize(dis);
-            map.put(cfid, cf);
-        }
-        return map;
-    }
-
-    public RowMutation deserialize(DataInputStream dis) throws IOException
-    {
-        String table = dis.readUTF();
-        byte[] key = FBUtilities.readShortByteArray(dis);
-        Map<Integer, ColumnFamily> modifications = defreezeTheMaps(dis);
-        return new RowMutation(table, key, modifications);
-    }
+  public String getPathPrefix() {
+    return pathPrefix;
+  }
 }

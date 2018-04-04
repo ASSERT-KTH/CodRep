@@ -1,10 +1,18 @@
-public static final char[] EMPTY_CHARS = new char[0];
+int[] newarray = ArrayUtil.grow(parents, ordinal + 1);
 
-package org.apache.lucene.util;
+package org.apache.lucene.facet.taxonomy.directory;
 
-import java.util.Comparator;
+import java.io.IOException;
 
-/**
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.ArrayUtil;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -22,256 +30,203 @@ import java.util.Comparator;
  */
 
 /**
- * Represents char[], as a slice (offset + length) into an existing char[].
- * The {@link #chars} member should never be null; use
- * {@link #EMPTY_ARRAY} if necessary.
- * @lucene.internal
+ * Returns 3 arrays for traversing the taxonomy:
+ * <ul>
+ * <li>{@code parents}: {@code parents[i]} denotes the parent of category
+ * ordinal {@code i}.</li>
+ * <li>{@code children}: {@code children[i]} denotes the youngest child of
+ * category ordinal {@code i}. The youngest child is defined as the category
+ * that was added last to the taxonomy as an immediate child of {@code i}.</li>
+ * <li>{@code siblings}: {@code siblings[i]} denotes the sibling of category
+ * ordinal {@code i}. The sibling is defined as the previous youngest child of
+ * {@code parents[i]}.</li>
+ * </ul>
+ * 
+ * To traverse the taxonomy tree, you typically start with {@code children[0]}
+ * (ordinal 0 is reserved for ROOT), and then depends if you want to do DFS or
+ * BFS, you call {@code children[children[0]]} or {@code siblings[children[0]]}
+ * and so forth, respectively.
+ * 
+ * <p>
+ * <b>NOTE:</b> you are not expected to modify the values of the arrays, since
+ * the arrays are shared with other threads.
+ * 
+ * @lucene.experimental
  */
-public final class CharsRef implements Comparable<CharsRef>, CharSequence, Cloneable {
-  private static final char[] EMPTY_CHARS = new char[0];
-  public char[] chars;
-  public int offset;
-  public int length;
+public class ParallelTaxonomyArrays {
 
-  /**
-   * Creates a new {@link CharsRef} initialized an empty array zero-length
-   */
-  public CharsRef() {
-    this(EMPTY_CHARS, 0, 0);
+  private final int[] parents;
+
+  // the following two arrays are lazily intialized. note that we only keep a
+  // single boolean member as volatile, instead of declaring the arrays
+  // volatile. the code guarantees that only after the boolean is set to true,
+  // the arrays are returned.
+  private volatile boolean initializedChildren = false;
+  private int[] children, siblings;
+  
+  /** Used by {@link #add(int, int)} after the array grew. */
+  private ParallelTaxonomyArrays(int[] parents) {
+    this.parents = parents;
   }
 
-  /**
-   * Creates a new {@link CharsRef} initialized with an array of the given
-   * capacity
-   */
-  public CharsRef(int capacity) {
-    chars = new char[capacity];
-  }
-
-  /**
-   * Creates a new {@link CharsRef} initialized with the given array, offset and
-   * length
-   */
-  public CharsRef(char[] chars, int offset, int length) {
-    assert chars != null;
-    assert chars.length >= offset + length;
-    this.chars = chars;
-    this.offset = offset;
-    this.length = length;
-  }
-
-  /**
-   * Creates a new {@link CharsRef} initialized with the given Strings character
-   * array
-   */
-  public CharsRef(String string) {
-    this.chars = string.toCharArray();
-    this.offset = 0;
-    this.length = chars.length;
-  }
-
-  @Override
-  public CharsRef clone() {
-    return new CharsRef(chars, offset, length);
-  }
-
-  @Override
-  public int hashCode() {
-    final int prime = 31;
-    int result = 0;
-    final int end = offset + length;
-    for (int i = offset; i < end; i++) {
-      result = prime * result + chars[i];
+  public ParallelTaxonomyArrays(IndexReader reader) throws IOException {
+    parents = new int[reader.maxDoc()];
+    if (parents.length > 0) {
+      initParents(reader, 0);
+      // Starting Lucene 2.9, following the change LUCENE-1542, we can
+      // no longer reliably read the parent "-1" (see comment in
+      // LuceneTaxonomyWriter.SinglePositionTokenStream). We have no way
+      // to fix this in indexing without breaking backward-compatibility
+      // with existing indexes, so what we'll do instead is just
+      // hard-code the parent of ordinal 0 to be -1, and assume (as is
+      // indeed the case) that no other parent can be -1.
+      parents[0] = TaxonomyReader.INVALID_ORDINAL;
     }
-    return result;
+  }
+  
+  public ParallelTaxonomyArrays(IndexReader reader, ParallelTaxonomyArrays copyFrom) throws IOException {
+    assert copyFrom != null;
+
+    // note that copyParents.length may be equal to reader.maxDoc(). this is not a bug
+    // it may be caused if e.g. the taxonomy segments were merged, and so an updated
+    // NRT reader was obtained, even though nothing was changed. this is not very likely
+    // to happen.
+    int[] copyParents = copyFrom.parents();
+    this.parents = new int[reader.maxDoc()];
+    System.arraycopy(copyParents, 0, parents, 0, copyParents.length);
+    initParents(reader, copyParents.length);
+
+    if (copyFrom.initializedChildren) {
+      initChildrenSiblings(copyFrom);
+    }
   }
 
-  @Override
-  public boolean equals(Object other) {
-    if (other == null) {
-      return false;
+  private final synchronized void initChildrenSiblings(ParallelTaxonomyArrays copyFrom) {
+    if (!initializedChildren) { // must do this check !
+      children = new int[parents.length];
+      siblings = new int[parents.length];
+      if (copyFrom != null) {
+        // called from the ctor, after we know copyFrom has initialized children/siblings
+        System.arraycopy(copyFrom.children(), 0, children, 0, copyFrom.children().length);
+        System.arraycopy(copyFrom.siblings(), 0, siblings, 0, copyFrom.siblings().length);
+      }
+      computeChildrenSiblings(parents, 0);
+      initializedChildren = true;
     }
-    if (other instanceof CharsRef) {
-      return this.charsEquals((CharsRef) other);
-    }
-    return false;
   }
+  
+  private void computeChildrenSiblings(int[] parents, int first) {
+    // reset the youngest child of all ordinals. while this should be done only
+    // for the leaves, we don't know up front which are the leaves, so we reset
+    // all of them.
+    for (int i = first; i < parents.length; i++) {
+      children[i] = TaxonomyReader.INVALID_ORDINAL;
+    }
+    
+    // the root category has no parent, and therefore no siblings
+    if (first == 0) {
+      first = 1;
+      siblings[0] = TaxonomyReader.INVALID_ORDINAL;
+    }
+    
+    for (int i = first; i < parents.length; i++) {
+      // note that parents[i] is always < i, so the right-hand-side of
+      // the following line is already set when we get here
+      siblings[i] = children[parents[i]];
+      children[parents[i]] = i;
+    }
+  }
+  
+  // Read the parents of the new categories
+  private void initParents(IndexReader reader, int first) throws IOException {
+    if (reader.maxDoc() == first) {
+      return;
+    }
+    
+    // it's ok to use MultiFields because we only iterate on one posting list.
+    // breaking it to loop over the leaves() only complicates code for no
+    // apparent gain.
+    DocsAndPositionsEnum positions = MultiFields.getTermPositionsEnum(reader, null,
+        Consts.FIELD_PAYLOADS, Consts.PAYLOAD_PARENT_BYTES_REF,
+        DocsAndPositionsEnum.FLAG_PAYLOADS);
 
-  public boolean charsEquals(CharsRef other) {
-    if (length == other.length) {
-      int otherUpto = other.offset;
-      final char[] otherChars = other.chars;
-      final int end = offset + length;
-      for (int upto = offset; upto < end; upto++, otherUpto++) {
-        if (chars[upto] != otherChars[otherUpto]) {
-          return false;
+    // shouldn't really happen, if it does, something's wrong
+    if (positions == null || positions.advance(first) == DocIdSetIterator.NO_MORE_DOCS) {
+      throw new CorruptIndexException("Missing parent data for category " + first);
+    }
+    
+    int num = reader.maxDoc();
+    for (int i = first; i < num; i++) {
+      if (positions.docID() == i) {
+        if (positions.freq() == 0) { // shouldn't happen
+          throw new CorruptIndexException("Missing parent data for category " + i);
         }
-      }
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  /** Signed int order comparison */
-  public int compareTo(CharsRef other) {
-    if (this == other)
-      return 0;
-
-    final char[] aChars = this.chars;
-    int aUpto = this.offset;
-    final char[] bChars = other.chars;
-    int bUpto = other.offset;
-
-    final int aStop = aUpto + Math.min(this.length, other.length);
-
-    while (aUpto < aStop) {
-      int aInt = aChars[aUpto++];
-      int bInt = bChars[bUpto++];
-      if (aInt > bInt) {
-        return 1;
-      } else if (aInt < bInt) {
-        return -1;
-      }
-    }
-
-    // One is a prefix of the other, or, they are equal:
-    return this.length - other.length;
-  }
-  
-  /**
-   * Copies the given {@link CharsRef} referenced content into this instance
-   * starting at offset 0.
-   * 
-   * @param other
-   *          the {@link CharsRef} to copy
-   */
-  // TODO: why does this behave differently/not invoke copyChars(char[], int, int) ???
-  public void copyChars(CharsRef other) {
-    if (chars == null) {
-      chars = new char[other.length];
-    } else {
-      chars = ArrayUtil.grow(chars, other.length);
-    }
-    System.arraycopy(other.chars, other.offset, chars, 0, other.length);
-    length = other.length;
-    offset = 0;
-  }
-
-  public void grow(int newLength) {
-    if (chars.length < newLength) {
-      chars = ArrayUtil.grow(chars, newLength);
-    }
-  }
-
-  /**
-   * Copies the given array into this CharsRef starting at offset 0
-   */
-  public void copyChars(char[] otherChars, int otherOffset, int otherLength) {
-    grow(otherLength);
-    System.arraycopy(otherChars, otherOffset, this.chars, 0,
-        otherLength);
-    this.offset = 0;
-    this.length = otherLength;
-  }
-
-  /**
-   * Appends the given array to this CharsRef
-   */
-  public void append(char[] otherChars, int otherOffset, int otherLength) {
-    final int newLength = length + otherLength;
-    grow(this.offset + newLength);
-    System.arraycopy(otherChars, otherOffset, this.chars, this.offset+length,
-        otherLength);
-    this.length += otherLength;
-  }
-
-  @Override
-  public String toString() {
-    return new String(chars, offset, length);
-  }
-
-  public int length() {
-    return length;
-  }
-
-  public char charAt(int index) {
-    return chars[offset + index];
-  }
-
-  public CharSequence subSequence(int start, int end) {
-    return new CharsRef(chars, offset + start, offset + end - 1);
-  }
-  
-  /** @deprecated */
-  @Deprecated
-  private final static Comparator<CharsRef> utf16SortedAsUTF8SortOrder = new UTF16SortedAsUTF8Comparator();
-  
-  /** @deprecated This comparator is only a transition mechanism */
-  @Deprecated
-  public static Comparator<CharsRef> getUTF16SortedAsUTF8Comparator() {
-    return utf16SortedAsUTF8SortOrder;
-  }
-  
-  /** @deprecated */
-  @Deprecated
-  private static class UTF16SortedAsUTF8Comparator implements Comparator<CharsRef> {
-    // Only singleton
-    private UTF16SortedAsUTF8Comparator() {};
-
-    public int compare(CharsRef a, CharsRef b) {
-      if (a == b)
-        return 0;
-
-      final char[] aChars = a.chars;
-      int aUpto = a.offset;
-      final char[] bChars = b.chars;
-      int bUpto = b.offset;
-
-      final int aStop = aUpto + Math.min(a.length, b.length);
-
-      while (aUpto < aStop) {
-        char aChar = aChars[aUpto++];
-        char bChar = bChars[bUpto++];
-        if (aChar != bChar) {
-          // http://icu-project.org/docs/papers/utf16_code_point_order.html
-          
-          /* aChar != bChar, fix up each one if they're both in or above the surrogate range, then compare them */
-          if (aChar >= 0xd800 && bChar >= 0xd800) {
-            if (aChar >= 0xe000) {
-              aChar -= 0x800;
-            } else {
-              aChar += 0x2000;
-            }
-            
-            if (bChar >= 0xe000) {
-              bChar -= 0x800;
-            } else {
-              bChar += 0x2000;
-            }
+        
+        parents[i] = positions.nextPosition();
+        
+        if (positions.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+          if (i + 1 < num) {
+            throw new CorruptIndexException("Missing parent data for category "+ (i + 1));
           }
-          
-          /* now aChar and bChar are in code point order */
-          return (int)aChar - (int)bChar; /* int must be 32 bits wide */
+          break;
         }
+      } else { // this shouldn't happen
+        throw new CorruptIndexException("Missing parent data for category " + i);
       }
-
-      // One is a prefix of the other, or, they are equal:
-      return a.length - b.length;
     }
   }
   
   /**
-   * Creates a new CharsRef that points to a copy of the chars from 
-   * <code>other</code>
+   * Adds the given ordinal/parent info and returns either a new instance if the
+   * underlying array had to grow, or this instance otherwise.
    * <p>
-   * The returned CharsRef will have a length of other.length
-   * and an offset of zero.
+   * <b>NOTE:</b> you should call this method from a thread-safe code.
    */
-  public static CharsRef deepCopyOf(CharsRef other) {
-    CharsRef clone = new CharsRef();
-    clone.copyChars(other);
-    return clone;
+  ParallelTaxonomyArrays add(int ordinal, int parentOrdinal) {
+    if (ordinal >= parents.length) {
+      int[] newarray = ArrayUtil.grow(parents);
+      newarray[ordinal] = parentOrdinal;
+      return new ParallelTaxonomyArrays(newarray);
+    }
+    parents[ordinal] = parentOrdinal;
+    return this;
   }
+  
+  /**
+   * Returns the parents array, where {@code parents[i]} denotes the parent of
+   * category ordinal {@code i}.
+   */
+  public int[] parents() {
+    return parents;
+  }
+  
+  /**
+   * Returns the children array, where {@code children[i]} denotes the youngest
+   * child of category ordinal {@code i}. The youngest child is defined as the
+   * category that was added last to the taxonomy as an immediate child of
+   * {@code i}.
+   */
+  public int[] children() {
+    if (!initializedChildren) {
+      initChildrenSiblings(null);
+    }
+    
+    // the array is guaranteed to be populated
+    return children;
+  }
+  
+  /**
+   * Returns the siblings array, where {@code siblings[i]} denotes the sibling
+   * of category ordinal {@code i}. The sibling is defined as the previous
+   * youngest child of {@code parents[i]}.
+   */
+  public int[] siblings() {
+    if (!initializedChildren) {
+      initChildrenSiblings(null);
+    }
+    
+    // the array is guaranteed to be populated
+    return siblings;
+  }
+
 }
- No newline at end of file

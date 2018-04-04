@@ -1,122 +1,143 @@
-state.directory, state.fieldInfos, state.segmentInfo,
+GossipDigestSynMessage gDigestMessage = GossipDigestSynMessage.serializer().deserialize(dis, message.getVersion());
 
-package org.apache.lucene.codecs.pulsing;
-
+package org.apache.cassandra.gms;
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
+
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.util.*;
 
-import org.apache.lucene.codecs.BlockTreeTermsReader;
-import org.apache.lucene.codecs.BlockTreeTermsWriter;
-import org.apache.lucene.codecs.FieldsConsumer;
-import org.apache.lucene.codecs.FieldsProducer;
-import org.apache.lucene.codecs.PostingsBaseFormat;
-import org.apache.lucene.codecs.PostingsFormat;
-import org.apache.lucene.codecs.PostingsReaderBase;
-import org.apache.lucene.codecs.PostingsWriterBase;
-import org.apache.lucene.index.SegmentReadState;
-import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.util.IOUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/** This postings format "inlines" the postings for terms that have
- *  low docFreq.  It wraps another postings format, which is used for
- *  writing the non-inlined terms.
- *
- *  @lucene.experimental */
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
 
-public abstract class PulsingPostingsFormat extends PostingsFormat {
+public class GossipDigestSynVerbHandler implements IVerbHandler
+{
+    private static Logger logger_ = LoggerFactory.getLogger( GossipDigestSynVerbHandler.class);
 
-  private final int freqCutoff;
-  private final int minBlockSize;
-  private final int maxBlockSize;
-  private final PostingsBaseFormat wrappedPostingsBaseFormat;
-  
-  public PulsingPostingsFormat(String name, PostingsBaseFormat wrappedPostingsBaseFormat, int freqCutoff) {
-    this(name, wrappedPostingsBaseFormat, freqCutoff, BlockTreeTermsWriter.DEFAULT_MIN_BLOCK_SIZE, BlockTreeTermsWriter.DEFAULT_MAX_BLOCK_SIZE);
-  }
+    public void doVerb(Message message)
+    {
+        InetAddress from = message.getFrom();
+        if (logger_.isTraceEnabled())
+            logger_.trace("Received a GossipDigestSynMessage from {}", from);
+        if (!Gossiper.instance.isEnabled())
+        {
+            if (logger_.isTraceEnabled())
+                logger_.trace("Ignoring GossipDigestSynMessage because gossip is disabled");
+            return;
+        }
 
-  /** Terms with freq <= freqCutoff are inlined into terms
-   *  dict. */
-  public PulsingPostingsFormat(String name, PostingsBaseFormat wrappedPostingsBaseFormat, int freqCutoff, int minBlockSize, int maxBlockSize) {
-    super(name);
-    this.freqCutoff = freqCutoff;
-    this.minBlockSize = minBlockSize;
-    assert minBlockSize > 1;
-    this.maxBlockSize = maxBlockSize;
-    this.wrappedPostingsBaseFormat = wrappedPostingsBaseFormat;
-  }
+        byte[] bytes = message.getMessageBody();
+        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
 
-  @Override
-  public String toString() {
-    return getName() + "(freqCutoff=" + freqCutoff + " minBlockSize=" + minBlockSize + " maxBlockSize=" + maxBlockSize + ")";
-  }
+        try
+        {
+            GossipDigestSynMessage gDigestMessage = GossipDigestSynMessage.serializer().deserialize(dis);
+            /* If the message is from a different cluster throw it away. */
+            if ( !gDigestMessage.clusterId_.equals(DatabaseDescriptor.getClusterName()) )
+            {
+                logger_.warn("ClusterName mismatch from " + from + " " + gDigestMessage.clusterId_  + "!=" + DatabaseDescriptor.getClusterName());
+                return;
+            }
 
-  @Override
-  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
-    PostingsWriterBase docsWriter = null;
+            List<GossipDigest> gDigestList = gDigestMessage.getGossipDigests();
+            if (logger_.isTraceEnabled())
+            {
+                StringBuilder sb = new StringBuilder();
+                for ( GossipDigest gDigest : gDigestList )
+                {
+                    sb.append(gDigest);
+                    sb.append(" ");
+                }
+                logger_.trace("Gossip syn digests are : " + sb.toString());
+            }
+            /* Notify the Failure Detector */
+            Gossiper.instance.notifyFailureDetector(gDigestList);
 
-    // Terms that have <= freqCutoff number of docs are
-    // "pulsed" (inlined):
-    PostingsWriterBase pulsingWriter = null;
+            doSort(gDigestList);
 
-    // Terms dict
-    boolean success = false;
-    try {
-      docsWriter = wrappedPostingsBaseFormat.postingsWriterBase(state);
+            List<GossipDigest> deltaGossipDigestList = new ArrayList<GossipDigest>();
+            Map<InetAddress, EndpointState> deltaEpStateMap = new HashMap<InetAddress, EndpointState>();
+            Gossiper.instance.examineGossiper(gDigestList, deltaGossipDigestList, deltaEpStateMap);
 
-      // Terms that have <= freqCutoff number of docs are
-      // "pulsed" (inlined):
-      pulsingWriter = new PulsingPostingsWriter(freqCutoff, docsWriter);
-      FieldsConsumer ret = new BlockTreeTermsWriter(state, pulsingWriter, minBlockSize, maxBlockSize);
-      success = true;
-      return ret;
-    } finally {
-      if (!success) {
-        IOUtils.closeWhileHandlingException(docsWriter, pulsingWriter);
-      }
+            GossipDigestAckMessage gDigestAck = new GossipDigestAckMessage(deltaGossipDigestList, deltaEpStateMap);
+            Message gDigestAckMessage = Gossiper.instance.makeGossipDigestAckMessage(gDigestAck, message.getVersion());
+            if (logger_.isTraceEnabled())
+                logger_.trace("Sending a GossipDigestAckMessage to {}", from);
+            MessagingService.instance().sendOneWay(gDigestAckMessage, from);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
-  }
 
-  @Override
-  public FieldsProducer fieldsProducer(SegmentReadState state) throws IOException {
-    PostingsReaderBase docsReader = null;
-    PostingsReaderBase pulsingReader = null;
+    /*
+     * First construct a map whose key is the endpoint in the GossipDigest and the value is the
+     * GossipDigest itself. Then build a list of version differences i.e difference between the
+     * version in the GossipDigest and the version in the local state for a given InetAddress.
+     * Sort this list. Now loop through the sorted list and retrieve the GossipDigest corresponding
+     * to the endpoint from the map that was initially constructed.
+    */
+    private void doSort(List<GossipDigest> gDigestList)
+    {
+        /* Construct a map of endpoint to GossipDigest. */
+        Map<InetAddress, GossipDigest> epToDigestMap = new HashMap<InetAddress, GossipDigest>();
+        for ( GossipDigest gDigest : gDigestList )
+        {
+            epToDigestMap.put(gDigest.getEndpoint(), gDigest);
+        }
 
-    boolean success = false;
-    try {
-      docsReader = wrappedPostingsBaseFormat.postingsReaderBase(state);
-      pulsingReader = new PulsingPostingsReader(docsReader);
-      FieldsProducer ret = new BlockTreeTermsReader(
-                                                    state.dir, state.fieldInfos, state.segmentInfo,
-                                                    pulsingReader,
-                                                    state.context,
-                                                    state.segmentSuffix,
-                                                    state.termsIndexDivisor);
-      success = true;
-      return ret;
-    } finally {
-      if (!success) {
-        IOUtils.closeWhileHandlingException(docsReader, pulsingReader);
-      }
+        /*
+         * These digests have their maxVersion set to the difference of the version
+         * of the local EndpointState and the version found in the GossipDigest.
+        */
+        List<GossipDigest> diffDigests = new ArrayList<GossipDigest>();
+        for ( GossipDigest gDigest : gDigestList )
+        {
+            InetAddress ep = gDigest.getEndpoint();
+            EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(ep);
+            int version = (epState != null) ? Gossiper.instance.getMaxEndpointStateVersion( epState ) : 0;
+            int diffVersion = Math.abs(version - gDigest.getMaxVersion() );
+            diffDigests.add( new GossipDigest(ep, gDigest.getGeneration(), diffVersion) );
+        }
+
+        gDigestList.clear();
+        Collections.sort(diffDigests);
+        int size = diffDigests.size();
+        /*
+         * Report the digests in descending order. This takes care of the endpoints
+         * that are far behind w.r.t this local endpoint
+        */
+        for ( int i = size - 1; i >= 0; --i )
+        {
+            gDigestList.add( epToDigestMap.get(diffDigests.get(i).getEndpoint()) );
+        }
     }
-  }
-
-  public int getFreqCutoff() {
-    return freqCutoff;
-  }
 }

@@ -1,8 +1,8 @@
-int mid = (lo + hi) >>> 1;
+waitForConnected(Long.MAX_VALUE);
 
-package org.apache.lucene.search;
+package org.apache.solr.common.cloud;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,313 +19,186 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.FieldSelector;
-import org.apache.lucene.index.CorruptIndexException;
-import org.apache.lucene.index.Term;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeoutException;
 
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import org.apache.solr.common.SolrException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/** Implements search over a set of <code>Searchables</code>.
- *
- * <p>Applications usually need only call the inherited {@link #search(Query)}
- * or {@link #search(Query,Filter)} methods.
- */
-public class MultiSearcher extends Searcher {
-    /**
-     * Document Frequency cache acting as a Dummy-Searcher.
-     * This class is no full-fledged Searcher, but only supports
-     * the methods necessary to initialize Weights.
-     */
-  private static class CachedDfSource extends Searcher {
-    private Map dfMap; // Map from Terms to corresponding doc freqs
-    private int maxDoc; // document count
+class ConnectionManager implements Watcher {
+  protected static final Logger log = LoggerFactory
+      .getLogger(ConnectionManager.class);
 
-    public CachedDfSource(Map dfMap, int maxDoc, Similarity similarity) {
-      this.dfMap = dfMap;
-      this.maxDoc = maxDoc;
-      setSimilarity(similarity);
-    }
+  private final String name;
+  private CountDownLatch clientConnected;
+  private KeeperState state;
+  private boolean connected;
 
-    public int docFreq(Term term) {
-      int df;
-      try {
-        df = ((Integer) dfMap.get(term)).intValue();
-      } catch (NullPointerException e) {
-        throw new IllegalArgumentException("df for term " + term.text()
-            + " not available");
-      }
-      return df;
-    }
-
-    public int[] docFreqs(Term[] terms) {
-      int[] result = new int[terms.length];
-      for (int i = 0; i < terms.length; i++) {
-        result[i] = docFreq(terms[i]);
-      }
-      return result;
-    }
-
-    public int maxDoc() {
-      return maxDoc;
-    }
-
-    public Query rewrite(Query query) {
-      // this is a bit of a hack. We know that a query which
-      // creates a Weight based on this Dummy-Searcher is
-      // always already rewritten (see preparedWeight()).
-      // Therefore we just return the unmodified query here
-      return query;
-    }
-
-    public void close() {
-      throw new UnsupportedOperationException();
-    }
-
-    public Document doc(int i) {
-      throw new UnsupportedOperationException();
-    }
-    
-    public Document doc(int i, FieldSelector fieldSelector) {
-        throw new UnsupportedOperationException();
-    }
-
-    public Explanation explain(Weight weight,int doc) {
-      throw new UnsupportedOperationException();
-    }
-
-    public void search(Weight weight, Filter filter, HitCollector results) {
-      throw new UnsupportedOperationException();
-    }
-
-    public TopDocs search(Weight weight,Filter filter,int n) {
-      throw new UnsupportedOperationException();
-    }
-
-    public TopFieldDocs search(Weight weight,Filter filter,int n,Sort sort) {
-      throw new UnsupportedOperationException();
-    }
-  }
-
-
-  private Searchable[] searchables;
-  private int[] starts;
-  private int maxDoc = 0;
-
-  /** Creates a searcher which searches <i>searchables</i>. */
-  public MultiSearcher(Searchable[] searchables) throws IOException {
-    this.searchables = searchables;
-
-    starts = new int[searchables.length + 1];	  // build starts array
-    for (int i = 0; i < searchables.length; i++) {
-      starts[i] = maxDoc;
-      maxDoc += searchables[i].maxDoc();          // compute maxDocs
-    }
-    starts[searchables.length] = maxDoc;
-  }
+  private final ZkClientConnectionStrategy connectionStrategy;
   
-  /** Return the array of {@link Searchable}s this searches. */
-  public Searchable[] getSearchables() {
-    return searchables;
+  private Object connectionUpdateLock = new Object();
+
+  private String zkServerAddress;
+
+  private int zkClientTimeout;
+
+  private SolrZkClient client;
+
+  private OnReconnect onReconnect;
+
+  private volatile boolean isClosed = false;
+
+  public ConnectionManager(String name, SolrZkClient client, String zkServerAddress, int zkClientTimeout, ZkClientConnectionStrategy strat, OnReconnect onConnect) {
+    this.name = name;
+    this.client = client;
+    this.connectionStrategy = strat;
+    this.zkServerAddress = zkServerAddress;
+    this.zkClientTimeout = zkClientTimeout;
+    this.onReconnect = onConnect;
+    reset();
   }
 
-  protected int[] getStarts() {
-  	return starts;
+  private synchronized void reset() {
+    clientConnected = new CountDownLatch(1);
+    state = KeeperState.Disconnected;
+    connected = false;
   }
 
-  // inherit javadoc
-  public void close() throws IOException {
-    for (int i = 0; i < searchables.length; i++)
-      searchables[i].close();
-  }
-
-  public int docFreq(Term term) throws IOException {
-    int docFreq = 0;
-    for (int i = 0; i < searchables.length; i++)
-      docFreq += searchables[i].docFreq(term);
-    return docFreq;
-  }
-
-  // inherit javadoc
-  public Document doc(int n) throws CorruptIndexException, IOException {
-    int i = subSearcher(n);			  // find searcher index
-    return searchables[i].doc(n - starts[i]);	  // dispatch to searcher
-  }
-
-  // inherit javadoc
-  public Document doc(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
-    int i = subSearcher(n);			  // find searcher index
-    return searchables[i].doc(n - starts[i], fieldSelector);	  // dispatch to searcher
-  }
-  
-  /** Returns index of the searcher for document <code>n</code> in the array
-   * used to construct this searcher. */
-  public int subSearcher(int n) {                 // find searcher for doc n:
-    // replace w/ call to Arrays.binarySearch in Java 1.2
-    int lo = 0;					  // search starts array
-    int hi = searchables.length - 1;		  // for first element less
-						  // than n, return its index
-    while (hi >= lo) {
-      int mid = (lo + hi) >> 1;
-      int midValue = starts[mid];
-      if (n < midValue)
-	hi = mid - 1;
-      else if (n > midValue)
-	lo = mid + 1;
-      else {                                      // found a match
-        while (mid+1 < searchables.length && starts[mid+1] == midValue) {
-          mid++;                                  // scan to last match
-        }
-	return mid;
-      }
+  @Override
+  public synchronized void process(WatchedEvent event) {
+    if (log.isInfoEnabled()) {
+      log.info("Watcher " + this + " name:" + name + " got event " + event
+          + " path:" + event.getPath() + " type:" + event.getType());
     }
-    return hi;
-  }
-
-  /** Returns the document number of document <code>n</code> within its
-   * sub-index. */
-  public int subDoc(int n) {
-    return n - starts[subSearcher(n)];
-  }
-
-  public int maxDoc() throws IOException {
-    return maxDoc;
-  }
-
-  public TopDocs search(Weight weight, Filter filter, int nDocs)
-  throws IOException {
-
-    HitQueue hq = new HitQueue(nDocs);
-    int totalHits = 0;
-
-    for (int i = 0; i < searchables.length; i++) { // search each searcher
-      TopDocs docs = searchables[i].search(weight, filter, nDocs);
-      totalHits += docs.totalHits;		  // update totalHits
-      ScoreDoc[] scoreDocs = docs.scoreDocs;
-      for (int j = 0; j < scoreDocs.length; j++) { // merge scoreDocs into hq
-	ScoreDoc scoreDoc = scoreDocs[j];
-        scoreDoc.doc += starts[i];                // convert doc
-        if(!hq.insert(scoreDoc))
-            break;                                // no more scores > minScore
-      }
+    
+    if (isClosed) {
+      log.info("Client->ZooKeeper status change trigger but we are already closed");
+      return;
     }
 
-    ScoreDoc[] scoreDocs = new ScoreDoc[hq.size()];
-    for (int i = hq.size()-1; i >= 0; i--)	  // put docs in array
-      scoreDocs[i] = (ScoreDoc)hq.pop();
-    
-    float maxScore = (totalHits==0) ? Float.NEGATIVE_INFINITY : scoreDocs[0].score;
-    
-    return new TopDocs(totalHits, scoreDocs, maxScore);
-  }
-
-  public TopFieldDocs search (Weight weight, Filter filter, int n, Sort sort)
-  throws IOException {
-    FieldDocSortedHitQueue hq = null;
-    int totalHits = 0;
-
-    float maxScore=Float.NEGATIVE_INFINITY;
-    
-    for (int i = 0; i < searchables.length; i++) { // search each searcher
-      TopFieldDocs docs = searchables[i].search (weight, filter, n, sort);
+    state = event.getState();
+    if (state == KeeperState.SyncConnected) {
+      connected = true;
+      clientConnected.countDown();
+      connectionStrategy.connected();
+    } else if (state == KeeperState.Expired) {
+      connected = false;
+      log.info("Our previous ZooKeeper session was expired. Attempting to reconnect to recover relationship with ZooKeeper...");
       
-      if (hq == null) hq = new FieldDocSortedHitQueue (docs.fields, n);
-      totalHits += docs.totalHits;		  // update totalHits
-      maxScore = Math.max(maxScore, docs.getMaxScore());
-      ScoreDoc[] scoreDocs = docs.scoreDocs;
-      for (int j = 0; j < scoreDocs.length; j++) { // merge scoreDocs into hq
-        ScoreDoc scoreDoc = scoreDocs[j];
-        scoreDoc.doc += starts[i];                // convert doc
-        if (!hq.insert (scoreDoc))
-          break;                                  // no more scores > minScore
+      try {
+        connectionStrategy.reconnect(zkServerAddress, zkClientTimeout, this,
+            new ZkClientConnectionStrategy.ZkUpdate() {
+              @Override
+              public void update(SolrZooKeeper keeper) {
+                // if keeper does not replace oldKeeper we must be sure to close it
+                synchronized (connectionUpdateLock) {
+                  try {
+                    waitForConnected(SolrZkClient.DEFAULT_CLIENT_CONNECT_TIMEOUT);
+                  } catch (Exception e1) {
+                    closeKeeper(keeper);
+                    throw new RuntimeException(e1);
+                  }
+                  log.info("Connection with ZooKeeper reestablished.");
+                  try {
+                    client.updateKeeper(keeper);
+                  } catch (InterruptedException e) {
+                    closeKeeper(keeper);
+                    Thread.currentThread().interrupt();
+                    // we must have been asked to stop
+                    throw new RuntimeException(e);
+                  } catch(Throwable t) {
+                    closeKeeper(keeper);
+                    throw new RuntimeException(t);
+                  }
+      
+                  if (onReconnect != null) {
+                    onReconnect.command();
+                  }
+                  synchronized (ConnectionManager.this) {
+                    ConnectionManager.this.connected = true;
+                  }
+                }
+                
+              }
+
+            });
+      } catch (Exception e) {
+        SolrException.log(log, "", e);
       }
+      log.info("Connected:" + connected);
+    } else if (state == KeeperState.Disconnected) {
+      log.info("zkClient has disconnected");
+      connected = false;
+      connectionStrategy.disconnected();
+    } else {
+      connected = false;
     }
-
-    ScoreDoc[] scoreDocs = new ScoreDoc[hq.size()];
-    for (int i = hq.size() - 1; i >= 0; i--)	  // put docs in array
-      scoreDocs[i] = (ScoreDoc) hq.pop();
-
-    return new TopFieldDocs (totalHits, scoreDocs, hq.getFields(), maxScore);
+    notifyAll();
   }
 
-
-  // inherit javadoc
-  public void search(Weight weight, Filter filter, final HitCollector results)
-    throws IOException {
-    for (int i = 0; i < searchables.length; i++) {
-
-      final int start = starts[i];
-
-      searchables[i].search(weight, filter, new HitCollector() {
-	  public void collect(int doc, float score) {
-	    results.collect(doc + start, score);
-	  }
-	});
-
-    }
+  public synchronized boolean isConnected() {
+    return !isClosed && connected;
+  }
+  
+  // we use a volatile rather than sync
+  // to avoid deadlock on shutdown
+  public void close() {
+    this.isClosed = true;
   }
 
-  public Query rewrite(Query original) throws IOException {
-    Query[] queries = new Query[searchables.length];
-    for (int i = 0; i < searchables.length; i++) {
-      queries[i] = searchables[i].rewrite(original);
-    }
-    return queries[0].combine(queries);
+  public synchronized KeeperState state() {
+    return state;
   }
 
-  public Explanation explain(Weight weight, int doc) throws IOException {
-    int i = subSearcher(doc);			  // find searcher index
-    return searchables[i].explain(weight,doc-starts[i]); // dispatch to searcher
-  }
-
-  /**
-   * Create weight in multiple index scenario.
-   * 
-   * Distributed query processing is done in the following steps:
-   * 1. rewrite query
-   * 2. extract necessary terms
-   * 3. collect dfs for these terms from the Searchables
-   * 4. create query weight using aggregate dfs.
-   * 5. distribute that weight to Searchables
-   * 6. merge results
-   *
-   * Steps 1-4 are done here, 5+6 in the search() methods
-   *
-   * @return rewritten queries
-   */
-  protected Weight createWeight(Query original) throws IOException {
-    // step 1
-    Query rewrittenQuery = rewrite(original);
-
-    // step 2
-    Set terms = new HashSet();
-    rewrittenQuery.extractTerms(terms);
-
-    // step3
-    Term[] allTermsArray = new Term[terms.size()];
-    terms.toArray(allTermsArray);
-    int[] aggregatedDfs = new int[terms.size()];
-    for (int i = 0; i < searchables.length; i++) {
-      int[] dfs = searchables[i].docFreqs(allTermsArray);
-      for(int j=0; j<aggregatedDfs.length; j++){
-        aggregatedDfs[j] += dfs[j];
+  public synchronized void waitForConnected(long waitForConnection)
+      throws TimeoutException {
+    log.info("Waiting for client to connect to ZooKeeper");
+    long expire = System.currentTimeMillis() + waitForConnection;
+    long left = 1;
+    while (!connected && left > 0) {
+      if (isClosed) {
+        break;
       }
+      try {
+        wait(500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      }
+      left = expire - System.currentTimeMillis();
     }
-
-    HashMap dfMap = new HashMap();
-    for(int i=0; i<allTermsArray.length; i++) {
-      dfMap.put(allTermsArray[i], new Integer(aggregatedDfs[i]));
+    if (!connected) {
+      throw new TimeoutException("Could not connect to ZooKeeper " + zkServerAddress + " within " + waitForConnection + " ms");
     }
-
-    // step4
-    int numDocs = maxDoc();
-    CachedDfSource cacheSim = new CachedDfSource(dfMap, numDocs, getSimilarity());
-
-    return rewrittenQuery.weight(cacheSim);
+    log.info("Client is connected to ZooKeeper");
   }
 
+  public synchronized void waitForDisconnected(long timeout)
+      throws InterruptedException, TimeoutException {
+    long expire = System.currentTimeMillis() + timeout;
+    long left = timeout;
+    while (connected && left > 0) {
+      wait(left);
+      left = expire - System.currentTimeMillis();
+    }
+    if (connected) {
+      throw new TimeoutException("Did not disconnect");
+    }
+  }
+
+  private void closeKeeper(SolrZooKeeper keeper) {
+    try {
+      keeper.close();
+    } catch (InterruptedException e) {
+      // Restore the interrupted status
+      Thread.currentThread().interrupt();
+      log.error("", e);
+      throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
+          "", e);
+    }
+  }
 }

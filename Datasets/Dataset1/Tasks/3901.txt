@@ -1,4 +1,4 @@
-long endPosition = 0, startPosition = -1;
+String remoteHost = remoteAddress.getAddress().getHostAddress();
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,132 +18,123 @@ long endPosition = 0, startPosition = -1;
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.cassandra.net.io;
 
-import java.io.DataOutput;
-import java.io.IOError;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.SocketChannel;
+import java.io.*;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.sstable.IndexHelper;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.util.IIterableColumns;
-import org.apache.cassandra.utils.BloomFilter;
-
+import org.apache.cassandra.db.Table;
+import org.apache.log4j.Logger;
 
 /**
- * Help to create an index for a column family based on size of columns
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-public class ColumnIndexer
-{
-	/**
-	 * Given a column family this, function creates an in-memory structure that represents the
-	 * column index for the column family, and subsequently writes it to disk.
-	 * @param columns Column family to create index for
-	 * @param dos data output stream
-	 * @throws IOException
-	 */
-    public static void serialize(IIterableColumns columns, DataOutput dos)
+
+
+class ContentStreamState extends StartState
+{       
+    private static Logger logger_ = Logger.getLogger(ContentStreamState.class);
+    private static long count_ = 64*1024*1024;
+    /* Return this byte array to exit event loop */
+    private static byte[] bytes_ = new byte[1];
+    private long bytesRead_ = 0L;
+    private FileChannel fc_;
+    private StreamContextManager.StreamContext streamContext_;
+    private StreamContextManager.StreamStatus streamStatus_;
+    
+    ContentStreamState(TcpReader stream)
     {
-        try
+        super(stream); 
+        SocketChannel socketChannel = stream.getStream();
+        InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+        String remoteHost = remoteAddress.getHostName();        
+        streamContext_ = StreamContextManager.getStreamContext(remoteHost);   
+        streamStatus_ = StreamContextManager.getStreamStatus(remoteHost);
+    }
+    
+    private void createFileChannel() throws IOException
+    {
+        if ( fc_ == null )
         {
-            serializeInternal(columns, dos);
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
+            if (logger_.isDebugEnabled())
+              logger_.debug("Creating file for " + streamContext_.getTargetFile());
+            FileOutputStream fos = new FileOutputStream( streamContext_.getTargetFile(), true );
+            fc_ = fos.getChannel();            
         }
     }
 
-    public static void serializeInternal(IIterableColumns columns, DataOutput dos) throws IOException
+    public byte[] read() throws IOException, ReadNotCompleteException
+    {        
+        SocketChannel socketChannel = stream_.getStream();
+        InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+        String remoteHostIp = remoteAddress.getAddress().getHostAddress();
+        createFileChannel();
+        if ( streamContext_ != null )
+        {  
+            try
+            {
+                bytesRead_ += fc_.transferFrom(socketChannel, bytesRead_, ContentStreamState.count_);
+                if ( bytesRead_ != streamContext_.getExpectedBytes() )
+                    throw new ReadNotCompleteException("Specified number of bytes have not been read from the Socket Channel");
+            }
+            catch ( IOException ex )
+            {
+                /* Ask the source node to re-stream this file. */
+                streamStatus_.setAction(StreamContextManager.StreamCompletionAction.STREAM);                
+                handleStreamCompletion(remoteHostIp);
+                /* Delete the orphaned file. */
+                File file = new File(streamContext_.getTargetFile());
+                file.delete();
+                throw ex;
+            }
+            if ( bytesRead_ == streamContext_.getExpectedBytes() )
+            {       
+                if (logger_.isDebugEnabled())
+                    logger_.debug("Removing stream context " + streamContext_);                 
+                handleStreamCompletion(remoteHostIp);                              
+                bytesRead_ = 0L;
+                fc_.close();
+                morphState();
+            }                            
+        }
+        
+        return new byte[0];
+    }
+    
+    private void handleStreamCompletion(String remoteHost) throws IOException
     {
-        int columnCount = columns.getEstimatedColumnCount();
-
-        BloomFilter bf = BloomFilter.getFilter(columnCount, 4);
-
-        if (columnCount == 0)
-        {
-            writeEmptyHeader(dos, bf);
-            return;
+        /* 
+         * Streaming is complete. If all the data that has to be received inform the sender via 
+         * the stream completion callback so that the source may perform the requisite cleanup. 
+        */
+        IStreamComplete streamComplete = StreamContextManager.getStreamCompletionHandler(remoteHost);
+        if ( streamComplete != null )
+        {                    
+            streamComplete.onStreamCompletion(remoteHost, streamContext_, streamStatus_);                    
         }
+    }
 
-        // update bloom filter and create a list of IndexInfo objects marking the first and last column
-        // in each block of ColumnIndexSize
-        List<IndexHelper.IndexInfo> indexList = new ArrayList<IndexHelper.IndexInfo>();
-        int endPosition = 0, startPosition = -1;
-        int indexSizeInBytes = 0;
-        IColumn lastColumn = null, firstColumn = null;
-        for (IColumn column : columns)
+    public void morphState() throws IOException
+    {        
+        /* We instantiate an array of size 1 so that we can exit the event loop of the read. */                
+        StartState nextState = stream_.getSocketState(TcpReader.TcpReaderState.DONE);
+        if ( nextState == null )
         {
-            bf.add(column.name());
-
-            if (firstColumn == null)
-            {
-                firstColumn = column;
-                startPosition = endPosition;
-            }
-            endPosition += column.serializedSize();
-            /* if we hit the column index size that we have to index after, go ahead and index it. */
-            if (endPosition - startPosition >= DatabaseDescriptor.getColumnIndexSize())
-            {
-                IndexHelper.IndexInfo cIndexInfo = new IndexHelper.IndexInfo(firstColumn.name(), column.name(), startPosition, endPosition - startPosition);
-                indexList.add(cIndexInfo);
-                indexSizeInBytes += cIndexInfo.serializedSize();
-                firstColumn = null;
-            }
-
-            lastColumn = column;
-        }
-
-        // all columns were GC'd after all
-        if (lastColumn == null)
-        {
-            writeEmptyHeader(dos, bf);
-            return;
-        }
-
-        // the last column may have fallen on an index boundary already.  if not, index it explicitly.
-        if (indexList.isEmpty() || columns.getComparator().compare(indexList.get(indexList.size() - 1).lastName, lastColumn.name()) != 0)
-        {
-            IndexHelper.IndexInfo cIndexInfo = new IndexHelper.IndexInfo(firstColumn.name(), lastColumn.name(), startPosition, endPosition - startPosition);
-            indexList.add(cIndexInfo);
-            indexSizeInBytes += cIndexInfo.serializedSize();
-        }
-
-        /* Write out the bloom filter. */
-        writeBloomFilter(dos, bf);
-
-        // write the index.  we should always have at least one computed index block, but we only write it out if there is more than that.
-        assert indexSizeInBytes > 0;
-        if (indexList.size() > 1)
-        {
-            dos.writeInt(indexSizeInBytes);
-            for (IndexHelper.IndexInfo cIndexInfo : indexList)
-            {
-                cIndexInfo.serialize(dos);
-            }
+            nextState = new DoneState(stream_, ContentStreamState.bytes_);
+            stream_.putSocketState( TcpReader.TcpReaderState.DONE, nextState );
         }
         else
         {
-            dos.writeInt(0);
+            nextState.setContextData(ContentStreamState.bytes_);
         }
-	}
-
-    private static void writeEmptyHeader(DataOutput dos, BloomFilter bf)
-            throws IOException
-    {
-        writeBloomFilter(dos, bf);
-        dos.writeInt(0);
+        stream_.morphState( nextState );  
     }
-
-    private static void writeBloomFilter(DataOutput dos, BloomFilter bf) throws IOException
+    
+    public void setContextData(Object data)
     {
-        DataOutputBuffer bufOut = new DataOutputBuffer();
-        BloomFilter.serializer().serialize(bf, bufOut);
-        dos.writeInt(bufOut.getLength());
-        dos.write(bufOut.getData(), 0, bufOut.getLength());
+        throw new UnsupportedOperationException("This method is not supported in the ContentStreamState");
     }
-
 }

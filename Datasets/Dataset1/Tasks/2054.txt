@@ -1,17 +1,16 @@
-IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer));
+protected long minSSTableSize;
 
-package org.apache.lucene.queryparser.xml;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- * 
- * http://www.apache.org/licenses/LICENSE-2.0
- * 
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,225 +18,198 @@ package org.apache.lucene.queryparser.xml;
  * limitations under the License.
  */
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.analysis.MockTokenFilter;
-import org.apache.lucene.analysis.MockTokenizer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.IntField;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.search.DisjunctionMaxQuery;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.Version;
-import org.junit.AfterClass;
-import org.junit.Assume;
-import org.junit.BeforeClass;
+package org.apache.cassandra.db.compaction;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.util.List;
+import java.util.*;
+import java.util.Map.Entry;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class TestParser extends LuceneTestCase {
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DataTracker;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.utils.Pair;
 
-  private static CoreParser builder;
-  private static Directory dir;
-  private static IndexReader reader;
-  private static IndexSearcher searcher;
+public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
+{
+    private static final Logger logger = LoggerFactory.getLogger(SizeTieredCompactionStrategy.class);
+    protected static final long DEFAULT_MIN_SSTABLE_SIZE = 50L * 1024L * 1024L;
+    protected static final String MIN_SSTABLE_SIZE_KEY = "min_sstable_size";
+    protected static long minSSTableSize;
+    protected volatile int estimatedRemainingTasks;
 
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    // TODO: rewrite test (this needs to set QueryParser.enablePositionIncrements, too, for work with CURRENT):
-    Analyzer analyzer = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, true, MockTokenFilter.ENGLISH_STOPSET);
-    //initialize the parser
-    builder = new CorePlusExtensionsParser("contents", analyzer);
-
-    BufferedReader d = new BufferedReader(new InputStreamReader(
-        TestParser.class.getResourceAsStream("reuters21578.txt"), "US-ASCII"));
-    dir = newDirectory();
-    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(Version.LUCENE_40, analyzer));
-    String line = d.readLine();
-    while (line != null) {
-      int endOfDate = line.indexOf('\t');
-      String date = line.substring(0, endOfDate).trim();
-      String content = line.substring(endOfDate).trim();
-      Document doc = new Document();
-      doc.add(newTextField("date", date, Field.Store.YES));
-      doc.add(newTextField("contents", content, Field.Store.YES));
-      doc.add(new IntField("date2", Integer.valueOf(date), Field.Store.NO));
-      writer.addDocument(doc);
-      line = d.readLine();
+    public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
+    {
+       super(cfs, options);
+       this.estimatedRemainingTasks = 0;
+       String optionValue = options.get(MIN_SSTABLE_SIZE_KEY);
+       minSSTableSize = (null != optionValue) ? Long.parseLong(optionValue) : DEFAULT_MIN_SSTABLE_SIZE;
     }
-    d.close();
-    writer.close();
-    reader = DirectoryReader.open(dir);
-    searcher = newSearcher(reader);
 
-  }
+    public AbstractCompactionTask getNextBackgroundTask(final int gcBefore)
+    {
+        if (cfs.isCompactionDisabled())
+        {
+            logger.debug("Compaction is currently disabled.");
+            return null;
+        }
 
-  @AfterClass
-  public static void afterClass() throws Exception {
-    reader.close();
-    dir.close();
-    reader = null;
-    searcher = null;
-    dir = null;
-    builder = null;
-  }
+        List<List<SSTableReader>> buckets = getBuckets(createSSTableAndLengthPairs(cfs.getUncompactingSSTables()), minSSTableSize);
+        updateEstimatedCompactionsByTasks(buckets);
 
-  public void testSimpleXML() throws ParserException, IOException {
-    Query q = parse("TermQuery.xml");
-    dumpResults("TermQuery", q, 5);
-  }
+        List<List<SSTableReader>> prunedBuckets = new ArrayList<List<SSTableReader>>();
+        for (List<SSTableReader> bucket : buckets)
+        {
+            if (bucket.size() < cfs.getMinimumCompactionThreshold())
+                continue;
 
-  public void testSimpleTermsQueryXML() throws ParserException, IOException {
-    Query q = parse("TermsQuery.xml");
-    dumpResults("TermsQuery", q, 5);
-  }
+            Collections.sort(bucket, new Comparator<SSTableReader>()
+            {
+                public int compare(SSTableReader o1, SSTableReader o2)
+                {
+                    return o1.descriptor.generation - o2.descriptor.generation;
+                }
+            });
+            prunedBuckets.add(bucket.subList(0, Math.min(bucket.size(), cfs.getMaximumCompactionThreshold())));
+        }
 
-  public void testBooleanQueryXML() throws ParserException, IOException {
-    Query q = parse("BooleanQuery.xml");
-    dumpResults("BooleanQuery", q, 5);
-  }
-  
-  public void testDisjunctionMaxQueryXML() throws ParserException, IOException {
-    Query q = parse("DisjunctionMaxQuery.xml");
-    assertTrue(q instanceof DisjunctionMaxQuery);
-    DisjunctionMaxQuery d = (DisjunctionMaxQuery)q;
-    assertEquals(0.0f, d.getTieBreakerMultiplier(), 0.0001f);
-    assertEquals(2, d.getDisjuncts().size());
-    DisjunctionMaxQuery ndq = (DisjunctionMaxQuery) d.getDisjuncts().get(1);
-    assertEquals(1.2f, ndq.getTieBreakerMultiplier(), 0.0001f);
-    assertEquals(1, ndq.getDisjuncts().size());
-  }
+        if (prunedBuckets.isEmpty())
+            return null;
 
-  public void testRangeFilterQueryXML() throws ParserException, IOException {
-    Query q = parse("RangeFilterQuery.xml");
-    dumpResults("RangeFilter", q, 5);
-  }
+        List<SSTableReader> smallestBucket = Collections.min(prunedBuckets, new Comparator<List<SSTableReader>>()
+        {
+            public int compare(List<SSTableReader> o1, List<SSTableReader> o2)
+            {
+                long n = avgSize(o1) - avgSize(o2);
+                if (n < 0)
+                    return -1;
+                if (n > 0)
+                    return 1;
+                return 0;
+            }
 
-  public void testUserQueryXML() throws ParserException, IOException {
-    Query q = parse("UserInputQuery.xml");
-    dumpResults("UserInput with Filter", q, 5);
-  }
-
-  public void testCustomFieldUserQueryXML() throws ParserException, IOException {
-    Query q = parse("UserInputQueryCustomField.xml");
-    int h = searcher.search(q, null, 1000).totalHits;
-    assertEquals("UserInputQueryCustomField should produce 0 result ", 0, h);
-  }
-
-  public void testLikeThisQueryXML() throws Exception {
-    Query q = parse("LikeThisQuery.xml");
-    dumpResults("like this", q, 5);
-  }
-
-  public void testBoostingQueryXML() throws Exception {
-    Query q = parse("BoostingQuery.xml");
-    dumpResults("boosting ", q, 5);
-  }
-
-  public void testFuzzyLikeThisQueryXML() throws Exception {
-    Query q = parse("FuzzyLikeThisQuery.xml");
-    //show rewritten fuzzyLikeThisQuery - see what is being matched on
-    if (VERBOSE) {
-      System.out.println(q.rewrite(reader));
+            private long avgSize(List<SSTableReader> sstables)
+            {
+                long n = 0;
+                for (SSTableReader sstable : sstables)
+                    n += sstable.bytesOnDisk();
+                return n / sstables.size();
+            }
+        });
+        return new CompactionTask(cfs, smallestBucket, gcBefore);
     }
-    dumpResults("FuzzyLikeThis", q, 5);
-  }
 
-  public void testTermsFilterXML() throws Exception {
-    Query q = parse("TermsFilterQuery.xml");
-    dumpResults("Terms Filter", q, 5);
-  }
-
-  public void testBoostingTermQueryXML() throws Exception {
-    Query q = parse("BoostingTermQuery.xml");
-    dumpResults("BoostingTermQuery", q, 5);
-  }
-
-  public void testSpanTermXML() throws Exception {
-    Query q = parse("SpanQuery.xml");
-    dumpResults("Span Query", q, 5);
-  }
-
-  public void testConstantScoreQueryXML() throws Exception {
-    Query q = parse("ConstantScoreQuery.xml");
-    dumpResults("ConstantScoreQuery", q, 5);
-  }
-
-  public void testMatchAllDocsPlusFilterXML() throws ParserException, IOException {
-    Query q = parse("MatchAllDocsQuery.xml");
-    dumpResults("MatchAllDocsQuery with range filter", q, 5);
-  }
-
-  public void testBooleanFilterXML() throws ParserException, IOException {
-    Query q = parse("BooleanFilter.xml");
-    dumpResults("Boolean filter", q, 5);
-  }
-
-  public void testNestedBooleanQuery() throws ParserException, IOException {
-    Query q = parse("NestedBooleanQuery.xml");
-    dumpResults("Nested Boolean query", q, 5);
-  }
-
-  public void testCachedFilterXML() throws ParserException, IOException {
-    Query q = parse("CachedFilter.xml");
-    dumpResults("Cached filter", q, 5);
-  }
-
-  public void testDuplicateFilterQueryXML() throws ParserException, IOException {
-    List<AtomicReaderContext> leaves = searcher.getTopReaderContext().leaves();
-    Assume.assumeTrue(leaves.size() == 1);
-    Query q = parse("DuplicateFilterQuery.xml");
-    int h = searcher.search(q, null, 1000).totalHits;
-    assertEquals("DuplicateFilterQuery should produce 1 result ", 1, h);
-  }
-
-  public void testNumericRangeFilterQueryXML() throws ParserException, IOException {
-    Query q = parse("NumericRangeFilterQuery.xml");
-    dumpResults("NumericRangeFilter", q, 5);
-  }
-
-  public void testNumericRangeQueryQueryXML() throws ParserException, IOException {
-    Query q = parse("NumericRangeQueryQuery.xml");
-    dumpResults("NumericRangeQuery", q, 5);
-  }
-
-  //================= Helper methods ===================================
-
-  private Query parse(String xmlFileName) throws ParserException, IOException {
-    InputStream xmlStream = TestParser.class.getResourceAsStream(xmlFileName);
-    Query result = builder.parse(xmlStream);
-    xmlStream.close();
-    return result;
-  }
-
-  private void dumpResults(String qType, Query q, int numDocs) throws IOException {
-    if (VERBOSE) {
-      System.out.println("TEST: query=" + q);
+    public AbstractCompactionTask getMaximalTask(final int gcBefore)
+    {
+        return cfs.getSSTables().isEmpty() ? null : new CompactionTask(cfs, cfs.getSSTables(), gcBefore);
     }
-    TopDocs hits = searcher.search(q, null, numDocs);
-    assertTrue(qType + " should produce results ", hits.totalHits > 0);
-    if (VERBOSE) {
-      System.out.println("=========" + qType + "============");
-      ScoreDoc[] scoreDocs = hits.scoreDocs;
-      for (int i = 0; i < Math.min(numDocs, hits.totalHits); i++) {
-        Document ldoc = searcher.doc(scoreDocs[i].doc);
-        System.out.println("[" + ldoc.get("date") + "]" + ldoc.get("contents"));
-      }
-      System.out.println();
+
+    public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore)
+    {
+        return new CompactionTask(cfs, sstables, gcBefore)
+                .isUserDefined(true)
+                .compactionFileLocation(cfs.table.getDataFileLocation(1));
     }
-  }
+
+    public int getEstimatedRemainingTasks()
+    {
+        return estimatedRemainingTasks;
+    }
+
+    private static List<Pair<SSTableReader, Long>> createSSTableAndLengthPairs(Collection<SSTableReader> collection)
+    {
+        List<Pair<SSTableReader, Long>> tableLengthPairs = new ArrayList<Pair<SSTableReader, Long>>();
+        for(SSTableReader table: collection)
+            tableLengthPairs.add(new Pair<SSTableReader, Long>(table, table.onDiskLength()));
+        return tableLengthPairs;
+    }
+
+    /*
+     * Group files of similar size into buckets.
+     */
+    static <T> List<List<T>> getBuckets(Collection<Pair<T, Long>> files, long minSSTableSize)
+    {
+        // Sort the list in order to get deterministic results during the grouping below
+        List<Pair<T, Long>> sortedFiles = new ArrayList<Pair<T, Long>>(files);
+        Collections.sort(sortedFiles, new Comparator<Pair<T, Long>>()
+        {
+            public int compare(Pair<T, Long> p1, Pair<T, Long> p2)
+            {
+                return p1.right.compareTo(p2.right);
+            }
+        });
+
+        Map<List<T>, Long> buckets = new HashMap<List<T>, Long>();
+
+        for (Pair<T, Long> pair: sortedFiles)
+        {
+            long size = pair.right;
+
+            boolean bFound = false;
+            // look for a bucket containing similar-sized files:
+            // group in the same bucket if it's w/in 50% of the average for this bucket,
+            // or this file and the bucket are all considered "small" (less than `minSSTableSize`)
+            for (Entry<List<T>, Long> entry : buckets.entrySet())
+            {
+                List<T> bucket = entry.getKey();
+                long averageSize = entry.getValue();
+                if ((size > (averageSize / 2) && size < (3 * averageSize) / 2)
+                    || (size < minSSTableSize && averageSize < minSSTableSize))
+                {
+                    // remove and re-add because adding changes the hash
+                    buckets.remove(bucket);
+                    long totalSize = bucket.size() * averageSize;
+                    averageSize = (totalSize + size) / (bucket.size() + 1);
+                    bucket.add(pair.left);
+                    buckets.put(bucket, averageSize);
+                    bFound = true;
+                    break;
+                }
+            }
+            // no similar bucket found; put it in a new one
+            if (!bFound)
+            {
+                ArrayList<T> bucket = new ArrayList<T>();
+                bucket.add(pair.left);
+                buckets.put(bucket, size);
+            }
+        }
+
+        return new LinkedList<List<T>>(buckets.keySet());
+    }
+
+    private void updateEstimatedCompactionsByTasks(List<List<SSTableReader>> tasks)
+    {
+        int n = 0;
+        for (List<SSTableReader> bucket: tasks)
+        {
+            if (bucket.size() >= cfs.getMinimumCompactionThreshold())
+                n += Math.ceil((double)bucket.size() / cfs.getMaximumCompactionThreshold());
+        }
+        estimatedRemainingTasks = n;
+    }
+
+    public long getMinSSTableSize()
+    {
+        return minSSTableSize;
+    }
+
+    public long getMaxSSTableSize()
+    {
+        return Long.MAX_VALUE;
+    }
+
+    public boolean isKeyExistenceExpensive(Set<? extends SSTable> sstablesToIgnore)
+    {
+        return cfs.getSSTables().size() - sstablesToIgnore.size() > 20;
+    }
+
+    public String toString()
+    {
+        return String.format("SizeTieredCompactionStrategy[%s/%s]",
+            cfs.getMinimumCompactionThreshold(),
+            cfs.getMaximumCompactionThreshold());
+    }
 }

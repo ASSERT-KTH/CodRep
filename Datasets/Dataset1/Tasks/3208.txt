@@ -1,6 +1,6 @@
-MatchAllScorer(IndexReader reader, Bits liveDocs, Weight w, float score) {
+private final void switchCurrentBuffer() {
 
-package org.apache.lucene.search;
+package org.apache.lucene.store;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,139 +19,188 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.util.ToStringUtils;
-import org.apache.lucene.util.Bits;
-
-import java.util.Set;
 import java.io.IOException;
 
 /**
- * A query that matches all documents.
+ * A memory-resident {@link IndexOutput} implementation.
  *
+ * @lucene.internal
  */
-public class MatchAllDocsQuery extends Query {
+public class RAMOutputStream extends IndexOutput {
+  static final int BUFFER_SIZE = 1024;
 
-  private class MatchAllScorer extends Scorer {
-    final float score;
-    private int doc = -1;
-    private final int maxDoc;
-    private final Bits liveDocs;
+  private RAMFile file;
 
-    MatchAllScorer(IndexReader reader, Bits liveDocs, Weight w, float score) throws IOException {
-      super(w);
-      this.liveDocs = liveDocs;
-      this.score = score;
-      maxDoc = reader.maxDoc();
-    }
+  private byte[] currentBuffer;
+  private int currentBufferIndex;
+  
+  private int bufferPosition;
+  private long bufferStart;
+  private int bufferLength;
 
-    @Override
-    public int docID() {
-      return doc;
-    }
+  /** Construct an empty output buffer. */
+  public RAMOutputStream() {
+    this(new RAMFile());
+  }
 
-    @Override
-    public int nextDoc() throws IOException {
-      doc++;
-      while(liveDocs != null && doc < maxDoc && !liveDocs.get(doc)) {
-        doc++;
+  public RAMOutputStream(RAMFile f) {
+    file = f;
+
+    // make sure that we switch to the
+    // first needed buffer lazily
+    currentBufferIndex = -1;
+    currentBuffer = null;
+  }
+
+  /** Copy the current contents of this buffer to the named output. */
+  public void writeTo(IndexOutput out) throws IOException {
+    flush();
+    final long end = file.length;
+    long pos = 0;
+    int buffer = 0;
+    while (pos < end) {
+      int length = BUFFER_SIZE;
+      long nextPos = pos + length;
+      if (nextPos > end) {                        // at the last buffer
+        length = (int)(end - pos);
       }
-      if (doc == maxDoc) {
-        doc = NO_MORE_DOCS;
+      out.writeBytes(file.getBuffer(buffer++), length);
+      pos = nextPos;
+    }
+  }
+
+  /** Copy the current contents of this buffer to output
+   *  byte array */
+  public void writeTo(byte[] bytes, int offset) throws IOException {
+    flush();
+    final long end = file.length;
+    long pos = 0;
+    int buffer = 0;
+    int bytesUpto = offset;
+    while (pos < end) {
+      int length = BUFFER_SIZE;
+      long nextPos = pos + length;
+      if (nextPos > end) {                        // at the last buffer
+        length = (int)(end - pos);
       }
-      return doc;
-    }
-    
-    @Override
-    public float score() {
-      return score;
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      doc = target-1;
-      return nextDoc();
+      System.arraycopy(file.getBuffer(buffer++), 0, bytes, bytesUpto, length);
+      bytesUpto += length;
+      pos = nextPos;
     }
   }
 
-  private class MatchAllDocsWeight extends Weight {
-    private float queryWeight;
-    private float queryNorm;
+  /** Resets this to an empty file. */
+  public void reset() {
+    currentBuffer = null;
+    currentBufferIndex = -1;
+    bufferPosition = 0;
+    bufferStart = 0;
+    bufferLength = 0;
+    file.setLength(0);
+  }
 
-    public MatchAllDocsWeight(IndexSearcher searcher) {
+  @Override
+  public void close() throws IOException {
+    flush();
+  }
+
+  @Override
+  public void seek(long pos) throws IOException {
+    // set the file length in case we seek back
+    // and flush() has not been called yet
+    setFileLength();
+    if (pos < bufferStart || pos >= bufferStart + bufferLength) {
+      currentBufferIndex = (int) (pos / BUFFER_SIZE);
+      switchCurrentBuffer();
     }
 
-    @Override
-    public String toString() {
-      return "weight(" + MatchAllDocsQuery.this + ")";
-    }
+    bufferPosition = (int) (pos % BUFFER_SIZE);
+  }
 
-    @Override
-    public Query getQuery() {
-      return MatchAllDocsQuery.this;
-    }
+  @Override
+  public long length() {
+    return file.length;
+  }
 
-    @Override
-    public float getValueForNormalization() {
-      queryWeight = getBoost();
-      return queryWeight * queryWeight;
+  @Override
+  public void writeByte(byte b) throws IOException {
+    if (bufferPosition == bufferLength) {
+      currentBufferIndex++;
+      switchCurrentBuffer();
     }
+    currentBuffer[bufferPosition++] = b;
+  }
 
-    @Override
-    public void normalize(float queryNorm, float topLevelBoost) {
-      this.queryNorm = queryNorm * topLevelBoost;
-      queryWeight *= this.queryNorm;
-    }
-
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, Bits acceptDocs) throws IOException {
-      return new MatchAllScorer(context.reader(), acceptDocs, this, queryWeight);
-    }
-
-    @Override
-    public Explanation explain(AtomicReaderContext context, int doc) {
-      // explain query weight
-      Explanation queryExpl = new ComplexExplanation
-        (true, queryWeight, "MatchAllDocsQuery, product of:");
-      if (getBoost() != 1.0f) {
-        queryExpl.addDetail(new Explanation(getBoost(),"boost"));
+  @Override
+  public void writeBytes(byte[] b, int offset, int len) throws IOException {
+    assert b != null;
+    while (len > 0) {
+      if (bufferPosition ==  bufferLength) {
+        currentBufferIndex++;
+        switchCurrentBuffer();
       }
-      queryExpl.addDetail(new Explanation(queryNorm,"queryNorm"));
 
-      return queryExpl;
+      int remainInBuffer = currentBuffer.length - bufferPosition;
+      int bytesToCopy = len < remainInBuffer ? len : remainInBuffer;
+      System.arraycopy(b, offset, currentBuffer, bufferPosition, bytesToCopy);
+      offset += bytesToCopy;
+      len -= bytesToCopy;
+      bufferPosition += bytesToCopy;
+    }
+  }
+
+  private final void switchCurrentBuffer() throws IOException {
+    if (currentBufferIndex == file.numBuffers()) {
+      currentBuffer = file.addBuffer(BUFFER_SIZE);
+    } else {
+      currentBuffer = file.getBuffer(currentBufferIndex);
+    }
+    bufferPosition = 0;
+    bufferStart = (long) BUFFER_SIZE * (long) currentBufferIndex;
+    bufferLength = currentBuffer.length;
+  }
+
+  private void setFileLength() {
+    long pointer = bufferStart + bufferPosition;
+    if (pointer > file.length) {
+      file.setLength(pointer);
     }
   }
 
   @Override
-  public Weight createWeight(IndexSearcher searcher) {
-    return new MatchAllDocsWeight(searcher);
+  public void flush() throws IOException {
+    setFileLength();
   }
 
   @Override
-  public void extractTerms(Set<Term> terms) {
+  public long getFilePointer() {
+    return currentBufferIndex < 0 ? 0 : bufferStart + bufferPosition;
   }
 
-  @Override
-  public String toString(String field) {
-    StringBuilder buffer = new StringBuilder();
-    buffer.append("*:*");
-    buffer.append(ToStringUtils.boost(getBoost()));
-    return buffer.toString();
+  /** Returns byte usage of all buffers. */
+  public long sizeInBytes() {
+    return (long) file.numBuffers() * (long) BUFFER_SIZE;
   }
+  
+  @Override
+  public void copyBytes(DataInput input, long numBytes) throws IOException {
+    assert numBytes >= 0: "numBytes=" + numBytes;
 
-  @Override
-  public boolean equals(Object o) {
-    if (!(o instanceof MatchAllDocsQuery))
-      return false;
-    MatchAllDocsQuery other = (MatchAllDocsQuery) o;
-    return this.getBoost() == other.getBoost();
-  }
+    while (numBytes > 0) {
+      if (bufferPosition == bufferLength) {
+        currentBufferIndex++;
+        switchCurrentBuffer();
+      }
 
-  @Override
-  public int hashCode() {
-    return Float.floatToIntBits(getBoost()) ^ 0x1AA71190;
+      int toCopy = currentBuffer.length - bufferPosition;
+      if (numBytes < toCopy) {
+        toCopy = (int) numBytes;
+      }
+      input.readBytes(currentBuffer, bufferPosition, toCopy, false);
+      numBytes -= toCopy;
+      bufferPosition += toCopy;
+    }
+
   }
+  
 }

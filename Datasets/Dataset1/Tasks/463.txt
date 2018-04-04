@@ -1,6 +1,6 @@
-Counter bytesUsed, IOContext context, float acceptableOverheadRatio) {
+public void setNextEnum(TermsEnum termsEnum) {
 
-package org.apache.lucene.codecs.lucene40.values;
+package org.apache.lucene.search;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,241 +20,176 @@ package org.apache.lucene.codecs.lucene40.values;
  */
 
 import java.io.IOException;
-import java.util.Comparator;
-import java.util.List;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.index.TermState;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.MultiTermQuery.RewriteMethod;
 
-import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
-import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSortedSourceBase;
-import org.apache.lucene.codecs.lucene40.values.Bytes.DerefBytesWriterBase;
-import org.apache.lucene.index.DocValues;
-import org.apache.lucene.index.SortedBytesMergeUtils;
-import org.apache.lucene.index.DocValues.SortedSource;
-import org.apache.lucene.index.DocValues.Type;
-import org.apache.lucene.index.SortedBytesMergeUtils.IndexOutputBytesRefConsumer;
-import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
-import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
-import org.apache.lucene.index.MergeState;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.ByteBlockPool;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.Counter;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.packed.PackedInts;
+import org.apache.lucene.util.BytesRefHash;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.BytesRefHash.DirectBytesStartArray;
 
-// Stores variable-length byte[] by deref, ie when two docs
-// have the same value, they store only 1 byte[] and both
-// docs reference that single source
+/** @lucene.internal Only public to be accessible by spans package. */
+public abstract class ScoringRewrite<Q extends Query> extends TermCollectingRewrite<Q> {
 
-/**
- * @lucene.experimental
- */
-final class VarSortedBytesImpl {
-
-  static final String CODEC_NAME_IDX = "VarDerefBytesIdx";
-  static final String CODEC_NAME_DAT = "VarDerefBytesDat";
-
-  static final int VERSION_START = 0;
-  static final int VERSION_CURRENT = VERSION_START;
-
-  final static class Writer extends DerefBytesWriterBase {
-    private final Comparator<BytesRef> comp;
-
-    public Writer(Directory dir, String id, Comparator<BytesRef> comp,
-        Counter bytesUsed, IOContext context, float acceptableOverheadRatio) throws IOException {
-      super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_CURRENT, bytesUsed, context, acceptableOverheadRatio, Type.BYTES_VAR_SORTED);
-      this.comp = comp;
-      size = 0;
-    }
-
+  /** A rewrite method that first translates each term into
+   *  {@link BooleanClause.Occur#SHOULD} clause in a
+   *  BooleanQuery, and keeps the scores as computed by the
+   *  query.  Note that typically such scores are
+   *  meaningless to the user, and require non-trivial CPU
+   *  to compute, so it's almost always better to use {@link
+   *  MultiTermQuery#CONSTANT_SCORE_AUTO_REWRITE_DEFAULT} instead.
+   *
+   *  <p><b>NOTE</b>: This rewrite method will hit {@link
+   *  BooleanQuery.TooManyClauses} if the number of terms
+   *  exceeds {@link BooleanQuery#getMaxClauseCount}.
+   *
+   *  @see MultiTermQuery#setRewriteMethod */
+  public final static ScoringRewrite<BooleanQuery> SCORING_BOOLEAN_QUERY_REWRITE = new ScoringRewrite<BooleanQuery>() {
     @Override
-    public void merge(MergeState mergeState, DocValues[] docValues)
-        throws IOException {
-      boolean success = false;
-      try {
-        MergeContext ctx = SortedBytesMergeUtils.init(Type.BYTES_VAR_SORTED, docValues, comp, mergeState.segmentInfo.getDocCount());
-        final List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(mergeState.docBase, mergeState.docMaps, docValues, ctx);
-        IndexOutput datOut = getOrCreateDataOut();
-        
-        ctx.offsets = new long[1];
-        final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, new IndexOutputBytesRefConsumer(datOut), slices);
-        final long[] offsets = ctx.offsets;
-        maxBytes = offsets[maxOrd-1];
-        final IndexOutput idxOut = getOrCreateIndexOut();
-        
-        idxOut.writeLong(maxBytes);
-        final PackedInts.Writer offsetWriter = PackedInts.getWriter(idxOut, maxOrd+1,
-            PackedInts.bitsRequired(maxBytes), PackedInts.DEFAULT);
-        offsetWriter.add(0);
-        for (int i = 0; i < maxOrd; i++) {
-          offsetWriter.add(offsets[i]);
-        }
-        offsetWriter.finish();
-        
-        final PackedInts.Writer ordsWriter = PackedInts.getWriter(idxOut, ctx.docToEntry.length,
-            PackedInts.bitsRequired(maxOrd-1), PackedInts.DEFAULT);
-        for (SortedSourceSlice slice : slices) {
-          slice.writeOrds(ordsWriter);
-        }
-        ordsWriter.finish();
-        success = true;
-      } finally {
-        releaseResources();
-        if (success) {
-          IOUtils.close(getIndexOut(), getDataOut());
-        } else {
-          IOUtils.closeWhileHandlingException(getIndexOut(), getDataOut());
-        }
-
-      }
-    }
-
-    @Override
-    protected void checkSize(BytesRef bytes) {
-      // allow var bytes sizes
-    }
-
-    // Important that we get docCount, in case there were
-    // some last docs that we didn't see
-    @Override
-    public void finishInternal(int docCount) throws IOException {
-      fillDefault(docCount);
-      final int count = hash.size();
-      final IndexOutput datOut = getOrCreateDataOut();
-      final IndexOutput idxOut = getOrCreateIndexOut();
-      long offset = 0;
-      final int[] index = new int[count];
-      final int[] sortedEntries = hash.sort(comp);
-      // total bytes of data
-      idxOut.writeLong(maxBytes);
-      PackedInts.Writer offsetWriter = PackedInts.getWriter(idxOut, count+1,
-          PackedInts.bitsRequired(maxBytes), PackedInts.DEFAULT);
-      // first dump bytes data, recording index & write offset as
-      // we go
-      final BytesRef spare = new BytesRef();
-      for (int i = 0; i < count; i++) {
-        final int e = sortedEntries[i];
-        offsetWriter.add(offset);
-        index[e] = i;
-        final BytesRef bytes = hash.get(e, spare);
-        // TODO: we could prefix code...
-        datOut.writeBytes(bytes.bytes, bytes.offset, bytes.length);
-        offset += bytes.length;
-      }
-      // write sentinel
-      offsetWriter.add(offset);
-      offsetWriter.finish();
-      // write index
-      writeIndex(idxOut, docCount, count, index, docToEntry);
-
-    }
-  }
-
-  public static class Reader extends BytesReaderBase {
-
-    private final Comparator<BytesRef> comparator;
-
-    Reader(Directory dir, String id, int maxDoc,
-        IOContext context, Type type, Comparator<BytesRef> comparator)
-        throws IOException {
-      super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_START, true, context, type);
-      this.comparator = comparator;
-    }
-
-    @Override
-    public org.apache.lucene.index.DocValues.Source load()
-        throws IOException {
-      return new VarSortedSource(cloneData(), cloneIndex(), comparator);
-    }
-
-    @Override
-    public Source getDirectSource() throws IOException {
-      return new DirectSortedSource(cloneData(), cloneIndex(), comparator, getType());
+    protected BooleanQuery getTopLevelQuery() {
+      return new BooleanQuery(true);
     }
     
-  }
-  private static final class VarSortedSource extends BytesSortedSourceBase {
-    private final int valueCount;
-
-    VarSortedSource(IndexInput datIn, IndexInput idxIn,
-        Comparator<BytesRef> comp) throws IOException {
-      super(datIn, idxIn, comp, idxIn.readLong(), Type.BYTES_VAR_SORTED, true);
-      valueCount = ordToOffsetIndex.size()-1; // the last value here is just a dummy value to get the length of the last value
-      closeIndexInput();
-    }
-
     @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      final long offset = ordToOffsetIndex.get(ord);
-      final long nextOffset = ordToOffsetIndex.get(1 + ord);
-      data.fillSlice(bytesRef, offset, (int) (nextOffset - offset));
-      return bytesRef;
+    protected void addClause(BooleanQuery topLevel, Term term, int docCount,
+        float boost, TermContext states) {
+      final TermQuery tq = new TermQuery(term, states);
+      tq.setBoost(boost);
+      topLevel.add(tq, BooleanClause.Occur.SHOULD);
     }
-
-    @Override
-    public int getValueCount() {
-      return valueCount;
-    }
-  }
-
-  private static final class DirectSortedSource extends SortedSource {
-    private final PackedInts.Reader docToOrdIndex;
-    private final PackedInts.Reader ordToOffsetIndex;
-    private final IndexInput datIn;
-    private final long basePointer;
-    private final int valueCount;
     
-    DirectSortedSource(IndexInput datIn, IndexInput idxIn,
-        Comparator<BytesRef> comparator, Type type) throws IOException {
-      super(type, comparator);
-      idxIn.readLong();
-      ordToOffsetIndex = PackedInts.getDirectReader(idxIn);
-      valueCount = ordToOffsetIndex.size()-1; // the last value here is just a dummy value to get the length of the last value
-      // advance this iterator to the end and clone the stream once it points to the docToOrdIndex header
-      ordToOffsetIndex.get(valueCount);
-      docToOrdIndex = PackedInts.getDirectReader((IndexInput) idxIn.clone()); // read the ords in to prevent too many random disk seeks
-      basePointer = datIn.getFilePointer();
-      this.datIn = datIn;
-    }
-
     @Override
-    public int ord(int docID) {
-      return (int) docToOrdIndex.get(docID);
+    protected void checkMaxClauseCount(int count) {
+      if (count > BooleanQuery.getMaxClauseCount())
+        throw new BooleanQuery.TooManyClauses();
     }
-
+  };
+  
+  /** Like {@link #SCORING_BOOLEAN_QUERY_REWRITE} except
+   *  scores are not computed.  Instead, each matching
+   *  document receives a constant score equal to the
+   *  query's boost.
+   * 
+   *  <p><b>NOTE</b>: This rewrite method will hit {@link
+   *  BooleanQuery.TooManyClauses} if the number of terms
+   *  exceeds {@link BooleanQuery#getMaxClauseCount}.
+   *
+   *  @see MultiTermQuery#setRewriteMethod */
+  public final static RewriteMethod CONSTANT_SCORE_BOOLEAN_QUERY_REWRITE = new RewriteMethod() {
     @Override
-    public boolean hasPackedDocToOrd() {
+    public Query rewrite(IndexReader reader, MultiTermQuery query) throws IOException {
+      final BooleanQuery bq = SCORING_BOOLEAN_QUERY_REWRITE.rewrite(reader, query);
+      // TODO: if empty boolean query return NullQuery?
+      if (bq.clauses().isEmpty())
+        return bq;
+      // strip the scores off
+      final Query result = new ConstantScoreQuery(bq);
+      result.setBoost(query.getBoost());
+      return result;
+    }
+  };
+
+  /** This method is called after every new term to check if the number of max clauses
+   * (e.g. in BooleanQuery) is not exceeded. Throws the corresponding {@link RuntimeException}. */
+  protected abstract void checkMaxClauseCount(int count) throws IOException;
+  
+  @Override
+  public final Q rewrite(final IndexReader reader, final MultiTermQuery query) throws IOException {
+    final Q result = getTopLevelQuery();
+    final ParallelArraysTermCollector col = new ParallelArraysTermCollector();
+    collectTerms(reader, query, col);
+    
+    final int size = col.terms.size();
+    if (size > 0) {
+      final int sort[] = col.terms.sort(col.termsEnum.getComparator());
+      final float[] boost = col.array.boost;
+      final TermContext[] termStates = col.array.termState;
+      for (int i = 0; i < size; i++) {
+        final int pos = sort[i];
+        final Term term = new Term(query.getField(), col.terms.get(pos, new BytesRef()));
+        assert reader.docFreq(term) == termStates[pos].docFreq();
+        addClause(result, term, termStates[pos].docFreq(), query.getBoost() * boost[pos], termStates[pos]);
+      }
+    }
+    return result;
+  }
+
+  final class ParallelArraysTermCollector extends TermCollector {
+    final TermFreqBoostByteStart array = new TermFreqBoostByteStart(16);
+    final BytesRefHash terms = new BytesRefHash(new ByteBlockPool(new ByteBlockPool.DirectAllocator()), 16, array);
+    TermsEnum termsEnum;
+
+    private BoostAttribute boostAtt;
+    
+    @Override
+    public void setNextEnum(TermsEnum termsEnum) throws IOException {
+      this.termsEnum = termsEnum;
+      this.boostAtt = termsEnum.attributes().addAttribute(BoostAttribute.class);
+    }
+  
+    @Override
+    public boolean collect(BytesRef bytes) throws IOException {
+      final int e = terms.add(bytes);
+      final TermState state = termsEnum.termState();
+      assert state != null; 
+      if (e < 0 ) {
+        // duplicate term: update docFreq
+        final int pos = (-e)-1;
+        array.termState[pos].register(state, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+        assert array.boost[pos] == boostAtt.getBoost() : "boost should be equal in all segment TermsEnums";
+      } else {
+        // new entry: we populate the entry initially
+        array.boost[e] = boostAtt.getBoost();
+        array.termState[e] = new TermContext(topReaderContext, state, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+        ScoringRewrite.this.checkMaxClauseCount(terms.size());
+      }
       return true;
     }
-
-    @Override
-    public PackedInts.Reader getDocToOrd() {
-      return docToOrdIndex;
+  }
+  
+  /** Special implementation of BytesStartArray that keeps parallel arrays for boost and docFreq */
+  static final class TermFreqBoostByteStart extends DirectBytesStartArray  {
+    float[] boost;
+    TermContext[] termState;
+    
+    public TermFreqBoostByteStart(int initSize) {
+      super(initSize);
     }
 
     @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      try {
-        final long offset = ordToOffsetIndex.get(ord);
-        // 1+ord is safe because we write a sentinel at the end
-        final long nextOffset = ordToOffsetIndex.get(1+ord);
-        datIn.seek(basePointer + offset);
-        final int length = (int) (nextOffset - offset);
-        bytesRef.offset = 0;
-        bytesRef.grow(length);
-        datIn.readBytes(bytesRef.bytes, 0, length);
-        bytesRef.length = length;
-        return bytesRef;
-      } catch (IOException ex) {
-        throw new IllegalStateException("failed", ex);
-      }
+    public int[] init() {
+      final int[] ord = super.init();
+      boost = new float[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_FLOAT)];
+      termState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+      assert termState.length >= ord.length && boost.length >= ord.length;
+      return ord;
+    }
+
+    @Override
+    public int[] grow() {
+      final int[] ord = super.grow();
+      boost = ArrayUtil.grow(boost, ord.length);
+      if (termState.length < ord.length) {
+        TermContext[] tmpTermState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+        System.arraycopy(termState, 0, tmpTermState, 0, termState.length);
+        termState = tmpTermState;
+      }     
+      assert termState.length >= ord.length && boost.length >= ord.length;
+      return ord;
+    }
+
+    @Override
+    public int[] clear() {
+     boost = null;
+     termState = null;
+     return super.clear();
     }
     
-    @Override
-    public int getValueCount() {
-      return valueCount;
-    }
-
   }
 }

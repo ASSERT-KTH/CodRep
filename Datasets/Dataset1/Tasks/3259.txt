@@ -1,6 +1,6 @@
-ModifiableSolrParams params) {
+for (final AtomicReaderContext ctx : reader.leaves()) {
 
-package org.apache.solr.update;
+package org.apache.lucene.search.spell;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -21,487 +21,670 @@ package org.apache.solr.update;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CompletionService;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorCompletionService;
-import java.util.concurrent.Future;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
-import org.apache.http.client.HttpClient;
-import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.HttpClientUtil;
-import org.apache.solr.client.solrj.impl.HttpSolrServer;
-import org.apache.solr.client.solrj.request.AbstractUpdateRequest;
-import org.apache.solr.client.solrj.request.UpdateRequestExt;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.cloud.ZkCoreNodeProps;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.util.DefaultSolrThreadFactory;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.ReaderUtil;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefIterator;
+import org.apache.lucene.util.Version;
 
+/**
+ * <p>
+ *   Spell Checker class  (Main class) <br/>
+ *  (initially inspired by the David Spencer code).
+ * </p>
+ *
+ * <p>Example Usage:
+ * 
+ * <pre>
+ *  SpellChecker spellchecker = new SpellChecker(spellIndexDirectory);
+ *  // To index a field of a user index:
+ *  spellchecker.indexDictionary(new LuceneDictionary(my_lucene_reader, a_field));
+ *  // To index a file containing words:
+ *  spellchecker.indexDictionary(new PlainTextDictionary(new File("myfile.txt")));
+ *  String[] suggestions = spellchecker.suggestSimilar("misspelt", 5);
+ * </pre>
+ * 
+ *
+ */
+public class SpellChecker implements java.io.Closeable {
 
+  /**
+   * The default minimum score to use, if not specified by calling {@link #setAccuracy(float)} .
+   */
+  public static final float DEFAULT_ACCURACY = 0.5f;
 
+  /**
+   * Field name for each word in the ngram index.
+   */
+  public static final String F_WORD = "word";
 
-public class SolrCmdDistributor {
-  private static final int MAX_RETRIES_ON_FORWARD = 6;
-  public static Logger log = LoggerFactory.getLogger(SolrCmdDistributor.class);
-  
-  // TODO: shut this thing down
-  // TODO: this cannot be per instance...
-  static ThreadPoolExecutor commExecutor = new ThreadPoolExecutor(0,
-      Integer.MAX_VALUE, 5, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(),
-      new DefaultSolrThreadFactory("cmdDistribExecutor"));
+  /**
+   * the spell index
+   */
+  // don't modify the directory directly - see #swapSearcher()
+  // TODO: why is this package private?
+  Directory spellIndex;
+  /**
+   * Boost value for start and end grams
+   */
+  private float bStart = 2.0f;
 
-  static final HttpClient client;
-  
-  static {
-    ModifiableSolrParams params = new ModifiableSolrParams();
-    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS, 200);
-    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS_PER_HOST, 8);
-    client = HttpClientUtil.createClient(params);
+  private float bEnd = 1.0f;
+  // don't use this searcher directly - see #swapSearcher()
+
+  private IndexSearcher searcher;
+  /*
+   * this locks all modifications to the current searcher.
+   */
+
+  private final Object searcherLock = new Object();
+  /*
+   * this lock synchronizes all possible modifications to the
+   * current index directory. It should not be possible to try modifying
+   * the same index concurrently. Note: Do not acquire the searcher lock
+   * before acquiring this lock!
+   */
+  private final Object modifyCurrentIndexLock = new Object();
+
+  private volatile boolean closed = false;
+  // minimum score for hits generated by the spell checker query
+
+  private float accuracy = DEFAULT_ACCURACY;
+
+  private StringDistance sd;
+  private Comparator<SuggestWord> comparator;
+
+  /**
+   * Use the given directory as a spell checker index. The directory
+   * is created if it doesn't exist yet.
+   * @param spellIndex the spell index directory
+   * @param sd the {@link StringDistance} measurement to use 
+   * @throws IOException if Spellchecker can not open the directory
+   */
+  public SpellChecker(Directory spellIndex, StringDistance sd) throws IOException {
+    this(spellIndex, sd, SuggestWordQueue.DEFAULT_COMPARATOR);
+  }
+  /**
+   * Use the given directory as a spell checker index with a
+   * {@link LevensteinDistance} as the default {@link StringDistance}. The
+   * directory is created if it doesn't exist yet.
+   * 
+   * @param spellIndex
+   *          the spell index directory
+   * @throws IOException
+   *           if spellchecker can not open the directory
+   */
+  public SpellChecker(Directory spellIndex) throws IOException {
+    this(spellIndex, new LevensteinDistance());
+  }
+
+  /**
+   * Use the given directory as a spell checker index with the given {@link org.apache.lucene.search.spell.StringDistance} measure
+   * and the given {@link java.util.Comparator} for sorting the results.
+   * @param spellIndex The spelling index
+   * @param sd The distance
+   * @param comparator The comparator
+   * @throws IOException if there is a problem opening the index
+   */
+  public SpellChecker(Directory spellIndex, StringDistance sd, Comparator<SuggestWord> comparator) throws IOException {
+    setSpellIndex(spellIndex);
+    setStringDistance(sd);
+    this.comparator = comparator;
   }
   
-  CompletionService<Request> completionService;
-  Set<Future<Request>> pending;
-  
-  int maxBufferedAddsPerServer = 10;
-  int maxBufferedDeletesPerServer = 10;
-
-  private Response response = new Response();
-  
-  private final Map<Node,List<AddRequest>> adds = new HashMap<Node,List<AddRequest>>();
-  private final Map<Node,List<DeleteRequest>> deletes = new HashMap<Node,List<DeleteRequest>>();
-  
-  class AddRequest {
-    AddUpdateCommand cmd;
-    ModifiableSolrParams params;
-  }
-  
-  class DeleteRequest {
-    DeleteUpdateCommand cmd;
-    ModifiableSolrParams params;
-  }
-  
-  public SolrCmdDistributor() {
-   
-  }
-  
-  public void finish() {
-
-    // piggyback on any outstanding adds or deletes if possible.
-    flushAdds(1);
-    flushDeletes(1);
-
-    checkResponses(true);
-  }
-  
-  public void distribDelete(DeleteUpdateCommand cmd, List<Node> urls, ModifiableSolrParams params) throws IOException {
-    checkResponses(false);
-    
-    if (cmd.isDeleteById()) {
-      doDelete(cmd, urls, params);
-    } else {
-      doDelete(cmd, urls, params);
-    }
-  }
-  
-  public void distribAdd(AddUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params) throws IOException {
-    checkResponses(false);
-    
-    // make sure any pending deletes are flushed
-    flushDeletes(1);
-    
-    // TODO: this is brittle
-    // need to make a clone since these commands may be reused
-    AddUpdateCommand clone = new AddUpdateCommand(null);
-    
-    clone.solrDoc = cmd.solrDoc;
-    clone.commitWithin = cmd.commitWithin;
-    clone.overwrite = cmd.overwrite;
-    clone.setVersion(cmd.getVersion());
-    AddRequest addRequest = new AddRequest();
-    addRequest.cmd = clone;
-    addRequest.params = params;
-
-    for (Node node : nodes) {
-      List<AddRequest> alist = adds.get(node);
-      if (alist == null) {
-        alist = new ArrayList<AddRequest>(2);
-        adds.put(node, alist);
+  /**
+   * Use a different index as the spell checker index or re-open
+   * the existing index if <code>spellIndex</code> is the same value
+   * as given in the constructor.
+   * @param spellIndexDir the spell directory to use
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   * @throws  IOException if spellchecker can not open the directory
+   */
+  // TODO: we should make this final as it is called in the constructor
+  public void setSpellIndex(Directory spellIndexDir) throws IOException {
+    // this could be the same directory as the current spellIndex
+    // modifications to the directory should be synchronized 
+    synchronized (modifyCurrentIndexLock) {
+      ensureOpen();
+      if (!DirectoryReader.indexExists(spellIndexDir)) {
+          IndexWriter writer = new IndexWriter(spellIndexDir,
+            new IndexWriterConfig(Version.LUCENE_CURRENT,
+                null));
+          writer.close();
       }
-      alist.add(addRequest);
-    }
-    
-    flushAdds(maxBufferedAddsPerServer);
-  }
-  
-  public void distribCommit(CommitUpdateCommand cmd, List<Node> nodes,
-      ModifiableSolrParams params) throws IOException {
-    // Wait for all outstanding responses to make sure that a commit
-    // can't sneak in ahead of adds or deletes we already sent.
-    // We could do this on a per-server basis, but it's more complex
-    // and this solution will lead to commits happening closer together.
-    checkResponses(true);
-    
-    // currently, we dont try to piggy back on outstanding adds or deletes
-    
-    UpdateRequestExt ureq = new UpdateRequestExt();
-    ureq.setParams(params);
-    
-    addCommit(ureq, cmd);
-    
-    for (Node node : nodes) {
-      submit(ureq, node);
-    }
-    
-    // if the command wanted to block until everything was committed,
-    // then do that here.
-    
-    if (cmd.waitSearcher) {
-      checkResponses(true);
+      swapSearcher(spellIndexDir);
     }
   }
-  
-  private void doDelete(DeleteUpdateCommand cmd, List<Node> nodes,
-      ModifiableSolrParams params) throws IOException {
-    
-    flushAdds(1);
-    
-    DeleteUpdateCommand clonedCmd = clone(cmd);
-    DeleteRequest deleteRequest = new DeleteRequest();
-    deleteRequest.cmd = clonedCmd;
-    deleteRequest.params = params;
-    for (Node node : nodes) {
-      List<DeleteRequest> dlist = deletes.get(node);
-      
-      if (dlist == null) {
-        dlist = new ArrayList<DeleteRequest>(2);
-        deletes.put(node, dlist);
-      }
-      dlist.add(deleteRequest);
-    }
-    
-    flushDeletes(maxBufferedDeletesPerServer);
-  }
-  
-  void addCommit(UpdateRequestExt ureq, CommitUpdateCommand cmd) {
-    if (cmd == null) return;
-    ureq.setAction(cmd.optimize ? AbstractUpdateRequest.ACTION.OPTIMIZE
-        : AbstractUpdateRequest.ACTION.COMMIT, false, cmd.waitSearcher);
-  }
-  
-  boolean flushAdds(int limit) {
-    // check for pending deletes
-  
-    Set<Node> removeNodes = new HashSet<Node>();
-    Set<Node> nodes = adds.keySet();
- 
-    for (Node node : nodes) {
-      List<AddRequest> alist = adds.get(node);
-      if (alist == null || alist.size() < limit) return false;
-  
-      UpdateRequestExt ureq = new UpdateRequestExt();
-      
-      ModifiableSolrParams combinedParams = new ModifiableSolrParams();
-      
-      for (AddRequest aReq : alist) {
-        AddUpdateCommand cmd = aReq.cmd;
-        combinedParams.add(aReq.params);
-       
-        ureq.add(cmd.solrDoc, cmd.commitWithin, cmd.overwrite);
-      }
-      
-      if (ureq.getParams() == null) ureq.setParams(new ModifiableSolrParams());
-      ureq.getParams().add(combinedParams);
 
-      removeNodes.add(node);
-      
-      submit(ureq, node);
-    }
-    
-    for (Node node : removeNodes) {
-      adds.remove(node);
-    }
-    
-    return true;
+  /**
+   * Sets the {@link java.util.Comparator} for the {@link SuggestWordQueue}.
+   * @param comparator the comparator
+   */
+  public void setComparator(Comparator<SuggestWord> comparator) {
+    this.comparator = comparator;
+  }
+
+  public Comparator<SuggestWord> getComparator() {
+    return comparator;
+  }
+
+  /**
+   * Sets the {@link StringDistance} implementation for this
+   * {@link SpellChecker} instance.
+   * 
+   * @param sd the {@link StringDistance} implementation for this
+   * {@link SpellChecker} instance
+   */
+  public void setStringDistance(StringDistance sd) {
+    this.sd = sd;
+  }
+  /**
+   * Returns the {@link StringDistance} instance used by this
+   * {@link SpellChecker} instance.
+   * 
+   * @return the {@link StringDistance} instance used by this
+   *         {@link SpellChecker} instance.
+   */
+  public StringDistance getStringDistance() {
+    return sd;
+  }
+
+  /**
+   * Sets the accuracy 0 &lt; minScore &lt; 1; default {@link #DEFAULT_ACCURACY}
+   * @param acc The new accuracy
+   */
+  public void setAccuracy(float acc) {
+    this.accuracy = acc;
+  }
+
+  /**
+   * The accuracy (minimum score) to be used, unless overridden in {@link #suggestSimilar(String, int, IndexReader, String, SuggestMode, float)}, to
+   * decide whether a suggestion is included or not.
+   * @return The current accuracy setting
+   */
+  public float getAccuracy() {
+    return accuracy;
+  }
+
+  /**
+   * Suggest similar words.
+   * 
+   * <p>As the Lucene similarity that is used to fetch the most relevant n-grammed terms
+   * is not the same as the edit distance strategy used to calculate the best
+   * matching spell-checked word from the hits that Lucene found, one usually has
+   * to retrieve a couple of numSug's in order to get the true best match.
+   *
+   * <p>I.e. if numSug == 1, don't count on that suggestion being the best one.
+   * Thus, you should set this value to <b>at least</b> 5 for a good suggestion.
+   *
+   * @param word the word you want a spell check done on
+   * @param numSug the number of suggested words
+   * @throws IOException if the underlying index throws an {@link IOException}
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   * @return String[]
+   *
+   * @see #suggestSimilar(String, int, IndexReader, String, SuggestMode, float) 
+   */
+  public String[] suggestSimilar(String word, int numSug) throws IOException {
+    return this.suggestSimilar(word, numSug, null, null, SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX);
+  }
+
+  /**
+   * Suggest similar words.
+   *
+   * <p>As the Lucene similarity that is used to fetch the most relevant n-grammed terms
+   * is not the same as the edit distance strategy used to calculate the best
+   * matching spell-checked word from the hits that Lucene found, one usually has
+   * to retrieve a couple of numSug's in order to get the true best match.
+   *
+   * <p>I.e. if numSug == 1, don't count on that suggestion being the best one.
+   * Thus, you should set this value to <b>at least</b> 5 for a good suggestion.
+   *
+   * @param word the word you want a spell check done on
+   * @param numSug the number of suggested words
+   * @param accuracy The minimum score a suggestion must have in order to qualify for inclusion in the results
+   * @throws IOException if the underlying index throws an {@link IOException}
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   * @return String[]
+   *
+   * @see #suggestSimilar(String, int, IndexReader, String, SuggestMode, float)
+   */
+  public String[] suggestSimilar(String word, int numSug, float accuracy) throws IOException {
+    return this.suggestSimilar(word, numSug, null, null, SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX, accuracy);
+  }
+
+  /**
+   * Calls {@link #suggestSimilar(String, int, IndexReader, String, SuggestMode, float) 
+   *       suggestSimilar(word, numSug, ir, suggestMode, field, this.accuracy)}
+   * 
+   */
+  public String[] suggestSimilar(String word, int numSug, IndexReader ir,
+      String field, SuggestMode suggestMode) throws IOException {
+  	return suggestSimilar(word, numSug, ir, field, suggestMode, this.accuracy);
   }
   
-  boolean flushDeletes(int limit) {
-    // check for pending deletes
- 
-    Set<Node> removeNodes = new HashSet<Node>();
-    Set<Node> nodes = deletes.keySet();
-    for (Node node : nodes) {
-      List<DeleteRequest> dlist = deletes.get(node);
-      if (dlist == null || dlist.size() < limit) return false;
-      UpdateRequestExt ureq = new UpdateRequestExt();
-      
-      ModifiableSolrParams combinedParams = new ModifiableSolrParams();
-      
-      for (DeleteRequest dReq : dlist) {
-        DeleteUpdateCommand cmd = dReq.cmd;
-        combinedParams.add(dReq.params);
-        if (cmd.isDeleteById()) {
-          ureq.deleteById(cmd.getId(), cmd.getVersion());
-        } else {
-          ureq.deleteByQuery(cmd.query);
+  /**
+   * Suggest similar words (optionally restricted to a field of an index).
+   *
+   * <p>As the Lucene similarity that is used to fetch the most relevant n-grammed terms
+   * is not the same as the edit distance strategy used to calculate the best
+   * matching spell-checked word from the hits that Lucene found, one usually has
+   * to retrieve a couple of numSug's in order to get the true best match.
+   *
+   * <p>I.e. if numSug == 1, don't count on that suggestion being the best one.
+   * Thus, you should set this value to <b>at least</b> 5 for a good suggestion.
+   *
+   * @param word the word you want a spell check done on
+   * @param numSug the number of suggested words
+   * @param ir the indexReader of the user index (can be null see field param)
+   * @param field the field of the user index: if field is not null, the suggested
+   * words are restricted to the words present in this field.
+   * @param suggestMode 
+   * (NOTE: if indexReader==null and/or field==null, then this is overridden with SuggestMode.SUGGEST_ALWAYS)
+   * @param accuracy The minimum score a suggestion must have in order to qualify for inclusion in the results
+   * @throws IOException if the underlying index throws an {@link IOException}
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   * @return String[] the sorted list of the suggest words with these 2 criteria:
+   * first criteria: the edit distance, second criteria (only if restricted mode): the popularity
+   * of the suggest words in the field of the user index
+   * 
+   */
+  public String[] suggestSimilar(String word, int numSug, IndexReader ir,
+      String field, SuggestMode suggestMode, float accuracy) throws IOException {
+    // obtainSearcher calls ensureOpen
+    final IndexSearcher indexSearcher = obtainSearcher();
+    try {
+      if (ir == null || field == null) {
+        suggestMode = SuggestMode.SUGGEST_ALWAYS;
+      }
+      if (suggestMode == SuggestMode.SUGGEST_ALWAYS) {
+        ir = null;
+        field = null;
+      }
+
+      final int lengthWord = word.length();
+
+      final int freq = (ir != null && field != null) ? ir.docFreq(new Term(field, word)) : 0;
+      final int goalFreq = suggestMode==SuggestMode.SUGGEST_MORE_POPULAR ? freq : 0;
+      // if the word exists in the real index and we don't care for word frequency, return the word itself
+      if (suggestMode==SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX && freq > 0) {
+        return new String[] { word };
+      }
+
+      BooleanQuery query = new BooleanQuery();
+      String[] grams;
+      String key;
+
+      for (int ng = getMin(lengthWord); ng <= getMax(lengthWord); ng++) {
+
+        key = "gram" + ng; // form key
+
+        grams = formGrams(word, ng); // form word into ngrams (allow dups too)
+
+        if (grams.length == 0) {
+          continue; // hmm
         }
-        
-        if (ureq.getParams() == null) ureq
-            .setParams(new ModifiableSolrParams());
-        ureq.getParams().add(combinedParams);
+
+        if (bStart > 0) { // should we boost prefixes?
+          add(query, "start" + ng, grams[0], bStart); // matches start of word
+
+        }
+        if (bEnd > 0) { // should we boost suffixes
+          add(query, "end" + ng, grams[grams.length - 1], bEnd); // matches end of word
+
+        }
+        for (int i = 0; i < grams.length; i++) {
+          add(query, key, grams[i]);
+        }
+      }
+
+      int maxHits = 10 * numSug;
+
+  //    System.out.println("Q: " + query);
+      ScoreDoc[] hits = indexSearcher.search(query, null, maxHits).scoreDocs;
+  //    System.out.println("HITS: " + hits.length());
+      SuggestWordQueue sugQueue = new SuggestWordQueue(numSug, comparator);
+
+      // go thru more than 'maxr' matches in case the distance filter triggers
+      int stop = Math.min(hits.length, maxHits);
+      SuggestWord sugWord = new SuggestWord();
+      for (int i = 0; i < stop; i++) {
+
+        sugWord.string = indexSearcher.doc(hits[i].doc).get(F_WORD); // get orig word
+
+        // don't suggest a word for itself, that would be silly
+        if (sugWord.string.equals(word)) {
+          continue;
+        }
+
+        // edit distance
+        sugWord.score = sd.getDistance(word,sugWord.string);
+        if (sugWord.score < accuracy) {
+          continue;
+        }
+
+        if (ir != null && field != null) { // use the user index
+          sugWord.freq = ir.docFreq(new Term(field, sugWord.string)); // freq in the index
+          // don't suggest a word that is not present in the field
+          if ((suggestMode==SuggestMode.SUGGEST_MORE_POPULAR && goalFreq > sugWord.freq) || sugWord.freq < 1) {
+            continue;
+          }
+        }
+        sugQueue.insertWithOverflow(sugWord);
+        if (sugQueue.size() == numSug) {
+          // if queue full, maintain the minScore score
+          accuracy = sugQueue.top().score;
+        }
+        sugWord = new SuggestWord();
+      }
+
+      // convert to array string
+      String[] list = new String[sugQueue.size()];
+      for (int i = sugQueue.size() - 1; i >= 0; i--) {
+        list[i] = sugQueue.pop().string;
+      }
+
+      return list;
+    } finally {
+      releaseSearcher(indexSearcher);
+    }
+  }
+  /**
+   * Add a clause to a boolean query.
+   */
+  private static void add(BooleanQuery q, String name, String value, float boost) {
+    Query tq = new TermQuery(new Term(name, value));
+    tq.setBoost(boost);
+    q.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
+  }
+
+  /**
+   * Add a clause to a boolean query.
+   */
+  private static void add(BooleanQuery q, String name, String value) {
+    q.add(new BooleanClause(new TermQuery(new Term(name, value)), BooleanClause.Occur.SHOULD));
+  }
+
+  /**
+   * Form all ngrams for a given word.
+   * @param text the word to parse
+   * @param ng the ngram length e.g. 3
+   * @return an array of all ngrams in the word and note that duplicates are not removed
+   */
+  private static String[] formGrams(String text, int ng) {
+    int len = text.length();
+    String[] res = new String[len - ng + 1];
+    for (int i = 0; i < len - ng + 1; i++) {
+      res[i] = text.substring(i, i + ng);
+    }
+    return res;
+  }
+
+  /**
+   * Removes all terms from the spell check index.
+   * @throws IOException
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   */
+  public void clearIndex() throws IOException {
+    synchronized (modifyCurrentIndexLock) {
+      ensureOpen();
+      final Directory dir = this.spellIndex;
+      final IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig(
+          Version.LUCENE_CURRENT,
+          null)
+          .setOpenMode(OpenMode.CREATE));
+      writer.close();
+      swapSearcher(dir);
+    }
+  }
+
+  /**
+   * Check whether the word exists in the index.
+   * @param word
+   * @throws IOException
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   * @return true if the word exists in the index
+   */
+  public boolean exist(String word) throws IOException {
+    // obtainSearcher calls ensureOpen
+    final IndexSearcher indexSearcher = obtainSearcher();
+    try{
+      // TODO: we should use ReaderUtil+seekExact, we dont care about the docFreq
+      // this is just an existence check
+      return indexSearcher.getIndexReader().docFreq(new Term(F_WORD, word)) > 0;
+    } finally {
+      releaseSearcher(indexSearcher);
+    }
+  }
+
+  /**
+   * Indexes the data from the given {@link Dictionary}.
+   * @param dict Dictionary to index
+   * @param config {@link IndexWriterConfig} to use
+   * @param fullMerge whether or not the spellcheck index should be fully merged
+   * @throws AlreadyClosedException if the Spellchecker is already closed
+   * @throws IOException
+   */
+  public final void indexDictionary(Dictionary dict, IndexWriterConfig config, boolean fullMerge) throws IOException {
+    synchronized (modifyCurrentIndexLock) {
+      ensureOpen();
+      final Directory dir = this.spellIndex;
+      final IndexWriter writer = new IndexWriter(dir, config);
+      IndexSearcher indexSearcher = obtainSearcher();
+      final List<TermsEnum> termsEnums = new ArrayList<TermsEnum>();
+
+      final IndexReader reader = searcher.getIndexReader();
+      if (reader.maxDoc() > 0) {
+        for (final AtomicReaderContext ctx : reader.getTopReaderContext().leaves()) {
+          Terms terms = ctx.reader().terms(F_WORD);
+          if (terms != null)
+            termsEnums.add(terms.iterator(null));
+        }
       }
       
-      removeNodes.add(node);
-      submit(ureq, node);
-    }
-    
-    for (Node node : removeNodes) {
-      deletes.remove(node);
-    }
-    
-    return true;
-  }
-  
-  private DeleteUpdateCommand clone(DeleteUpdateCommand cmd) {
-    DeleteUpdateCommand c = (DeleteUpdateCommand)cmd.clone();
-    // TODO: shouldnt the clone do this?
-    c.setFlags(cmd.getFlags());
-    c.setVersion(cmd.getVersion());
-    return c;
-  }
-  
-  public static class Request {
-    public Node node;
-    UpdateRequestExt ureq;
-    NamedList<Object> ursp;
-    int rspCode;
-    public Exception exception;
-    int retries;
-  }
-  
-  void submit(UpdateRequestExt ureq, Node node) {
-    Request sreq = new Request();
-    sreq.node = node;
-    sreq.ureq = ureq;
-    submit(sreq);
-  }
-  
-  public void submit(final Request sreq) {
-    if (completionService == null) {
-      completionService = new ExecutorCompletionService<Request>(commExecutor);
-      pending = new HashSet<Future<Request>>();
-    }
-    final String url = sreq.node.getUrl();
+      boolean isEmpty = termsEnums.isEmpty();
 
-    Callable<Request> task = new Callable<Request>() {
-      @Override
-      public Request call() throws Exception {
-        Request clonedRequest = new Request();
-        clonedRequest.node = sreq.node;
-        clonedRequest.ureq = sreq.ureq;
-        clonedRequest.retries = sreq.retries;
+      try { 
+        BytesRefIterator iter = dict.getWordsIterator();
+        BytesRef currentTerm;
         
-        try {
-          String fullUrl;
-          if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            fullUrl = "http://" + url;
-          } else {
-            fullUrl = url;
+        terms: while ((currentTerm = iter.next()) != null) {
+  
+          String word = currentTerm.utf8ToString();
+          int len = word.length();
+          if (len < 3) {
+            continue; // too short we bail but "too long" is fine...
           }
   
-          HttpSolrServer server = new HttpSolrServer(fullUrl,
-              client);
-          
-          clonedRequest.ursp = server.request(clonedRequest.ureq);
-          
-          // currently no way to get the request body.
-        } catch (Exception e) {
-          clonedRequest.exception = e;
-          if (e instanceof SolrException) {
-            clonedRequest.rspCode = ((SolrException) e).code();
-          } else {
-            clonedRequest.rspCode = -1;
-          }
-        }
-        return clonedRequest;
-      }
-    };
-    
-    pending.add(completionService.submit(task));
-    
-  }
-
-  void checkResponses(boolean block) {
-
-    while (pending != null && pending.size() > 0) {
-      try {
-        Future<Request> future = block ? completionService.take()
-            : completionService.poll();
-        if (future == null) return;
-        pending.remove(future);
-        
-        try {
-          Request sreq = future.get();
-          if (sreq.rspCode != 0) {
-            // error during request
-            
-            // if there is a retry url, we want to retry...
-            boolean isRetry = sreq.node.checkRetry();
-            boolean doRetry = false;
-            int rspCode = sreq.rspCode;
-            
-            // this can happen in certain situations such as shutdown
-            if (isRetry) {
-              if (rspCode == 404 || rspCode == 403 || rspCode == 503
-                  || rspCode == 500) {
-                doRetry = true;
-              }
-              
-              // if its an ioexception, lets try again
-              if (sreq.exception instanceof IOException) {
-                doRetry = true;
-              } else if (sreq.exception instanceof SolrServerException) {
-                if (((SolrServerException) sreq.exception).getRootCause() instanceof IOException) {
-                  doRetry = true;
-                }
+          if (!isEmpty) {
+            for (TermsEnum te : termsEnums) {
+              if (te.seekExact(currentTerm, false)) {
+                continue terms;
               }
             }
-            
-            if (isRetry && sreq.retries < MAX_RETRIES_ON_FORWARD && doRetry) {
-              sreq.retries++;
-              sreq.rspCode = 0;
-              sreq.exception = null;
-              SolrException.log(SolrCmdDistributor.log, "forwarding update to " + sreq.node.getUrl() + " failed - retrying ... ");
-              Thread.sleep(500);
-              submit(sreq);
-              checkResponses(block);
-            } else {
-              Exception e = sreq.exception;
-              Error error = new Error();
-              error.e = e;
-              error.node = sreq.node;
-              response.errors.add(error);
-              response.sreq = sreq;
-              SolrException.log(SolrCmdDistributor.log, "shard update error "
-                  + sreq.node, sreq.exception);
-            }
           }
-          
-        } catch (ExecutionException e) {
-          // shouldn't happen since we catch exceptions ourselves
-          SolrException.log(SolrCore.log,
-              "error sending update request to shard", e);
+  
+          // ok index the word
+          Document doc = createDocument(word, getMin(len), getMax(len));
+          writer.addDocument(doc);
         }
-        
-      } catch (InterruptedException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE,
-            "interrupted waiting for shard update response", e);
+      } finally {
+        releaseSearcher(indexSearcher);
+      }
+      if (fullMerge) {
+        writer.forceMerge(1);
+      }
+      // close writer
+      writer.close();
+      // TODO: this isn't that great, maybe in the future SpellChecker should take
+      // IWC in its ctor / keep its writer open?
+      
+      // also re-open the spell index to see our own changes when the next suggestion
+      // is fetched:
+      swapSearcher(dir);
+    }
+  }
+
+  private static int getMin(int l) {
+    if (l > 5) {
+      return 3;
+    }
+    if (l == 5) {
+      return 2;
+    }
+    return 1;
+  }
+
+  private static int getMax(int l) {
+    if (l > 5) {
+      return 4;
+    }
+    if (l == 5) {
+      return 3;
+    }
+    return 2;
+  }
+
+  private static Document createDocument(String text, int ng1, int ng2) {
+    Document doc = new Document();
+    // the word field is never queried on... its indexed so it can be quickly
+    // checked for rebuild (and stored for retrieval). Doesn't need norms or TF/pos
+    Field f = new StringField(F_WORD, text, Field.Store.YES);
+    doc.add(f); // orig term
+    addGram(text, doc, ng1, ng2);
+    return doc;
+  }
+
+  private static void addGram(String text, Document doc, int ng1, int ng2) {
+    int len = text.length();
+    for (int ng = ng1; ng <= ng2; ng++) {
+      String key = "gram" + ng;
+      String end = null;
+      for (int i = 0; i < len - ng + 1; i++) {
+        String gram = text.substring(i, i + ng);
+        FieldType ft = new FieldType(StringField.TYPE_NOT_STORED);
+        ft.setIndexOptions(IndexOptions.DOCS_AND_FREQS);
+        Field ngramField = new Field(key, gram, ft);
+        // spellchecker does not use positional queries, but we want freqs
+        // for scoring these multivalued n-gram fields.
+        doc.add(ngramField);
+        if (i == 0) {
+          // only one term possible in the startXXField, TF/pos and norms aren't needed.
+          Field startField = new StringField("start" + ng, gram, Field.Store.NO);
+          doc.add(startField);
+        }
+        end = gram;
+      }
+      if (end != null) { // may not be present if len==ng1
+        // only one term possible in the endXXField, TF/pos and norms aren't needed.
+        Field endField = new StringField("end" + ng, end, Field.Store.NO);
+        doc.add(endField);
       }
     }
   }
   
-  public static class Response {
-    public Request sreq;
-    public List<Error> errors = new ArrayList<Error>();
+  private IndexSearcher obtainSearcher() {
+    synchronized (searcherLock) {
+      ensureOpen();
+      searcher.getIndexReader().incRef();
+      return searcher;
+    }
   }
   
-  public static class Error {
-    public Node node;
-    public Exception e;
-  }
-
-  public Response getResponse() {
-    return response;
+  private void releaseSearcher(final IndexSearcher aSearcher) throws IOException{
+      // don't check if open - always decRef 
+      // don't decrement the private searcher - could have been swapped
+      aSearcher.getIndexReader().decRef();      
   }
   
-  public static abstract class Node {
-    public abstract String getUrl();
-    public abstract boolean checkRetry();
-    public abstract String getCoreName();
-    public abstract String getBaseUrl();
-    public abstract ZkCoreNodeProps getNodeProps();
-  }
-
-  public static class StdNode extends Node {
-    protected String url;
-    protected String baseUrl;
-    protected String coreName;
-    private ZkCoreNodeProps nodeProps;
-
-    public StdNode(ZkCoreNodeProps nodeProps) {
-      this.url = nodeProps.getCoreUrl();
-      this.baseUrl = nodeProps.getBaseUrl();
-      this.coreName = nodeProps.getCoreName();
-      this.nodeProps = nodeProps;
-    }
-    
-    @Override
-    public String getUrl() {
-      return url;
-    }
-    
-    @Override
-    public String toString() {
-      return this.getClass().getSimpleName() + ": " + url;
-    }
-
-    @Override
-    public boolean checkRetry() {
-      return false;
-    }
-
-    @Override
-    public String getBaseUrl() {
-      return baseUrl;
-    }
-
-    @Override
-    public String getCoreName() {
-      return coreName;
-    }
-
-    @Override
-    public int hashCode() {
-      final int prime = 31;
-      int result = 1;
-      result = prime * result + ((baseUrl == null) ? 0 : baseUrl.hashCode());
-      result = prime * result + ((coreName == null) ? 0 : coreName.hashCode());
-      result = prime * result + ((url == null) ? 0 : url.hashCode());
-      return result;
-    }
-
-    @Override
-    public boolean equals(Object obj) {
-      if (this == obj) return true;
-      if (obj == null) return false;
-      if (getClass() != obj.getClass()) return false;
-      StdNode other = (StdNode) obj;
-      if (baseUrl == null) {
-        if (other.baseUrl != null) return false;
-      } else if (!baseUrl.equals(other.baseUrl)) return false;
-      if (coreName == null) {
-        if (other.coreName != null) return false;
-      } else if (!coreName.equals(other.coreName)) return false;
-      if (url == null) {
-        if (other.url != null) return false;
-      } else if (!url.equals(other.url)) return false;
-      return true;
-    }
-
-    public ZkCoreNodeProps getNodeProps() {
-      return nodeProps;
+  private void ensureOpen() {
+    if (closed) {
+      throw new AlreadyClosedException("Spellchecker has been closed");
     }
   }
+  
+  /**
+   * Close the IndexSearcher used by this SpellChecker
+   * @throws IOException if the close operation causes an {@link IOException}
+   * @throws AlreadyClosedException if the {@link SpellChecker} is already closed
+   */
+  public void close() throws IOException {
+    synchronized (searcherLock) {
+      ensureOpen();
+      closed = true;
+      if (searcher != null) {
+        searcher.getIndexReader().close();
+      }
+      searcher = null;
+    }
+  }
+  
+  private void swapSearcher(final Directory dir) throws IOException {
+    /*
+     * opening a searcher is possibly very expensive.
+     * We rather close it again if the Spellchecker was closed during
+     * this operation than block access to the current searcher while opening.
+     */
+    final IndexSearcher indexSearcher = createSearcher(dir);
+    synchronized (searcherLock) {
+      if(closed){
+        indexSearcher.getIndexReader().close();
+        throw new AlreadyClosedException("Spellchecker has been closed");
+      }
+      if (searcher != null) {
+        searcher.getIndexReader().close();
+      }
+      // set the spellindex in the sync block - ensure consistency.
+      searcher = indexSearcher;
+      this.spellIndex = dir;
+    }
+  }
+  
+  /**
+   * Creates a new read-only IndexSearcher 
+   * @param dir the directory used to open the searcher
+   * @return a new read-only IndexSearcher
+   * @throws IOException f there is a low-level IO error
+   */
+  // for testing purposes
+  IndexSearcher createSearcher(final Directory dir) throws IOException{
+    return new IndexSearcher(DirectoryReader.open(dir));
+  }
+  
+  /**
+   * Returns <code>true</code> if and only if the {@link SpellChecker} is
+   * closed, otherwise <code>false</code>.
+   * 
+   * @return <code>true</code> if and only if the {@link SpellChecker} is
+   *         closed, otherwise <code>false</code>.
+   */
+  boolean isClosed(){
+    return closed;
+  }
+  
 }

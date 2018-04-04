@@ -1,26 +1,18 @@
-private void doTest(boolean withCache, boolean plantWrongData) throws Exception {
+void add(int ordinal, int parentOrdinal) {
 
-package org.apache.lucene.facet.search;
+package org.apache.lucene.facet.taxonomy.directory;
 
 import java.io.IOException;
-import java.util.List;
-import java.util.Map;
 
-import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-
-import org.apache.lucene.facet.FacetTestBase;
-import org.apache.lucene.facet.index.params.CategoryListParams;
-import org.apache.lucene.facet.index.params.FacetIndexingParams;
-import org.apache.lucene.facet.search.cache.CategoryListCache;
-import org.apache.lucene.facet.search.cache.CategoryListData;
-import org.apache.lucene.facet.search.params.CountFacetRequest;
-import org.apache.lucene.facet.search.params.FacetSearchParams;
-import org.apache.lucene.facet.search.results.FacetResult;
-import org.apache.lucene.facet.taxonomy.CategoryPath;
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -39,96 +31,134 @@ import org.apache.lucene.facet.taxonomy.CategoryPath;
  * limitations under the License.
  */
 
-public class TestCategoryListCache extends FacetTestBase {
+// getParent() needs to be extremely efficient, to the point that we need
+// to fetch all the data in advance into memory, and answer these calls
+// from memory. Currently we use a large integer array, which is
+// initialized when the taxonomy is opened, and potentially enlarged
+// when it is refresh()ed.
+/**
+ * @lucene.experimental
+ */
+class ParentArray {
 
-  public TestCategoryListCache() {
-    super();
-  }
-  
-  @Before
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    initIndex();
-  }
-  
-  @After
-  @Override
-  public void tearDown() throws Exception {
-    closeAll();
-    super.tearDown();
-  }
-  
-  @Test
-  public void testNoClCache() throws Exception {
-    doTest(false,false);
+  // These arrays are not syncrhonized. Rather, the reference to the array
+  // is volatile, and the only writing operation (refreshPrefetchArrays)
+  // simply creates a new array and replaces the reference. The volatility
+  // of the reference ensures the correct atomic replacement and its
+  // visibility properties (the content of the array is visible when the
+  // new reference is visible).
+  private volatile int prefetchParentOrdinal[] = null;
+
+  public int[] getArray() {
+    return prefetchParentOrdinal;
   }
 
-  @Test
-  public void testCorrectClCache() throws Exception {
-    doTest(true,false);
-  }
-  
-  @Test
-  public void testWrongClCache() throws Exception {
-    doTest(true,true);
-  }
-  
-  private void doTest(boolean withCache, boolean plantWrongData) throws IOException, Exception {
-    Map<CategoryPath,Integer> truth = facetCountsTruth();
-    CategoryPath cp = (CategoryPath) truth.keySet().toArray()[0]; // any category path will do for this test 
-    CountFacetRequest frq = new CountFacetRequest(cp, 10);
-    FacetSearchParams sParams = getFacetedSearchParams();
-    sParams.addFacetRequest(frq);
-    if (withCache) {
-      //let's use a cached cl data
-      FacetIndexingParams iparams = sParams.getFacetIndexingParams();
-      CategoryListParams clp = new CategoryListParams(); // default term ok as only single list
-      CategoryListCache clCache = new CategoryListCache();
-      clCache.loadAndRegister(clp, indexReader, taxoReader, iparams);
-      if (plantWrongData) {
-        // let's mess up the cached data and then expect a wrong result...
-        messCachedData(clCache, clp);
+  /**
+   * refreshPrefetch() refreshes the parent array. Initially, it fills the
+   * array from the positions of an appropriate posting list. If called during
+   * a refresh(), when the arrays already exist, only values for new documents
+   * (those beyond the last one in the array) are read from the positions and
+   * added to the arrays (that are appropriately enlarged). We assume (and
+   * this is indeed a correct assumption in our case) that existing categories
+   * are never modified or deleted.
+   */
+  void refresh(IndexReader indexReader) throws IOException {
+    // Note that it is not necessary for us to obtain the read lock.
+    // The reason is that we are only called from refresh() (precluding
+    // another concurrent writer) or from the constructor (when no method
+    // could be running).
+    // The write lock is also not held during the following code, meaning
+    // that reads *can* happen while this code is running. The "volatile"
+    // property of the prefetchParentOrdinal and prefetchDepth array
+    // references ensure the correct visibility property of the assignment
+    // but other than that, we do *not* guarantee that a reader will not
+    // use an old version of one of these arrays (or both) while a refresh
+    // is going on. But we find this acceptable - until a refresh has
+    // finished, the reader should not expect to see new information
+    // (and the old information is the same in the old and new versions).
+    int first;
+    int num = indexReader.maxDoc();
+    if (prefetchParentOrdinal==null) {
+      prefetchParentOrdinal = new int[num];
+      // Starting Lucene 2.9, following the change LUCENE-1542, we can
+      // no longer reliably read the parent "-1" (see comment in
+      // LuceneTaxonomyWriter.SinglePositionTokenStream). We have no way
+      // to fix this in indexing without breaking backward-compatibility
+      // with existing indexes, so what we'll do instead is just
+      // hard-code the parent of ordinal 0 to be -1, and assume (as is
+      // indeed the case) that no other parent can be -1.
+      if (num>0) {
+        prefetchParentOrdinal[0] = TaxonomyReader.INVALID_ORDINAL;
       }
-      sParams.setClCache(clCache);
+      first = 1;
+    } else {
+      first = prefetchParentOrdinal.length;
+      if (first==num) {
+        return; // nothing to do - no category was added
+      }
+      // In Java 6, we could just do Arrays.copyOf()...
+      int[] newarray = new int[num];
+      System.arraycopy(prefetchParentOrdinal, 0, newarray, 0,
+          prefetchParentOrdinal.length);
+      prefetchParentOrdinal = newarray;
     }
-    FacetsCollector fc = new FacetsCollector(sParams, indexReader, taxoReader);
-    searcher.search(new MatchAllDocsQuery(), fc);
-    List<FacetResult> res = fc.getFacetResults();
-    try {
-      assertCountsAndCardinality(truth, res);
-      assertFalse("Correct results not expected when wrong data was cached", plantWrongData);
-    } catch (Throwable e) {
-      assertTrue("Wrong results not expected unless wrong data was cached", withCache);
-      assertTrue("Wrong results not expected unless wrong data was cached", plantWrongData);
-    }
-  }
 
-  /** Mess the cached data for this {@link CategoryListParams} */
-  private void messCachedData(CategoryListCache clCache, CategoryListParams clp) {
-    final CategoryListData cld = clCache.get(clp);
-    CategoryListData badCld = new CategoryListData() {
-      @Override
-      public CategoryListIterator iterator(int partition)  throws IOException {
-        final CategoryListIterator it = cld.iterator(partition);
-        return new CategoryListIterator() {              
-          public boolean skipTo(int docId) throws IOException {
-            return it.skipTo(docId);
+    // Read the new part of the parents array from the positions:
+    // TODO (Facet): avoid Multi*?
+    Bits liveDocs = MultiFields.getLiveDocs(indexReader);
+    DocsAndPositionsEnum positions = MultiFields.getTermPositionsEnum(indexReader, liveDocs,
+                                                                      Consts.FIELD_PAYLOADS, new BytesRef(Consts.PAYLOAD_PARENT),
+                                                                      false);
+      if ((positions == null || positions.advance(first) == DocIdSetIterator.NO_MORE_DOCS) && first < num) {
+        throw new CorruptIndexException("Missing parent data for category " + first);
+      }
+      for (int i=first; i<num; i++) {
+        // Note that we know positions.doc() >= i (this is an
+        // invariant kept throughout this loop)
+        if (positions.docID()==i) {
+          if (positions.freq() == 0) { // shouldn't happen
+            throw new CorruptIndexException(
+                "Missing parent data for category "+i);
           }
-          public long nextCategory() throws IOException {
-            long res = it.nextCategory();
-            if (res>Integer.MAX_VALUE) {
-              return res;
+
+          // TODO (Facet): keep a local (non-volatile) copy of the prefetchParentOrdinal
+          // reference, because access to volatile reference is slower (?).
+          // Note: The positions we get here are one less than the position
+          // increment we added originally, so we get here the right numbers:
+          prefetchParentOrdinal[i] = positions.nextPosition();
+
+          if (positions.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+            if ( i+1 < num ) {
+              throw new CorruptIndexException(
+                  "Missing parent data for category "+(i+1));
             }
-            return res>1 ? res-1 : res+1;
+            break;
           }
-          public boolean init() throws IOException {
-            return it.init();
-          }
-        };
+        } else { // this shouldn't happen
+        throw new CorruptIndexException(
+            "Missing parent data for category "+i);
       }
-    };
-    clCache.register(clp, badCld);
+    }
   }
-  
+
+  /**
+   * add() is used in LuceneTaxonomyWriter, not in LuceneTaxonomyReader.
+   * It is only called from a synchronized method, so it is not reentrant,
+   * and also doesn't need to worry about reads happening at the same time.
+   * 
+   * NOTE: add() and refresh() CANNOT be used together. If you call add(),
+   * this changes the arrays and refresh() can no longer be used.
+   */
+  void add(int ordinal, int parentOrdinal) throws IOException {
+    if (ordinal >= prefetchParentOrdinal.length) {
+      // grow the array, if necessary.
+      // In Java 6, we could just do Arrays.copyOf()...
+      int[] newarray = new int[ordinal*2+1];
+      System.arraycopy(prefetchParentOrdinal, 0, newarray, 0,
+          prefetchParentOrdinal.length);
+      prefetchParentOrdinal = newarray;
+    }
+    prefetchParentOrdinal[ordinal] = parentOrdinal;
+  }
+
 }

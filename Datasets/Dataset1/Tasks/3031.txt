@@ -1,13 +1,14 @@
-public class BufferedRandomAccessFile extends RandomAccessFile implements FileDataInput
+((LogMergePolicy) writer.getConfig().getMergePolicy()).setUseCompoundFile(false);
+
+package org.apache.lucene.index;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,404 +19,187 @@ public class BufferedRandomAccessFile extends RandomAccessFile implements FileDa
  * limitations under the License.
  */
 
-package org.apache.cassandra.io.util;
+import java.io.*;
+import java.util.*;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.util.Arrays;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldInfosReader;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.search.similarities.DefaultSimilarity;
+import org.apache.lucene.store.CompoundFileDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.LuceneTestCase;
 
-/**
- * A <code>BufferedRandomAccessFile</code> is like a
- * <code>RandomAccessFile</code>, but it uses a private buffer so that most
- * operations do not require a disk access.
- * <P>
- * 
- * Note: The operations on this class are unmonitored. Also, the correct
- * functioning of the <code>RandomAccessFile</code> methods that are not
- * overridden here relies on the implementation of those methods in the
- * superclass.
- */
+/*
+  Verify we can read the pre-2.1 file format, do searches
+  against it, and add documents to it.
+*/
 
-public final class BufferedRandomAccessFile extends RandomAccessFile implements FileDataInput
-{
-    static final int LogBuffSz_ = 16; // 64K buffer
-    public static final int BuffSz_ = (1 << LogBuffSz_);
-    static final long BuffMask_ = ~(((long) BuffSz_) - 1L);
+public class TestIndexFileDeleter extends LuceneTestCase {
+  
+  public void testDeleteLeftoverFiles() throws IOException {
+    MockDirectoryWrapper dir = newDirectory();
+    dir.setPreventDoubleWrite(false);
 
-    private String path_;
-    
+    LogMergePolicy mergePolicy = newLogMergePolicy(true, 10);
+    mergePolicy.setNoCFSRatio(1); // This test expects all of its segments to be in CFS
+
+    IndexWriter writer = new IndexWriter(
+        dir,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+            setMaxBufferedDocs(10).
+            setMergePolicy(mergePolicy)
+    );
+
+    int i;
+    for(i=0;i<35;i++) {
+      addDoc(writer, i);
+    }
+    mergePolicy.setUseCompoundFile(false);
+    for(;i<45;i++) {
+      addDoc(writer, i);
+    }
+    writer.close();
+
+    // Delete one doc so we get a .del file:
+    writer = new IndexWriter(
+        dir,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+            setMergePolicy(NoMergePolicy.NO_COMPOUND_FILES)
+    );
+    Term searchTerm = new Term("id", "7");
+    writer.deleteDocuments(searchTerm);
+    writer.close();
+
+    // Now, artificially create an extra .del file & extra
+    // .s0 file:
+    String[] files = dir.listAll();
+
     /*
-     * This implementation is based on the buffer implementation in Modula-3's
-     * "Rd", "Wr", "RdClass", and "WrClass" interfaces.
-     */
-    private boolean dirty_; // true iff unflushed bytes exist
-    private boolean syncNeeded_; // dirty_ can be cleared by e.g. seek, so track sync separately
-    private long curr_; // current position in file
-    private long lo_, hi_; // bounds on characters in "buff"
-    private byte[] buff_; // local buffer
-    private long maxHi_; // this.lo + this.buff.length
-    private boolean hitEOF_; // buffer contains last file block?
-    private long diskPos_; // disk position
-    private long markedPointer;
-
-    /*
-    * To describe the above fields, we introduce the following abstractions for
-    * the file "f":
-    *
-    * len(f) the length of the file curr(f) the current position in the file
-    * c(f) the abstract contents of the file disk(f) the contents of f's
-    * backing disk file closed(f) true iff the file is closed
-    *
-    * "curr(f)" is an index in the closed interval [0, len(f)]. "c(f)" is a
-    * character sequence of length "len(f)". "c(f)" and "disk(f)" may differ if
-    * "c(f)" contains unflushed writes not reflected in "disk(f)". The flush
-    * operation has the effect of making "disk(f)" identical to "c(f)".
-    *
-    * A file is said to be *valid* if the following conditions hold:
-    *
-    * V1. The "closed" and "curr" fields are correct:
-    *
-    * f.closed == closed(f) f.curr == curr(f)
-    *
-    * V2. The current position is either contained in the buffer, or just past
-    * the buffer:
-    *
-    * f.lo <= f.curr <= f.hi
-    *
-    * V3. Any (possibly) unflushed characters are stored in "f.buff":
-    *
-    * (forall i in [f.lo, f.curr): c(f)[i] == f.buff[i - f.lo])
-    *
-    * V4. For all characters not covered by V3, c(f) and disk(f) agree:
-    *
-    * (forall i in [f.lo, len(f)): i not in [f.lo, f.curr) => c(f)[i] ==
-    * disk(f)[i])
-    *
-    * V5. "f.dirty" is true iff the buffer contains bytes that should be
-    * flushed to the file; by V3 and V4, only part of the buffer can be dirty.
-    *
-    * f.dirty == (exists i in [f.lo, f.curr): c(f)[i] != f.buff[i - f.lo])
-    *
-    * V6. this.maxHi == this.lo + this.buff.length
-    *
-    * Note that "f.buff" can be "null" in a valid file, since the range of
-    * characters in V3 is empty when "f.lo == f.curr".
-    *
-    * A file is said to be *ready* if the buffer contains the current position,
-    * i.e., when:
-    *
-    * R1. !f.closed && f.buff != null && f.lo <= f.curr && f.curr < f.hi
-    *
-    * When a file is ready, reading or writing a single byte can be performed
-    * by reading or writing the in-memory buffer without performing a disk
-    * operation.
+    for(int j=0;j<files.length;j++) {
+      System.out.println(j + ": " + files[j]);
+    }
     */
-    
-    /**
-     * Open a new <code>BufferedRandomAccessFile</code> on <code>file</code>
-     * in mode <code>mode</code>, which should be "r" for reading only, or
-     * "rw" for reading and writing.
-     */
-    public BufferedRandomAccessFile(File file, String mode) throws IOException
-    {
-        this(file, mode, 0);
-    }
-    
-    public BufferedRandomAccessFile(File file, String mode, int size) throws IOException
-    {
-        super(file, mode);
-        path_ = file.getAbsolutePath();
-        this.init(size);
-    }
-    
-    /**
-     * Open a new <code>BufferedRandomAccessFile</code> on the file named
-     * <code>name</code> in mode <code>mode</code>, which should be "r" for
-     * reading only, or "rw" for reading and writing.
-     */
-    public BufferedRandomAccessFile(String name, String mode) throws IOException
-    {
-        this(name, mode, 0);
-    }
-    
-    public BufferedRandomAccessFile(String name, String mode, int size) throws FileNotFoundException
-    {
-        super(name, mode);
-        path_ = name;
-        this.init(size);
-    }
-    
-    private void init(int size)
-    {
-        this.dirty_ = false;
-        this.lo_ = this.curr_ = this.hi_ = 0;
-        this.buff_ = (size > BuffSz_) ? new byte[size] : new byte[BuffSz_];
-        this.maxHi_ = (long) BuffSz_;
-        this.hitEOF_ = false;
-        this.diskPos_ = 0L;
-    }
 
-    public String getPath()
-    {
-        return path_;
-    }
+    // TODO: fix this test better
+    String ext = Codec.getDefault().getName().equals("SimpleText") ? ".liv" : ".del";
+    
+    // Create a bogus separate del file for a
+    // segment that already has a separate del file: 
+    copyFile(dir, "_0_1" + ext, "_0_2" + ext);
 
-    public void sync() throws IOException
-    {
-        if (syncNeeded_)
-        {
-            flush();
-            getChannel().force(true); // true, because file length counts as "metadata"
-            syncNeeded_ = false;
-        }
-    }
+    // Create a bogus separate del file for a
+    // segment that does not yet have a separate del file:
+    copyFile(dir, "_0_1" + ext, "_1_1" + ext);
 
-    public void close() throws IOException
-    {
-        this.flush();
-        this.buff_ = null;
-        super.close();
-    }
-    
-    /**
-     * Flush any bytes in the file's buffer that have not yet been written to
-     * disk. If the file was created read-only, this method is a no-op.
-     */
-    public void flush() throws IOException
-    {        
-        this.flushBuffer();
-    }
-    
-    /* Flush any dirty bytes in the buffer to disk. */
-    private void flushBuffer() throws IOException
-    {   
-        if (this.dirty_)
-        {
-            if (this.diskPos_ != this.lo_)
-                super.seek(this.lo_);
-            int len = (int) (this.curr_ - this.lo_);
-            super.write(this.buff_, 0, len);
-            this.diskPos_ = this.curr_;             
-            this.dirty_ = false;
-        }
-    }
-    
-    /*
-     * Read at most "this.buff.length" bytes into "this.buff", returning the
-     * number of bytes read. If the return result is less than
-     * "this.buff.length", then EOF was read.
-     */
-    private int fillBuffer() throws IOException
-    {
-        int cnt = 0;
-        int rem = this.buff_.length;
-        while (rem > 0)
-        {
-            int n = super.read(this.buff_, cnt, rem);
-            if (n < 0)
-                break;
-            cnt += n;
-            rem -= n;
-        }
-        if ( (cnt < 0) && (this.hitEOF_ = (cnt < this.buff_.length)) )
-        {
-            // make sure buffer that wasn't read is initialized with -1
-            Arrays.fill(this.buff_, cnt, this.buff_.length, (byte) 0xff);
-        }
-        this.diskPos_ += cnt;
-        return cnt;
-    }
-    
-    /*
-     * This method positions <code>this.curr</code> at position <code>pos</code>.
-     * If <code>pos</code> does not fall in the current buffer, it flushes the
-     * current buffer and loads the correct one.<p>
-     * 
-     * On exit from this routine <code>this.curr == this.hi</code> iff <code>pos</code>
-     * is at or past the end-of-file, which can only happen if the file was
-     * opened in read-only mode.
-     */
-    public void seek(long pos) throws IOException
-    {
-        if (pos >= this.hi_ || pos < this.lo_)
-        {
-            // seeking outside of current buffer -- flush and read             
-            this.flushBuffer();
-            this.lo_ = pos & BuffMask_; // start at BuffSz boundary
-            this.maxHi_ = this.lo_ + (long) this.buff_.length;
-            if (this.diskPos_ != this.lo_)
-            {
-                super.seek(this.lo_);
-                this.diskPos_ = this.lo_;
-            }
-            int n = this.fillBuffer();
-            this.hi_ = this.lo_ + (long) n;
-        }
-        else
-        {
-            // seeking inside current buffer -- no read required
-            if (pos < this.curr_)
-            {
-                // if seeking backwards, we must flush to maintain V4
-                this.flushBuffer();
-            }
-        }
-        this.curr_ = pos;
-    }
-    
-    public long getFilePointer()
-    {
-        return this.curr_;
-    }
+    // Create a bogus separate del file for a
+    // non-existent segment:
+    copyFile(dir, "_0_1" + ext, "_188_1" + ext);
 
-    public long length() throws IOException
-    {
-        // max accounts for the case where we have written past the old file length, but not yet flushed our buffer
-        return Math.max(this.curr_, super.length());
-    }
+    // Create a bogus segment file:
+    copyFile(dir, "_0.cfs", "_188.cfs");
 
-    public int read() throws IOException
-    {
-        if (this.curr_ >= this.hi_)
-        {
-            // test for EOF
-            // if (this.hi < this.maxHi) return -1;
-            if (this.hitEOF_)
-                return -1;
-            
-            // slow path -- read another buffer
-            this.seek(this.curr_);
-            if (this.curr_ == this.hi_)
-                return -1;
-        }
-        byte res = this.buff_[(int) (this.curr_ - this.lo_)];
-        this.curr_++;
-        return ((int) res) & 0xFF; // convert byte -> int
-    }
+    // Create a bogus fnm file when the CFS already exists:
+    copyFile(dir, "_0.cfs", "_0.fnm");
     
-    public int read(byte[] b) throws IOException
-    {
-        return this.read(b, 0, b.length);
-    }
-    
-    public int read(byte[] b, int off, int len) throws IOException
-    {
-        if (this.curr_ >= this.hi_)
-        {
-            // test for EOF
-            // if (this.hi < this.maxHi) return -1;
-            if (this.hitEOF_)
-                return -1;
-            
-            // slow path -- read another buffer
-            this.seek(this.curr_);
-            if (this.curr_ == this.hi_)
-                return -1;
-        }
-        len = Math.min(len, (int) (this.hi_ - this.curr_));
-        int buffOff = (int) (this.curr_ - this.lo_);
-        System.arraycopy(this.buff_, buffOff, b, off, len);
-        this.curr_ += len;
-        return len;
-    }
-    
-    public void write(int b) throws IOException
-    {
-        if (this.curr_ >= this.hi_)
-        {
-            if (this.hitEOF_ && this.hi_ < this.maxHi_)
-            {
-                // at EOF -- bump "hi"
-                this.hi_++;
-            }
-            else
-            {
-                // slow path -- write current buffer; read next one
-                this.seek(this.curr_);
-                if (this.curr_ == this.hi_)
-                {
-                    // appending to EOF -- bump "hi"
-                    this.hi_++;
-                }
-            }
-        }
-        this.buff_[(int) (this.curr_ - this.lo_)] = (byte) b;
-        this.curr_++;
-        this.dirty_ = true;
-        syncNeeded_ = true;
-    }
-    
-    public void write(byte[] b) throws IOException
-    {
-        this.write(b, 0, b.length);
-    }
-    
-    public void write(byte[] b, int off, int len) throws IOException
-    {        
-        while (len > 0)
-        {              
-            int n = this.writeAtMost(b, off, len);
-            off += n;
-            len -= n;
-            this.dirty_ = true;
-            syncNeeded_ = true;
-        }
-    }
-    
-    /*
-     * Write at most "len" bytes to "b" starting at position "off", and return
-     * the number of bytes written.
-     */
-    private int writeAtMost(byte[] b, int off, int len) throws IOException
-    {        
-        if (this.curr_ >= this.hi_)
-        {
-            if (this.hitEOF_ && this.hi_ < this.maxHi_)
-            {
-                // at EOF -- bump "hi"
-                this.hi_ = this.maxHi_;
-            }
-            else
-            {                                
-                // slow path -- write current buffer; read next one                
-                this.seek(this.curr_);
-                if (this.curr_ == this.hi_)
-                {
-                    // appending to EOF -- bump "hi"
-                    this.hi_ = this.maxHi_;
-                }
-            }
-        }
-        len = Math.min(len, (int) (this.hi_ - this.curr_));
-        int buffOff = (int) (this.curr_ - this.lo_);
-        System.arraycopy(b, off, this.buff_, buffOff, len);
-        this.curr_ += len;
-        return len;
-    }
+    // Create some old segments file:
+    copyFile(dir, "segments_2", "segments");
+    copyFile(dir, "segments_2", "segments_1");
 
-    public boolean isEOF() throws IOException
-    {
-        return getFilePointer() == length();
-    }
+    // Create a bogus cfs file shadowing a non-cfs segment:
+    
+    // TODO: assert is bogus (relies upon codec-specific filenames)
+    assertTrue(dir.fileExists("_3.fdt") || dir.fileExists("_3.fld"));
+    assertTrue(!dir.fileExists("_3.cfs"));
+    copyFile(dir, "_1.cfs", "_3.cfs");
+    
+    String[] filesPre = dir.listAll();
 
-    public void mark()
-    {
-        markedPointer = getFilePointer();
-    }
+    // Open & close a writer: it should delete the above 4
+    // files and nothing more:
+    writer = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setOpenMode(OpenMode.APPEND));
+    writer.close();
 
-    public void reset() throws IOException
-    {
-        seek(markedPointer);
-    }
+    String[] files2 = dir.listAll();
+    dir.close();
 
-    public int bytesPastMark()
-    {
-        long bytes = getFilePointer() - markedPointer;
-        assert bytes >= 0;
-        if (bytes > Integer.MAX_VALUE)
-            throw new UnsupportedOperationException("Overflow: " + bytes);
-        return (int) bytes;
+    Arrays.sort(files);
+    Arrays.sort(files2);
+    
+    Set<String> dif = difFiles(files, files2);
+    
+    if (!Arrays.equals(files, files2)) {
+      fail("IndexFileDeleter failed to delete unreferenced extra files: should have deleted " + (filesPre.length-files.length) + " files but only deleted " + (filesPre.length - files2.length) + "; expected files:\n    " + asString(files) + "\n  actual files:\n    " + asString(files2)+"\ndiff: "+dif);
     }
+  }
+
+  private static Set<String> difFiles(String[] files1, String[] files2) {
+    Set<String> set1 = new HashSet<String>();
+    Set<String> set2 = new HashSet<String>();
+    Set<String> extra = new HashSet<String>();
+    
+    for (int x=0; x < files1.length; x++) {
+      set1.add(files1[x]);
+    }
+    for (int x=0; x < files2.length; x++) {
+      set2.add(files2[x]);
+    }
+    Iterator<String> i1 = set1.iterator();
+    while (i1.hasNext()) {
+      String o = i1.next();
+      if (!set2.contains(o)) {
+        extra.add(o);
+      }
+    }
+    Iterator<String> i2 = set2.iterator();
+    while (i2.hasNext()) {
+      String o = i2.next();
+      if (!set1.contains(o)) {
+        extra.add(o);
+      }
+    }
+    return extra;
+  }
+  
+  private String asString(String[] l) {
+    String s = "";
+    for(int i=0;i<l.length;i++) {
+      if (i > 0) {
+        s += "\n    ";
+      }
+      s += l[i];
+    }
+    return s;
+  }
+
+  public void copyFile(Directory dir, String src, String dest) throws IOException {
+    IndexInput in = dir.openInput(src, newIOContext(random()));
+    IndexOutput out = dir.createOutput(dest, newIOContext(random()));
+    byte[] b = new byte[1024];
+    long remainder = in.length();
+    while(remainder > 0) {
+      int len = (int) Math.min(b.length, remainder);
+      in.readBytes(b, 0, len);
+      out.writeBytes(b, len);
+      remainder -= len;
+    }
+    in.close();
+    out.close();
+  }
+
+  private void addDoc(IndexWriter writer, int id) throws IOException
+  {
+    Document doc = new Document();
+    doc.add(newField("content", "aaa", TextField.TYPE_UNSTORED));
+    doc.add(newField("id", Integer.toString(id), StringField.TYPE_UNSTORED));
+    writer.addDocument(doc);
+  }
 }

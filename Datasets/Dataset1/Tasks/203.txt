@@ -1,12 +1,13 @@
-s.setConnectionTimeout(100); // 1/10th sec
+org.apache.cassandra.config.avro.KsDef ks = SerDeUtils.deserialize(schema, column.value(), new org.apache.cassandra.config.avro.KsDef());
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,67 +18,117 @@ s.setConnectionTimeout(100); // 1/10th sec
  * limitations under the License.
  */
 
-package org.apache.solr.client.solrj.embedded;
+package org.apache.cassandra.db;
 
-import org.apache.solr.client.solrj.SolrExampleTests;
-import org.apache.solr.client.solrj.SolrServer;
-import org.apache.solr.client.solrj.impl.CommonsHttpSolrServer;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.schema.SchemaField;
+import org.apache.avro.Schema;
 
-/**
- * TODO? perhaps use:
- *  http://docs.codehaus.org/display/JETTY/ServletTester
- * rather then open a real connection?
- * 
- * @version $Id$
- * @since solr 1.3
- */
-public class SolrExampleJettyTest extends SolrExampleTests {
+import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.db.filter.SliceQueryFilter;
+import org.apache.cassandra.db.migration.Migration;
+import org.apache.cassandra.io.SerDeUtils;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.UUIDGen;
 
-  SolrServer server;
-  JettySolrRunner jetty;
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.UUID;
 
-  static final int port = 8984; // not 8983
-  static final String context = "/example";
-  
-  @Override public void setUp() throws Exception 
-  {
-    super.setUp();
-    
-    jetty = new JettySolrRunner( context, port );
-    jetty.start();
-    
-    server = this.createNewSolrServer();
-  }
+import static com.google.common.base.Charsets.UTF_8;
 
-  @Override public void tearDown() throws Exception 
-  {
-    super.tearDown();
-    jetty.stop();  // stop the server
-  }
-  
-  
-  @Override
-  protected SolrServer getSolrServer()
-  {
-    return server;
-  }
+public class DefsTable
+{
+    // column name for the schema storing serialized keyspace definitions
+    // NB: must be an invalid keyspace name
+    public static final byte[] DEFINITION_SCHEMA_COLUMN_NAME = "Avro/Schema".getBytes(UTF_8);
 
-  @Override
-  protected SolrServer createNewSolrServer()
-  {
-    try {
-      // setup the server...
-      String url = "http://localhost:"+port+context;
-      CommonsHttpSolrServer s = new CommonsHttpSolrServer( url );
-      s.setConnectionTimeout(5);
-      s.setDefaultMaxConnectionsPerHost(100);
-      s.setMaxTotalConnections(100);
-      return s;
+    /** dumps current keyspace definitions to storage */
+    public static synchronized void dumpToStorage(UUID version) throws IOException
+    {
+        final byte[] versionKey = Migration.toUTF8Bytes(version);
+
+        // build a list of keyspaces
+        Collection<String> ksnames = DatabaseDescriptor.getNonSystemTables();
+
+        // persist keyspaces under new version
+        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, versionKey);
+        TimestampClock now = new TimestampClock(System.currentTimeMillis());
+        for (String ksname : ksnames)
+        {
+            KSMetaData ksm = DatabaseDescriptor.getTableDefinition(ksname);
+            rm.add(new QueryPath(Migration.SCHEMA_CF, null, ksm.name.getBytes(UTF_8)), SerDeUtils.serialize(ksm.deflate()), now);
+        }
+        // add the schema
+        rm.add(new QueryPath(Migration.SCHEMA_CF,
+                             null,
+                             DEFINITION_SCHEMA_COLUMN_NAME),
+                             org.apache.cassandra.config.avro.KsDef.SCHEMA$.toString().getBytes(UTF_8),
+                             now);
+        rm.apply();
+
+        // apply new version
+        rm = new RowMutation(Table.SYSTEM_TABLE, Migration.LAST_MIGRATION_KEY);
+        rm.add(new QueryPath(Migration.SCHEMA_CF, null, Migration.LAST_MIGRATION_KEY),
+               UUIDGen.decompose(version),
+               now);
+        rm.apply();
     }
-    catch( Exception ex ) {
-      throw new RuntimeException( ex );
+
+    /** loads a version of keyspace definitions from storage */
+    public static synchronized Collection<KSMetaData> loadFromStorage(UUID version) throws IOException
+    {
+        DecoratedKey vkey = StorageService.getPartitioner().decorateKey(Migration.toUTF8Bytes(version));
+        Table defs = Table.open(Table.SYSTEM_TABLE);
+        ColumnFamilyStore cfStore = defs.getColumnFamilyStore(Migration.SCHEMA_CF);
+        QueryFilter filter = QueryFilter.getIdentityFilter(vkey, new QueryPath(Migration.SCHEMA_CF));
+        ColumnFamily cf = cfStore.getColumnFamily(filter);
+        IColumn avroschema = cf.getColumn(DEFINITION_SCHEMA_COLUMN_NAME);
+        if (avroschema == null)
+            // TODO: more polite way to handle this?
+            throw new RuntimeException("Cannot read system table! Are you upgrading a pre-release version?");
+        Schema schema = Schema.parse(new String(avroschema.value()));
+
+        // deserialize keyspaces using schema
+        Collection<KSMetaData> keyspaces = new ArrayList<KSMetaData>();
+        for (IColumn column : cf.getSortedColumns())
+        {
+            if (Arrays.equals(column.name(), DEFINITION_SCHEMA_COLUMN_NAME))
+                continue;
+            org.apache.cassandra.config.avro.KsDef ks = SerDeUtils.<org.apache.cassandra.config.avro.KsDef>deserialize(schema, column.value());
+            keyspaces.add(KSMetaData.inflate(ks));
+        }
+        return keyspaces;
     }
-  }
+    
+    /** gets all the files that belong to a given column family. */
+    public static Collection<File> getFiles(String table, final String cf)
+    {
+        List<File> found = new ArrayList<File>();
+        for (String path : DatabaseDescriptor.getAllDataFileLocationsForTable(table))
+        {
+            File[] dbFiles = new File(path).listFiles(new FileFilter()
+            {
+                public boolean accept(File pathname)
+                {
+                    return pathname.getName().startsWith(cf + "-") && pathname.getName().endsWith(".db") && pathname.exists();        
+                }
+            });
+            found.addAll(Arrays.asList(dbFiles));
+        }
+        return found;
+    }
 }

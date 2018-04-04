@@ -1,172 +1,374 @@
-ManifestHeaderProcessor.parseBundleSymbolicName(bm.getSymbolicName()).getAttributes());
+assertTrue(((TrackingCMS) w.w.getConfig().getMergeScheduler()).totMergedBytes != 0);
+
+package org.apache.lucene.index;
 
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIESOR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.aries.application.utils.management;
+import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.Map.Entry;
-import java.util.jar.Attributes;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util._TestUtil;
 
-import org.apache.aries.application.Content;
-import org.apache.aries.application.impl.ContentImpl;
-import org.apache.aries.application.management.BundleInfo;
-import org.apache.aries.util.manifest.BundleManifest;
-import org.apache.aries.util.manifest.ManifestHeaderProcessor;
-import org.osgi.framework.Constants;
-import org.osgi.framework.Version;
-
-public final class SimpleBundleInfo implements BundleInfo {
-  private Content _contentName;
-  private Version _version;
-  private Attributes _attributes;
-  private Set<Content> _exportPackages = null;
-  private Set<Content> _importPackages = null;
-  private Set<Content> _exportServices = null;
-  private Set<Content> _importServices = null;
-  private Set<Content> _requireBundle = null;
+public class TestConcurrentMergeScheduler extends LuceneTestCase {
   
-  private String _location;
-  
-  public SimpleBundleInfo(BundleManifest bm, String location) { 
-    _contentName = new ContentImpl(
-        bm.getSymbolicName(), 
-        ManifestHeaderProcessor.parseBundleSymbolicName(bm.getSymbolicName()).getValue());
-    _version = bm.getVersion();
-    _attributes = bm.getRawAttributes();
-    _location = location;
-  }
-    
-  public Set<Content> getExportPackage() {
-    if (_exportPackages == null) { 
-      _exportPackages = getContentSetFromHeader (_attributes, Constants.EXPORT_PACKAGE);
+  private class FailOnlyOnFlush extends MockDirectoryWrapper.Failure {
+    boolean doFail;
+    boolean hitExc;
+
+    @Override
+    public void setDoFail() {
+      this.doFail = true;
+      hitExc = false;
     }
-    return _exportPackages;
-  }
-  
-  public Set<Content> getExportService() {
-    if (_exportServices == null) {
-      _exportServices = getContentSetFromHeader (_attributes, Constants.EXPORT_SERVICE);
+    @Override
+    public void clearDoFail() {
+      this.doFail = false;
     }
-    return _exportPackages;
-  }
 
-  public Map<String, String> getHeaders() {
-    Map<String, String> result = new HashMap<String, String>();
-    for (Entry<Object, Object> h: _attributes.entrySet()) {
-      Attributes.Name name = (Attributes.Name) h.getKey();
-      String value = (String) h.getValue();
-      result.put(name.toString(), value);
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail && isTestThread()) {
+        boolean isDoFlush = false;
+        boolean isClose = false;
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        for (int i = 0; i < trace.length; i++) {
+          if ("flush".equals(trace[i].getMethodName())) {
+            isDoFlush = true;
+          }
+          if ("close".equals(trace[i].getMethodName())) {
+            isClose = true;
+          }
+        }
+        if (isDoFlush && !isClose && random().nextBoolean()) {
+          hitExc = true;
+          throw new IOException(Thread.currentThread().getName() + ": now failing during flush");
+        }
+      }
     }
-    return result;
   }
 
-  public Set<Content> getImportPackage() {
-    if (_importPackages == null) { 
-      _importPackages = getContentSetFromHeader (_attributes, Constants.IMPORT_PACKAGE);
+  // Make sure running BG merges still work fine even when
+  // we are hitting exceptions during flushing.
+  public void testFlushExceptions() throws IOException {
+    MockDirectoryWrapper directory = newMockDirectory();
+    FailOnlyOnFlush failure = new FailOnlyOnFlush();
+    directory.failOn(failure);
+
+    IndexWriter writer = new IndexWriter(directory, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMaxBufferedDocs(2));
+    Document doc = new Document();
+    Field idField = newStringField("id", "", Field.Store.YES);
+    doc.add(idField);
+    int extraCount = 0;
+
+    for(int i=0;i<10;i++) {
+      if (VERBOSE) {
+        System.out.println("TEST: iter=" + i);
+      }
+
+      for(int j=0;j<20;j++) {
+        idField.setStringValue(Integer.toString(i*20+j));
+        writer.addDocument(doc);
+      }
+
+      // must cycle here because sometimes the merge flushes
+      // the doc we just added and so there's nothing to
+      // flush, and we don't hit the exception
+      while(true) {
+        writer.addDocument(doc);
+        failure.setDoFail();
+        try {
+          writer.flush(true, true);
+          if (failure.hitExc) {
+            fail("failed to hit IOException");
+          }
+          extraCount++;
+        } catch (IOException ioe) {
+          if (VERBOSE) {
+            ioe.printStackTrace(System.out);
+          }
+          failure.clearDoFail();
+          break;
+        }
+      }
+      assertEquals(20*(i+1)+extraCount, writer.numDocs());
     }
-    return _importPackages;
+
+    writer.close();
+    IndexReader reader = DirectoryReader.open(directory);
+    assertEquals(200+extraCount, reader.numDocs());
+    reader.close();
+    directory.close();
   }
 
-  public Set<Content> getImportService() {
-    if (_importServices == null) {
-      _importServices = getContentSetFromHeader (_attributes, Constants.IMPORT_SERVICE);
+  // Test that deletes committed after a merge started and
+  // before it finishes, are correctly merged back:
+  public void testDeleteMerging() throws IOException {
+    Directory directory = newDirectory();
+
+    LogDocMergePolicy mp = new LogDocMergePolicy();
+    // Force degenerate merging so we can get a mix of
+    // merging of segments with and without deletes at the
+    // start:
+    mp.setMinMergeDocs(1000);
+    IndexWriter writer = new IndexWriter(directory, newIndexWriterConfig(
+        TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+        .setMergePolicy(mp));
+
+    Document doc = new Document();
+    Field idField = newStringField("id", "", Field.Store.YES);
+    doc.add(idField);
+    for(int i=0;i<10;i++) {
+      if (VERBOSE) {
+        System.out.println("\nTEST: cycle");
+      }
+      for(int j=0;j<100;j++) {
+        idField.setStringValue(Integer.toString(i*100+j));
+        writer.addDocument(doc);
+      }
+
+      int delID = i;
+      while(delID < 100*(1+i)) {
+        if (VERBOSE) {
+          System.out.println("TEST: del " + delID);
+        }
+        writer.deleteDocuments(new Term("id", ""+delID));
+        delID += 10;
+      }
+
+      writer.commit();
     }
-    return _importServices;
+
+    writer.close();
+    IndexReader reader = DirectoryReader.open(directory);
+    // Verify that we did not lose any deletes...
+    assertEquals(450, reader.numDocs());
+    reader.close();
+    directory.close();
   }
 
-  public String getLocation() {
-    return _location;
-  }
+  public void testNoExtraFiles() throws IOException {
+    Directory directory = newDirectory();
+    IndexWriter writer = new IndexWriter(directory, newIndexWriterConfig(
+        TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+        .setMaxBufferedDocs(2));
 
-  public String getSymbolicName() {
-    return _contentName.getContentName();
-  }
+    for(int iter=0;iter<7;iter++) {
+      if (VERBOSE) {
+        System.out.println("TEST: iter=" + iter);
+      }
 
-  public Version getVersion() {
-    return _version;
-  }
+      for(int j=0;j<21;j++) {
+        Document doc = new Document();
+        doc.add(newTextField("content", "a b c", Field.Store.NO));
+        writer.addDocument(doc);
+      }
+        
+      writer.close();
+      TestIndexWriter.assertNoUnreferencedFiles(directory, "testNoExtraFiles");
 
-  private Set<Content> getContentSetFromHeader (Attributes attributes, String key) {
-    String header = _attributes.getValue(key);
-    List<String> splitHeader = ManifestHeaderProcessor.split(header, ",");
-    HashSet<Content> result = new HashSet<Content>();
-    for (String s: splitHeader) { 
-      Content c = new ContentImpl(s);
-      result.add(c);
+      // Reopen
+      writer = new IndexWriter(directory, newIndexWriterConfig(
+          TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+          .setOpenMode(OpenMode.APPEND).setMaxBufferedDocs(2));
     }
-    return result;
+
+    writer.close();
+
+    directory.close();
   }
 
-  public Map<String, String> getBundleAttributes()
-  {
-    return _contentName.getAttributes();
-  }
+  public void testNoWaitClose() throws IOException {
+    Directory directory = newDirectory();
+    Document doc = new Document();
+    Field idField = newStringField("id", "", Field.Store.YES);
+    doc.add(idField);
 
-  public Map<String, String> getBundleDirectives()
-  {
-    return _contentName.getDirectives();
-  }
+    IndexWriter writer = new IndexWriter(
+        directory,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+            setMaxBufferedDocs(2).
+            setMergePolicy(newLogMergePolicy(100))
+    );
 
-  public Set<Content> getRequireBundle()
-  {
-    if (_requireBundle == null) {
-      _requireBundle = getContentSetFromHeader(_attributes, Constants.REQUIRE_BUNDLE);
+    for(int iter=0;iter<10;iter++) {
+
+      for(int j=0;j<201;j++) {
+        idField.setStringValue(Integer.toString(iter*201+j));
+        writer.addDocument(doc);
+      }
+
+      int delID = iter*201;
+      for(int j=0;j<20;j++) {
+        writer.deleteDocuments(new Term("id", Integer.toString(delID)));
+        delID += 5;
+      }
+
+      // Force a bunch of merge threads to kick off so we
+      // stress out aborting them on close:
+      ((LogMergePolicy) writer.getConfig().getMergePolicy()).setMergeFactor(3);
+      writer.addDocument(doc);
+      writer.commit();
+
+      writer.close(false);
+
+      IndexReader reader = DirectoryReader.open(directory);
+      assertEquals((1+iter)*182, reader.numDocs());
+      reader.close();
+
+      // Reopen
+      writer = new IndexWriter(
+          directory,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setOpenMode(OpenMode.APPEND).
+              setMergePolicy(newLogMergePolicy(100))
+      );
     }
-    
-    return _requireBundle;
+    writer.close();
+
+    directory.close();
   }
-  
-  /**
-   * Equality is just based on the location. If you install a bundle from the same location string
-   * you get the same Bundle, even if the underlying bundle had a different symbolic name/version.
-   * This seems reasonable and quick.
-   */
-  public boolean equals(Object other)
-  {
-    if (other == null) return false;
-    if (other == this) return true;
-    if (other instanceof SimpleBundleInfo) {
-      return _location.equals(((SimpleBundleInfo)other)._location);
+
+  // LUCENE-4544
+  public void testMaxMergeCount() throws Exception {
+    Directory dir = newDirectory();
+    IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
+
+    final int maxMergeCount = _TestUtil.nextInt(random(), 1, 5);
+    final int maxMergeThreads = _TestUtil.nextInt(random(), 1, maxMergeCount);
+    final CountDownLatch enoughMergesWaiting = new CountDownLatch(maxMergeCount);
+    final AtomicInteger runningMergeCount = new AtomicInteger(0);
+    final AtomicBoolean failed = new AtomicBoolean();
+
+    if (VERBOSE) {
+      System.out.println("TEST: maxMergeCount=" + maxMergeCount + " maxMergeThreads=" + maxMergeThreads);
     }
-    
-    return false;
+
+    ConcurrentMergeScheduler cms = new ConcurrentMergeScheduler() {
+
+      @Override
+      protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
+        try {
+          // Stall all incoming merges until we see
+          // maxMergeCount:
+          int count = runningMergeCount.incrementAndGet();
+          try {
+            assertTrue("count=" + count + " vs maxMergeCount=" + maxMergeCount, count <= maxMergeCount);
+            enoughMergesWaiting.countDown();
+
+            // Stall this merge until we see exactly
+            // maxMergeCount merges waiting
+            while (true) {
+              if (enoughMergesWaiting.await(10, TimeUnit.MILLISECONDS) || failed.get()) {
+                break;
+              }
+            }
+            // Then sleep a bit to give a chance for the bug
+            // (too many pending merges) to appear:
+            Thread.sleep(20);
+            super.doMerge(merge);
+          } finally {
+            runningMergeCount.decrementAndGet();
+          }
+        } catch (Throwable t) {
+          failed.set(true);
+          writer.mergeFinish(merge);
+          throw new RuntimeException(t);
+        }
+      }
+      };
+    if (maxMergeThreads > cms.getMaxMergeCount()) {
+      cms.setMaxMergeCount(maxMergeCount);
+    }
+    cms.setMaxThreadCount(maxMergeThreads);
+    cms.setMaxMergeCount(maxMergeCount);
+    iwc.setMergeScheduler(cms);
+    iwc.setMaxBufferedDocs(2);
+
+    TieredMergePolicy tmp = new TieredMergePolicy();
+    iwc.setMergePolicy(tmp);
+    tmp.setMaxMergeAtOnce(2);
+    tmp.setSegmentsPerTier(2);
+
+    IndexWriter w = new IndexWriter(dir, iwc);
+    Document doc = new Document();
+    doc.add(newField("field", "field", TextField.TYPE_NOT_STORED));
+    while(enoughMergesWaiting.getCount() != 0 && !failed.get()) {
+      for(int i=0;i<10;i++) {
+        w.addDocument(doc);
+      }
+    }
+    w.close(false);
+    dir.close();
   }
-  
-  public int hashCode()
-  {
-    return _location.hashCode();
+
+
+  private static class TrackingCMS extends ConcurrentMergeScheduler {
+    long totMergedBytes;
+
+    public TrackingCMS() {
+      setMaxMergeCount(5);
+      setMaxThreadCount(5);
+    }
+
+    @Override
+    public void doMerge(MergePolicy.OneMerge merge) throws IOException {
+      totMergedBytes += merge.totalBytesSize();
+      super.doMerge(merge);
+    }
   }
-  
-  public String toString()
-  {
-    return _contentName.getContentName() + "_" + getVersion();
-  }
-  public Attributes getRawAttributes()
-  {
-    
-    return _attributes;
+
+  public void testTotalBytesSize() throws Exception {
+    Directory d = newDirectory();
+    if (d instanceof MockDirectoryWrapper) {
+      ((MockDirectoryWrapper)d).setThrottling(MockDirectoryWrapper.Throttling.NEVER);
+    }
+    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
+    iwc.setMaxBufferedDocs(5);
+    iwc.setMergeScheduler(new TrackingCMS());
+    if (_TestUtil.getPostingsFormat("id").equals("SimpleText")) {
+      // no
+      iwc.setCodec(_TestUtil.alwaysPostingsFormat(new Lucene41PostingsFormat()));
+    }
+    RandomIndexWriter w = new RandomIndexWriter(random(), d, iwc);
+    for(int i=0;i<1000;i++) {
+      Document doc = new Document();
+      doc.add(new StringField("id", ""+i, Field.Store.NO));
+      w.addDocument(doc);
+
+      if (random().nextBoolean()) {
+        w.deleteDocuments(new Term("id", ""+random().nextInt(i+1)));
+      }
+    }
+    assertTrue(((TrackingCMS) iwc.getMergeScheduler()).totMergedBytes != 0);
+    w.close();
+    d.close();
   }
 }
- No newline at end of file

@@ -1,6 +1,6 @@
-new CharacterRunAutomaton(new RegExp("[A-Za-zªµºÀ-ÖØ-öø-ˁ]+").toAutomaton());
+0);
 
-package org.apache.lucene.analysis;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,239 +20,580 @@ package org.apache.lucene.analysis;
  */
 
 import java.io.IOException;
-import java.io.Reader;
-import java.nio.CharBuffer;
-import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.util.automaton.CharacterRunAutomaton;
-import org.apache.lucene.util.automaton.RegExp;
-
-import com.carrotsearch.randomizedtesting.RandomizedContext;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.BaseDirectoryWrapper;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LineFileDocs;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.util.LuceneTestCase.Slow;
 
 /**
- * Tokenizer for testing.
- * <p>
- * This tokenizer is a replacement for {@link #WHITESPACE}, {@link #SIMPLE}, and {@link #KEYWORD}
- * tokenizers. If you are writing a component such as a TokenFilter, its a great idea to test
- * it wrapping this tokenizer instead for extra checks. This tokenizer has the following behavior:
- * <ul>
- *   <li>An internal state-machine is used for checking consumer consistency. These checks can
- *       be disabled with {@link #setEnableChecks(boolean)}.
- *   <li>For convenience, optionally lowercases terms that it outputs.
- * </ul>
+ * MultiThreaded IndexWriter tests
  */
-public class MockTokenizer extends Tokenizer {
-  /** Acts Similar to WhitespaceTokenizer */
-  public static final CharacterRunAutomaton WHITESPACE = 
-    new CharacterRunAutomaton(new RegExp("[^ \t\r\n]+").toAutomaton());
-  /** Acts Similar to KeywordTokenizer.
-   * TODO: Keyword returns an "empty" token for an empty reader... 
-   */
-  public static final CharacterRunAutomaton KEYWORD =
-    new CharacterRunAutomaton(new RegExp(".*").toAutomaton());
-  /** Acts like LetterTokenizer. */
-  // the ugly regex below is incomplete Unicode 5.2 [:Letter:]
-  public static final CharacterRunAutomaton SIMPLE =
-    new CharacterRunAutomaton(new RegExp("[A-Za-zªµºÀ-ÖØ-öø-Ｚ]+").toAutomaton());
+@Slow
+public class TestIndexWriterWithThreads extends LuceneTestCase {
 
-  private final CharacterRunAutomaton runAutomaton;
-  private final boolean lowerCase;
-  private final int maxTokenLength;
-  public static final int DEFAULT_MAX_TOKEN_LENGTH = Integer.MAX_VALUE;
-  private int state;
+  // Used by test cases below
+  private class IndexerThread extends Thread {
 
-  private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
-  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
-  int off = 0;
+    boolean diskFull;
+    Throwable error;
+    AlreadyClosedException ace;
+    IndexWriter writer;
+    boolean noErrors;
+    volatile int addCount;
 
-  // TODO: "register" with LuceneTestCase to ensure all streams are closed() ?
-  // currently, we can only check that the lifecycle is correct if someone is reusing,
-  // but not for "one-offs".
-  private static enum State { 
-    SETREADER,       // consumer set a reader input either via ctor or via reset(Reader)
-    RESET,           // consumer has called reset()
-    INCREMENT,       // consumer is consuming, has called incrementToken() == true
-    INCREMENT_FALSE, // consumer has called incrementToken() which returned false
-    END,             // consumer has called end() to perform end of stream operations
-    CLOSE            // consumer has called close() to release any resources
-  };
-  
-  private State streamState = State.CLOSE;
-  private int lastOffset = 0; // only for asserting
-  private boolean enableChecks = true;
-  
-  // evil: but we don't change the behavior with this random, we only switch up how we read
-  private final Random random = new Random(RandomizedContext.current().getRandom().nextLong());
-  
-  public MockTokenizer(AttributeFactory factory, Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase, int maxTokenLength) {
-    super(factory, input);
-    this.runAutomaton = runAutomaton;
-    this.lowerCase = lowerCase;
-    this.state = runAutomaton.getInitialState();
-    this.streamState = State.SETREADER;
-    this.maxTokenLength = maxTokenLength;
-  }
+    public IndexerThread(IndexWriter writer, boolean noErrors) {
+      this.writer = writer;
+      this.noErrors = noErrors;
+    }
 
-  public MockTokenizer(Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase, int maxTokenLength) {
-    this(AttributeFactory.DEFAULT_ATTRIBUTE_FACTORY, input, runAutomaton, lowerCase, maxTokenLength);
-  }
+    @Override
+    public void run() {
 
-  public MockTokenizer(Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase) {
-    this(input, runAutomaton, lowerCase, DEFAULT_MAX_TOKEN_LENGTH);
-  }
-  
-  /** Calls {@link #MockTokenizer(Reader, CharacterRunAutomaton, boolean) MockTokenizer(Reader, WHITESPACE, true)} */
-  public MockTokenizer(Reader input) {
-    this(input, WHITESPACE, true);
-  }
-  
-  @Override
-  public final boolean incrementToken() throws IOException {
-    assert !enableChecks || (streamState == State.RESET || streamState == State.INCREMENT) 
-                            : "incrementToken() called while in wrong state: " + streamState;
-    clearAttributes();
-    for (;;) {
-      int startOffset = off;
-      int cp = readCodePoint();
-      if (cp < 0) {
-        break;
-      } else if (isTokenChar(cp)) {
-        int endOffset;
-        do {
-          char chars[] = Character.toChars(normalize(cp));
-          for (int i = 0; i < chars.length; i++)
-            termAtt.append(chars[i]);
-          endOffset = off;
-          if (termAtt.length() >= maxTokenLength) {
+      final Document doc = new Document();
+      FieldType customType = new FieldType(TextField.TYPE_STORED);
+      customType.setStoreTermVectors(true);
+      customType.setStoreTermVectorPositions(true);
+      customType.setStoreTermVectorOffsets(true);
+      
+      doc.add(newField("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", customType));
+
+      int idUpto = 0;
+      int fullCount = 0;
+      final long stopTime = System.currentTimeMillis() + 200;
+
+      do {
+        try {
+          writer.updateDocument(new Term("id", ""+(idUpto++)), doc);
+          addCount++;
+        } catch (IOException ioe) {
+          if (VERBOSE) {
+            System.out.println("TEST: expected exc:");
+            ioe.printStackTrace(System.out);
+          }
+          //System.out.println(Thread.currentThread().getName() + ": hit exc");
+          //ioe.printStackTrace(System.out);
+          if (ioe.getMessage().startsWith("fake disk full at") ||
+              ioe.getMessage().equals("now failing on purpose")) {
+            diskFull = true;
+            try {
+              Thread.sleep(1);
+            } catch (InterruptedException ie) {
+              throw new ThreadInterruptedException(ie);
+            }
+            if (fullCount++ >= 5)
+              break;
+          } else {
+            if (noErrors) {
+              System.out.println(Thread.currentThread().getName() + ": ERROR: unexpected IOException:");
+              ioe.printStackTrace(System.out);
+              error = ioe;
+            }
             break;
           }
-          cp = readCodePoint();
-        } while (cp >= 0 && isTokenChar(cp));
-        
-        int correctedStartOffset = correctOffset(startOffset);
-        int correctedEndOffset = correctOffset(endOffset);
-        assert correctedStartOffset >= 0;
-        assert correctedEndOffset >= 0;
-        assert correctedStartOffset >= lastOffset;
-        lastOffset = correctedStartOffset;
-        assert correctedEndOffset >= correctedStartOffset;
-        offsetAtt.setOffset(correctedStartOffset, correctedEndOffset);
-        streamState = State.INCREMENT;
-        return true;
-      }
+        } catch (Throwable t) {
+          //t.printStackTrace(System.out);
+          if (noErrors) {
+            System.out.println(Thread.currentThread().getName() + ": ERROR: unexpected Throwable:");
+            t.printStackTrace(System.out);
+            error = t;
+          }
+          break;
+        }
+      } while(System.currentTimeMillis() < stopTime);
     }
-    streamState = State.INCREMENT_FALSE;
-    return false;
   }
 
-  protected int readCodePoint() throws IOException {
-    int ch = readChar();
-    if (ch < 0) {
-      return ch;
-    } else {
-      assert !Character.isLowSurrogate((char) ch) : "unpaired low surrogate: " + Integer.toHexString(ch);
-      off++;
-      if (Character.isHighSurrogate((char) ch)) {
-        int ch2 = readChar();
-        if (ch2 >= 0) {
-          off++;
-          assert Character.isLowSurrogate((char) ch2) : "unpaired high surrogate: " + Integer.toHexString(ch) + ", followed by: " + Integer.toHexString(ch2);
-          return Character.toCodePoint((char) ch, (char) ch2);
-        } else {
-          assert false : "stream ends with unpaired high surrogate: " + Integer.toHexString(ch);
+  // LUCENE-1130: make sure immediate disk full on creating
+  // an IndexWriter (hit during DW.ThreadState.init()), with
+  // multiple threads, is OK:
+  public void testImmediateDiskFullWithThreads() throws Exception {
+
+    int NUM_THREADS = 3;
+    final int numIterations = TEST_NIGHTLY ? 10 : 3;
+    for(int iter=0;iter<numIterations;iter++) {
+      if (VERBOSE) {
+        System.out.println("\nTEST: iter=" + iter);
+      }
+      MockDirectoryWrapper dir = newMockDirectory();
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(2).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+      dir.setMaxSizeInBytes(4*1024+20*iter);
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, true);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      for(int i=0;i<NUM_THREADS;i++) {
+        // Without fix for LUCENE-1130: one of the
+        // threads will hang
+        threads[i].join();
+        assertTrue("hit unexpected Throwable", threads[i].error == null);
+      }
+
+      // Make sure once disk space is avail again, we can
+      // cleanly close:
+      dir.setMaxSizeInBytes(0);
+      writer.close(false);
+      dir.close();
+    }
+  }
+
+
+  // LUCENE-1130: make sure we can close() even while
+  // threads are trying to add documents.  Strictly
+  // speaking, this isn't valid us of Lucene's APIs, but we
+  // still want to be robust to this case:
+  public void testCloseWithThreads() throws Exception {
+    int NUM_THREADS = 3;
+    int numIterations = TEST_NIGHTLY ? 7 : 3;
+    for(int iter=0;iter<numIterations;iter++) {
+      Directory dir = newDirectory();
+
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(10).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, false);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      boolean done = false;
+      while(!done) {
+        Thread.sleep(100);
+        for(int i=0;i<NUM_THREADS;i++)
+          // only stop when at least one thread has added a doc
+          if (threads[i].addCount > 0) {
+            done = true;
+            break;
+          } else if (!threads[i].isAlive()) {
+            fail("thread failed before indexing a single document");
+          }
+      }
+
+      writer.close(false);
+
+      // Make sure threads that are adding docs are not hung:
+      for(int i=0;i<NUM_THREADS;i++) {
+        // Without fix for LUCENE-1130: one of the
+        // threads will hang
+        threads[i].join();
+        if (threads[i].isAlive())
+          fail("thread seems to be hung");
+      }
+
+      // Quick test to make sure index is not corrupt:
+      IndexReader reader = DirectoryReader.open(dir);
+      DocsEnum tdocs = _TestUtil.docs(random(), reader,
+                                      "field",
+                                      new BytesRef("aaa"),
+                                      MultiFields.getLiveDocs(reader),
+                                      null,
+                                      false);
+      int count = 0;
+      while(tdocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+        count++;
+      }
+      assertTrue(count > 0);
+      reader.close();
+
+      dir.close();
+    }
+  }
+
+  // Runs test, with multiple threads, using the specific
+  // failure to trigger an IOException
+  public void _testMultipleThreadsFailure(MockDirectoryWrapper.Failure failure) throws Exception {
+
+    int NUM_THREADS = 3;
+
+    for(int iter=0;iter<2;iter++) {
+      if (VERBOSE) {
+        System.out.println("TEST: iter=" + iter);
+      }
+      MockDirectoryWrapper dir = newMockDirectory();
+
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(2).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, true);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      Thread.sleep(10);
+
+      dir.failOn(failure);
+      failure.setDoFail();
+
+      for(int i=0;i<NUM_THREADS;i++) {
+        threads[i].join();
+        assertTrue("hit unexpected Throwable", threads[i].error == null);
+      }
+
+      boolean success = false;
+      try {
+        writer.close(false);
+        success = true;
+      } catch (IOException ioe) {
+        failure.clearDoFail();
+        writer.close(false);
+      }
+
+      if (success) {
+        IndexReader reader = DirectoryReader.open(dir);
+        final Bits delDocs = MultiFields.getLiveDocs(reader);
+        for(int j=0;j<reader.maxDoc();j++) {
+          if (delDocs == null || !delDocs.get(j)) {
+            reader.document(j);
+            reader.getTermVectors(j);
+          }
+        }
+        reader.close();
+      }
+
+      dir.close();
+    }
+  }
+
+  // Runs test, with one thread, using the specific failure
+  // to trigger an IOException
+  public void _testSingleThreadFailure(MockDirectoryWrapper.Failure failure) throws IOException {
+    MockDirectoryWrapper dir = newMockDirectory();
+
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+      .setMaxBufferedDocs(2).setMergeScheduler(new ConcurrentMergeScheduler()));
+    final Document doc = new Document();
+    FieldType customType = new FieldType(TextField.TYPE_STORED);
+    customType.setStoreTermVectors(true);
+    customType.setStoreTermVectorPositions(true);
+    customType.setStoreTermVectorOffsets(true);
+    doc.add(newField("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", customType));
+
+    for(int i=0;i<6;i++)
+      writer.addDocument(doc);
+
+    dir.failOn(failure);
+    failure.setDoFail();
+    try {
+      writer.addDocument(doc);
+      writer.addDocument(doc);
+      writer.commit();
+      fail("did not hit exception");
+    } catch (IOException ioe) {
+    }
+    failure.clearDoFail();
+    writer.addDocument(doc);
+    writer.close(false);
+    dir.close();
+  }
+
+  // Throws IOException during FieldsWriter.flushDocument and during DocumentsWriter.abort
+  private static class FailOnlyOnAbortOrFlush extends MockDirectoryWrapper.Failure {
+    private boolean onlyOnce;
+    public FailOnlyOnAbortOrFlush(boolean onlyOnce) {
+      this.onlyOnce = onlyOnce;
+    }
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        boolean sawAbortOrFlushDoc = false;
+        boolean sawClose = false;
+        for (int i = 0; i < trace.length; i++) {
+          if ("abort".equals(trace[i].getMethodName()) ||
+              "finishDocument".equals(trace[i].getMethodName())) {
+            sawAbortOrFlushDoc = true;
+          }
+          if ("close".equals(trace[i].getMethodName())) {
+            sawClose = true;
+          }
+        }
+        if (sawAbortOrFlushDoc && !sawClose) {
+          if (onlyOnce)
+            doFail = false;
+          //System.out.println(Thread.currentThread().getName() + ": now fail");
+          //new Throwable().printStackTrace(System.out);
+          throw new IOException("now failing on purpose");
         }
       }
-      return ch;
     }
+  }
+
+
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), is OK:
+  public void testIOExceptionDuringAbort() throws IOException {
+    _testSingleThreadFailure(new FailOnlyOnAbortOrFlush(false));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), is OK:
+  public void testIOExceptionDuringAbortOnlyOnce() throws IOException {
+    _testSingleThreadFailure(new FailOnlyOnAbortOrFlush(true));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), with multiple threads, is OK:
+  public void testIOExceptionDuringAbortWithThreads() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyOnAbortOrFlush(false));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), with multiple threads, is OK:
+  public void testIOExceptionDuringAbortWithThreadsOnlyOnce() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyOnAbortOrFlush(true));
+  }
+
+  // Throws IOException during DocumentsWriter.writeSegment
+  private static class FailOnlyInWriteSegment extends MockDirectoryWrapper.Failure {
+    private boolean onlyOnce;
+    public FailOnlyInWriteSegment(boolean onlyOnce) {
+      this.onlyOnce = onlyOnce;
+    }
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        for (int i = 0; i < trace.length; i++) {
+          if ("flush".equals(trace[i].getMethodName()) && "org.apache.lucene.index.DocFieldProcessor".equals(trace[i].getClassName())) {
+            if (onlyOnce)
+              doFail = false;
+            throw new IOException("now failing on purpose");
+          }
+        }
+      }
+    }
+  }
+
+  // LUCENE-1130: test IOException in writeSegment
+  public void testIOExceptionDuringWriteSegment() throws IOException {
+    _testSingleThreadFailure(new FailOnlyInWriteSegment(false));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment
+  public void testIOExceptionDuringWriteSegmentOnlyOnce() throws IOException {
+    _testSingleThreadFailure(new FailOnlyInWriteSegment(true));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment, with threads
+  public void testIOExceptionDuringWriteSegmentWithThreads() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyInWriteSegment(false));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment, with threads
+  public void testIOExceptionDuringWriteSegmentWithThreadsOnlyOnce() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyInWriteSegment(true));
   }
   
-  protected int readChar() throws IOException {
-    switch(random.nextInt(10)) {
-      case 0: {
-        // read(char[])
-        char c[] = new char[1];
-        int ret = input.read(c);
-        return ret < 0 ? ret : c[0];
-      }
-      case 1: {
-        // read(char[], int, int)
-        char c[] = new char[2];
-        int ret = input.read(c, 1, 1);
-        return ret < 0 ? ret : c[1];
-      }
-      case 2: {
-        // read(CharBuffer)
-        char c[] = new char[1];
-        CharBuffer cb = CharBuffer.wrap(c);
-        int ret = input.read(cb);
-        return ret < 0 ? ret : c[0];
-      }
-      default: 
-        // read()
-        return input.read();
-    }
-  }
+  //  LUCENE-3365: Test adding two documents with the same field from two different IndexWriters 
+  //  that we attempt to open at the same time.  As long as the first IndexWriter completes
+  //  and closes before the second IndexWriter time's out trying to get the Lock,
+  //  we should see both documents
+  public void testOpenTwoIndexWritersOnDifferentThreads() throws IOException, InterruptedException {
+     final Directory dir = newDirectory();
+     CountDownLatch oneIWConstructed = new CountDownLatch(1);
+     DelayedIndexAndCloseRunnable thread1 = new DelayedIndexAndCloseRunnable(
+         dir, oneIWConstructed);
+     DelayedIndexAndCloseRunnable thread2 = new DelayedIndexAndCloseRunnable(
+         dir, oneIWConstructed);
 
-  protected boolean isTokenChar(int c) {
-    state = runAutomaton.step(state, c);
-    if (state < 0) {
-      state = runAutomaton.getInitialState();
-      return false;
-    } else {
-      return true;
-    }
+     thread1.start();
+     thread2.start();
+     oneIWConstructed.await();
+
+     thread1.startIndexing();
+     thread2.startIndexing();
+
+     thread1.join();
+     thread2.join();
+     
+     assertFalse("Failed due to: " + thread1.failure, thread1.failed);
+     assertFalse("Failed due to: " + thread2.failure, thread2.failed);
+     // now verify that we have two documents in the index
+     IndexReader reader = DirectoryReader.open(dir);
+     assertEquals("IndexReader should have one document per thread running", 2,
+         reader.numDocs());
+     
+     reader.close();
+     dir.close();
   }
   
-  protected int normalize(int c) {
-    return lowerCase ? Character.toLowerCase(c) : c;
-  }
+  static class DelayedIndexAndCloseRunnable extends Thread {
+    private final Directory dir;
+    boolean failed = false;
+    Throwable failure = null;
+    private final CountDownLatch startIndexing = new CountDownLatch(1);
+    private CountDownLatch iwConstructed;
 
-  @Override
-  public void reset() throws IOException {
-    super.reset();
-    state = runAutomaton.getInitialState();
-    lastOffset = off = 0;
-    assert !enableChecks || streamState != State.RESET : "double reset()";
-    streamState = State.RESET;
-  }
-  
-  @Override
-  public void close() throws IOException {
-    super.close();
-    // in some exceptional cases (e.g. TestIndexWriterExceptions) a test can prematurely close()
-    // these tests should disable this check, by default we check the normal workflow.
-    // TODO: investigate the CachingTokenFilter "double-close"... for now we ignore this
-    assert !enableChecks || streamState == State.END || streamState == State.CLOSE : "close() called in wrong state: " + streamState;
-    streamState = State.CLOSE;
-  }
+    public DelayedIndexAndCloseRunnable(Directory dir,
+                                        CountDownLatch iwConstructed) {
+      this.dir = dir;
+      this.iwConstructed = iwConstructed;
+    }
 
-  @Override
-  boolean setReaderTestPoint() {
-    assert !enableChecks || streamState == State.CLOSE : "setReader() called in wrong state: " + streamState;
-    streamState = State.SETREADER;
-    return true;
-  }
+    public void startIndexing() {
+      this.startIndexing.countDown();
+    }
 
-  @Override
-  public void end() throws IOException {
-    int finalOffset = correctOffset(off);
-    offsetAtt.setOffset(finalOffset, finalOffset);
-    // some tokenizers, such as limiting tokenizers, call end() before incrementToken() returns false.
-    // these tests should disable this check (in general you should consume the entire stream)
-    try {
-      assert !enableChecks || streamState == State.INCREMENT_FALSE : "end() called before incrementToken() returned false!";
-    } finally {
-      streamState = State.END;
+    @Override
+    public void run() {
+      try {
+        Document doc = new Document();
+        Field field = newTextField("field", "testData", Field.Store.YES);
+        doc.add(field);
+        IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+                                                                       TEST_VERSION_CURRENT, new MockAnalyzer(random())));
+        iwConstructed.countDown();
+        startIndexing.await();
+        writer.addDocument(doc);
+        writer.close();
+      } catch (Throwable e) {
+        failed = true;
+        failure = e;
+        failure.printStackTrace(System.out);
+        return;
+      }
     }
   }
 
-  /** 
-   * Toggle consumer workflow checking: if your test consumes tokenstreams normally you
-   * should leave this enabled.
-   */
-  public void setEnableChecks(boolean enableChecks) {
-    this.enableChecks = enableChecks;
+  // LUCENE-4147
+  public void testRollbackAndCommitWithThreads() throws Exception {
+    final BaseDirectoryWrapper d = newFSDirectory(_TestUtil.getTempDir("RollbackAndCommitWithThreads"));
+    if (d instanceof MockDirectoryWrapper) {
+      ((MockDirectoryWrapper)d).setPreventDoubleWrite(false);
+    }
+
+    final int threadCount = _TestUtil.nextInt(random(), 2, 6);
+
+    final AtomicReference<IndexWriter> writerRef = new AtomicReference<IndexWriter>();
+    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
+    final LineFileDocs docs = new LineFileDocs(random());
+    final Thread[] threads = new Thread[threadCount];
+    final int iters = atLeast(1000);
+    final AtomicBoolean failed = new AtomicBoolean();
+    final Lock rollbackLock = new ReentrantLock();
+    final Lock commitLock = new ReentrantLock();
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID] = new Thread() {
+          @Override
+          public void run() {
+            for(int iter=0;iter<iters && !failed.get();iter++) {
+              //final int x = random().nextInt(5);
+              final int x = random().nextInt(3);
+              try {
+                switch(x) {
+                case 0:
+                  rollbackLock.lock();
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now rollback");
+                  }
+                  try {
+                    writerRef.get().rollback();
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": rollback done; now open new writer");
+                    }
+                    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
+                  } finally {
+                    rollbackLock.unlock();
+                  }
+                  break;
+                case 1:
+                  commitLock.lock();
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now commit");
+                  }
+                  try {
+                    if (random().nextBoolean()) {
+                      writerRef.get().prepareCommit();
+                    }
+                    writerRef.get().commit();
+                  } catch (AlreadyClosedException ace) {
+                    // ok
+                  } catch (NullPointerException npe) {
+                    // ok
+                  } finally {
+                    commitLock.unlock();
+                  }
+                  break;
+                case 2:
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now add");
+                  }
+                  try {
+                    writerRef.get().addDocument(docs.nextDoc());
+                  } catch (AlreadyClosedException ace) {
+                    // ok
+                  } catch (NullPointerException npe) {
+                    // ok
+                  } catch (AssertionError ae) {
+                    // ok
+                  }
+                  break;
+                }
+              } catch (Throwable t) {
+                failed.set(true);
+                throw new RuntimeException(t);
+              }
+            }
+          }
+        };
+      threads[threadID].start();
+    }
+
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID].join();
+    }
+
+    assertTrue(!failed.get());
+    writerRef.get().close();
+    d.close();
   }
 }

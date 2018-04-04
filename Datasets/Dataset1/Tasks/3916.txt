@@ -1,6 +1,6 @@
-workDir = _TestUtil.getTempDir("TestMultiMMap");
+s += " " + numTermDeletes.get() + " deleted terms (unique count=" + terms.size() + ")";
 
-package org.apache.lucene.store;
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,70 +19,145 @@ package org.apache.lucene.store;
  * limitations under the License.
  */
 
-import java.io.File;
-import java.util.Random;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.util.RamUsageEstimator;
 
-/**
- * Tests MMapDirectory's MultiMMapIndexInput
- * <p>
- * Because Java's ByteBuffer uses an int to address the
- * values, it's necessary to access a file >
- * Integer.MAX_VALUE in size using multiple byte buffers.
- */
-public class TestMultiMMap extends LuceneTestCase {
-  File workDir;
-  
+/* Holds buffered deletes, by docID, term or query for a
+ * single segment. This is used to hold buffered pending
+ * deletes against the to-be-flushed segment.  Once the
+ * deletes are pushed (on flush in DocumentsWriter), these
+ * deletes are converted to a FrozenDeletes instance. */
+
+// NOTE: we are sync'd by BufferedDeletes, ie, all access to
+// instances of this class is via sync'd methods on
+// BufferedDeletes
+
+class BufferedDeletes {
+
+  /* Rough logic: HashMap has an array[Entry] w/ varying
+     load factor (say 2 * POINTER).  Entry is object w/ Term
+     key, Integer val, int hash, Entry next
+     (OBJ_HEADER + 3*POINTER + INT).  Term is object w/
+     String field and String text (OBJ_HEADER + 2*POINTER).
+     Term's field is String (OBJ_HEADER + 4*INT + POINTER +
+     OBJ_HEADER + string.length*CHAR).
+     Term's text is String (OBJ_HEADER + 4*INT + POINTER +
+     OBJ_HEADER + string.length*CHAR).  Integer is
+     OBJ_HEADER + INT. */
+  final static int BYTES_PER_DEL_TERM = 9*RamUsageEstimator.NUM_BYTES_OBJECT_REF + 7*RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + 10*RamUsageEstimator.NUM_BYTES_INT;
+
+  /* Rough logic: del docIDs are List<Integer>.  Say list
+     allocates ~2X size (2*POINTER).  Integer is OBJ_HEADER
+     + int */
+  final static int BYTES_PER_DEL_DOCID = 2*RamUsageEstimator.NUM_BYTES_OBJECT_REF + RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + RamUsageEstimator.NUM_BYTES_INT;
+
+  /* Rough logic: HashMap has an array[Entry] w/ varying
+     load factor (say 2 * POINTER).  Entry is object w/
+     Query key, Integer val, int hash, Entry next
+     (OBJ_HEADER + 3*POINTER + INT).  Query we often
+     undercount (say 24 bytes).  Integer is OBJ_HEADER + INT. */
+  final static int BYTES_PER_DEL_QUERY = 5*RamUsageEstimator.NUM_BYTES_OBJECT_REF + 2*RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + 2*RamUsageEstimator.NUM_BYTES_INT + 24;
+
+  final AtomicInteger numTermDeletes = new AtomicInteger();
+  final Map<Term,Integer> terms = new HashMap<Term,Integer>();
+  final Map<Query,Integer> queries = new HashMap<Query,Integer>();
+  final List<Integer> docIDs = new ArrayList<Integer>();
+
+  public static final Integer MAX_INT = Integer.valueOf(Integer.MAX_VALUE);
+
+  final AtomicLong bytesUsed;
+
+  private final static boolean VERBOSE_DELETES = false;
+
+  long gen;
+  public BufferedDeletes() {
+    this(new AtomicLong());
+  }
+
+  BufferedDeletes(AtomicLong bytesUsed) {
+    assert bytesUsed != null;
+    this.bytesUsed = bytesUsed;
+  }
+
   @Override
-  public void setUp() throws Exception {
-      super.setUp();
-      workDir = new File(TEMP_DIR, "TestMultiMMap");
-      workDir.mkdirs();
+  public String toString() {
+    if (VERBOSE_DELETES) {
+      return "gen=" + gen + " numTerms=" + numTermDeletes + ", terms=" + terms
+        + ", queries=" + queries + ", docIDs=" + docIDs + ", bytesUsed="
+        + bytesUsed;
+    } else {
+      String s = "gen=" + gen;
+      if (numTermDeletes.get() != 0) {
+        s += " " + numTermDeletes.get() + " deleted terms (unique count=" + terms.size() + ") terms=" + terms.keySet();
+      }
+      if (queries.size() != 0) {
+        s += " " + queries.size() + " deleted queries";
+      }
+      if (docIDs.size() != 0) {
+        s += " " + docIDs.size() + " deleted docIDs";
+      }
+      if (bytesUsed.get() != 0) {
+        s += " bytesUsed=" + bytesUsed.get();
+      }
+
+      return s;
+    }
+  }
+
+  public void addQuery(Query query, int docIDUpto) {
+    Integer current = queries.put(query, docIDUpto);
+    // increment bytes used only if the query wasn't added so far.
+    if (current == null) {
+      bytesUsed.addAndGet(BYTES_PER_DEL_QUERY);
+    }
+  }
+
+  public void addDocID(int docID) {
+    docIDs.add(Integer.valueOf(docID));
+    bytesUsed.addAndGet(BYTES_PER_DEL_DOCID);
+  }
+
+  public void addTerm(Term term, int docIDUpto) {
+    Integer current = terms.get(term);
+    if (current != null && docIDUpto < current) {
+      // Only record the new number if it's greater than the
+      // current one.  This is important because if multiple
+      // threads are replacing the same doc at nearly the
+      // same time, it's possible that one thread that got a
+      // higher docID is scheduled before the other
+      // threads.  If we blindly replace than we can
+      // incorrectly get both docs indexed.
+      return;
+    }
+
+    terms.put(term, Integer.valueOf(docIDUpto));
+    numTermDeletes.incrementAndGet();
+    if (current == null) {
+      bytesUsed.addAndGet(BYTES_PER_DEL_TERM + term.bytes.length + (RamUsageEstimator.NUM_BYTES_CHAR * term.field().length()));
+    }
+  }
+ 
+  void clear() {
+    terms.clear();
+    queries.clear();
+    docIDs.clear();
+    numTermDeletes.set(0);
+    bytesUsed.set(0);
   }
   
-  public void testRandomChunkSizes() throws Exception {
-    for (int i = 0; i < 10*RANDOM_MULTIPLIER; i++)
-      assertChunking(random, _TestUtil.nextInt(random, 20, 100));
+  void clearDocIDs() {
+    bytesUsed.addAndGet(-docIDs.size()*BYTES_PER_DEL_DOCID);
+    docIDs.clear();
   }
   
-  private void assertChunking(Random random, int chunkSize) throws Exception {
-    File path = File.createTempFile("mmap" + chunkSize, "tmp", workDir);
-    path.delete();
-    path.mkdirs();
-    MMapDirectory dir = new MMapDirectory(path);
-    dir.setMaxChunkSize(chunkSize);
-    // we will map a lot, try to turn on the unmap hack
-    if (MMapDirectory.UNMAP_SUPPORTED)
-      dir.setUseUnmap(true);
-    RandomIndexWriter writer = new RandomIndexWriter(random, dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
-    Document doc = new Document();
-    Field docid = newField("docid", "0", Field.Store.YES, Field.Index.NOT_ANALYZED);
-    Field junk = newField("junk", "", Field.Store.YES, Field.Index.NOT_ANALYZED);
-    doc.add(docid);
-    doc.add(junk);
-    
-    int numDocs = 100;
-    for (int i = 0; i < numDocs; i++) {
-      docid.setValue("" + i);
-      junk.setValue(_TestUtil.randomUnicodeString(random));
-      writer.addDocument(doc);
-    }
-    IndexReader reader = writer.getReader();
-    writer.close();
-    
-    int numAsserts = 100*RANDOM_MULTIPLIER;
-    for (int i = 0; i < numAsserts; i++) {
-      int docID = random.nextInt(numDocs);
-      assertEquals("" + docID, reader.document(docID).get("docid"));
-    }
-    reader.close();
-    dir.close();
+  boolean any() {
+    return terms.size() > 0 || docIDs.size() > 0 || queries.size() > 0;
   }
 }

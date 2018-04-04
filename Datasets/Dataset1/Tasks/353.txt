@@ -1,6 +1,6 @@
-FileUtils.writeStringToFile(file, stopwords, "UTF-8");
+finish(indexOptions == IndexOptions.DOCS_ONLY ? -1 : sumTotalTermFreq, sumDocFreq, visitedDocs.cardinality());
 
-package org.apache.solr;
+package org.apache.lucene.codecs;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,135 +19,194 @@ package org.apache.solr;
  * limitations under the License.
  */
 
-import java.io.File;
 import java.io.IOException;
+import java.util.Comparator;
 
-import org.apache.commons.io.FileUtils;
-import org.apache.solr.client.solrj.SolrQuery;
-import org.apache.solr.client.solrj.SolrServer;
-import org.apache.solr.client.solrj.embedded.EmbeddedSolrServer;
-import org.apache.solr.client.solrj.request.AbstractUpdateRequest.ACTION;
-import org.apache.solr.client.solrj.request.QueryRequest;
-import org.apache.solr.client.solrj.request.UpdateRequest;
-import org.apache.solr.common.SolrInputDocument;
-import org.apache.solr.core.SolrCore;
-import org.junit.BeforeClass;
-import org.junit.AfterClass;
+import org.apache.lucene.index.FieldInfo; // javadocs
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.MergeState;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.index.MultiDocsEnum;
+import org.apache.lucene.index.MultiDocsAndPositionsEnum;
 
-public class AnalysisAfterCoreReloadTest extends SolrTestCaseJ4 {
-  
-  private static String tmpSolrHome;
-  int port = 0;
-  static final String context = "/solr";
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
 
-  static final String collection = "collection1";
-  
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    createTempDir();
-    tmpSolrHome = TEMP_DIR + File.separator + AnalysisAfterCoreReloadTest.class.getSimpleName() + System.currentTimeMillis();
-    FileUtils.copyDirectory(new File(TEST_HOME()), new File(tmpSolrHome).getAbsoluteFile());
-    initCore("solrconfig.xml", "schema.xml", new File(tmpSolrHome).getAbsolutePath());
-  }
+/**
+ * Abstract API that consumes terms for an individual field.
+ * <p>
+ * The lifecycle is:
+ * <ol>
+ *   <li>TermsConsumer is returned for each field 
+ *       by {@link FieldsConsumer#addField(FieldInfo)}.
+ *   <li>TermsConsumer returns a {@link PostingsConsumer} for
+ *       each term in {@link #startTerm(BytesRef)}.
+ *   <li>When the producer (e.g. IndexWriter)
+ *       is done adding documents for the term, it calls 
+ *       {@link #finishTerm(BytesRef, TermStats)}, passing in
+ *       the accumulated term statistics.
+ *   <li>Producer calls {@link #finish(long, long, int)} with
+ *       the accumulated collection statistics when it is finished
+ *       adding terms to the field.
+ * </ol>
+ * 
+ * @lucene.experimental
+ */
+public abstract class TermsConsumer {
 
-  @AfterClass
-  public static void AfterClass() throws Exception {
-    FileUtils.deleteDirectory(new File(tmpSolrHome).getAbsoluteFile());
-  }
-  
-  public void testStopwordsAfterCoreReload() throws Exception {
-    SolrInputDocument doc = new SolrInputDocument();
-    doc.setField( "id", "42" );
-    doc.setField( "teststop", "terma stopworda stopwordb stopwordc" );
-    
-    // default stopwords - stopworda and stopwordb
-    
-    UpdateRequest up = new UpdateRequest();
-    up.setAction(ACTION.COMMIT, true, true);
-    up.add( doc );
-    up.process( getSolrCore() );
+  /** Starts a new term in this field; this may be called
+   *  with no corresponding call to finish if the term had
+   *  no docs. */
+  public abstract PostingsConsumer startTerm(BytesRef text) throws IOException;
 
-    SolrQuery q = new SolrQuery();
-    QueryRequest r = new QueryRequest( q );
-    q.setQuery( "teststop:terma" );
-    assertEquals( 1, r.process( getSolrCore() ).getResults().size() );
+  /** Finishes the current term; numDocs must be > 0. */
+  public abstract void finishTerm(BytesRef text, TermStats stats) throws IOException;
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:stopworda" );
-    assertEquals( 0, r.process( getSolrCore() ).getResults().size() );
+  /** Called when we are done adding terms to this field */
+  public abstract void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException;
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:stopwordb" );
-    assertEquals( 0, r.process( getSolrCore() ).getResults().size() );
+  /** Return the BytesRef Comparator used to sort terms
+   *  before feeding to this API. */
+  public abstract Comparator<BytesRef> getComparator() throws IOException;
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:stopwordc" );
-    assertEquals( 1, r.process( getSolrCore() ).getResults().size() );
+  private MappingMultiDocsEnum docsEnum;
+  private MappingMultiDocsEnum docsAndFreqsEnum;
+  private MappingMultiDocsAndPositionsEnum postingsEnum;
 
-    // overwrite stopwords file with stopword list ["stopwordc"] and reload the core
-    overwriteStopwords("stopwordc\n");
-    h.getCoreContainer().reload(collection);
+  /** Default merge impl */
+  public void merge(MergeState mergeState, TermsEnum termsEnum) throws IOException {
 
-    up.process( getSolrCore() );
+    BytesRef term;
+    assert termsEnum != null;
+    long sumTotalTermFreq = 0;
+    long sumDocFreq = 0;
+    long sumDFsinceLastAbortCheck = 0;
+    FixedBitSet visitedDocs = new FixedBitSet(mergeState.segmentInfo.getDocCount());
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:terma" );
-    assertEquals( 1, r.process( getSolrCore() ).getResults().size() );
+    IndexOptions indexOptions = mergeState.fieldInfo.getIndexOptions();
+    if (indexOptions == IndexOptions.DOCS_ONLY) {
+      if (docsEnum == null) {
+        docsEnum = new MappingMultiDocsEnum();
+      }
+      docsEnum.setMergeState(mergeState);
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:stopworda" );
-    // stopworda is no longer a stopword
-    assertEquals( 1, r.process( getSolrCore() ).getResults().size() );
+      MultiDocsEnum docsEnumIn = null;
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:stopwordb" );
-    // stopwordb is no longer a stopword
-    assertEquals( 1, r.process( getSolrCore() ).getResults().size() );
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        docsEnumIn = (MultiDocsEnum) termsEnum.docs(null, docsEnumIn, false);
+        if (docsEnumIn != null) {
+          docsEnum.reset(docsEnumIn);
+          final PostingsConsumer postingsConsumer = startTerm(term);
+          final TermStats stats = postingsConsumer.merge(mergeState, docsEnum, visitedDocs);
+          if (stats.docFreq > 0) {
+            finishTerm(term, stats);
+            sumTotalTermFreq += stats.docFreq;
+            sumDFsinceLastAbortCheck += stats.docFreq;
+            sumDocFreq += stats.docFreq;
+            if (sumDFsinceLastAbortCheck > 60000) {
+              mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+              sumDFsinceLastAbortCheck = 0;
+            }
+          }
+        }
+      }
+    } else if (indexOptions == IndexOptions.DOCS_AND_FREQS) {
+      if (docsAndFreqsEnum == null) {
+        docsAndFreqsEnum = new MappingMultiDocsEnum();
+      }
+      docsAndFreqsEnum.setMergeState(mergeState);
 
-    q = new SolrQuery();
-    r = new QueryRequest( q );
-    q.setQuery( "teststop:stopwordc" );
-    // stopwordc should be a stopword
-    assertEquals( 0, r.process( getSolrCore() ).getResults().size() );
-  }
-  
-  private void overwriteStopwords(String stopwords) throws IOException {
-    SolrCore core = h.getCoreContainer().getCore(collection);
-    try {
-      String configDir = core.getResourceLoader().getConfigDir();
-      FileUtils.moveFile(new File(configDir, "stopwords.txt"), new File(configDir, "stopwords.txt.bak"));
-      File file = new File(configDir, "stopwords.txt");
-      FileUtils.writeStringToFile(file, stopwords);
-     
-    } finally {
-      core.close();
+      MultiDocsEnum docsAndFreqsEnumIn = null;
+
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        docsAndFreqsEnumIn = (MultiDocsEnum) termsEnum.docs(null, docsAndFreqsEnumIn, true);
+        assert docsAndFreqsEnumIn != null;
+        docsAndFreqsEnum.reset(docsAndFreqsEnumIn);
+        final PostingsConsumer postingsConsumer = startTerm(term);
+        final TermStats stats = postingsConsumer.merge(mergeState, docsAndFreqsEnum, visitedDocs);
+        if (stats.docFreq > 0) {
+          finishTerm(term, stats);
+          sumTotalTermFreq += stats.totalTermFreq;
+          sumDFsinceLastAbortCheck += stats.docFreq;
+          sumDocFreq += stats.docFreq;
+          if (sumDFsinceLastAbortCheck > 60000) {
+            mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+            sumDFsinceLastAbortCheck = 0;
+          }
+        }
+      }
+    } else if (indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
+      if (postingsEnum == null) {
+        postingsEnum = new MappingMultiDocsAndPositionsEnum();
+      }
+      postingsEnum.setMergeState(mergeState);
+      MultiDocsAndPositionsEnum postingsEnumIn = null;
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        postingsEnumIn = (MultiDocsAndPositionsEnum) termsEnum.docsAndPositions(null, postingsEnumIn, false);
+        assert postingsEnumIn != null;
+        postingsEnum.reset(postingsEnumIn);
+        // set PayloadProcessor
+        if (mergeState.payloadProcessorProvider != null) {
+          for (int i = 0; i < mergeState.readers.size(); i++) {
+            if (mergeState.readerPayloadProcessor[i] != null) {
+              mergeState.currentPayloadProcessor[i] = mergeState.readerPayloadProcessor[i].getProcessor(mergeState.fieldInfo.name, term);
+            }
+          }
+        }
+        final PostingsConsumer postingsConsumer = startTerm(term);
+        final TermStats stats = postingsConsumer.merge(mergeState, postingsEnum, visitedDocs);
+        if (stats.docFreq > 0) {
+          finishTerm(term, stats);
+          sumTotalTermFreq += stats.totalTermFreq;
+          sumDFsinceLastAbortCheck += stats.docFreq;
+          sumDocFreq += stats.docFreq;
+          if (sumDFsinceLastAbortCheck > 60000) {
+            mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+            sumDFsinceLastAbortCheck = 0;
+          }
+        }
+      }
+    } else {
+      assert indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS;
+      if (postingsEnum == null) {
+        postingsEnum = new MappingMultiDocsAndPositionsEnum();
+      }
+      postingsEnum.setMergeState(mergeState);
+      MultiDocsAndPositionsEnum postingsEnumIn = null;
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        postingsEnumIn = (MultiDocsAndPositionsEnum) termsEnum.docsAndPositions(null, postingsEnumIn, true);
+        assert postingsEnumIn != null;
+        postingsEnum.reset(postingsEnumIn);
+        // set PayloadProcessor
+        if (mergeState.payloadProcessorProvider != null) {
+          for (int i = 0; i < mergeState.readers.size(); i++) {
+            if (mergeState.readerPayloadProcessor[i] != null) {
+              mergeState.currentPayloadProcessor[i] = mergeState.readerPayloadProcessor[i].getProcessor(mergeState.fieldInfo.name, term);
+            }
+          }
+        }
+        final PostingsConsumer postingsConsumer = startTerm(term);
+        final TermStats stats = postingsConsumer.merge(mergeState, postingsEnum, visitedDocs);
+        if (stats.docFreq > 0) {
+          finishTerm(term, stats);
+          sumTotalTermFreq += stats.totalTermFreq;
+          sumDFsinceLastAbortCheck += stats.docFreq;
+          sumDocFreq += stats.docFreq;
+          if (sumDFsinceLastAbortCheck > 60000) {
+            mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+            sumDFsinceLastAbortCheck = 0;
+          }
+        }
+      }
     }
+    finish(sumTotalTermFreq, sumDocFreq, visitedDocs.cardinality());
   }
-  
-  @Override
-  public void tearDown() throws Exception {
-    SolrCore core = h.getCoreContainer().getCore(collection);
-    String configDir;
-    try {
-      configDir = core.getResourceLoader().getConfigDir();
-    } finally {
-      core.close();
-    }
-    super.tearDown();
-    if (new File(configDir, "stopwords.txt.bak").exists()) {
-      FileUtils.deleteQuietly(new File(configDir, "stopwords.txt"));
-      FileUtils.moveFile(new File(configDir, "stopwords.txt.bak"), new File(configDir, "stopwords.txt"));
-    }
-  }
-
-  protected SolrServer getSolrCore() {
-    return new EmbeddedSolrServer(h.getCore());
-  }
-
 }

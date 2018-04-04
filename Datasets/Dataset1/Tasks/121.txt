@@ -1,4 +1,4 @@
-for(AtomicReaderContext context : reader.leaves()) {
+final List<AtomicReaderContext> leaves = reader.leaves();
 
 package org.apache.lucene.index;
 
@@ -18,1599 +18,587 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 import java.io.IOException;
-import java.io.Reader;
-import java.io.StringReader;
+import java.lang.reflect.Array;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Random;
-import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.apache.lucene.analysis.*;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.IndexWriterConfig.OpenMode;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.PhraseQuery;
-import org.apache.lucene.store.BaseDirectoryWrapper;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.store.RAMDirectory;
-import org.apache.lucene.util.Bits;
+import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
+import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
+import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.InfoStream;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.util.PagedBytes;
+import org.apache.lucene.util.packed.PackedInts.Reader;
 
-public class TestIndexWriterExceptions extends LuceneTestCase {
-
-  private static class DocCopyIterator implements Iterable<Document> {
-    private final Document doc;
-    private final int count;
+/**
+ * A wrapper for CompositeIndexReader providing access to per segment
+ * {@link DocValues}
+ * 
+ * <p><b>NOTE</b>: for multi readers, you'll get better
+ * performance by gathering the sub readers using
+ * {@link IndexReader#getTopReaderContext()} to get the
+ * atomic leaves and then operate per-AtomicReader,
+ * instead of using this class.
+ *
+ * @lucene.experimental
+ * @lucene.internal
+ */
+public class MultiDocValues extends DocValues {
+  
+  private static DocValuesPuller DEFAULT_PULLER = new DocValuesPuller();
+  private static final DocValuesPuller NORMS_PULLER = new DocValuesPuller() {
+    public DocValues pull(AtomicReader reader, String field) throws IOException {
+      return reader.normValues(field);
+    }
     
-    /* private field types */
-    /* private field types */
+    public boolean stopLoadingOnNull(AtomicReader reader, String field) {
+      // for norms we drop all norms if one leaf reader has no norms and the field is present
+      FieldInfos fieldInfos = reader.getFieldInfos();
+      FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+      return fieldInfo != null && fieldInfo.omitsNorms();
+    }
+  };
 
-    private static final FieldType custom1 = new FieldType(TextField.TYPE_NOT_STORED);
-    private static final FieldType custom2 = new FieldType();
-    private static final FieldType custom3 = new FieldType();
-    private static final FieldType custom4 = new FieldType(StringField.TYPE_NOT_STORED);
-    private static final FieldType custom5 = new FieldType(TextField.TYPE_STORED);
+  public static class DocValuesSlice {
+    public final static DocValuesSlice[] EMPTY_ARRAY = new DocValuesSlice[0];
+    final int start;
+    final int length;
+    DocValues docValues;
+
+    public DocValuesSlice(DocValues docValues, int start, int length) {
+      this.docValues = docValues;
+      this.start = start;
+      this.length = length;
+    }
+  }
+  
+  private static class DocValuesPuller {
+    public DocValuesPuller() {}
+
+    public DocValues pull(AtomicReader reader, String field) throws IOException {
+      return reader.docValues(field);
+    }
     
-    static {
-
-      custom1.setStoreTermVectors(true);
-      custom1.setStoreTermVectorPositions(true);
-      custom1.setStoreTermVectorOffsets(true);
-      
-      custom2.setStored(true);
-      custom2.setIndexed(true);
-      
-      custom3.setStored(true);
-
-      custom4.setStoreTermVectors(true);
-      custom4.setStoreTermVectorPositions(true);
-      custom4.setStoreTermVectorOffsets(true);
-      
-      custom5.setStoreTermVectors(true);
-      custom5.setStoreTermVectorPositions(true);
-      custom5.setStoreTermVectorOffsets(true);
-    }
-
-    public DocCopyIterator(Document doc, int count) {
-      this.count = count;
-      this.doc = doc;
-    }
-
-    @Override
-    public Iterator<Document> iterator() {
-      return new Iterator<Document>() {
-        int upto;
-
-        @Override
-        public boolean hasNext() {
-          return upto < count;
-        }
-
-        @Override
-        public Document next() {
-          upto++;
-          return doc;
-        }
-
-        @Override
-        public void remove() {
-          throw new UnsupportedOperationException();
-        }
-      };
+    public boolean stopLoadingOnNull(AtomicReader reader, String field) {
+      return false;
     }
   }
 
-  private class IndexerThread extends Thread {
+  private DocValuesSlice[] slices;
+  private int[] starts;
+  private Type type;
+  private int valueSize;
 
-    IndexWriter writer;
-
-    final Random r = new Random(random().nextLong());
-    volatile Throwable failure;
-
-    public IndexerThread(int i, IndexWriter writer) {
-      setName("Indexer " + i);
-      this.writer = writer;
+  private MultiDocValues(DocValuesSlice[] slices, int[] starts, TypePromoter promotedType) {
+    this.starts = starts;
+    this.slices = slices;
+    this.type = promotedType.type();
+    this.valueSize = promotedType.getValueSize();
+  }
+  /**
+   * Returns a single {@link DocValues} instance for this field, merging
+   * their values on the fly.
+   * 
+   * <p>
+   * <b>NOTE</b>: this is a slow way to access DocValues.
+   * It's better to get the sub-readers and iterate through them
+   * yourself.
+   */
+  public static DocValues getDocValues(IndexReader r, final String field) throws IOException {
+    return getDocValues(r, field, DEFAULT_PULLER);
+  }
+  
+  /**
+   * Returns a single {@link DocValues} instance for this norms field, merging
+   * their values on the fly.
+   * 
+   * <p>
+   * <b>NOTE</b>: this is a slow way to access DocValues.
+   * It's better to get the sub-readers and iterate through them
+   * yourself.
+   */
+  public static DocValues getNormDocValues(IndexReader r, final String field) throws IOException {
+    return getDocValues(r, field, NORMS_PULLER);
+  }
+  
+ 
+  private static DocValues getDocValues(IndexReader reader, final String field, final DocValuesPuller puller) throws IOException {
+    if (reader instanceof AtomicReader) {
+      // already an atomic reader
+      return puller.pull((AtomicReader) reader, field);
     }
-
-    @Override
-    public void run() {
-
-      final Document doc = new Document();
-
-      doc.add(newTextField(r, "content1", "aaa bbb ccc ddd", Field.Store.YES));
-      doc.add(newField(r, "content6", "aaa bbb ccc ddd", DocCopyIterator.custom1));
-      doc.add(newField(r, "content2", "aaa bbb ccc ddd", DocCopyIterator.custom2));
-      doc.add(newField(r, "content3", "aaa bbb ccc ddd", DocCopyIterator.custom3));
-
-      doc.add(newTextField(r, "content4", "aaa bbb ccc ddd", Field.Store.NO));
-      doc.add(newStringField(r, "content5", "aaa bbb ccc ddd", Field.Store.NO));
-
-      doc.add(newField(r, "content7", "aaa bbb ccc ddd", DocCopyIterator.custom4));
-
-      final Field idField = newField(r, "id", "", DocCopyIterator.custom2);
-      doc.add(idField);
-
-      final long stopTime = System.currentTimeMillis() + 500;
-
-      do {
-        if (VERBOSE) {
-          System.out.println(Thread.currentThread().getName() + ": TEST: IndexerThread: cycle");
-        }
-        doFail.set(this);
-        final String id = ""+r.nextInt(50);
-        idField.setStringValue(id);
-        Term idTerm = new Term("id", id);
-        try {
-          if (r.nextBoolean()) {
-            writer.updateDocuments(idTerm, new DocCopyIterator(doc, _TestUtil.nextInt(r, 1, 20)));
-          } else {
-            writer.updateDocument(idTerm, doc);
+    assert reader instanceof CompositeReader;
+    final List<AtomicReaderContext> leaves = reader.getTopReaderContext().leaves();
+    switch (leaves.size()) {
+      case 0:
+        // no fields
+        return null;
+      case 1:
+        // already an atomic reader / reader with one leave
+        return getDocValues(leaves.get(0).reader(), field, puller);
+      default:
+        final List<DocValuesSlice> slices = new ArrayList<DocValuesSlice>();
+        
+        TypePromoter promotedType =  TypePromoter.getIdentityPromoter();
+        
+        // gather all docvalues fields, accumulating a promoted type across 
+        // potentially incompatible types
+        for (final AtomicReaderContext ctx : leaves) {
+          final AtomicReader r = ctx.reader();
+          final DocValues d = puller.pull(r, field);
+          if (d != null) {
+            TypePromoter incoming = TypePromoter.create(d.getType(), d.getValueSize());
+            promotedType = promotedType.promote(incoming);
+          } else if (puller.stopLoadingOnNull(r, field)){
+            return null;
           }
-        } catch (RuntimeException re) {
-          if (VERBOSE) {
-            System.out.println(Thread.currentThread().getName() + ": EXC: ");
-            re.printStackTrace(System.out);
-          }
-          try {
-            _TestUtil.checkIndex(writer.getDirectory());
-          } catch (IOException ioe) {
-            System.out.println(Thread.currentThread().getName() + ": unexpected exception1");
-            ioe.printStackTrace(System.out);
-            failure = ioe;
-            break;
-          }
-        } catch (Throwable t) {
-          System.out.println(Thread.currentThread().getName() + ": unexpected exception2");
-          t.printStackTrace(System.out);
-          failure = t;
-          break;
-        }
-
-        doFail.set(null);
-
-        // After a possible exception (above) I should be able
-        // to add a new document without hitting an
-        // exception:
-        try {
-          writer.updateDocument(idTerm, doc);
-        } catch (Throwable t) {
-          System.out.println(Thread.currentThread().getName() + ": unexpected exception3");
-          t.printStackTrace(System.out);
-          failure = t;
-          break;
-        }
-      } while(System.currentTimeMillis() < stopTime);
-    }
-  }
-
-  ThreadLocal<Thread> doFail = new ThreadLocal<Thread>();
-
-  private class MockIndexWriter extends IndexWriter {
-    Random r = new Random(random().nextLong());
-
-    public MockIndexWriter(Directory dir, IndexWriterConfig conf) throws IOException {
-      super(dir, conf);
-    }
-
-    @Override
-    boolean testPoint(String name) {
-      if (doFail.get() != null && !name.equals("startDoFlush") && r.nextInt(40) == 17) {
-        if (VERBOSE) {
-          System.out.println(Thread.currentThread().getName() + ": NOW FAIL: " + name);
-          new Throwable().printStackTrace(System.out);
-        }
-        throw new RuntimeException(Thread.currentThread().getName() + ": intentionally failing at " + name);
-      }
-      return true;
-    }
-  }
-
-  public void testRandomExceptions() throws Throwable {
-    if (VERBOSE) {
-      System.out.println("\nTEST: start testRandomExceptions");
-    }
-    Directory dir = newDirectory();
-
-    MockAnalyzer analyzer = new MockAnalyzer(random());
-    analyzer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-    MockIndexWriter writer  = new MockIndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, analyzer)
-        .setRAMBufferSizeMB(0.1).setMergeScheduler(new ConcurrentMergeScheduler()));
-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
-    //writer.setMaxBufferedDocs(10);
-    if (VERBOSE) {
-      System.out.println("TEST: initial commit");
-    }
-    writer.commit();
-
-    IndexerThread thread = new IndexerThread(0, writer);
-    thread.run();
-    if (thread.failure != null) {
-      thread.failure.printStackTrace(System.out);
-      fail("thread " + thread.getName() + ": hit unexpected failure");
-    }
-
-    if (VERBOSE) {
-      System.out.println("TEST: commit after thread start");
-    }
-    writer.commit();
-
-    try {
-      writer.close();
-    } catch (Throwable t) {
-      System.out.println("exception during close:");
-      t.printStackTrace(System.out);
-      writer.rollback();
-    }
-
-    // Confirm that when doc hits exception partway through tokenization, it's deleted:
-    IndexReader r2 = DirectoryReader.open(dir);
-    final int count = r2.docFreq(new Term("content4", "aaa"));
-    final int count2 = r2.docFreq(new Term("content4", "ddd"));
-    assertEquals(count, count2);
-    r2.close();
-
-    dir.close();
-  }
-
-  public void testRandomExceptionsThreads() throws Throwable {
-    Directory dir = newDirectory();
-    MockAnalyzer analyzer = new MockAnalyzer(random());
-    analyzer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-    MockIndexWriter writer  = new MockIndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, analyzer)
-        .setRAMBufferSizeMB(0.2).setMergeScheduler(new ConcurrentMergeScheduler()));
-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
-    //writer.setMaxBufferedDocs(10);
-    writer.commit();
-
-    final int NUM_THREADS = 4;
-
-    final IndexerThread[] threads = new IndexerThread[NUM_THREADS];
-    for(int i=0;i<NUM_THREADS;i++) {
-      threads[i] = new IndexerThread(i, writer);
-      threads[i].start();
-    }
-
-    for(int i=0;i<NUM_THREADS;i++)
-      threads[i].join();
-
-    for(int i=0;i<NUM_THREADS;i++)
-      if (threads[i].failure != null) {
-        fail("thread " + threads[i].getName() + ": hit unexpected failure");
-      }
-
-    writer.commit();
-
-    try {
-      writer.close();
-    } catch (Throwable t) {
-      System.out.println("exception during close:");
-      t.printStackTrace(System.out);
-      writer.rollback();
-    }
-
-    // Confirm that when doc hits exception partway through tokenization, it's deleted:
-    IndexReader r2 = DirectoryReader.open(dir);
-    final int count = r2.docFreq(new Term("content4", "aaa"));
-    final int count2 = r2.docFreq(new Term("content4", "ddd"));
-    assertEquals(count, count2);
-    r2.close();
-
-    dir.close();
-  }
-
-  // LUCENE-1198
-  private static final class MockIndexWriter2 extends IndexWriter {
-
-    public MockIndexWriter2(Directory dir, IndexWriterConfig conf) throws IOException {
-      super(dir, conf);
-    }
-
-    boolean doFail;
-
-    @Override
-    boolean testPoint(String name) {
-      if (doFail && name.equals("DocumentsWriterPerThread addDocument start"))
-        throw new RuntimeException("intentionally failing");
-      return true;
-    }
-  }
-
-  private static String CRASH_FAIL_MESSAGE = "I'm experiencing problems";
-
-  private class CrashingFilter extends TokenFilter {
-    String fieldName;
-    int count;
-
-    public CrashingFilter(String fieldName, TokenStream input) {
-      super(input);
-      this.fieldName = fieldName;
-    }
-
-    @Override
-    public boolean incrementToken() throws IOException {
-      if (this.fieldName.equals("crash") && count++ >= 4)
-        throw new IOException(CRASH_FAIL_MESSAGE);
-      return input.incrementToken();
-    }
-
-    @Override
-    public void reset() throws IOException {
-      super.reset();
-      count = 0;
-    }
-  }
-
-  public void testExceptionDocumentsWriterInit() throws IOException {
-    Directory dir = newDirectory();
-    MockIndexWriter2 w = new MockIndexWriter2(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-    Document doc = new Document();
-    doc.add(newTextField("field", "a field", Field.Store.YES));
-    w.addDocument(doc);
-    w.doFail = true;
-    try {
-      w.addDocument(doc);
-      fail("did not hit exception");
-    } catch (RuntimeException re) {
-      // expected
-    }
-    w.close();
-    dir.close();
-  }
-
-  // LUCENE-1208
-  public void testExceptionJustBeforeFlush() throws IOException {
-    Directory dir = newDirectory();
-    MockIndexWriter w = new MockIndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMaxBufferedDocs(2));
-    Document doc = new Document();
-    doc.add(newTextField("field", "a field", Field.Store.YES));
-    w.addDocument(doc);
-
-    Analyzer analyzer = new Analyzer(new Analyzer.PerFieldReuseStrategy()) {
-      @Override
-      public TokenStreamComponents createComponents(String fieldName, Reader reader) {
-        MockTokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.WHITESPACE, false);
-        tokenizer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-        return new TokenStreamComponents(tokenizer, new CrashingFilter(fieldName, tokenizer));
-      }
-    };
-
-    Document crashDoc = new Document();
-    crashDoc.add(newTextField("crash", "do it on token 4", Field.Store.YES));
-    try {
-      w.addDocument(crashDoc, analyzer);
-      fail("did not hit expected exception");
-    } catch (IOException ioe) {
-      // expected
-    }
-    w.addDocument(doc);
-    w.close();
-    dir.close();
-  }
-
-  private static final class MockIndexWriter3 extends IndexWriter {
-
-    public MockIndexWriter3(Directory dir, IndexWriterConfig conf) throws IOException {
-      super(dir, conf);
-    }
-
-    boolean doFail;
-    boolean failed;
-
-    @Override
-    boolean testPoint(String name) {
-      if (doFail && name.equals("startMergeInit")) {
-        failed = true;
-        throw new RuntimeException("intentionally failing");
-      }
-      return true;
-    }
-  }
-
-
-  // LUCENE-1210
-  public void testExceptionOnMergeInit() throws IOException {
-    Directory dir = newDirectory();
-    IndexWriterConfig conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random()))
-      .setMaxBufferedDocs(2).setMergeScheduler(new ConcurrentMergeScheduler()).setMergePolicy(newLogMergePolicy());
-    ((LogMergePolicy) conf.getMergePolicy()).setMergeFactor(2);
-    MockIndexWriter3 w = new MockIndexWriter3(dir, conf);
-    w.doFail = true;
-    Document doc = new Document();
-    doc.add(newTextField("field", "a field", Field.Store.YES));
-    for(int i=0;i<10;i++)
-      try {
-        w.addDocument(doc);
-      } catch (RuntimeException re) {
-        break;
-      }
-
-    ((ConcurrentMergeScheduler) w.getConfig().getMergeScheduler()).sync();
-    assertTrue(w.failed);
-    w.close();
-    dir.close();
-  }
-
-  // LUCENE-1072
-  public void testExceptionFromTokenStream() throws IOException {
-    Directory dir = newDirectory();
-    IndexWriterConfig conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new Analyzer() {
-
-      @Override
-      public TokenStreamComponents createComponents(String fieldName, Reader reader) {
-        MockTokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
-        tokenizer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-        return new TokenStreamComponents(tokenizer, new TokenFilter(tokenizer) {
-          private int count = 0;
-
-          @Override
-          public boolean incrementToken() throws IOException {
-            if (count++ == 5) {
-              throw new IOException();
-            }
-            return input.incrementToken();
-          }
-
-          @Override
-          public void reset() throws IOException {
-            super.reset();
-            this.count = 0;
-          }
-        });
-      }
-
-    });
-    conf.setMaxBufferedDocs(Math.max(3, conf.getMaxBufferedDocs()));
-
-    IndexWriter writer = new IndexWriter(dir, conf);
-
-    Document doc = new Document();
-    String contents = "aa bb cc dd ee ff gg hh ii jj kk";
-    doc.add(newTextField("content", contents, Field.Store.NO));
-    try {
-      writer.addDocument(doc);
-      fail("did not hit expected exception");
-    } catch (Exception e) {
-    }
-
-    // Make sure we can add another normal document
-    doc = new Document();
-    doc.add(newTextField("content", "aa bb cc dd", Field.Store.NO));
-    writer.addDocument(doc);
-
-    // Make sure we can add another normal document
-    doc = new Document();
-    doc.add(newTextField("content", "aa bb cc dd", Field.Store.NO));
-    writer.addDocument(doc);
-
-    writer.close();
-    IndexReader reader = DirectoryReader.open(dir);
-    final Term t = new Term("content", "aa");
-    assertEquals(3, reader.docFreq(t));
-
-    // Make sure the doc that hit the exception was marked
-    // as deleted:
-    DocsEnum tdocs = _TestUtil.docs(random(), reader,
-                                    t.field(),
-                                    new BytesRef(t.text()),
-                                    MultiFields.getLiveDocs(reader),
-                                    null,
-                                    0);
-
-    int count = 0;
-    while(tdocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-      count++;
-    }
-    assertEquals(2, count);
-
-    assertEquals(reader.docFreq(new Term("content", "gg")), 0);
-    reader.close();
-    dir.close();
-  }
-
-  private static class FailOnlyOnFlush extends MockDirectoryWrapper.Failure {
-    boolean doFail = false;
-    int count;
-
-    @Override
-    public void setDoFail() {
-      this.doFail = true;
-    }
-    @Override
-    public void clearDoFail() {
-      this.doFail = false;
-    }
-
-    @Override
-    public void eval(MockDirectoryWrapper dir)  throws IOException {
-      if (doFail) {
-        StackTraceElement[] trace = new Exception().getStackTrace();
-        boolean sawAppend = false;
-        boolean sawFlush = false;
-        for (int i = 0; i < trace.length; i++) {
-          if (FreqProxTermsWriterPerField.class.getName().equals(trace[i].getClassName()) && "flush".equals(trace[i].getMethodName()))
-            sawAppend = true;
-          if ("flush".equals(trace[i].getMethodName()))
-            sawFlush = true;
-        }
-
-        if (sawAppend && sawFlush && count++ >= 30) {
-          doFail = false;
-          throw new IOException("now failing during flush");
-        }
-      }
-    }
-  }
-
-  // LUCENE-1072: make sure an errant exception on flushing
-  // one segment only takes out those docs in that one flush
-  public void testDocumentsWriterAbort() throws IOException {
-    MockDirectoryWrapper dir = newMockDirectory();
-    FailOnlyOnFlush failure = new FailOnlyOnFlush();
-    failure.setDoFail();
-    dir.failOn(failure);
-
-    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMaxBufferedDocs(2));
-    Document doc = new Document();
-    String contents = "aa bb cc dd ee ff gg hh ii jj kk";
-    doc.add(newTextField("content", contents, Field.Store.NO));
-    boolean hitError = false;
-    for(int i=0;i<200;i++) {
-      try {
-        writer.addDocument(doc);
-      } catch (IOException ioe) {
-        // only one flush should fail:
-        assertFalse(hitError);
-        hitError = true;
-      }
-    }
-    assertTrue(hitError);
-    writer.close();
-    IndexReader reader = DirectoryReader.open(dir);
-    assertEquals(198, reader.docFreq(new Term("content", "aa")));
-    reader.close();
-    dir.close();
-  }
-
-  public void testDocumentsWriterExceptions() throws IOException {
-    Analyzer analyzer = new Analyzer(new Analyzer.PerFieldReuseStrategy()) {
-      @Override
-      public TokenStreamComponents createComponents(String fieldName, Reader reader) {
-        MockTokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.WHITESPACE, false);
-        tokenizer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-        return new TokenStreamComponents(tokenizer, new CrashingFilter(fieldName, tokenizer));
-      }
-    };
-
-    for(int i=0;i<2;i++) {
-      if (VERBOSE) {
-        System.out.println("TEST: cycle i=" + i);
-      }
-      Directory dir = newDirectory();
-      IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, analyzer).setMergePolicy(newLogMergePolicy()));
-
-      // don't allow a sudden merge to clean up the deleted
-      // doc below:
-      LogMergePolicy lmp = (LogMergePolicy) writer.getConfig().getMergePolicy();
-      lmp.setMergeFactor(Math.max(lmp.getMergeFactor(), 5));
-
-      Document doc = new Document();
-      doc.add(newField("contents", "here are some contents", DocCopyIterator.custom5));
-      writer.addDocument(doc);
-      writer.addDocument(doc);
-      doc.add(newField("crash", "this should crash after 4 terms", DocCopyIterator.custom5));
-      doc.add(newField("other", "this will not get indexed", DocCopyIterator.custom5));
-      try {
-        writer.addDocument(doc);
-        fail("did not hit expected exception");
-      } catch (IOException ioe) {
-        if (VERBOSE) {
-          System.out.println("TEST: hit expected exception");
-          ioe.printStackTrace(System.out);
-        }
-      }
-
-      if (0 == i) {
-        doc = new Document();
-        doc.add(newField("contents", "here are some contents", DocCopyIterator.custom5));
-        writer.addDocument(doc);
-        writer.addDocument(doc);
-      }
-      writer.close();
-
-      if (VERBOSE) {
-        System.out.println("TEST: open reader");
-      }
-      IndexReader reader = DirectoryReader.open(dir);
-      if (i == 0) { 
-        int expected = 5;
-        assertEquals(expected, reader.docFreq(new Term("contents", "here")));
-        assertEquals(expected, reader.maxDoc());
-        int numDel = 0;
-        final Bits liveDocs = MultiFields.getLiveDocs(reader);
-        assertNotNull(liveDocs);
-        for(int j=0;j<reader.maxDoc();j++) {
-          if (!liveDocs.get(j))
-            numDel++;
-          else {
-            reader.document(j);
-            reader.getTermVectors(j);
-          }
-        }
-        assertEquals(1, numDel);
-      }
-      reader.close();
-
-      writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT,
-          analyzer).setMaxBufferedDocs(10));
-      doc = new Document();
-      doc.add(newField("contents", "here are some contents", DocCopyIterator.custom5));
-      for(int j=0;j<17;j++)
-        writer.addDocument(doc);
-      writer.forceMerge(1);
-      writer.close();
-
-      reader = DirectoryReader.open(dir);
-      int expected = 19+(1-i)*2;
-      assertEquals(expected, reader.docFreq(new Term("contents", "here")));
-      assertEquals(expected, reader.maxDoc());
-      int numDel = 0;
-      assertNull(MultiFields.getLiveDocs(reader));
-      for(int j=0;j<reader.maxDoc();j++) {
-        reader.document(j);
-        reader.getTermVectors(j);
-      }
-      reader.close();
-      assertEquals(0, numDel);
-
-      dir.close();
-    }
-  }
-
-  public void testDocumentsWriterExceptionThreads() throws Exception {
-    Analyzer analyzer = new Analyzer(new Analyzer.PerFieldReuseStrategy()) {
-      @Override
-      public TokenStreamComponents createComponents(String fieldName, Reader reader) {
-        MockTokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.WHITESPACE, false);
-        tokenizer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-        return new TokenStreamComponents(tokenizer, new CrashingFilter(fieldName, tokenizer));
-      }
-    };
-
-    final int NUM_THREAD = 3;
-    final int NUM_ITER = 100;
-
-    for(int i=0;i<2;i++) {
-      Directory dir = newDirectory();
-
-      {
-        final IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
-            TEST_VERSION_CURRENT, analyzer).setMaxBufferedDocs(-1)
-            .setMergePolicy(
-                random().nextBoolean() ? NoMergePolicy.COMPOUND_FILES
-                    : NoMergePolicy.NO_COMPOUND_FILES));
-        // don't use a merge policy here they depend on the DWPThreadPool and its max thread states etc.
-        final int finalI = i;
-
-        Thread[] threads = new Thread[NUM_THREAD];
-        for(int t=0;t<NUM_THREAD;t++) {
-          threads[t] = new Thread() {
-              @Override
-              public void run() {
-                try {
-                  for(int iter=0;iter<NUM_ITER;iter++) {
-                    Document doc = new Document();
-                    doc.add(newField("contents", "here are some contents", DocCopyIterator.custom5));
-                    writer.addDocument(doc);
-                    writer.addDocument(doc);
-                    doc.add(newField("crash", "this should crash after 4 terms", DocCopyIterator.custom5));
-                    doc.add(newField("other", "this will not get indexed", DocCopyIterator.custom5));
-                    try {
-                      writer.addDocument(doc);
-                      fail("did not hit expected exception");
-                    } catch (IOException ioe) {
-                    }
-
-                    if (0 == finalI) {
-                      doc = new Document();
-                      doc.add(newField("contents", "here are some contents", DocCopyIterator.custom5));
-                      writer.addDocument(doc);
-                      writer.addDocument(doc);
-                    }
-                  }
-                } catch (Throwable t) {
-                  synchronized(this) {
-                    System.out.println(Thread.currentThread().getName() + ": ERROR: hit unexpected exception");
-                    t.printStackTrace(System.out);
-                  }
-                  fail();
-                }
-              }
-            };
-          threads[t].start();
-        }
-
-        for(int t=0;t<NUM_THREAD;t++)
-          threads[t].join();
-
-        writer.close();
-      }
-
-      IndexReader reader = DirectoryReader.open(dir);
-      int expected = (3+(1-i)*2)*NUM_THREAD*NUM_ITER;
-      assertEquals("i=" + i, expected, reader.docFreq(new Term("contents", "here")));
-      assertEquals(expected, reader.maxDoc());
-      int numDel = 0;
-      final Bits liveDocs = MultiFields.getLiveDocs(reader);
-      assertNotNull(liveDocs);
-      for(int j=0;j<reader.maxDoc();j++) {
-        if (!liveDocs.get(j))
-          numDel++;
-        else {
-          reader.document(j);
-          reader.getTermVectors(j);
-        }
-      }
-      reader.close();
-
-      assertEquals(NUM_THREAD*NUM_ITER, numDel);
-
-      IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
-          TEST_VERSION_CURRENT, analyzer).setMaxBufferedDocs(10));
-      Document doc = new Document();
-      doc.add(newField("contents", "here are some contents", DocCopyIterator.custom5));
-      for(int j=0;j<17;j++)
-        writer.addDocument(doc);
-      writer.forceMerge(1);
-      writer.close();
-
-      reader = DirectoryReader.open(dir);
-      expected += 17-NUM_THREAD*NUM_ITER;
-      assertEquals(expected, reader.docFreq(new Term("contents", "here")));
-      assertEquals(expected, reader.maxDoc());
-      assertNull(MultiFields.getLiveDocs(reader));
-      for(int j=0;j<reader.maxDoc();j++) {
-        reader.document(j);
-        reader.getTermVectors(j);
-      }
-      reader.close();
-
-      dir.close();
-    }
-  }
-
-  // Throws IOException during MockDirectoryWrapper.sync
-  private static class FailOnlyInSync extends MockDirectoryWrapper.Failure {
-    boolean didFail;
-    @Override
-    public void eval(MockDirectoryWrapper dir)  throws IOException {
-      if (doFail) {
-        StackTraceElement[] trace = new Exception().getStackTrace();
-        for (int i = 0; i < trace.length; i++) {
-          if (doFail && MockDirectoryWrapper.class.getName().equals(trace[i].getClassName()) && "sync".equals(trace[i].getMethodName())) {
-            didFail = true;
-            if (VERBOSE) {
-              System.out.println("TEST: now throw exc:");
-              new Throwable().printStackTrace(System.out);
-            }
-            throw new IOException("now failing on purpose during sync");
-          }
-        }
-      }
-    }
-  }
-
-  // TODO: these are also in TestIndexWriter... add a simple doc-writing method
-  // like this to LuceneTestCase?
-  private void addDoc(IndexWriter writer) throws IOException
-  {
-      Document doc = new Document();
-      doc.add(newTextField("content", "aaa", Field.Store.NO));
-      writer.addDocument(doc);
-  }
-
-  // LUCENE-1044: test exception during sync
-  public void testExceptionDuringSync() throws IOException {
-    MockDirectoryWrapper dir = newMockDirectory();
-    FailOnlyInSync failure = new FailOnlyInSync();
-    dir.failOn(failure);
-
-    IndexWriter writer = new IndexWriter(
-        dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
-            setMaxBufferedDocs(2).
-            setMergeScheduler(new ConcurrentMergeScheduler()).
-            setMergePolicy(newLogMergePolicy(5))
-    );
-    failure.setDoFail();
-
-    for (int i = 0; i < 23; i++) {
-      addDoc(writer);
-      if ((i-1)%2 == 0) {
-        try {
-          writer.commit();
-        } catch (IOException ioe) {
-          // expected
-        }
-      }
-    }
-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
-    assertTrue(failure.didFail);
-    failure.clearDoFail();
-    writer.close();
-
-    IndexReader reader = DirectoryReader.open(dir);
-    assertEquals(23, reader.numDocs());
-    reader.close();
-    dir.close();
-  }
-
-  private static class FailOnlyInCommit extends MockDirectoryWrapper.Failure {
-
-    boolean failOnCommit, failOnDeleteFile;
-    private final boolean dontFailDuringGlobalFieldMap;
-    private static final String PREPARE_STAGE = "prepareCommit";
-    private static final String FINISH_STAGE = "finishCommit";
-    private final String stage;
-    
-    public FailOnlyInCommit(boolean dontFailDuringGlobalFieldMap, String stage) {
-      this.dontFailDuringGlobalFieldMap = dontFailDuringGlobalFieldMap;
-      this.stage = stage;
-    }
-
-    @Override
-    public void eval(MockDirectoryWrapper dir)  throws IOException {
-      StackTraceElement[] trace = new Exception().getStackTrace();
-      boolean isCommit = false;
-      boolean isDelete = false;
-      boolean isInGlobalFieldMap = false;
-      for (int i = 0; i < trace.length; i++) {
-        if (SegmentInfos.class.getName().equals(trace[i].getClassName()) && stage.equals(trace[i].getMethodName()))
-          isCommit = true;
-        if (MockDirectoryWrapper.class.getName().equals(trace[i].getClassName()) && "deleteFile".equals(trace[i].getMethodName()))
-          isDelete = true;
-        if (SegmentInfos.class.getName().equals(trace[i].getClassName()) && "writeGlobalFieldMap".equals(trace[i].getMethodName()))
-          isInGlobalFieldMap = true;
-          
-      }
-      if (isInGlobalFieldMap && dontFailDuringGlobalFieldMap) {
-        isCommit = false;
-      }
-      if (isCommit) {
-        if (!isDelete) {
-          failOnCommit = true;
-          throw new RuntimeException("now fail first");
-        } else {
-          failOnDeleteFile = true;
-          throw new IOException("now fail during delete");
-        }
-      }
-    }
-  }
-
-  public void testExceptionsDuringCommit() throws Throwable {
-    FailOnlyInCommit[] failures = new FailOnlyInCommit[] {
-        // LUCENE-1214
-        new FailOnlyInCommit(false, FailOnlyInCommit.PREPARE_STAGE), // fail during global field map is written
-        new FailOnlyInCommit(true, FailOnlyInCommit.PREPARE_STAGE), // fail after global field map is written
-        new FailOnlyInCommit(false, FailOnlyInCommit.FINISH_STAGE)  // fail while running finishCommit    
-    };
-    
-    for (FailOnlyInCommit failure : failures) {
-      MockDirectoryWrapper dir = newMockDirectory();
-      dir.setFailOnCreateOutput(false);
-      IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(
-          TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-      Document doc = new Document();
-      doc.add(newTextField("field", "a field", Field.Store.YES));
-      w.addDocument(doc);
-      dir.failOn(failure);
-      try {
-        w.close();
-        fail();
-      } catch (IOException ioe) {
-        fail("expected only RuntimeException");
-      } catch (RuntimeException re) {
-        // Expected
-      }
-      assertTrue(failure.failOnCommit && failure.failOnDeleteFile);
-      w.rollback();
-      assertEquals(0, dir.listAll().length);
-      dir.close();
-    }
-  }
-
-  public void testForceMergeExceptions() throws IOException {
-    Directory startDir = newDirectory();
-    IndexWriterConfig conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMaxBufferedDocs(2).setMergePolicy(newLogMergePolicy());
-    ((LogMergePolicy) conf.getMergePolicy()).setMergeFactor(100);
-    IndexWriter w = new IndexWriter(startDir, conf);
-    for(int i=0;i<27;i++)
-      addDoc(w);
-    w.close();
-
-    int iter = TEST_NIGHTLY ? 200 : 10;
-    for(int i=0;i<iter;i++) {
-      if (VERBOSE) {
-        System.out.println("TEST: iter " + i);
-      }
-      MockDirectoryWrapper dir = new MockDirectoryWrapper(random(), new RAMDirectory(startDir, newIOContext(random())));
-      conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergeScheduler(new ConcurrentMergeScheduler());
-      ((ConcurrentMergeScheduler) conf.getMergeScheduler()).setSuppressExceptions();
-      w = new IndexWriter(dir, conf);
-      dir.setRandomIOExceptionRate(0.5);
-      try {
-        w.forceMerge(1);
-      } catch (IOException ioe) {
-        if (ioe.getCause() == null)
-          fail("forceMerge threw IOException without root cause");
-      }
-      dir.setRandomIOExceptionRate(0);
-      w.close();
-      dir.close();
-    }
-    startDir.close();
-  }
-
-  // LUCENE-1429
-  public void testOutOfMemoryErrorCausesCloseToFail() throws Exception {
-
-    final AtomicBoolean thrown = new AtomicBoolean(false);
-    final Directory dir = newDirectory();
-    final IndexWriter writer = new IndexWriter(dir,
-        newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())).setInfoStream(new InfoStream() {
-        @Override
-        public void message(String component, final String message) {
-          if (message.startsWith("now flush at close") && thrown.compareAndSet(false, true)) {
-            throw new OutOfMemoryError("fake OOME at " + message);
-          }
-        }
-
-        @Override
-        public boolean isEnabled(String component) {
-          return true;
+          slices.add(new DocValuesSlice(d, ctx.docBase, r.maxDoc()));
         }
         
-        @Override
-        public void close() {}
-      }));
-
-    try {
-      writer.close();
-      fail("OutOfMemoryError expected");
+        // return null if no docvalues encountered anywhere
+        if (promotedType == TypePromoter.getIdentityPromoter()) {
+          return null;
+        }
+             
+        // populate starts and fill gaps with empty docvalues 
+        int starts[] = new int[slices.size()];
+        for (int i = 0; i < slices.size(); i++) {
+          DocValuesSlice slice = slices.get(i);
+          starts[i] = slice.start;
+          if (slice.docValues == null) {
+            Type promoted = promotedType.type();
+            switch(promoted) {
+              case BYTES_FIXED_DEREF:
+              case BYTES_FIXED_STRAIGHT:
+              case BYTES_FIXED_SORTED:
+                assert promotedType.getValueSize() >= 0;
+                slice.docValues = new EmptyFixedDocValues(slice.length, promoted, promotedType.getValueSize());
+                break;
+              default:
+                slice.docValues = new EmptyDocValues(slice.length, promoted);
+            }
+          }
+        }
+        
+        return new MultiDocValues(slices.toArray(new DocValuesSlice[slices.size()]), starts, promotedType);
     }
-    catch (final OutOfMemoryError expected) {}
-
-    // throws IllegalStateEx w/o bug fix
-    writer.close();
-    dir.close();
   }
 
-  // LUCENE-1347
-  private static final class MockIndexWriter4 extends IndexWriter {
+  @Override
+  public Source load() throws IOException {
+    return new MultiSource(slices, starts, false, type);
+  }
 
-    public MockIndexWriter4(Directory dir, IndexWriterConfig conf) throws IOException {
-      super(dir, conf);
+  public static class EmptyDocValues extends DocValues {
+    final int maxDoc;
+    final Source emptySource;
+
+    public EmptyDocValues(int maxDoc, Type type) {
+      this.maxDoc = maxDoc;
+      this.emptySource = new EmptySource(type);
     }
-
-    boolean doFail;
 
     @Override
-    boolean testPoint(String name) {
-      if (doFail && name.equals("rollback before checkpoint"))
-        throw new RuntimeException("intentionally failing");
-      return true;
-    }
-  }
-
-  // LUCENE-1347
-  public void testRollbackExceptionHang() throws Throwable {
-    Directory dir = newDirectory();
-    MockIndexWriter4 w = new MockIndexWriter4(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-
-    addDoc(w);
-    w.doFail = true;
-    try {
-      w.rollback();
-      fail("did not hit intentional RuntimeException");
-    } catch (RuntimeException re) {
-      // expected
+    public Source load() throws IOException {
+      return emptySource;
     }
 
-    w.doFail = false;
-    w.rollback();
-    dir.close();
-  }
-
-  // LUCENE-1044: Simulate checksum error in segments_N
-  public void testSegmentsChecksumError() throws IOException {
-    Directory dir = newDirectory();
-
-    IndexWriter writer = null;
-
-    writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-
-    // add 100 documents
-    for (int i = 0; i < 100; i++) {
-      addDoc(writer);
+    @Override
+    public Type getType() {
+      return emptySource.getType();
     }
 
-    // close
-    writer.close();
-
-    long gen = SegmentInfos.getLastCommitGeneration(dir);
-    assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
-
-    final String segmentsFileName = SegmentInfos.getLastCommitSegmentsFileName(dir);
-    IndexInput in = dir.openInput(segmentsFileName, newIOContext(random()));
-    IndexOutput out = dir.createOutput(IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS, "", 1+gen), newIOContext(random()));
-    out.copyBytes(in, in.length()-1);
-    byte b = in.readByte();
-    out.writeByte((byte) (1+b));
-    out.close();
-    in.close();
-
-    IndexReader reader = null;
-    try {
-      reader = DirectoryReader.open(dir);
-    } catch (IOException e) {
-      e.printStackTrace(System.out);
-      fail("segmentInfos failed to retry fallback to correct segments_N file");
-    }
-    reader.close();
-    dir.close();
-  }
-
-  // Simulate a corrupt index by removing last byte of
-  // latest segments file and make sure we get an
-  // IOException trying to open the index:
-  public void testSimulatedCorruptIndex1() throws IOException {
-      BaseDirectoryWrapper dir = newDirectory();
-      dir.setCheckIndexOnClose(false); // we are corrupting it!
-
-      IndexWriter writer = null;
-
-      writer  = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-
-      // add 100 documents
-      for (int i = 0; i < 100; i++) {
-          addDoc(writer);
-      }
-
-      // close
-      writer.close();
-
-      long gen = SegmentInfos.getLastCommitGeneration(dir);
-      assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
-
-      String fileNameIn = SegmentInfos.getLastCommitSegmentsFileName(dir);
-      String fileNameOut = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                 "",
-                                                                 1+gen);
-      IndexInput in = dir.openInput(fileNameIn, newIOContext(random()));
-      IndexOutput out = dir.createOutput(fileNameOut, newIOContext(random()));
-      long length = in.length();
-      for(int i=0;i<length-1;i++) {
-        out.writeByte(in.readByte());
-      }
-      in.close();
-      out.close();
-      dir.deleteFile(fileNameIn);
-
-      IndexReader reader = null;
-      try {
-        reader = DirectoryReader.open(dir);
-        fail("reader did not hit IOException on opening a corrupt index");
-      } catch (Exception e) {
-      }
-      if (reader != null) {
-        reader.close();
-      }
-      dir.close();
-  }
-
-  // Simulate a corrupt index by removing one of the cfs
-  // files and make sure we get an IOException trying to
-  // open the index:
-  public void testSimulatedCorruptIndex2() throws IOException {
-    BaseDirectoryWrapper dir = newDirectory();
-    dir.setCheckIndexOnClose(false); // we are corrupting it!
-    IndexWriter writer = null;
-
-    writer  = new IndexWriter(
-                              dir,
-                              newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
-                              setMergePolicy(newLogMergePolicy(true))
-                              );
-    ((LogMergePolicy) writer.getConfig().getMergePolicy()).setNoCFSRatio(1.0);
-
-    // add 100 documents
-    for (int i = 0; i < 100; i++) {
-      addDoc(writer);
-    }
-
-    // close
-    writer.close();
-
-    long gen = SegmentInfos.getLastCommitGeneration(dir);
-    assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
-
-    String[] files = dir.listAll();
-    boolean corrupted = false;
-    for(int i=0;i<files.length;i++) {
-      if (files[i].endsWith(".cfs")) {
-        dir.deleteFile(files[i]);
-        corrupted = true;
-        break;
-      }
-    }
-    assertTrue("failed to find cfs file to remove", corrupted);
-
-    IndexReader reader = null;
-    try {
-      reader = DirectoryReader.open(dir);
-      fail("reader did not hit IOException on opening a corrupt index");
-    } catch (Exception e) {
-    }
-    if (reader != null) {
-      reader.close();
-    }
-    dir.close();
-  }
-
-  // Simulate a writer that crashed while writing segments
-  // file: make sure we can still open the index (ie,
-  // gracefully fallback to the previous segments file),
-  // and that we can add to the index:
-  public void testSimulatedCrashedWriter() throws IOException {
-      Directory dir = newDirectory();
-      if (dir instanceof MockDirectoryWrapper) {
-        ((MockDirectoryWrapper)dir).setPreventDoubleWrite(false);
-      }
-
-      IndexWriter writer = null;
-
-      writer  = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-
-      // add 100 documents
-      for (int i = 0; i < 100; i++) {
-          addDoc(writer);
-      }
-
-      // close
-      writer.close();
-
-      long gen = SegmentInfos.getLastCommitGeneration(dir);
-      assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
-
-      // Make the next segments file, with last byte
-      // missing, to simulate a writer that crashed while
-      // writing segments file:
-      String fileNameIn = SegmentInfos.getLastCommitSegmentsFileName(dir);
-      String fileNameOut = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                 "",
-                                                                 1+gen);
-      IndexInput in = dir.openInput(fileNameIn, newIOContext(random()));
-      IndexOutput out = dir.createOutput(fileNameOut, newIOContext(random()));
-      long length = in.length();
-      for(int i=0;i<length-1;i++) {
-        out.writeByte(in.readByte());
-      }
-      in.close();
-      out.close();
-
-      IndexReader reader = null;
-      try {
-        reader = DirectoryReader.open(dir);
-      } catch (Exception e) {
-        fail("reader failed to open on a crashed index");
-      }
-      reader.close();
-
-      try {
-        writer  = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random())).setOpenMode(OpenMode.CREATE));
-      } catch (Exception e) {
-        e.printStackTrace(System.out);
-        fail("writer failed to open on a crashed index");
-      }
-
-      // add 100 documents
-      for (int i = 0; i < 100; i++) {
-          addDoc(writer);
-      }
-
-      // close
-      writer.close();
-      dir.close();
-  }
-
-  public void testTermVectorExceptions() throws IOException {
-    FailOnTermVectors[] failures = new FailOnTermVectors[] {
-        new FailOnTermVectors(FailOnTermVectors.AFTER_INIT_STAGE),
-        new FailOnTermVectors(FailOnTermVectors.INIT_STAGE), };
-    int num = atLeast(1);
-    for (int j = 0; j < num; j++) {
-      for (FailOnTermVectors failure : failures) {
-        MockDirectoryWrapper dir = newMockDirectory();
-        IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(
-            TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-        dir.failOn(failure);
-        int numDocs = 10 + random().nextInt(30);
-        for (int i = 0; i < numDocs; i++) {
-          Document doc = new Document();
-          Field field = newTextField(random(), "field", "a field", Field.Store.YES);
-          doc.add(field);
-          // random TV
-          try {
-            w.addDocument(doc);
-            assertFalse(field.fieldType().storeTermVectors());
-          } catch (RuntimeException e) {
-            assertTrue(e.getMessage().startsWith(FailOnTermVectors.EXC_MSG));
-          }
-          if (random().nextInt(20) == 0) {
-            w.commit();
-            _TestUtil.checkIndex(dir);
-          }
-            
-        }
-        Document document = new Document();
-        document.add(new TextField("field", "a field", Field.Store.YES));
-        w.addDocument(document);
-
-        for (int i = 0; i < numDocs; i++) {
-          Document doc = new Document();
-          Field field = newTextField(random(), "field", "a field", Field.Store.YES);
-          doc.add(field);
-          // random TV
-          try {
-            w.addDocument(doc);
-            assertFalse(field.fieldType().storeTermVectors());
-          } catch (RuntimeException e) {
-            assertTrue(e.getMessage().startsWith(FailOnTermVectors.EXC_MSG));
-          }
-          if (random().nextInt(20) == 0) {
-            w.commit();
-            _TestUtil.checkIndex(dir);
-          }
-        }
-        document = new Document();
-        document.add(new TextField("field", "a field", Field.Store.YES));
-        w.addDocument(document);
-        w.close();
-        IndexReader reader = DirectoryReader.open(dir);
-        assertTrue(reader.numDocs() > 0);
-        SegmentInfos sis = new SegmentInfos();
-        sis.read(dir);
-        for(AtomicReaderContext context : reader.getTopReaderContext().leaves()) {
-          assertFalse(context.reader().getFieldInfos().hasVectors());
-        }
-        reader.close();
-        dir.close();
-      }
+    @Override
+    public Source getDirectSource() throws IOException {
+      return emptySource;
     }
   }
   
-  private static class FailOnTermVectors extends MockDirectoryWrapper.Failure {
+  public static class EmptyFixedDocValues extends DocValues {
+    final int maxDoc;
+    final Source emptyFixedSource;
+    final int valueSize;
 
-    private static final String INIT_STAGE = "initTermVectorsWriter";
-    private static final String AFTER_INIT_STAGE = "finishDocument";
-    private static final String EXC_MSG = "FOTV";
-    private final String stage;
-    
-    public FailOnTermVectors(String stage) {
-      this.stage = stage;
+    public EmptyFixedDocValues(int maxDoc, Type type, int valueSize) {
+      this.maxDoc = maxDoc;
+      this.emptyFixedSource = new EmptyFixedSource(type, valueSize);
+      this.valueSize = valueSize;
     }
 
     @Override
-    public void eval(MockDirectoryWrapper dir)  throws IOException {
+    public Source load() throws IOException {
+      return emptyFixedSource;
+    }
 
-      StackTraceElement[] trace = new Exception().getStackTrace();
-      boolean fail = false;
-      for (int i = 0; i < trace.length; i++) {
-        if (TermVectorsConsumer.class.getName().equals(trace[i].getClassName()) && stage.equals(trace[i].getMethodName())) {
-          fail = true;
-        }
-      }
-      
-      if (fail) {
-        throw new RuntimeException(EXC_MSG);
-      }
+    @Override
+    public Type getType() {
+      return emptyFixedSource.getType();
+    }
+
+    @Override
+    public int getValueSize() {
+      return valueSize;
+    }
+
+    @Override
+    public Source getDirectSource() throws IOException {
+      return emptyFixedSource;
     }
   }
 
-  public void testAddDocsNonAbortingException() throws Exception {
-    final Directory dir = newDirectory();
-    final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
-    final int numDocs1 = random().nextInt(25);
-    for(int docCount=0;docCount<numDocs1;docCount++) {
-      Document doc = new Document();
-      doc.add(newTextField("content", "good content", Field.Store.NO));
-      w.addDocument(doc);
+  private static class MultiSource extends Source {
+    private int numDocs = 0;
+    private int start = 0;
+    private Source current;
+    private final int[] starts;
+    private final DocValuesSlice[] slices;
+    private boolean direct;
+    private Object cachedArray; // cached array if supported
+
+    public MultiSource(DocValuesSlice[] slices, int[] starts, boolean direct, Type type) {
+      super(type);
+      this.slices = slices;
+      this.starts = starts;
+      assert slices.length != 0;
+      this.direct = direct;
+    }
+
+    public long getInt(int docID) {
+      final int doc = ensureSource(docID);
+      return current.getInt(doc);
+    }
+
+    private final int ensureSource(int docID) {
+      if (docID >= start && docID < start+numDocs) {
+        return docID - start;
+      } else {
+        final int idx = ReaderUtil.subIndex(docID, starts);
+        assert idx >= 0 && idx < slices.length : "idx was " + idx
+            + " for doc id: " + docID + " slices : " + Arrays.toString(starts);
+        assert slices[idx] != null;
+        try {
+          if (direct) {
+            current = slices[idx].docValues.getDirectSource();
+          } else {
+            current = slices[idx].docValues.getSource();
+          }
+        } catch (IOException e) {
+          throw new RuntimeException("load failed", e); // TODO how should we
+          // handle this
+        }
+
+        start = slices[idx].start;
+        numDocs = slices[idx].length;
+        return docID - start;
+      }
+    }
+
+    public double getFloat(int docID) {
+      final int doc = ensureSource(docID);
+      return current.getFloat(doc);
+    }
+
+    public BytesRef getBytes(int docID, BytesRef bytesRef) {
+      final int doc = ensureSource(docID);
+      return current.getBytes(doc, bytesRef);
+    }
+
+    @Override
+    public SortedSource asSortedSource() {
+      try {
+        if (type == Type.BYTES_FIXED_SORTED || type == Type.BYTES_VAR_SORTED) {
+          DocValues[] values = new DocValues[slices.length];
+          Comparator<BytesRef> comp = null;
+          for (int i = 0; i < values.length; i++) {
+            values[i] = slices[i].docValues;
+            if (!(values[i] instanceof EmptyDocValues)) {
+              Comparator<BytesRef> comparator = values[i].getDirectSource()
+                  .asSortedSource().getComparator();
+              assert comp == null || comp == comparator;
+              comp = comparator;
+            }
+          }
+          assert comp != null;
+          final int globalNumDocs = globalNumDocs();
+          final MergeContext ctx = SortedBytesMergeUtils.init(type, values,
+              comp, globalNumDocs);
+          List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(
+              docBases(), new MergeState.DocMap[values.length], values, ctx);
+          RecordingBytesRefConsumer consumer = new RecordingBytesRefConsumer(
+              type);
+          final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, consumer,
+              slices);
+          final int[] docToOrd = new int[globalNumDocs];
+          for (SortedSourceSlice slice : slices) {
+            slice.toAbsolutOrds(docToOrd);
+          }
+          return new MultiSortedSource(type, comp, consumer.pagedBytes,
+              ctx.sizePerValues, maxOrd, docToOrd, consumer.ordToOffset);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("load failed", e);
+      }
+      return super.asSortedSource();
     }
     
-    final List<Document> docs = new ArrayList<Document>();
-    for(int docCount=0;docCount<7;docCount++) {
-      Document doc = new Document();
-      docs.add(doc);
-      doc.add(newStringField("id", docCount+"", Field.Store.NO));
-      doc.add(newTextField("content", "silly content " + docCount, Field.Store.NO));
-      if (docCount == 4) {
-        Field f = newTextField("crash", "", Field.Store.NO);
-        doc.add(f);
-        MockTokenizer tokenizer = new MockTokenizer(new StringReader("crash me on the 4th token"), MockTokenizer.WHITESPACE, false);
-        tokenizer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-        f.setTokenStream(new CrashingFilter("crash", tokenizer));
+    private int globalNumDocs() {
+      int docs = 0;
+      for (int i = 0; i < slices.length; i++) {
+        docs += slices[i].length;
       }
+      return docs;
     }
-    try {
-      w.addDocuments(docs);
-      // BUG: CrashingFilter didn't
-      fail("did not hit expected exception");
-    } catch (IOException ioe) {
-      // expected
-      assertEquals(CRASH_FAIL_MESSAGE, ioe.getMessage());
-    }
-
-    final int numDocs2 = random().nextInt(25);
-    for(int docCount=0;docCount<numDocs2;docCount++) {
-      Document doc = new Document();
-      doc.add(newTextField("content", "good content", Field.Store.NO));
-      w.addDocument(doc);
-    }
-
-    final IndexReader r = w.getReader();
-    w.close();
-
-    final IndexSearcher s = new IndexSearcher(r);
-    PhraseQuery pq = new PhraseQuery();
-    pq.add(new Term("content", "silly"));
-    pq.add(new Term("content", "content"));
-    assertEquals(0, s.search(pq, 1).totalHits);
-
-    pq = new PhraseQuery();
-    pq.add(new Term("content", "good"));
-    pq.add(new Term("content", "content"));
-    assertEquals(numDocs1+numDocs2, s.search(pq, 1).totalHits);
-    r.close();
-    dir.close();
-  }
-
-
-  public void testUpdateDocsNonAbortingException() throws Exception {
-    final Directory dir = newDirectory();
-    final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
-    final int numDocs1 = random().nextInt(25);
-    for(int docCount=0;docCount<numDocs1;docCount++) {
-      Document doc = new Document();
-      doc.add(newTextField("content", "good content", Field.Store.NO));
-      w.addDocument(doc);
-    }
-
-    // Use addDocs (no exception) to get docs in the index:
-    final List<Document> docs = new ArrayList<Document>();
-    final int numDocs2 = random().nextInt(25);
-    for(int docCount=0;docCount<numDocs2;docCount++) {
-      Document doc = new Document();
-      docs.add(doc);
-      doc.add(newStringField("subid", "subs", Field.Store.NO));
-      doc.add(newStringField("id", docCount+"", Field.Store.NO));
-      doc.add(newTextField("content", "silly content " + docCount, Field.Store.NO));
-    }
-    w.addDocuments(docs);
-
-    final int numDocs3 = random().nextInt(25);
-    for(int docCount=0;docCount<numDocs3;docCount++) {
-      Document doc = new Document();
-      doc.add(newTextField("content", "good content", Field.Store.NO));
-      w.addDocument(doc);
-    }
-
-    docs.clear();
-    final int limit = _TestUtil.nextInt(random(), 2, 25);
-    final int crashAt = random().nextInt(limit);
-    for(int docCount=0;docCount<limit;docCount++) {
-      Document doc = new Document();
-      docs.add(doc);
-      doc.add(newStringField("id", docCount+"", Field.Store.NO));
-      doc.add(newTextField("content", "silly content " + docCount, Field.Store.NO));
-      if (docCount == crashAt) {
-        Field f = newTextField("crash", "", Field.Store.NO);
-        doc.add(f);
-        MockTokenizer tokenizer = new MockTokenizer(new StringReader("crash me on the 4th token"), MockTokenizer.WHITESPACE, false);
-        tokenizer.setEnableChecks(false); // disable workflow checking as we forcefully close() in exceptional cases.
-        f.setTokenStream(new CrashingFilter("crash", tokenizer));
+    
+    private int[] docBases() {
+      int[] docBases = new int[slices.length];
+      for (int i = 0; i < slices.length; i++) {
+        docBases[i] = slices[i].start;
       }
+      return docBases;
     }
-
-    try {
-      w.updateDocuments(new Term("subid", "subs"), docs);
-      // BUG: CrashingFilter didn't
-      fail("did not hit expected exception");
-    } catch (IOException ioe) {
-      // expected
-      assertEquals(CRASH_FAIL_MESSAGE, ioe.getMessage());
+    
+    public boolean hasArray() {
+      boolean oneRealSource = false;
+      for (DocValuesSlice slice : slices) {
+        try {
+          Source source = slice.docValues.getSource();
+          if (source instanceof EmptySource) {
+            /*
+             * empty source marks a gap in the array skip if we encounter one
+             */
+            continue;
+          }
+          oneRealSource = true;
+          if (!source.hasArray()) {
+            return false;
+          }
+        } catch (IOException e) {
+          throw new RuntimeException("load failed", e);
+        }
+      }
+      return oneRealSource;
     }
-
-    final int numDocs4 = random().nextInt(25);
-    for(int docCount=0;docCount<numDocs4;docCount++) {
-      Document doc = new Document();
-      doc.add(newTextField("content", "good content", Field.Store.NO));
-      w.addDocument(doc);
-    }
-
-    final IndexReader r = w.getReader();
-    w.close();
-
-    final IndexSearcher s = new IndexSearcher(r);
-    PhraseQuery pq = new PhraseQuery();
-    pq.add(new Term("content", "silly"));
-    pq.add(new Term("content", "content"));
-    assertEquals(numDocs2, s.search(pq, 1).totalHits);
-
-    pq = new PhraseQuery();
-    pq.add(new Term("content", "good"));
-    pq.add(new Term("content", "content"));
-    assertEquals(numDocs1+numDocs3+numDocs4, s.search(pq, 1).totalHits);
-    r.close();
-    dir.close();
-  }
-  
-  static class UOEDirectory extends RAMDirectory {
-    boolean doFail = false;
 
     @Override
-    public IndexInput openInput(String name, IOContext context) throws IOException {
-      if (doFail && name.startsWith("segments_")) {
-        StackTraceElement[] trace = new Exception().getStackTrace();
-        for (int i = 0; i < trace.length; i++) {
-          if ("indexExists".equals(trace[i].getMethodName())) {
-            throw new UnsupportedOperationException("expected UOE");
-          }
-        }
+    public Object getArray() {
+      if (!hasArray()) {
+        return null;
       }
-      return super.openInput(name, context);
+      try {
+        Class<?> componentType = null;
+        Object[] arrays = new Object[slices.length];
+        int numDocs = 0;
+        for (int i = 0; i < slices.length; i++) {
+          DocValuesSlice slice = slices[i];
+          Source source = slice.docValues.getSource();
+          Object array = null;
+          if (!(source instanceof EmptySource)) {
+            // EmptySource is skipped - marks a gap in the array
+            array = source.getArray();
+          }
+          numDocs += slice.length;
+          if (array != null) {
+            if (componentType == null) {
+              componentType = array.getClass().getComponentType();
+            }
+            assert componentType == array.getClass().getComponentType();
+          }
+          arrays[i] = array;
+        }
+        assert componentType != null;
+        synchronized (this) {
+          if (cachedArray != null) {
+            return cachedArray;
+          }
+          final Object globalArray = Array.newInstance(componentType, numDocs);
+
+          for (int i = 0; i < slices.length; i++) {
+            DocValuesSlice slice = slices[i];
+            if (arrays[i] != null) {
+              assert slice.length == Array.getLength(arrays[i]);
+              System.arraycopy(arrays[i], 0, globalArray, slice.start,
+                  slice.length);
+            }
+          }
+          return cachedArray = globalArray;
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("load failed", e);
+      }
     }
   }
   
-  public void testExceptionOnCtor() throws Exception {
-    UOEDirectory uoe = new UOEDirectory();
-    Directory d = new MockDirectoryWrapper(random(), uoe);
-    IndexWriter iw = new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, null));
-    iw.addDocument(new Document());
-    iw.close();
-    uoe.doFail = true;
-    try {
-      new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, null));
-      fail("should have gotten a UOE");
-    } catch (UnsupportedOperationException expected) {
-      
+  private static final class RecordingBytesRefConsumer implements SortedBytesMergeUtils.BytesRefConsumer {
+    private final static int PAGED_BYTES_BITS = 15;
+    final PagedBytes pagedBytes = new PagedBytes(PAGED_BYTES_BITS);
+    long[] ordToOffset;
+    
+    public RecordingBytesRefConsumer(Type type) {
+      ordToOffset = type == Type.BYTES_VAR_SORTED ? new long[2] : null;
     }
-    uoe.doFail = false;
-    d.close();
+    @Override
+    public void consume(BytesRef ref, int ord, long offset) {
+      pagedBytes.copy(ref);
+      if (ordToOffset != null) {
+        if (ord+1 >= ordToOffset.length) {
+          ordToOffset = ArrayUtil.grow(ordToOffset, ord + 2);
+        }
+        ordToOffset[ord+1] = offset;
+      }
+    }
+    
   }
   
-  public void testIllegalPositions() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriter iw = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, null));
-    Document doc = new Document();
-    Token t1 = new Token("foo", 0, 3);
-    t1.setPositionIncrement(Integer.MAX_VALUE);
-    Token t2 = new Token("bar", 4, 7);
-    t2.setPositionIncrement(200);
-    TokenStream overflowingTokenStream = new CannedTokenStream(
-        new Token[] { t1, t2 }
-    );
-    Field field = new TextField("foo", overflowingTokenStream);
-    doc.add(field);
-    try {
-      iw.addDocument(doc);
-      fail();
-    } catch (IllegalArgumentException expected) {
-      // expected exception
+  private static final class MultiSortedSource extends SortedSource {
+    private final PagedBytes.Reader data;
+    private final int[] docToOrd;
+    private final long[] ordToOffset;
+    private int size;
+    private int valueCount;
+    public MultiSortedSource(Type type, Comparator<BytesRef> comparator, PagedBytes pagedBytes, int size, int numValues, int[] docToOrd, long[] ordToOffset) {
+      super(type, comparator);
+      data = pagedBytes.freeze(true);
+      this.size = size;
+      this.valueCount = numValues;
+      this.docToOrd = docToOrd;
+      this.ordToOffset = ordToOffset;
     }
-    iw.close();
-    dir.close();
+
+    @Override
+    public int ord(int docID) {
+      return docToOrd[docID];
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      int size = this.size;
+      long offset = (ord*size);
+      if (ordToOffset != null) {
+        offset =  ordToOffset[ord];
+        size = (int) (ordToOffset[1 + ord] - offset);
+      }
+      assert size >=0;
+      return data.fillSlice(bytesRef, offset, size);
+     }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return valueCount;
+    }
+  }
+
+  // TODO: this is dup of DocValues.getDefaultSource()?
+  private static class EmptySource extends SortedSource {
+
+    public EmptySource(Type type) {
+      super(type, BytesRef.getUTF8SortedAsUnicodeComparator());
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.length = 0;
+      return ref;
+    }
+
+    @Override
+    public double getFloat(int docID) {
+      return 0d;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return 0;
+    }
+
+    @Override
+    public SortedSource asSortedSource() {
+      if (getType() == Type.BYTES_FIXED_SORTED || getType() == Type.BYTES_VAR_SORTED) {
+        
+      }
+      return super.asSortedSource();
+    }
+
+    @Override
+    public int ord(int docID) {
+      return 0;
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.length = 0;
+      bytesRef.offset = 0;
+      return bytesRef;
+    }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return 1;
+    }
+    
   }
   
-  public void testLegalbutVeryLargePositions() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriter iw = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, null));
-    Document doc = new Document();
-    Token t1 = new Token("foo", 0, 3);
-    t1.setPositionIncrement(Integer.MAX_VALUE-500);
-    if (random().nextBoolean()) {
-      t1.setPayload(new BytesRef(new byte[] { 0x1 } ));
+  private static class EmptyFixedSource extends EmptySource {
+    private final int valueSize;
+    private final byte[] valueArray;
+    public EmptyFixedSource(Type type, int valueSize) {
+      super(type);
+      this.valueSize = valueSize;
+      valueArray = new byte[valueSize];
     }
-    TokenStream overflowingTokenStream = new CannedTokenStream(
-        new Token[] { t1 }
-    );
-    Field field = new TextField("foo", overflowingTokenStream);
-    doc.add(field);
-    iw.addDocument(doc);
-    iw.close();
-    dir.close();
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.grow(valueSize);
+      ref.length = valueSize;
+      Arrays.fill(ref.bytes, ref.offset, ref.offset+valueSize, (byte)0);
+      return ref;
+    }
+
+    @Override
+    public double getFloat(int docID) {
+      return 0d;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return 0;
+    }
+    
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.bytes = valueArray;
+      bytesRef.length = valueSize;
+      bytesRef.offset = 0;
+      return bytesRef;
+    }
+  }
+
+  @Override
+  public Type getType() {
+    return type;
+  }
+
+  @Override
+  public int getValueSize() {
+    return valueSize;
+  }
+
+  @Override
+  public Source getDirectSource() throws IOException {
+    return new MultiSource(slices, starts, true, type);
   }
   
-  public void testBoostOmitNorms() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
-    iwc.setMergePolicy(newLogMergePolicy());
-    IndexWriter iw = new IndexWriter(dir, iwc);
-    Document doc = new Document();
-    doc.add(new StringField("field1", "sometext", Field.Store.YES));
-    doc.add(new TextField("field2", "sometext", Field.Store.NO));
-    doc.add(new StringField("foo", "bar", Field.Store.NO));
-    iw.addDocument(doc); // add an 'ok' document
-    try {
-      doc = new Document();
-      // try to boost with norms omitted
-      List<IndexableField> list = new ArrayList<IndexableField>();
-      list.add(new IndexableField() {
-
-        @Override
-        public String name() {
-          return "foo";
-        }
-
-        @Override
-        public IndexableFieldType fieldType() {
-          return StringField.TYPE_NOT_STORED;
-        }
-
-        @Override
-        public float boost() {
-          return 5f;
-        }
-
-        @Override
-        public BytesRef binaryValue() {
-          return null;
-        }
-
-        @Override
-        public String stringValue() {
-          return "baz";
-        }
-
-        @Override
-        public Reader readerValue() {
-          return null;
-        }
-
-        @Override
-        public Number numericValue() {
-          return null;
-        }
-
-        @Override
-        public TokenStream tokenStream(Analyzer analyzer) throws IOException {
-          return null;
-        }
-      });
-      iw.addDocument(list);
-      fail("didn't get any exception, boost silently discarded");
-    } catch (UnsupportedOperationException expected) {
-      // expected
-    }
-    DirectoryReader ir = DirectoryReader.open(iw, false);
-    assertEquals(1, ir.numDocs());
-    assertEquals("sometext", ir.document(0).get("field1"));
-    ir.close();
-    iw.close();
-    dir.close();
-  }
+  
 }

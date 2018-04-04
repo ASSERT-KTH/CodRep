@@ -1,6 +1,6 @@
-public final void visitDocument(int n, StoredFieldVisitor visitor) throws IOException {
+public MergeThread(IndexWriter writer, MergePolicy.OneMerge startMerge) {
 
-package org.apache.lucene.codecs.lucene40;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,225 +19,505 @@ package org.apache.lucene.codecs.lucene40;
  * limitations under the License.
  */
 
-import java.io.IOException;
-
-import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.StoredFieldsReader;
-import org.apache.lucene.index.CorruptIndexException;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfos;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.StoredFieldVisitor;
-import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util.CollectionUtil;
 
-import java.io.Closeable;
+import java.io.IOException;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Comparator;
 
-import static org.apache.lucene.codecs.lucene40.Lucene40StoredFieldsWriter.*;
+/** A {@link MergeScheduler} that runs each merge using a
+ *  separate thread.
+ *
+ *  <p>Specify the max number of threads that may run at
+ *  once with {@link #setMaxThreadCount}.</p>
+ *
+ *  <p>Separately specify the maximum number of simultaneous
+ *  merges with {@link #setMaxMergeCount}.  If the number of
+ *  merges exceeds the max number of threads then the
+ *  largest merges are paused until one of the smaller
+ *  merges completes.</p>
+ *
+ *  <p>If more than {@link #getMaxMergeCount} merges are
+ *  requested then this class will forcefully throttle the
+ *  incoming threads by pausing until one more more merges
+ *  complete.</p>
+ */ 
+public class ConcurrentMergeScheduler extends MergeScheduler {
 
-/**
- * Class responsible for access to stored document fields.
- * <p/>
- * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
- * 
- * @see Lucene40StoredFieldsFormat
- * @lucene.internal
- */
-public final class Lucene40StoredFieldsReader extends StoredFieldsReader implements Cloneable, Closeable {
-  private final FieldInfos fieldInfos;
-  private final IndexInput fieldsStream;
-  private final IndexInput indexStream;
-  private int numTotalDocs;
-  private int size;
-  private boolean closed;
+  private int mergeThreadPriority = -1;
 
-  /** Returns a cloned FieldsReader that shares open
-   *  IndexInputs with the original one.  It is the caller's
-   *  job not to close the original FieldsReader until all
-   *  clones are called (eg, currently SegmentReader manages
-   *  this logic). */
+  protected List<MergeThread> mergeThreads = new ArrayList<MergeThread>();
+
+  // Max number of merge threads allowed to be running at
+  // once.  When there are more merges then this, we
+  // forcefully pause the larger ones, letting the smaller
+  // ones run, up until maxMergeCount merges at which point
+  // we forcefully pause incoming threads (that presumably
+  // are the ones causing so much merging).  We dynamically
+  // default this from 1 to 3, depending on how many cores
+  // you have:
+  private int maxThreadCount = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors()/2));
+
+  // Max number of merges we accept before forcefully
+  // throttling the incoming threads
+  private int maxMergeCount = maxThreadCount+2;
+
+  protected Directory dir;
+
+  protected IndexWriter writer;
+  protected int mergeThreadCount;
+
+  /** Sets the max # simultaneous merge threads that should
+   *  be running at once.  This must be <= {@link
+   *  #setMaxMergeCount}. */
+  public void setMaxThreadCount(int count) {
+    if (count < 1) {
+      throw new IllegalArgumentException("count should be at least 1");
+    }
+    if (count > maxMergeCount) {
+      throw new IllegalArgumentException("count should be <= maxMergeCount (= " + maxMergeCount + ")");
+    }
+    maxThreadCount = count;
+  }
+
+  /** @see #setMaxThreadCount(int) */
+  public int getMaxThreadCount() {
+    return maxThreadCount;
+  }
+
+  /** Sets the max # simultaneous merges that are allowed.
+   *  If a merge is necessary yet we already have this many
+   *  threads running, the incoming thread (that is calling
+   *  add/updateDocument) will block until a merge thread
+   *  has completed.  Note that we will only run the
+   *  smallest {@link #setMaxThreadCount} merges at a time. */
+  public void setMaxMergeCount(int count) {
+    if (count < 1) {
+      throw new IllegalArgumentException("count should be at least 1");
+    }
+    if (count < maxThreadCount) {
+      throw new IllegalArgumentException("count should be >= maxThreadCount (= " + maxThreadCount + ")");
+    }
+    maxMergeCount = count;
+  }
+
+  /** See {@link #setMaxMergeCount}. */
+  public int getMaxMergeCount() {
+    return maxMergeCount;
+  }
+
+  /** Return the priority that merge threads run at.  By
+   *  default the priority is 1 plus the priority of (ie,
+   *  slightly higher priority than) the first thread that
+   *  calls merge. */
+  public synchronized int getMergeThreadPriority() {
+    initMergeThreadPriority();
+    return mergeThreadPriority;
+  }
+
+  /** Set the base priority that merge threads run at.
+   *  Note that CMS may increase priority of some merge
+   *  threads beyond this base priority.  It's best not to
+   *  set this any higher than
+   *  Thread.MAX_PRIORITY-maxThreadCount, so that CMS has
+   *  room to set relative priority among threads.  */
+  public synchronized void setMergeThreadPriority(int pri) {
+    if (pri > Thread.MAX_PRIORITY || pri < Thread.MIN_PRIORITY)
+      throw new IllegalArgumentException("priority must be in range " + Thread.MIN_PRIORITY + " .. " + Thread.MAX_PRIORITY + " inclusive");
+    mergeThreadPriority = pri;
+    updateMergeThreads();
+  }
+
+  // Larger merges come first
+  protected static final Comparator<MergeThread> compareByMergeDocCount = new Comparator<MergeThread>() {
+    public int compare(MergeThread t1, MergeThread t2) {
+      final MergePolicy.OneMerge m1 = t1.getCurrentMerge();
+      final MergePolicy.OneMerge m2 = t2.getCurrentMerge();
+      
+      final int c1 = m1 == null ? Integer.MAX_VALUE : m1.totalDocCount;
+      final int c2 = m2 == null ? Integer.MAX_VALUE : m2.totalDocCount;
+
+      return c2 - c1;
+    }
+  };
+
+  /**
+   * Called whenever the running merges have changed, to pause & unpause
+   * threads. This method sorts the merge threads by their merge size in
+   * descending order and then pauses/unpauses threads from first to last --
+   * that way, smaller merges are guaranteed to run before larger ones.
+   */
+  protected synchronized void updateMergeThreads() {
+
+    // Only look at threads that are alive & not in the
+    // process of stopping (ie have an active merge):
+    final List<MergeThread> activeMerges = new ArrayList<MergeThread>();
+
+    int threadIdx = 0;
+    while (threadIdx < mergeThreads.size()) {
+      final MergeThread mergeThread = mergeThreads.get(threadIdx);
+      if (!mergeThread.isAlive()) {
+        // Prune any dead threads
+        mergeThreads.remove(threadIdx);
+        continue;
+      }
+      if (mergeThread.getCurrentMerge() != null) {
+        activeMerges.add(mergeThread);
+      }
+      threadIdx++;
+    }
+
+    // Sort the merge threads in descending order.
+    CollectionUtil.mergeSort(activeMerges, compareByMergeDocCount);
+    
+    int pri = mergeThreadPriority;
+    final int activeMergeCount = activeMerges.size();
+    for (threadIdx=0;threadIdx<activeMergeCount;threadIdx++) {
+      final MergeThread mergeThread = activeMerges.get(threadIdx);
+      final MergePolicy.OneMerge merge = mergeThread.getCurrentMerge();
+      if (merge == null) { 
+        continue;
+      }
+
+      // pause the thread if maxThreadCount is smaller than the number of merge threads.
+      final boolean doPause = threadIdx < activeMergeCount - maxThreadCount;
+
+      if (verbose()) {
+        if (doPause != merge.getPause()) {
+          if (doPause) {
+            message("pause thread " + mergeThread.getName());
+          } else {
+            message("unpause thread " + mergeThread.getName());
+          }
+        }
+      }
+      if (doPause != merge.getPause()) {
+        merge.setPause(doPause);
+      }
+
+      if (!doPause) {
+        if (verbose()) {
+          message("set priority of merge thread " + mergeThread.getName() + " to " + pri);
+        }
+        mergeThread.setThreadPriority(pri);
+        pri = Math.min(Thread.MAX_PRIORITY, 1+pri);
+      }
+    }
+  }
+
+  /**
+   * Returns true if verbosing is enabled. This method is usually used in
+   * conjunction with {@link #message(String)}, like that:
+   * 
+   * <pre>
+   * if (verbose()) {
+   *   message(&quot;your message&quot;);
+   * }
+   * </pre>
+   */
+  protected boolean verbose() {
+    return writer != null && writer.infoStream.isEnabled("CMS");
+  }
+  
+  /**
+   * Outputs the given message - this method assumes {@link #verbose()} was
+   * called and returned true.
+   */
+  protected void message(String message) {
+    writer.infoStream.message("CMS", message);
+  }
+
+  private synchronized void initMergeThreadPriority() {
+    if (mergeThreadPriority == -1) {
+      // Default to slightly higher priority than our
+      // calling thread
+      mergeThreadPriority = 1+Thread.currentThread().getPriority();
+      if (mergeThreadPriority > Thread.MAX_PRIORITY)
+        mergeThreadPriority = Thread.MAX_PRIORITY;
+    }
+  }
+
   @Override
-  public Lucene40StoredFieldsReader clone() {
-    ensureOpen();
-    return new Lucene40StoredFieldsReader(fieldInfos, numTotalDocs, size, (IndexInput)fieldsStream.clone(), (IndexInput)indexStream.clone());
-  }
-  
-  // Used only by clone
-  private Lucene40StoredFieldsReader(FieldInfos fieldInfos, int numTotalDocs, int size, IndexInput fieldsStream, IndexInput indexStream) {
-    this.fieldInfos = fieldInfos;
-    this.numTotalDocs = numTotalDocs;
-    this.size = size;
-    this.fieldsStream = fieldsStream;
-    this.indexStream = indexStream;
+  public void close() {
+    sync();
   }
 
-  public Lucene40StoredFieldsReader(Directory d, SegmentInfo si, FieldInfos fn, IOContext context) throws IOException {
-    final String segment = si.name;
-    boolean success = false;
-    fieldInfos = fn;
-    try {
-      fieldsStream = d.openInput(IndexFileNames.segmentFileName(segment, "", FIELDS_EXTENSION), context);
-      final String indexStreamFN = IndexFileNames.segmentFileName(segment, "", FIELDS_INDEX_EXTENSION);
-      indexStream = d.openInput(indexStreamFN, context);
-      
-      CodecUtil.checkHeader(indexStream, CODEC_NAME_IDX, VERSION_START, VERSION_CURRENT);
-      CodecUtil.checkHeader(fieldsStream, CODEC_NAME_DAT, VERSION_START, VERSION_CURRENT);
-      assert HEADER_LENGTH_DAT == fieldsStream.getFilePointer();
-      assert HEADER_LENGTH_IDX == indexStream.getFilePointer();
-      final long indexSize = indexStream.length() - HEADER_LENGTH_IDX;
-      this.size = (int) (indexSize >> 3);
-      // Verify two sources of "maxDoc" agree:
-      if (this.size != si.getDocCount()) {
-        throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + this.size + " but segmentInfo shows " + si.getDocCount());
+  /** Wait for any running merge threads to finish */
+  public void sync() {
+    while (true) {
+      MergeThread toSync = null;
+      synchronized (this) {
+        for (MergeThread t : mergeThreads) {
+          if (t.isAlive()) {
+            toSync = t;
+            break;
+          }
+        }
       }
-      numTotalDocs = (int) (indexSize >> 3);
-      success = true;
-    } finally {
-      // With lock-less commits, it's entirely possible (and
-      // fine) to hit a FileNotFound exception above. In
-      // this case, we want to explicitly close any subset
-      // of things that were opened so that we don't have to
-      // wait for a GC to do so.
-      if (!success) {
-        close();
-      }
-    }
-  }
-
-  /**
-   * @throws AlreadyClosedException if this FieldsReader is closed
-   */
-  private void ensureOpen() throws AlreadyClosedException {
-    if (closed) {
-      throw new AlreadyClosedException("this FieldsReader is closed");
-    }
-  }
-
-  /**
-   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams.
-   * This means that the Fields values will not be accessible.
-   *
-   * @throws IOException
-   */
-  public final void close() throws IOException {
-    if (!closed) {
-      IOUtils.close(fieldsStream, indexStream);
-      closed = true;
-    }
-  }
-
-  public final int size() {
-    return size;
-  }
-
-  private void seekIndex(int docID) throws IOException {
-    indexStream.seek(HEADER_LENGTH_IDX + docID * 8L);
-  }
-
-  public final void visitDocument(int n, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
-    seekIndex(n);
-    fieldsStream.seek(indexStream.readLong());
-
-    final int numFields = fieldsStream.readVInt();
-    for (int fieldIDX = 0; fieldIDX < numFields; fieldIDX++) {
-      int fieldNumber = fieldsStream.readVInt();
-      FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
-      
-      int bits = fieldsStream.readByte() & 0xFF;
-      assert bits <= (FIELD_IS_NUMERIC_MASK | FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
-
-      switch(visitor.needsField(fieldInfo)) {
-        case YES:
-          readField(visitor, fieldInfo, bits);
-          break;
-        case NO: 
-          skipField(bits);
-          break;
-        case STOP: 
-          return;
-      }
-    }
-  }
-
-  private void readField(StoredFieldVisitor visitor, FieldInfo info, int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-          visitor.intField(info, fieldsStream.readInt());
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-          visitor.longField(info, fieldsStream.readLong());
-          return;
-        case FIELD_IS_NUMERIC_FLOAT:
-          visitor.floatField(info, Float.intBitsToFloat(fieldsStream.readInt()));
-          return;
-        case FIELD_IS_NUMERIC_DOUBLE:
-          visitor.doubleField(info, Double.longBitsToDouble(fieldsStream.readLong()));
-          return;
-        default:
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
-      }
-    } else { 
-      final int length = fieldsStream.readVInt();
-      byte bytes[] = new byte[length];
-      fieldsStream.readBytes(bytes, 0, length);
-      if ((bits & FIELD_IS_BINARY) != 0) {
-        visitor.binaryField(info, bytes, 0, bytes.length);
+      if (toSync != null) {
+        try {
+          toSync.join();
+        } catch (InterruptedException ie) {
+          throw new ThreadInterruptedException(ie);
+        }
       } else {
-        visitor.stringField(info, new String(bytes, 0, bytes.length, IOUtils.CHARSET_UTF_8));
+        break;
       }
-    }
-  }
-  
-  private void skipField(int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-        case FIELD_IS_NUMERIC_FLOAT:
-          fieldsStream.readInt();
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-        case FIELD_IS_NUMERIC_DOUBLE:
-          fieldsStream.readLong();
-          return;
-        default: 
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
-      }
-    } else {
-      final int length = fieldsStream.readVInt();
-      fieldsStream.seek(fieldsStream.getFilePointer() + length);
     }
   }
 
-  /** Returns the length in bytes of each raw document in a
-   *  contiguous range of length numDocs starting with
-   *  startDocID.  Returns the IndexInput (the fieldStream),
-   *  already seeked to the starting point for startDocID.*/
-  public final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
-    seekIndex(startDocID);
-    long startOffset = indexStream.readLong();
-    long lastOffset = startOffset;
+  /**
+   * Returns the number of merge threads that are alive. Note that this number
+   * is &le; {@link #mergeThreads} size.
+   */
+  protected synchronized int mergeThreadCount() {
     int count = 0;
-    while (count < numDocs) {
-      final long offset;
-      final int docID = startDocID + count + 1;
-      assert docID <= numTotalDocs;
-      if (docID < numTotalDocs) 
-        offset = indexStream.readLong();
-      else
-        offset = fieldsStream.length();
-      lengths[count++] = (int) (offset-lastOffset);
-      lastOffset = offset;
+    for (MergeThread mt : mergeThreads) {
+      if (mt.isAlive() && mt.getCurrentMerge() != null) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  @Override
+  public void merge(IndexWriter writer) throws IOException {
+
+    assert !Thread.holdsLock(writer);
+
+    this.writer = writer;
+
+    initMergeThreadPriority();
+
+    dir = writer.getDirectory();
+
+    // First, quickly run through the newly proposed merges
+    // and add any orthogonal merges (ie a merge not
+    // involving segments already pending to be merged) to
+    // the queue.  If we are way behind on merging, many of
+    // these newly proposed merges will likely already be
+    // registered.
+
+    if (verbose()) {
+      message("now merge");
+      message("  index: " + writer.segString());
+    }
+    
+    // Iterate, pulling from the IndexWriter's queue of
+    // pending merges, until it's empty:
+    while (true) {
+
+      synchronized(this) {
+        long startStallTime = 0;
+        while (mergeThreadCount() >= 1+maxMergeCount) {
+          startStallTime = System.currentTimeMillis();
+          if (verbose()) {
+            message("    too many merges; stalling...");
+          }
+          try {
+            wait();
+          } catch (InterruptedException ie) {
+            throw new ThreadInterruptedException(ie);
+          }
+        }
+
+        if (verbose()) {
+          if (startStallTime != 0) {
+            message("  stalled for " + (System.currentTimeMillis()-startStallTime) + " msec");
+          }
+        }
+      }
+
+
+      // TODO: we could be careful about which merges to do in
+      // the BG (eg maybe the "biggest" ones) vs FG, which
+      // merges to do first (the easiest ones?), etc.
+      MergePolicy.OneMerge merge = writer.getNextMerge();
+      if (merge == null) {
+        if (verbose()) {
+          message("  no more merges pending; now return");
+        }
+        return;
+      }
+
+      // We do this w/ the primary thread to keep
+      // deterministic assignment of segment names
+      writer.mergeInit(merge);
+
+      boolean success = false;
+      try {
+        synchronized(this) {
+          if (verbose()) {
+            message("  consider merge " + writer.segString(merge.segments));
+          }
+
+          // OK to spawn a new merge thread to handle this
+          // merge:
+          final MergeThread merger = getMergeThread(writer, merge);
+          mergeThreads.add(merger);
+          if (verbose()) {
+            message("    launch new thread [" + merger.getName() + "]");
+          }
+
+          merger.start();
+
+          // Must call this after starting the thread else
+          // the new thread is removed from mergeThreads
+          // (since it's not alive yet):
+          updateMergeThreads();
+
+          success = true;
+        }
+      } finally {
+        if (!success) {
+          writer.mergeFinish(merge);
+        }
+      }
+    }
+  }
+
+  /** Does the actual merge, by calling {@link IndexWriter#merge} */
+  protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
+    writer.merge(merge);
+  }
+
+  /** Create and return a new MergeThread */
+  protected synchronized MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
+    final MergeThread thread = new MergeThread(writer, merge);
+    thread.setThreadPriority(mergeThreadPriority);
+    thread.setDaemon(true);
+    thread.setName("Lucene Merge Thread #" + mergeThreadCount++);
+    return thread;
+  }
+
+  protected class MergeThread extends Thread {
+
+    IndexWriter tWriter;
+    MergePolicy.OneMerge startMerge;
+    MergePolicy.OneMerge runningMerge;
+    private volatile boolean done;
+
+    public MergeThread(IndexWriter writer, MergePolicy.OneMerge startMerge) throws IOException {
+      this.tWriter = writer;
+      this.startMerge = startMerge;
     }
 
-    fieldsStream.seek(startOffset);
+    public synchronized void setRunningMerge(MergePolicy.OneMerge merge) {
+      runningMerge = merge;
+    }
 
-    return fieldsStream;
+    public synchronized MergePolicy.OneMerge getRunningMerge() {
+      return runningMerge;
+    }
+
+    public synchronized MergePolicy.OneMerge getCurrentMerge() {
+      if (done) {
+        return null;
+      } else if (runningMerge != null) {
+        return runningMerge;
+      } else {
+        return startMerge;
+      }
+    }
+
+    public void setThreadPriority(int pri) {
+      try {
+        setPriority(pri);
+      } catch (NullPointerException npe) {
+        // Strangely, Sun's JDK 1.5 on Linux sometimes
+        // throws NPE out of here...
+      } catch (SecurityException se) {
+        // Ignore this because we will still run fine with
+        // normal thread priority
+      }
+    }
+
+    @Override
+    public void run() {
+      
+      // First time through the while loop we do the merge
+      // that we were started with:
+      MergePolicy.OneMerge merge = this.startMerge;
+      
+      try {
+
+        if (verbose()) {
+          message("  merge thread: start");
+        }
+
+        while(true) {
+          setRunningMerge(merge);
+          doMerge(merge);
+
+          // Subsequent times through the loop we do any new
+          // merge that writer says is necessary:
+          merge = tWriter.getNextMerge();
+          if (merge != null) {
+            tWriter.mergeInit(merge);
+            updateMergeThreads();
+            if (verbose()) {
+              message("  merge thread: do another merge " + tWriter.segString(merge.segments));
+            }
+          } else {
+            break;
+          }
+        }
+
+        if (verbose()) {
+          message("  merge thread: done");
+        }
+
+      } catch (Throwable exc) {
+
+        // Ignore the exception if it was due to abort:
+        if (!(exc instanceof MergePolicy.MergeAbortedException)) {
+          //System.out.println(Thread.currentThread().getName() + ": CMS: exc");
+          //exc.printStackTrace(System.out);
+          if (!suppressExceptions) {
+            // suppressExceptions is normally only set during
+            // testing.
+            handleMergeException(exc);
+          }
+        }
+      } finally {
+        done = true;
+        synchronized(ConcurrentMergeScheduler.this) {
+          updateMergeThreads();
+          ConcurrentMergeScheduler.this.notifyAll();
+        }
+      }
+    }
+  }
+
+  /** Called when an exception is hit in a background merge
+   *  thread */
+  protected void handleMergeException(Throwable exc) {
+    try {
+      // When an exception is hit during merge, IndexWriter
+      // removes any partial files and then allows another
+      // merge to run.  If whatever caused the error is not
+      // transient then the exception will keep happening,
+      // so, we sleep here to avoid saturating CPU in such
+      // cases:
+      Thread.sleep(250);
+    } catch (InterruptedException ie) {
+      throw new ThreadInterruptedException(ie);
+    }
+    throw new MergePolicy.MergeException(exc, dir);
+  }
+
+  private boolean suppressExceptions;
+
+  /** Used for testing */
+  void setSuppressExceptions() {
+    suppressExceptions = true;
+  }
+
+  /** Used for testing */
+  void clearSuppressExceptions() {
+    suppressExceptions = false;
   }
 }

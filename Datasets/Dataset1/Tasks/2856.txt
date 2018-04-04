@@ -1,450 +1,677 @@
-assertTrue("got score=" + score, score==1.0f);
+bf = LegacyBloomFilter.serializer().deserialize(stream, 0); // version means nothing.
 
-package org.apache.lucene.index;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
-import java.io.IOException;
+package org.apache.cassandra.io.sstable;
 
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.search.*;
-import org.apache.lucene.search.BooleanClause.Occur;
-import org.apache.lucene.search.similarities.TFIDFSimilarity;
-import org.apache.lucene.store.Directory;
+import java.io.*;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.nio.ByteBuffer;
+import java.util.*;
 
+import com.google.common.base.Function;
+import com.google.common.collect.Collections2;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class TestOmitTf extends LuceneTestCase {
-  
-  public static class SimpleSimilarity extends TFIDFSimilarity {
-    @Override
-    public float queryNorm(float sumOfSquaredWeights) { return 1.0f; }
-    @Override
-    public float coord(int overlap, int maxOverlap) { return 1.0f; }
-    @Override public float lengthNorm(FieldInvertState state) { return state.getBoost(); }
-    @Override public float tf(float freq) { return freq; }
-    @Override public float sloppyFreq(int distance) { return 2.0f; }
-    @Override public float idf(long docFreq, long numDocs) { return 1.0f; }
-    @Override public Explanation idfExplain(CollectionStatistics collectionStats, TermStatistics[] termStats) {
-      return new Explanation(1.0f, "Inexplicable");
-    }
-    @Override public float scorePayload(int doc, int start, int end, BytesRef payload) { return 1.0f; }
-  }
+import org.apache.cassandra.cache.InstrumentedCache;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.ICompactSerializer2;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SegmentedFile;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.*;
 
-  private static final FieldType omitType = new FieldType(TextField.TYPE_NOT_STORED);
-  private static final FieldType normalType = new FieldType(TextField.TYPE_NOT_STORED);
-  
-  static {
-    omitType.setIndexOptions(IndexOptions.DOCS_ONLY);
-  }
+/**
+ * SSTableReaders are open()ed by Table.onStart; after that they are created by SSTableWriter.renameAndOpen.
+ * Do not re-call open() on existing SSTable files; use the references kept by ColumnFamilyStore post-start instead.
+ */
+public class SSTableReader extends SSTable implements Comparable<SSTableReader>
+{
+    private static final Logger logger = LoggerFactory.getLogger(SSTableReader.class);
 
-  // Tests whether the DocumentWriter correctly enable the
-  // omitTermFreqAndPositions bit in the FieldInfo
-  public void testOmitTermFreqAndPositions() throws Exception {
-    Directory ram = newDirectory();
-    Analyzer analyzer = new MockAnalyzer(random());
-    IndexWriter writer = new IndexWriter(ram, newIndexWriterConfig( TEST_VERSION_CURRENT, analyzer));
-    Document d = new Document();
-        
-    // this field will have Tf
-    Field f1 = newField("f1", "This field has term freqs", normalType);
-    d.add(f1);
-       
-    // this field will NOT have Tf
-    Field f2 = newField("f2", "This field has NO Tf in all docs", omitType);
-    d.add(f2);
-        
-    writer.addDocument(d);
-    writer.forceMerge(1);
-    // now we add another document which has term freq for field f2 and not for f1 and verify if the SegmentMerger
-    // keep things constant
-    d = new Document();
-        
-    // Reverse
-    f1 = newField("f1", "This field has term freqs", omitType);
-    d.add(f1);
-        
-    f2 = newField("f2", "This field has NO Tf in all docs", normalType);     
-    d.add(f2);
-        
-    writer.addDocument(d);
+    // guesstimated size of INDEX_INTERVAL index entries
+    private static final int INDEX_FILE_BUFFER_BYTES = 16 * DatabaseDescriptor.getIndexInterval();
 
-    // force merge
-    writer.forceMerge(1);
-    // flush
-    writer.close();
+    // `finalizers` is required to keep the PhantomReferences alive after the enclosing SSTR is itself
+    // unreferenced.  otherwise they will never get enqueued.
+    private static final Set<Reference<SSTableReader>> finalizers = new HashSet<Reference<SSTableReader>>();
+    private static final ReferenceQueue<SSTableReader> finalizerQueue = new ReferenceQueue<SSTableReader>()
+    {{
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                while (true)
+                {
+                    SSTableDeletingReference r;
+                    try
+                    {
+                        r = (SSTableDeletingReference) finalizerQueue.remove();
+                        finalizers.remove(r);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                    try
+                    {
+                        r.cleanup();
+                    }
+                    catch (IOException e)
+                    {
+                        logger.error("Error deleting " + r.desc, e);
+                    }
+                }
+            }
+        };
+        new Thread(runnable, "SSTABLE-DELETER").start();
+    }};
 
-    SegmentReader reader = getOnlySegmentReader(DirectoryReader.open(ram));
-    FieldInfos fi = reader.getFieldInfos();
-    assertEquals("OmitTermFreqAndPositions field bit should be set.", IndexOptions.DOCS_ONLY, fi.fieldInfo("f1").getIndexOptions());
-    assertEquals("OmitTermFreqAndPositions field bit should be set.", IndexOptions.DOCS_ONLY, fi.fieldInfo("f2").getIndexOptions());
-        
-    reader.close();
-    ram.close();
-  }
- 
-  // Tests whether merging of docs that have different
-  // omitTermFreqAndPositions for the same field works
-  public void testMixedMerge() throws Exception {
-    Directory ram = newDirectory();
-    Analyzer analyzer = new MockAnalyzer(random());
-    IndexWriter writer = new IndexWriter(
-        ram,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer).
-            setMaxBufferedDocs(3).
-            setMergePolicy(newLogMergePolicy(2))
-    );
-    Document d = new Document();
-        
-    // this field will have Tf
-    Field f1 = newField("f1", "This field has term freqs", normalType);
-    d.add(f1);
-       
-    // this field will NOT have Tf
-    Field f2 = newField("f2", "This field has NO Tf in all docs", omitType);
-    d.add(f2);
+    /**
+     * maxDataAge is a timestamp in local server time (e.g. System.currentTimeMilli) which represents an uppper bound
+     * to the newest piece of data stored in the sstable. In other words, this sstable does not contain items created
+     * later than maxDataAge.
+     * 
+     * The field is not serialized to disk, so relying on it for more than what truncate does is not advised.
+     *
+     * When a new sstable is flushed, maxDataAge is set to the time of creation.
+     * When a sstable is created from compaction, maxDataAge is set to max of all merged tables.
+     *
+     * The age is in milliseconds since epoc and is local to this host.
+     */
+    public final long maxDataAge;
 
-    for(int i=0;i<30;i++)
-      writer.addDocument(d);
-        
-    // now we add another document which has term freq for field f2 and not for f1 and verify if the SegmentMerger
-    // keep things constant
-    d = new Document();
-        
-    // Reverese
-    f1 = newField("f1", "This field has term freqs", omitType);
-    d.add(f1);
-        
-    f2 = newField("f2", "This field has NO Tf in all docs", normalType);     
-    d.add(f2);
-        
-    for(int i=0;i<30;i++)
-      writer.addDocument(d);
-        
-    // force merge
-    writer.forceMerge(1);
-    // flush
-    writer.close();
+    // indexfile and datafile: might be null before a call to load()
+    private SegmentedFile ifile;
+    private SegmentedFile dfile;
 
-    SegmentReader reader = getOnlySegmentReader(DirectoryReader.open(ram));
-    FieldInfos fi = reader.getFieldInfos();
-    assertEquals("OmitTermFreqAndPositions field bit should be set.", IndexOptions.DOCS_ONLY, fi.fieldInfo("f1").getIndexOptions());
-    assertEquals("OmitTermFreqAndPositions field bit should be set.", IndexOptions.DOCS_ONLY, fi.fieldInfo("f2").getIndexOptions());
-        
-    reader.close();
-    ram.close();
-  }
+    private IndexSummary indexSummary;
+    private Filter bf;
 
-  // Make sure first adding docs that do not omitTermFreqAndPositions for
-  // field X, then adding docs that do omitTermFreqAndPositions for that same
-  // field, 
-  public void testMixedRAM() throws Exception {
-    Directory ram = newDirectory();
-    Analyzer analyzer = new MockAnalyzer(random());
-    IndexWriter writer = new IndexWriter(
-        ram,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer).
-            setMaxBufferedDocs(10).
-            setMergePolicy(newLogMergePolicy(2))
-    );
-    Document d = new Document();
-        
-    // this field will have Tf
-    Field f1 = newField("f1", "This field has term freqs", normalType);
-    d.add(f1);
-       
-    // this field will NOT have Tf
-    Field f2 = newField("f2", "This field has NO Tf in all docs", omitType);
-    d.add(f2);
+    private InstrumentedCache<Pair<Descriptor,DecoratedKey>, Long> keyCache;
 
-    for(int i=0;i<5;i++)
-      writer.addDocument(d);
+    private BloomFilterTracker bloomFilterTracker = new BloomFilterTracker();
 
-    for(int i=0;i<20;i++)
-      writer.addDocument(d);
+    private volatile SSTableDeletingReference phantomReference;
 
-    // force merge
-    writer.forceMerge(1);
+    public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
+    {
+        long count = 0;
 
-    // flush
-    writer.close();
+        for (SSTableReader sstable : sstables)
+        {
+            int indexKeyCount = sstable.getKeySamples().size();
+            count = count + (indexKeyCount + 1) * DatabaseDescriptor.getIndexInterval();
+            if (logger.isDebugEnabled())
+                logger.debug("index size for bloom filter calc for file  : " + sstable.getFilename() + "   : " + count);
+        }
 
-    SegmentReader reader = getOnlySegmentReader(DirectoryReader.open(ram));
-    FieldInfos fi = reader.getFieldInfos();
-    assertEquals("OmitTermFreqAndPositions field bit should not be set.", IndexOptions.DOCS_AND_FREQS_AND_POSITIONS, fi.fieldInfo("f1").getIndexOptions());
-    assertEquals("OmitTermFreqAndPositions field bit should be set.", IndexOptions.DOCS_ONLY, fi.fieldInfo("f2").getIndexOptions());
-        
-    reader.close();
-    ram.close();
-  }
-
-  private void assertNoPrx(Directory dir) throws Throwable {
-    final String[] files = dir.listAll();
-    for(int i=0;i<files.length;i++) {
-      assertFalse(files[i].endsWith(".prx"));
-      assertFalse(files[i].endsWith(".pos"));
-    }
-  }
-
-  // Verifies no *.prx exists when all fields omit term freq:
-  public void testNoPrxFile() throws Throwable {
-    Directory ram = newDirectory();
-    Analyzer analyzer = new MockAnalyzer(random());
-    IndexWriter writer = new IndexWriter(ram, newIndexWriterConfig(
-                                                                   TEST_VERSION_CURRENT, analyzer).setMaxBufferedDocs(3).setMergePolicy(newLogMergePolicy()));
-    LogMergePolicy lmp = (LogMergePolicy) writer.getConfig().getMergePolicy();
-    lmp.setMergeFactor(2);
-    lmp.setUseCompoundFile(false);
-    Document d = new Document();
-        
-    Field f1 = newField("f1", "This field has term freqs", omitType);
-    d.add(f1);
-
-    for(int i=0;i<30;i++)
-      writer.addDocument(d);
-
-    writer.commit();
-
-    assertNoPrx(ram);
-    
-    // now add some documents with positions, and check
-    // there is no prox after full merge
-    d = new Document();
-    f1 = newTextField("f1", "This field has positions", Field.Store.NO);
-    d.add(f1);
-    
-    for(int i=0;i<30;i++)
-      writer.addDocument(d);
- 
-    // force merge
-    writer.forceMerge(1);
-    // flush
-    writer.close();
-
-    assertNoPrx(ram);
-    ram.close();
-  }
- 
-  // Test scores with one field with Term Freqs and one without, otherwise with equal content 
-  public void testBasic() throws Exception {
-    Directory dir = newDirectory();  
-    Analyzer analyzer = new MockAnalyzer(random());
-    IndexWriter writer = new IndexWriter(
-        dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer).
-            setMaxBufferedDocs(2).
-            setSimilarity(new SimpleSimilarity()).
-            setMergePolicy(newLogMergePolicy(2))
-    );
-        
-    StringBuilder sb = new StringBuilder(265);
-    String term = "term";
-    for(int i = 0; i<30; i++){
-      Document d = new Document();
-      sb.append(term).append(" ");
-      String content  = sb.toString();
-      Field noTf = newField("noTf", content + (i%2==0 ? "" : " notf"), omitType);
-      d.add(noTf);
-          
-      Field tf = newField("tf", content + (i%2==0 ? " tf" : ""), normalType);
-      d.add(tf);
-          
-      writer.addDocument(d);
-      //System.out.println(d);
-    }
-        
-    writer.forceMerge(1);
-    // flush
-    writer.close();
-
-    /*
-     * Verify the index
-     */         
-    IndexReader reader = DirectoryReader.open(dir);
-    IndexSearcher searcher = new IndexSearcher(reader);
-    searcher.setSimilarity(new SimpleSimilarity());
-        
-    Term a = new Term("noTf", term);
-    Term b = new Term("tf", term);
-    Term c = new Term("noTf", "notf");
-    Term d = new Term("tf", "tf");
-    TermQuery q1 = new TermQuery(a);
-    TermQuery q2 = new TermQuery(b);
-    TermQuery q3 = new TermQuery(c);
-    TermQuery q4 = new TermQuery(d);
-
-    PhraseQuery pq = new PhraseQuery();
-    pq.add(a);
-    pq.add(c);
-    try {
-      searcher.search(pq, 10);
-      fail("did not hit expected exception");
-    } catch (IllegalStateException ise) {
-      // expected
-    }
-        
-    searcher.search(q1,
-                    new CountingHitCollector() {
-                      private Scorer scorer;
-                      @Override
-                      public final void setScorer(Scorer scorer) {
-                        this.scorer = scorer;
-                      }
-                      @Override
-                      public final void collect(int doc) throws IOException {
-                        //System.out.println("Q1: Doc=" + doc + " score=" + score);
-                        float score = scorer.score();
-                        assertTrue(score==1.0f);
-                        super.collect(doc);
-                      }
-                    });
-    //System.out.println(CountingHitCollector.getCount());
-        
-        
-    searcher.search(q2,
-                    new CountingHitCollector() {
-                      private Scorer scorer;
-                      @Override
-                      public final void setScorer(Scorer scorer) {
-                        this.scorer = scorer;
-                      }
-                      @Override
-                      public final void collect(int doc) throws IOException {
-                        //System.out.println("Q2: Doc=" + doc + " score=" + score);
-                        float score = scorer.score();
-                        assertEquals(1.0f+doc, score, 0.00001f);
-                        super.collect(doc);
-                      }
-                    });
-    //System.out.println(CountingHitCollector.getCount());
-         
-        
-        
-        
-        
-    searcher.search(q3,
-                    new CountingHitCollector() {
-                      private Scorer scorer;
-                      @Override
-                      public final void setScorer(Scorer scorer) {
-                        this.scorer = scorer;
-                      }
-                      @Override
-                      public final void collect(int doc) throws IOException {
-                        //System.out.println("Q1: Doc=" + doc + " score=" + score);
-                        float score = scorer.score();
-                        assertTrue(score==1.0f);
-                        assertFalse(doc%2==0);
-                        super.collect(doc);
-                      }
-                    });
-    //System.out.println(CountingHitCollector.getCount());
-        
-        
-    searcher.search(q4,
-                    new CountingHitCollector() {
-                      private Scorer scorer;
-                      @Override
-                      public final void setScorer(Scorer scorer) {
-                        this.scorer = scorer;
-                      }
-                      @Override
-                      public final void collect(int doc) throws IOException {
-                        float score = scorer.score();
-                        //System.out.println("Q1: Doc=" + doc + " score=" + score);
-                        assertTrue(score==1.0f);
-                        assertTrue(doc%2==0);
-                        super.collect(doc);
-                      }
-                    });
-    //System.out.println(CountingHitCollector.getCount());
-        
-        
-        
-    BooleanQuery bq = new BooleanQuery();
-    bq.add(q1,Occur.MUST);
-    bq.add(q4,Occur.MUST);
-        
-    searcher.search(bq,
-                    new CountingHitCollector() {
-                      @Override
-                      public final void collect(int doc) throws IOException {
-                        //System.out.println("BQ: Doc=" + doc + " score=" + score);
-                        super.collect(doc);
-                      }
-                    });
-    assertEquals(15, CountingHitCollector.getCount());
-         
-    reader.close();
-    dir.close();
-  }
-     
-  public static class CountingHitCollector extends Collector {
-    static int count=0;
-    static int sum=0;
-    private int docBase = -1;
-    CountingHitCollector(){count=0;sum=0;}
-    @Override
-    public void setScorer(Scorer scorer) throws IOException {}
-    @Override
-    public void collect(int doc) throws IOException {
-      count++;
-      sum += doc + docBase;  // use it to avoid any possibility of being merged away
+        return count;
     }
 
-    public static int getCount() { return count; }
-    public static int getSum() { return sum; }
-    
-    @Override
-    public void setNextReader(AtomicReaderContext context) {
-      docBase = context.docBase;
+    public static SSTableReader open(Descriptor desc) throws IOException
+    {
+        Set<Component> components = SSTable.componentsFor(desc);
+        return open(desc, components, DatabaseDescriptor.getCFMetaData(desc.ksname, desc.cfname), StorageService.getPartitioner());
     }
-    @Override
-    public boolean acceptsDocsOutOfOrder() {
-      return true;
+
+    public static SSTableReader open(Descriptor descriptor, Set<Component> components, CFMetaData metadata, IPartitioner partitioner) throws IOException
+    {
+        return open(descriptor, components, Collections.<DecoratedKey>emptySet(), null, metadata, partitioner);
     }
-  }
-  
-  /** test that when freqs are omitted, that totalTermFreq and sumTotalTermFreq are -1 */
-  public void testStats() throws Exception {
-    Directory dir = newDirectory();
-    RandomIndexWriter iw = new RandomIndexWriter(random(), dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-    Document doc = new Document();
-    FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
-    ft.setIndexOptions(IndexOptions.DOCS_ONLY);
-    ft.freeze();
-    Field f = newField("foo", "bar", ft);
-    doc.add(f);
-    iw.addDocument(doc);
-    IndexReader ir = iw.getReader();
-    iw.close();
-    Terms terms = MultiFields.getTerms(ir, "foo");
-    assertEquals(-1, MultiFields.totalTermFreq(ir, "foo", new BytesRef("bar")));
-    assertEquals(-1, terms.getSumTotalTermFreq());
-    ir.close();
-    dir.close();
-  }
+
+    public static SSTableReader open(Descriptor descriptor, Set<Component> components, Set<DecoratedKey> savedKeys, SSTableTracker tracker, CFMetaData metadata, IPartitioner partitioner) throws IOException
+    {
+        assert partitioner != null;
+
+        long start = System.currentTimeMillis();
+        logger.info("Opening " + descriptor);
+
+        EstimatedHistogram rowSizes;
+        EstimatedHistogram columnCounts;
+        File statsFile = new File(descriptor.filenameFor(SSTable.COMPONENT_STATS));
+        if (statsFile.exists())
+        {
+            DataInputStream dis = null;
+            try
+            {
+                logger.debug("Load statistics for {}", descriptor);
+                dis = new DataInputStream(new BufferedInputStream(new FileInputStream(statsFile)));
+                rowSizes = EstimatedHistogram.serializer.deserialize(dis);
+                columnCounts = EstimatedHistogram.serializer.deserialize(dis);
+            }
+            finally
+            {
+                FileUtils.closeQuietly(dis);
+            }
+        }
+        else
+        {
+            logger.debug("No statistics for {}", descriptor);
+            rowSizes = SSTable.defaultRowHistogram();
+            columnCounts = SSTable.defaultColumnHistogram();
+        }
+
+        SSTableReader sstable = new SSTableReader(descriptor, components, metadata, partitioner, null, null, null, null, System.currentTimeMillis(), rowSizes, columnCounts);
+        sstable.setTrackedBy(tracker);
+
+        // versions before 'c' encoded keys as utf-16 before hashing to the filter
+        if (descriptor.hasStringsInBloomFilter)
+        {
+            sstable.load(true, savedKeys);
+        }
+        else
+        {
+            sstable.load(false, savedKeys);
+            sstable.loadBloomFilter();
+        }
+        if (logger.isDebugEnabled())
+            logger.debug("INDEX LOAD TIME for " + descriptor + ": " + (System.currentTimeMillis() - start) + " ms.");
+
+        if (logger.isDebugEnabled() && sstable.getKeyCache() != null)
+            logger.debug(String.format("key cache contains %s/%s keys", sstable.getKeyCache().getSize(), sstable.getKeyCache().getCapacity()));
+
+        return sstable;
+    }
+
+    /**
+     * Open a RowIndexedReader which already has its state initialized (by SSTableWriter).
+     */
+    static SSTableReader internalOpen(Descriptor desc, Set<Component> components, CFMetaData metadata, IPartitioner partitioner, SegmentedFile ifile, SegmentedFile dfile, IndexSummary isummary, Filter bf, long maxDataAge, EstimatedHistogram rowsize,
+                                      EstimatedHistogram columncount) throws IOException
+    {
+        assert desc != null && partitioner != null && ifile != null && dfile != null && isummary != null && bf != null;
+        return new SSTableReader(desc, components, metadata, partitioner, ifile, dfile, isummary, bf, maxDataAge, rowsize, columncount);
+    }
+
+    private SSTableReader(Descriptor desc,
+                          Set<Component> components,
+                          CFMetaData metadata,
+                          IPartitioner partitioner,
+                          SegmentedFile ifile,
+                          SegmentedFile dfile,
+                          IndexSummary indexSummary,
+                          Filter bloomFilter,
+                          long maxDataAge,
+                          EstimatedHistogram rowSizes,
+                          EstimatedHistogram columnCounts)
+    throws IOException
+    {
+        super(desc, components, metadata, partitioner, rowSizes, columnCounts);
+        this.maxDataAge = maxDataAge;
+
+        this.ifile = ifile;
+        this.dfile = dfile;
+        this.indexSummary = indexSummary;
+        this.bf = bloomFilter;
+    }
+
+    public void setTrackedBy(SSTableTracker tracker)
+    {
+        if (tracker != null)
+        {
+            phantomReference = new SSTableDeletingReference(tracker, this, finalizerQueue);
+            finalizers.add(phantomReference);
+            keyCache = tracker.getKeyCache();
+        }
+    }
+
+    void loadBloomFilter() throws IOException
+    {
+        DataInputStream stream = null;
+        try
+        {
+            stream = new DataInputStream(new BufferedInputStream(new FileInputStream(descriptor.filenameFor(Component.FILTER))));
+            if (descriptor.usesOldBloomFilter)
+            {
+                bf = LegacyBloomFilter.serializer().deserialize(stream);
+            }
+            else
+            {
+                bf = BloomFilter.serializer().deserialize(stream);
+            }
+        }
+        finally
+        {
+            FileUtils.closeQuietly(stream);
+        }
+    }
+
+    /**
+     * Loads ifile, dfile and indexSummary, and optionally recreates the bloom filter.
+     */
+    private void load(boolean recreatebloom, Set<DecoratedKey> keysToLoadInCache) throws IOException
+    {
+        boolean cacheLoading = keyCache != null && !keysToLoadInCache.isEmpty();
+        SegmentedFile.Builder ibuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getIndexAccessMode());
+        SegmentedFile.Builder dbuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getDiskAccessMode());
+
+        // we read the positions in a BRAF so we don't have to worry about an entry spanning a mmap boundary.
+        BufferedRandomAccessFile input = new BufferedRandomAccessFile(new File(descriptor.filenameFor(Component.PRIMARY_INDEX)),
+                                                                      "r",
+                                                                      BufferedRandomAccessFile.DEFAULT_BUFFER_SIZE,
+                                                                      true);
+        try
+        {
+            if (keyCache != null && keyCache.getCapacity() - keyCache.getSize() < keysToLoadInCache.size())
+                keyCache.updateCapacity(keyCache.getSize() + keysToLoadInCache.size());
+
+            long indexSize = input.length();
+            long estimatedKeys = SSTable.estimateRowsFromIndex(input);
+            indexSummary = new IndexSummary(estimatedKeys);
+            if (recreatebloom)
+                // estimate key count based on index length
+                bf = LegacyBloomFilter.getFilter(estimatedKeys, 15);
+            while (true)
+            {
+                long indexPosition = input.getFilePointer();
+                if (indexPosition == indexSize)
+                    break;
+
+                boolean shouldAddEntry = indexSummary.shouldAddEntry();
+                ByteBuffer key = (shouldAddEntry || cacheLoading || recreatebloom)
+                             ? ByteBufferUtil.readWithShortLength(input)
+                             : ByteBufferUtil.skipShortLength(input);
+                long dataPosition = input.readLong();
+                if (key != null)
+                {
+                    DecoratedKey decoratedKey = decodeKey(partitioner, descriptor, ByteBufferUtil.clone(key));
+                    if (recreatebloom)
+                        bf.add(decoratedKey.key);
+                    if (shouldAddEntry)
+                        indexSummary.addEntry(decoratedKey, indexPosition);
+                    if (cacheLoading && keysToLoadInCache.contains(decoratedKey))
+                        keyCache.put(new Pair<Descriptor, DecoratedKey>(descriptor, decoratedKey), dataPosition);
+                }
+
+                indexSummary.incrementRowid();
+                ibuilder.addPotentialBoundary(indexPosition);
+                dbuilder.addPotentialBoundary(dataPosition);
+            }
+            indexSummary.complete();
+        }
+        finally
+        {
+            FileUtils.closeQuietly(input);
+        }
+
+        // finalize the state of the reader
+        ifile = ibuilder.complete(descriptor.filenameFor(Component.PRIMARY_INDEX));
+        dfile = dbuilder.complete(descriptor.filenameFor(Component.DATA));
+    }
+
+    /** get the position in the index file to start scanning to find the given key (at most indexInterval keys away) */
+    private IndexSummary.KeyPosition getIndexScanPosition(DecoratedKey decoratedKey)
+    {
+        assert indexSummary.getIndexPositions() != null && indexSummary.getIndexPositions().size() > 0;
+        int index = Collections.binarySearch(indexSummary.getIndexPositions(), new IndexSummary.KeyPosition(decoratedKey, -1));
+        if (index < 0)
+        {
+            // binary search gives us the first index _greater_ than the key searched for,
+            // i.e., its insertion position
+            int greaterThan = (index + 1) * -1;
+            if (greaterThan == 0)
+                return null;
+            return indexSummary.getIndexPositions().get(greaterThan - 1);
+        }
+        else
+        {
+            return indexSummary.getIndexPositions().get(index);
+        }
+    }
+
+    /**
+     * For testing purposes only.
+     */
+    public void forceFilterFailures()
+    {
+        bf = LegacyBloomFilter.alwaysMatchingBloomFilter();
+    }
+
+    public Filter getBloomFilter()
+    {
+      return bf;
+    }
+
+    /**
+     * @return The key cache: for monitoring purposes.
+     */
+    public InstrumentedCache getKeyCache()
+    {
+        return keyCache;
+    }
+
+    /**
+     * @return An estimate of the number of keys in this SSTable.
+     */
+    public long estimatedKeys()
+    {
+        return indexSummary.getIndexPositions().size() * DatabaseDescriptor.getIndexInterval();
+    }
+
+    /**
+     * @return Approximately 1/INDEX_INTERVALth of the keys in this SSTable.
+     */
+    public Collection<DecoratedKey> getKeySamples()
+    {
+        return Collections2.transform(indexSummary.getIndexPositions(),
+                                      new Function<IndexSummary.KeyPosition, DecoratedKey>(){
+                                          public DecoratedKey apply(IndexSummary.KeyPosition kp)
+                                          {
+                                              return kp.key;
+                                          }
+                                      });
+    }
+
+    /**
+     * Determine the minimal set of sections that can be extracted from this SSTable to cover the given ranges.
+     * @return A sorted list of (offset,end) pairs that cover the given ranges in the datafile for this SSTable.
+     */
+    public List<Pair<Long,Long>> getPositionsForRanges(Collection<Range> ranges)
+    {
+        // use the index to determine a minimal section for each range
+        List<Pair<Long,Long>> positions = new ArrayList<Pair<Long,Long>>();
+        for (AbstractBounds range : AbstractBounds.normalize(ranges))
+        {
+            long left = getPosition(new DecoratedKey(range.left, null), Operator.GT);
+            if (left == -1)
+                // left is past the end of the file
+                continue;
+            long right = getPosition(new DecoratedKey(range.right, null), Operator.GT);
+            if (right == -1 || Range.isWrapAround(range.left, range.right))
+                // right is past the end of the file, or it wraps
+                right = length();
+            if (left == right)
+                // empty range
+                continue;
+            positions.add(new Pair(Long.valueOf(left), Long.valueOf(right)));
+        }
+        return positions;
+    }
+
+    public void cacheKey(DecoratedKey key, Long info)
+    {
+        keyCache.put(new Pair<Descriptor, DecoratedKey>(descriptor, key), info);
+    }
+
+    public Long getCachedPosition(DecoratedKey key)
+    {
+        return getCachedPosition(new Pair<Descriptor, DecoratedKey>(descriptor, key));
+    }
+
+    private Long getCachedPosition(Pair<Descriptor, DecoratedKey> unifiedKey)
+    {
+        if (keyCache != null && keyCache.getCapacity() > 0)
+            return keyCache.get(unifiedKey);
+        return null;
+    }
+
+    /**
+     * @param decoratedKey The key to apply as the rhs to the given Operator.
+     * @param op The Operator defining matching keys: the nearest key to the target matching the operator wins.
+     * @return The position in the data file to find the key, or -1 if the key is not present
+     */
+    public long getPosition(DecoratedKey decoratedKey, Operator op)
+    {
+        // first, check bloom filter
+        if (op == Operator.EQ && !bf.isPresent(decoratedKey.key))
+            return -1;
+
+        // next, the key cache
+        Pair<Descriptor, DecoratedKey> unifiedKey = new Pair<Descriptor, DecoratedKey>(descriptor, decoratedKey);
+        Long cachedPosition = getCachedPosition(unifiedKey);
+        if (cachedPosition != null)
+            return cachedPosition;
+
+        // next, see if the sampled index says it's impossible for the key to be present
+        IndexSummary.KeyPosition sampledPosition = getIndexScanPosition(decoratedKey);
+        if (sampledPosition == null)
+        {
+            if (op == Operator.EQ)
+                bloomFilterTracker.addFalsePositive();
+            // we matched the -1th position: if the operator might match forward, return the 0th position
+            return op.apply(1) >= 0 ? 0 : -1;
+        }
+
+        // scan the on-disk index, starting at the nearest sampled position
+        Iterator<FileDataInput> segments = ifile.iterator(sampledPosition.indexPosition, INDEX_FILE_BUFFER_BYTES);
+        while (segments.hasNext())
+        {
+            FileDataInput input = segments.next();
+            try
+            {
+                while (!input.isEOF())
+                {
+                    // read key & data position from index entry
+                    DecoratedKey indexDecoratedKey = decodeKey(partitioner, descriptor, ByteBufferUtil.readWithShortLength(input));
+                    long dataPosition = input.readLong();
+
+                    int comparison = indexDecoratedKey.compareTo(decoratedKey);
+                    int v = op.apply(comparison);
+                    if (v == 0)
+                    {
+                        if (comparison == 0 && keyCache != null && keyCache.getCapacity() > 0)
+                        {
+                            if (op == Operator.EQ)
+                                bloomFilterTracker.addTruePositive();
+                            // store exact match for the key
+                            keyCache.put(unifiedKey, dataPosition);
+                        }
+                        return dataPosition;
+                    }
+                    if (v < 0)
+                    {
+                        if (op == Operator.EQ)
+                            bloomFilterTracker.addFalsePositive();
+                        return -1;
+                    }
+                }
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+            finally
+            {
+                FileUtils.closeQuietly(input);
+            }
+        }
+
+        if (op == Operator.EQ)
+            bloomFilterTracker.addFalsePositive();
+        return -1;
+    }
+
+    /**
+     * @return The length in bytes of the data file for this SSTable.
+     */
+    public long length()
+    {
+        return dfile.length;
+    }
+
+    public void markCompacted()
+    {
+        if (logger.isDebugEnabled())
+            logger.debug("Marking " + getFilename() + " compacted");
+        try
+        {
+            if (!new File(descriptor.filenameFor(Component.COMPACTED_MARKER)).createNewFile())
+                throw new IOException("Unable to create compaction marker");
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        phantomReference.deleteOnCleanup();
+    }
+
+    /**
+     * @param bufferSize Buffer size in bytes for this Scanner.
+     * @param filter filter to use when reading the columns
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public SSTableScanner getScanner(int bufferSize, QueryFilter filter)
+    {
+        return new SSTableScanner(this, filter, bufferSize);
+    }
+
+   /**
+    * Direct I/O SSTableScanner
+    * @param bufferSize Buffer size in bytes for this Scanner.
+    * @return A Scanner for seeking over the rows of the SSTable.
+    */
+    public SSTableScanner getDirectScanner(int bufferSize)
+    {
+        return new SSTableScanner(this, bufferSize, true);
+    }
+
+    public FileDataInput getFileDataInput(DecoratedKey decoratedKey, int bufferSize)
+    {
+        long position = getPosition(decoratedKey, Operator.EQ);
+        if (position < 0)
+            return null;
+
+        return dfile.getSegment(position, bufferSize);
+    }
+
+
+    public int compareTo(SSTableReader o)
+    {
+        return descriptor.generation - o.descriptor.generation;
+    }
+
+    public AbstractType getColumnComparator()
+    {
+        return metadata.comparator;
+    }
+
+    public ColumnFamily createColumnFamily()
+    {
+        return ColumnFamily.create(metadata);
+    }
+
+    public ICompactSerializer2<IColumn> getColumnSerializer()
+    {
+        return metadata.cfType == ColumnFamilyType.Standard
+               ? Column.serializer()
+               : SuperColumn.serializer(getColumnComparator());
+    }
+
+    /**
+     * Tests if the sstable contains data newer than the given age param (in localhost currentMilli time).
+     * This works in conjunction with maxDataAge which is an upper bound on the create of data in this sstable.
+     * @param age The age to compare the maxDataAre of this sstable. Measured in millisec since epoc on this host
+     * @return True iff this sstable contains data that's newer than the given age parameter.
+     */
+    public boolean newSince(long age)
+    {
+        return maxDataAge > age;
+    }
+
+    public static long readRowSize(DataInput in, Descriptor d) throws IOException
+    {
+        if (d.hasIntRowSize)
+            return in.readInt();
+        return in.readLong();
+    }
+
+    public void createLinks(String snapshotDirectoryPath) throws IOException
+    {
+        for (Component component : components)
+        {
+            File sourceFile = new File(descriptor.filenameFor(component));
+            File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+            CLibrary.createHardLink(sourceFile, targetLink);
+        }
+    }
+
+    /**
+     * Conditionally use the deprecated 'IPartitioner.convertFromDiskFormat' method.
+     */
+    public static DecoratedKey decodeKey(IPartitioner p, Descriptor d, ByteBuffer bytes)
+    {
+        if (d.hasEncodedKeys)
+            return p.convertFromDiskFormat(bytes);
+        return p.decorateKey(bytes);
+    }
+
+    /**
+     * TODO: Move someplace reusable
+     */
+    public abstract static class Operator
+    {
+        public static final Operator EQ = new Equals();
+        public static final Operator GE = new GreaterThanOrEqualTo();
+        public static final Operator GT = new GreaterThan();
+
+        /**
+         * @param comparison The result of a call to compare/compareTo, with the desired field on the rhs.
+         * @return less than 0 if the operator cannot match forward, 0 if it matches, greater than 0 if it might match forward.
+         */
+        public abstract int apply(int comparison);
+
+        final static class Equals extends Operator
+        {
+            public int apply(int comparison) { return -comparison; }
+        }
+
+        final static class GreaterThanOrEqualTo extends Operator
+        {
+            public int apply(int comparison) { return comparison >= 0 ? 0 : -comparison; }
+        }
+
+        final static class GreaterThan extends Operator
+        {
+            public int apply(int comparison) { return comparison > 0 ? 0 : 1; }
+        }
+    }
+
+    public long getBloomFilterFalsePositiveCount()
+    {
+        return bloomFilterTracker.getFalsePositiveCount();
+    }
+
+    public long getRecentBloomFilterFalsePositiveCount()
+    {
+        return bloomFilterTracker.getRecentFalsePositiveCount();
+    }
+
+    public long getBloomFilterTruePositiveCount()
+    {
+        return bloomFilterTracker.getTruePositiveCount();
+    }
+
+    public long getRecentBloomFilterTruePositiveCount()
+    {
+        return bloomFilterTracker.getRecentTruePositiveCount();
+    }
 }

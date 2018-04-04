@@ -1,4 +1,6 @@
-final String errPrefix = VERSION_FIELD + " field must exist in schema, using indexed=\"true\" stored=\"true\" and multiValued=\"false\"";
+finish(indexOptions == IndexOptions.DOCS_ONLY ? -1 : sumTotalTermFreq, sumDocFreq, visitedDocs.cardinality());
+
+package org.apache.lucene.codecs;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,198 +19,194 @@ final String errPrefix = VERSION_FIELD + " field must exist in schema, using ind
  * limitations under the License.
  */
 
-package org.apache.solr.update;
-
 import java.io.IOException;
-import java.util.Map;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.Comparator;
 
-import org.apache.lucene.queries.function.FunctionValues;
-import org.apache.lucene.queries.function.ValueSource;
-import org.apache.lucene.util.BitUtil;
+import org.apache.lucene.index.FieldInfo; // javadocs
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.MergeState;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.index.MultiDocsEnum;
+import org.apache.lucene.index.MultiDocsAndPositionsEnum;
+
 import org.apache.lucene.util.BytesRef;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.util.RefCounted;
+import org.apache.lucene.util.FixedBitSet;
 
-public class VersionInfo {
-  public static final String VERSION_FIELD="_version_";
+/**
+ * Abstract API that consumes terms for an individual field.
+ * <p>
+ * The lifecycle is:
+ * <ol>
+ *   <li>TermsConsumer is returned for each field 
+ *       by {@link FieldsConsumer#addField(FieldInfo)}.
+ *   <li>TermsConsumer returns a {@link PostingsConsumer} for
+ *       each term in {@link #startTerm(BytesRef)}.
+ *   <li>When the producer (e.g. IndexWriter)
+ *       is done adding documents for the term, it calls 
+ *       {@link #finishTerm(BytesRef, TermStats)}, passing in
+ *       the accumulated term statistics.
+ *   <li>Producer calls {@link #finish(long, long, int)} with
+ *       the accumulated collection statistics when it is finished
+ *       adding terms to the field.
+ * </ol>
+ * 
+ * @lucene.experimental
+ */
+public abstract class TermsConsumer {
 
-  private final UpdateLog ulog;
-  private final VersionBucket[] buckets;
-  private SchemaField versionField;
-  private SchemaField idField;
-  final ReadWriteLock lock = new ReentrantReadWriteLock(true);
+  /** Starts a new term in this field; this may be called
+   *  with no corresponding call to finish if the term had
+   *  no docs. */
+  public abstract PostingsConsumer startTerm(BytesRef text) throws IOException;
 
-  /**
-   * Gets and returns the {@link #VERSION_FIELD} from the specified 
-   * schema, after verifying that it is indexed, stored, and single-valued.  
-   * If any of these pre-conditions are not met, it throws a SolrException 
-   * with a user suitable message indicating the problem.
-   */
-  public static SchemaField getAndCheckVersionField(IndexSchema schema) 
-    throws SolrException {
-    final String errPrefix = VERSION_FIELD + "field must exist in schema, using indexed=\"true\" stored=\"true\" and multiValued=\"false\"";
-    SchemaField sf = schema.getFieldOrNull(VERSION_FIELD);
+  /** Finishes the current term; numDocs must be > 0. */
+  public abstract void finishTerm(BytesRef text, TermStats stats) throws IOException;
 
-    if (null == sf) {
-      throw new SolrException
-        (SolrException.ErrorCode.SERVER_ERROR, 
-         errPrefix + " (" + VERSION_FIELD + " does not exist)");
-    }
-    if ( !sf.indexed() ) {
-      throw new SolrException
-        (SolrException.ErrorCode.SERVER_ERROR, 
-         errPrefix + " (" + VERSION_FIELD + " is not indexed");
-    }
-    if ( !sf.stored() ) {
-      throw new SolrException
-        (SolrException.ErrorCode.SERVER_ERROR, 
-         errPrefix + " (" + VERSION_FIELD + " is not stored");
-    }
-    if ( sf.multiValued() ) {
-      throw new SolrException
-        (SolrException.ErrorCode.SERVER_ERROR, 
-         errPrefix + " (" + VERSION_FIELD + " is multiValued");
-    }
-    
-    return sf;
-  }
+  /** Called when we are done adding terms to this field */
+  public abstract void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException;
 
-  public VersionInfo(UpdateLog ulog, int nBuckets) {
-    this.ulog = ulog;
-    IndexSchema schema = ulog.uhandler.core.getLatestSchema(); 
-    versionField = getAndCheckVersionField(schema);
-    idField = schema.getUniqueKeyField();
-    buckets = new VersionBucket[ BitUtil.nextHighestPowerOfTwo(nBuckets) ];
-    for (int i=0; i<buckets.length; i++) {
-      buckets[i] = new VersionBucket();
-    }
-  }
+  /** Return the BytesRef Comparator used to sort terms
+   *  before feeding to this API. */
+  public abstract Comparator<BytesRef> getComparator() throws IOException;
 
-  public void reload() {
+  private MappingMultiDocsEnum docsEnum;
+  private MappingMultiDocsEnum docsAndFreqsEnum;
+  private MappingMultiDocsAndPositionsEnum postingsEnum;
 
-  }
+  /** Default merge impl */
+  public void merge(MergeState mergeState, TermsEnum termsEnum) throws IOException {
 
-  public SchemaField getVersionField() {
-    return versionField;
-  }
+    BytesRef term;
+    assert termsEnum != null;
+    long sumTotalTermFreq = 0;
+    long sumDocFreq = 0;
+    long sumDFsinceLastAbortCheck = 0;
+    FixedBitSet visitedDocs = new FixedBitSet(mergeState.segmentInfo.getDocCount());
 
-  public void lockForUpdate() {
-    lock.readLock().lock();
-  }
-
-  public void unlockForUpdate() {
-    lock.readLock().unlock();
-  }
-
-  public void blockUpdates() {
-    lock.writeLock().lock();
-  }
-
-  public void unblockUpdates() {
-    lock.writeLock().unlock();
-  }
-
-  /***
-  // todo: initialize... use current time to start?
-  // a clock that increments by 1 for every operation makes it easier to detect missing
-  // messages, but raises other issues:
-  // - need to initialize to largest thing in index or tlog
-  // - when becoming leader, need to make sure it's greater than
-  // - using to detect missing messages means we need to keep track per-leader, or make
-  //   sure a new leader starts off with 1 greater than the last leader.
-  private final AtomicLong clock = new AtomicLong();
-
-  public long getNewClock() {
-    return clock.incrementAndGet();
-  }
-
-  // Named *old* to prevent accidental calling getClock and expecting a new updated clock.
-  public long getOldClock() {
-    return clock.get();
-  }
-  ***/
-
-  /** We are currently using this time-based clock to avoid going back in time on a
-   * server restart (i.e. we don't want version numbers to start at 1 again).
-   */
-
-  // Time-based lamport clock.  Good for introducing some reality into clocks (to the degree
-  // that times are somewhat synchronized in the cluster).
-  // Good if we want to relax some constraints to scale down to where only one node may be
-  // up at a time.  Possibly harder to detect missing messages (because versions are not contiguous.
-  long vclock;
-  long time;
-  private final Object clockSync = new Object();
-
-
-  public long getNewClock() {
-    synchronized (clockSync) {
-      time = System.currentTimeMillis();
-      long result = time << 20;
-      if (result <= vclock) {
-        result = vclock + 1;
+    IndexOptions indexOptions = mergeState.fieldInfo.getIndexOptions();
+    if (indexOptions == IndexOptions.DOCS_ONLY) {
+      if (docsEnum == null) {
+        docsEnum = new MappingMultiDocsEnum();
       }
-      vclock = result;
-      return vclock;
-    }
-  }
+      docsEnum.setMergeState(mergeState);
 
-  public long getOldClock() {
-    synchronized (clockSync) {
-      return vclock;
-    }
-  }
+      MultiDocsEnum docsEnumIn = null;
 
-  public void updateClock(long clock) {
-    synchronized (clockSync) {
-      vclock = Math.max(vclock, clock);
-    }
-  }
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        docsEnumIn = (MultiDocsEnum) termsEnum.docs(null, docsEnumIn, false);
+        if (docsEnumIn != null) {
+          docsEnum.reset(docsEnumIn);
+          final PostingsConsumer postingsConsumer = startTerm(term);
+          final TermStats stats = postingsConsumer.merge(mergeState, docsEnum, visitedDocs);
+          if (stats.docFreq > 0) {
+            finishTerm(term, stats);
+            sumTotalTermFreq += stats.docFreq;
+            sumDFsinceLastAbortCheck += stats.docFreq;
+            sumDocFreq += stats.docFreq;
+            if (sumDFsinceLastAbortCheck > 60000) {
+              mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+              sumDFsinceLastAbortCheck = 0;
+            }
+          }
+        }
+      }
+    } else if (indexOptions == IndexOptions.DOCS_AND_FREQS) {
+      if (docsAndFreqsEnum == null) {
+        docsAndFreqsEnum = new MappingMultiDocsEnum();
+      }
+      docsAndFreqsEnum.setMergeState(mergeState);
 
+      MultiDocsEnum docsAndFreqsEnumIn = null;
 
-  public VersionBucket bucket(int hash) {
-    // If this is a user provided hash, it may be poor in the right-hand bits.
-    // Make sure high bits are moved down, since only the low bits will matter.
-    // int h = hash + (hash >>> 8) + (hash >>> 16) + (hash >>> 24);
-    // Assume good hash codes for now.
-
-    int slot = hash & (buckets.length-1);
-    return buckets[slot];
-  }
-
-  public Long lookupVersion(BytesRef idBytes) {
-    return ulog.lookupVersion(idBytes);
-  }
-
-  public Long getVersionFromIndex(BytesRef idBytes) {
-    // TODO: we could cache much of this and invalidate during a commit.
-    // TODO: most DocValues classes are threadsafe - expose which.
-
-    RefCounted<SolrIndexSearcher> newestSearcher = ulog.uhandler.core.getRealtimeSearcher();
-    try {
-      SolrIndexSearcher searcher = newestSearcher.get();
-      long lookup = searcher.lookupId(idBytes);
-      if (lookup < 0) return null;
-
-      ValueSource vs = versionField.getType().getValueSource(versionField, null);
-      Map context = ValueSource.newContext(searcher);
-      vs.createWeight(context, searcher);
-      FunctionValues fv = vs.getValues(context, searcher.getTopReaderContext().leaves().get((int)(lookup>>32)));
-      long ver = fv.longVal((int)lookup);
-      return ver;
-
-    } catch (IOException e) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error reading version from index", e);
-    } finally {
-      if (newestSearcher != null) {
-        newestSearcher.decref();
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        docsAndFreqsEnumIn = (MultiDocsEnum) termsEnum.docs(null, docsAndFreqsEnumIn, true);
+        assert docsAndFreqsEnumIn != null;
+        docsAndFreqsEnum.reset(docsAndFreqsEnumIn);
+        final PostingsConsumer postingsConsumer = startTerm(term);
+        final TermStats stats = postingsConsumer.merge(mergeState, docsAndFreqsEnum, visitedDocs);
+        if (stats.docFreq > 0) {
+          finishTerm(term, stats);
+          sumTotalTermFreq += stats.totalTermFreq;
+          sumDFsinceLastAbortCheck += stats.docFreq;
+          sumDocFreq += stats.docFreq;
+          if (sumDFsinceLastAbortCheck > 60000) {
+            mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+            sumDFsinceLastAbortCheck = 0;
+          }
+        }
+      }
+    } else if (indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
+      if (postingsEnum == null) {
+        postingsEnum = new MappingMultiDocsAndPositionsEnum();
+      }
+      postingsEnum.setMergeState(mergeState);
+      MultiDocsAndPositionsEnum postingsEnumIn = null;
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        postingsEnumIn = (MultiDocsAndPositionsEnum) termsEnum.docsAndPositions(null, postingsEnumIn, false);
+        assert postingsEnumIn != null;
+        postingsEnum.reset(postingsEnumIn);
+        // set PayloadProcessor
+        if (mergeState.payloadProcessorProvider != null) {
+          for (int i = 0; i < mergeState.readers.size(); i++) {
+            if (mergeState.readerPayloadProcessor[i] != null) {
+              mergeState.currentPayloadProcessor[i] = mergeState.readerPayloadProcessor[i].getProcessor(mergeState.fieldInfo.name, term);
+            }
+          }
+        }
+        final PostingsConsumer postingsConsumer = startTerm(term);
+        final TermStats stats = postingsConsumer.merge(mergeState, postingsEnum, visitedDocs);
+        if (stats.docFreq > 0) {
+          finishTerm(term, stats);
+          sumTotalTermFreq += stats.totalTermFreq;
+          sumDFsinceLastAbortCheck += stats.docFreq;
+          sumDocFreq += stats.docFreq;
+          if (sumDFsinceLastAbortCheck > 60000) {
+            mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+            sumDFsinceLastAbortCheck = 0;
+          }
+        }
+      }
+    } else {
+      assert indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS;
+      if (postingsEnum == null) {
+        postingsEnum = new MappingMultiDocsAndPositionsEnum();
+      }
+      postingsEnum.setMergeState(mergeState);
+      MultiDocsAndPositionsEnum postingsEnumIn = null;
+      while((term = termsEnum.next()) != null) {
+        // We can pass null for liveDocs, because the
+        // mapping enum will skip the non-live docs:
+        postingsEnumIn = (MultiDocsAndPositionsEnum) termsEnum.docsAndPositions(null, postingsEnumIn, true);
+        assert postingsEnumIn != null;
+        postingsEnum.reset(postingsEnumIn);
+        // set PayloadProcessor
+        if (mergeState.payloadProcessorProvider != null) {
+          for (int i = 0; i < mergeState.readers.size(); i++) {
+            if (mergeState.readerPayloadProcessor[i] != null) {
+              mergeState.currentPayloadProcessor[i] = mergeState.readerPayloadProcessor[i].getProcessor(mergeState.fieldInfo.name, term);
+            }
+          }
+        }
+        final PostingsConsumer postingsConsumer = startTerm(term);
+        final TermStats stats = postingsConsumer.merge(mergeState, postingsEnum, visitedDocs);
+        if (stats.docFreq > 0) {
+          finishTerm(term, stats);
+          sumTotalTermFreq += stats.totalTermFreq;
+          sumDFsinceLastAbortCheck += stats.docFreq;
+          sumDocFreq += stats.docFreq;
+          if (sumDFsinceLastAbortCheck > 60000) {
+            mergeState.checkAbort.work(sumDFsinceLastAbortCheck/5.0);
+            sumDFsinceLastAbortCheck = 0;
+          }
+        }
       }
     }
+    finish(sumTotalTermFreq, sumDocFreq, visitedDocs.cardinality());
   }
-
 }

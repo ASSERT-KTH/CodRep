@@ -1,14 +1,13 @@
-import org.apache.lucene.search.IndexSearcher; // javadocs
+Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8), message.getVersion());
 
-package org.apache.lucene.search;
-
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ /**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,200 +18,272 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.Closeable;
-import java.io.IOException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Semaphore;
+package org.apache.cassandra.dht;
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.NRTManager; // javadocs
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.store.AlreadyClosedException;
-import org.apache.lucene.store.Directory;
+ import java.io.IOException;
+ import java.net.InetAddress;
+ import java.util.*;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.locks.Condition;
 
-/** Utility class to safely share {@link IndexSearcher} instances
- *  across multiple threads, while periodically reopening.
- *  This class ensures each IndexSearcher instance is not
- *  closed until it is no longer needed.
- *
- *  <p>Use {@link #acquire} to obtain the current searcher, and
- *  {@link #release} to release it, like this:
- *
- *  <pre>
- *    IndexSearcher s = manager.acquire();
- *    try {
- *      // Do searching, doc retrieval, etc. with s
- *    } finally {
- *      manager.release(s);
- *    }
- *    // Do not use s after this!
- *    s = null;
- *  </pre>
- *
- *  <p>In addition you should periodically call {@link
- *  #maybeReopen}.  While it's possible to call this just
- *  before running each query, this is discouraged since it
- *  penalizes the unlucky queries that do the reopen.  It's
- *  better to  use a separate background thread, that
- *  periodically calls maybeReopen.  Finally, be sure to
- *  call {@link #close} once you are done.
- *
- *  <p><b>NOTE</b>: if you have an {@link IndexWriter}, it's
- *  better to use {@link NRTManager} since that class pulls
- *  near-real-time readers from the IndexWriter.
- *
- *  @lucene.experimental
- */
+ import com.google.common.base.Charsets;
+ import com.google.common.collect.ArrayListMultimap;
+ import com.google.common.collect.HashMultimap;
+ import com.google.common.collect.Multimap;
+ import org.apache.commons.lang.ArrayUtils;
+ import org.apache.commons.lang.StringUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
 
-public class SearcherManager implements Closeable {
+ import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.gms.FailureDetector;
+ import org.apache.cassandra.gms.IFailureDetector;
+ import org.apache.cassandra.locator.AbstractReplicationStrategy;
+ import org.apache.cassandra.locator.TokenMetadata;
+ import org.apache.cassandra.net.IAsyncCallback;
+ import org.apache.cassandra.net.IVerbHandler;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.streaming.OperationType;
+ import org.apache.cassandra.streaming.StreamIn;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.SimpleCondition;
 
-  // Current searcher
-  private volatile IndexSearcher currentSearcher;
-  private final SearcherWarmer warmer;
-  private final Semaphore reopening = new Semaphore(1);
-  private final ExecutorService es;
 
-  /** Opens an initial searcher from the Directory.
-   *
-   * @param dir Directory to open the searcher from
-   *
-   * @param warmer optional {@link SearcherWarmer}.  Pass
-   *        null if you don't require the searcher to warmed
-   *        before going live.
-   *
-   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
-   *  not invoked for the initial searcher; you should
-   *  warm it yourself if necessary.
-   */
-  public SearcherManager(Directory dir, SearcherWarmer warmer) throws IOException {
-    this(dir, warmer, null);
-  }
+public class BootStrapper
+{
+    private static final Logger logger = LoggerFactory.getLogger(BootStrapper.class);
 
-  /** Opens an initial searcher from the Directory.
-   *
-   * @param dir Directory to open the searcher from
-   *
-   * @param warmer optional {@link SearcherWarmer}.  Pass
-   *        null if you don't require the searcher to warmed
-   *        before going live.
-   *
-   * @param es optional ExecutorService so different segments can
-   *        be searched concurrently (see {@link
-   *        IndexSearcher#IndexSearcher(IndexReader,ExecutorService)}.  Pass null
-   *        to search segments sequentially.
-   *
-   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
-   *  not invoked for the initial searcher; you should
-   *  warm it yourself if necessary.
-   */
-  public SearcherManager(Directory dir, SearcherWarmer warmer, ExecutorService es) throws IOException {
-    this.es = es;
-    currentSearcher = new IndexSearcher(IndexReader.open(dir), this.es);
-    this.warmer = warmer;
-  }
+    /* endpoints that need to be bootstrapped */
+    protected final InetAddress address;
+    /* tokens of the nodes being bootstrapped. */
+    protected final Token token;
+    protected final TokenMetadata tokenMetadata;
 
-  /** You must call this, periodically, to perform a
-   *  reopen.  This calls {@link IndexReader#reopen} on the
-   *  underlying reader, and if that returns a new reader,
-   *  it's warmed (if you provided a {@link SearcherWarmer}
-   *  and then swapped into production.
-   *
-   *  <p><b>Threads</b>: it's fine for more than one thread to
-   *  call this at once.  Only the first thread will attempt
-   *  the reopen; subsequent threads will see that another
-   *  thread is already handling reopen and will return
-   *  immediately.  Note that this means if another thread
-   *  is already reopening then subsequent threads will
-   *  return right away without waiting for the reader
-   *  reopen to complete.</p>
-   *
-   *  <p>This method returns true if a new reader was in
-   *  fact opened.</p>
-   */
-  public boolean maybeReopen()
-    throws  IOException {
+    public BootStrapper(InetAddress address, Token token, TokenMetadata tmd)
+    {
+        assert address != null;
+        assert token != null;
 
-    if (currentSearcher == null) {
-      throw new AlreadyClosedException("this SearcherManager is closed");
+        this.address = address;
+        this.token = token;
+        tokenMetadata = tmd;
     }
 
-    // Ensure only 1 thread does reopen at once; other
-    // threads just return immediately:
-    if (reopening.tryAcquire()) {
-      try {
-        IndexReader newReader = currentSearcher.getIndexReader().reopen();
-        if (newReader != currentSearcher.getIndexReader()) {
-          IndexSearcher newSearcher = new IndexSearcher(newReader, es);
-          boolean success = false;
-          try {
-            if (warmer != null) {
-              warmer.warm(newSearcher);
+    public void bootstrap() throws IOException
+    {
+        if (logger.isDebugEnabled())
+            logger.debug("Beginning bootstrap process");
+
+        final Multimap<String, Map.Entry<InetAddress, Collection<Range>>> rangesToFetch = HashMultimap.create();
+
+        int requests = 0;
+        for (String table : DatabaseDescriptor.getNonSystemTables())
+        {
+            Map<InetAddress, Collection<Range>> workMap = getWorkMap(getRangesWithSources(table)).asMap();
+            for (Map.Entry<InetAddress, Collection<Range>> entry : workMap.entrySet())
+            {
+                requests++;
+                rangesToFetch.put(table, entry);
             }
-            swapSearcher(newSearcher);
-            success = true;
-          } finally {
-            if (!success) {
-              release(newSearcher);
-            }
-          }
-          return true;
-        } else {
-          return false;
         }
-      } finally {
-        reopening.release();
-      }
-    } else {
-      return false;
+
+        final CountDownLatch latch = new CountDownLatch(requests);
+        for (final String table : rangesToFetch.keySet())
+        {
+            /* Send messages to respective folks to stream data over to me */
+            for (Map.Entry<InetAddress, Collection<Range>> entry : rangesToFetch.get(table))
+            {
+                final InetAddress source = entry.getKey();
+                Collection<Range> ranges = entry.getValue();
+                final Runnable callback = new Runnable()
+                {
+                    public void run()
+                    {
+                        latch.countDown();
+                        if (logger.isDebugEnabled())
+                            logger.debug(String.format("Removed %s/%s as a bootstrap source; remaining is %s",
+                                                       source, table, latch.getCount()));
+                    }
+                };
+                if (logger.isDebugEnabled())
+                    logger.debug("Bootstrapping from " + source + " ranges " + StringUtils.join(entry.getValue(), ", "));
+                StreamIn.requestRanges(source, table, entry.getValue(), callback, OperationType.BOOTSTRAP);
+            }
+        }
+
+        try
+        {
+            latch.await();
+            StorageService.instance.finishBootstrapping();
+        }
+        catch (InterruptedException e)
+        {
+            throw new AssertionError(e);
+        }
     }
-  }
 
-  /** Obtain the current IndexSearcher.  You must match
-   *  every call to acquire with one call to {@link #release};
-   *  it's best to do so in a finally clause. */
-  public IndexSearcher acquire() {
-    IndexSearcher searcher;
-    do {
-      if ((searcher = currentSearcher) == null) {
-        throw new AlreadyClosedException("this SearcherManager is closed");
-      }
-    } while (!searcher.getIndexReader().tryIncRef());
-    return searcher;
-  }    
+    /**
+     * if initialtoken was specified, use that.
+     * otherwise, pick a token to assume half the load of the most-loaded node.
+     */
+    public static Token getBootstrapToken(final TokenMetadata metadata, final Map<InetAddress, Double> load) throws IOException, ConfigurationException
+    {
+        if (DatabaseDescriptor.getInitialToken() != null)
+        {
+            logger.debug("token manually specified as " + DatabaseDescriptor.getInitialToken());
+            Token token = StorageService.getPartitioner().getTokenFactory().fromString(DatabaseDescriptor.getInitialToken());
+            if (metadata.getEndpoint(token) != null)
+                throw new ConfigurationException("Bootstraping to existing token " + token + " is not allowed (decommission/removetoken the old node first).");
+            return token;
+        }
 
-  /** Release the searcher previously obtained with {@link
-   *  #acquire}.
-   *
-   *  <p><b>NOTE</b>: it's safe to call this after {@link
-   *  #close}. */
-  public void release(IndexSearcher searcher)
-    throws IOException {
-    searcher.getIndexReader().decRef();
-  }
-
-  // Replaces old searcher with new one - needs to be synced to make close() work
-  private synchronized void swapSearcher(IndexSearcher newSearcher)
-    throws IOException {
-    IndexSearcher oldSearcher = currentSearcher;
-    if (oldSearcher == null) {
-      throw new AlreadyClosedException("this SearcherManager is closed");
+        return getBalancedToken(metadata, load);
     }
-    currentSearcher = newSearcher;
-    release(oldSearcher);
-  }
 
-  /** Close this SearcherManager to future searching.  Any
-   *  searches still in process in other threads won't be
-   *  affected, and they should still call {@link #release}
-   *  after they are done. */
-  // Not in Java 5: @Override
-  public synchronized void close() throws IOException {
-    if (currentSearcher != null) {
-      // make sure we can call this more than once
-      // closeable javadoc says:
-      //   if this is already closed then invoking this method has no effect.
-      swapSearcher(null);
+    public static Token getBalancedToken(TokenMetadata metadata, Map<InetAddress, Double> load)
+    {
+        InetAddress maxEndpoint = getBootstrapSource(metadata, load);
+        Token<?> t = getBootstrapTokenFrom(maxEndpoint);
+        logger.info("New token will be " + t + " to assume load from " + maxEndpoint);
+        return t;
     }
-  }
+
+    static InetAddress getBootstrapSource(final TokenMetadata metadata, final Map<InetAddress, Double> load)
+    {
+        // sort first by number of nodes already bootstrapping into a source node's range, then by load.
+        List<InetAddress> endpoints = new ArrayList<InetAddress>(load.size());
+        for (InetAddress endpoint : load.keySet())
+        {
+            if (!metadata.isMember(endpoint))
+                continue;
+            endpoints.add(endpoint);
+        }
+
+        if (endpoints.isEmpty())
+            throw new RuntimeException("No other nodes seen!  Unable to bootstrap");
+        Collections.sort(endpoints, new Comparator<InetAddress>()
+        {
+            public int compare(InetAddress ia1, InetAddress ia2)
+            {
+                int n1 = metadata.pendingRangeChanges(ia1);
+                int n2 = metadata.pendingRangeChanges(ia2);
+                if (n1 != n2)
+                    return -(n1 - n2); // more targets = _less_ priority!
+
+                double load1 = load.get(ia1);
+                double load2 = load.get(ia2);
+                if (load1 == load2)
+                    return 0;
+                return load1 < load2 ? -1 : 1;
+            }
+        });
+
+        InetAddress maxEndpoint = endpoints.get(endpoints.size() - 1);
+        assert !maxEndpoint.equals(FBUtilities.getLocalAddress());
+        if (metadata.pendingRangeChanges(maxEndpoint) > 0)
+            throw new RuntimeException("Every node is a bootstrap source! Please specify an initial token manually or wait for an existing bootstrap operation to finish.");
+        
+        return maxEndpoint;
+    }
+
+    /** get potential sources for each range, ordered by proximity (as determined by EndpointSnitch) */
+    Multimap<Range, InetAddress> getRangesWithSources(String table)
+    {
+        assert tokenMetadata.sortedTokens().size() > 0;
+        final AbstractReplicationStrategy strat = Table.open(table).getReplicationStrategy();
+        Collection<Range> myRanges = strat.getPendingAddressRanges(tokenMetadata, token, address);
+
+        Multimap<Range, InetAddress> myRangeAddresses = ArrayListMultimap.create();
+        Multimap<Range, InetAddress> rangeAddresses = strat.getRangeAddresses(tokenMetadata);
+        for (Range myRange : myRanges)
+        {
+            for (Range range : rangeAddresses.keySet())
+            {
+                if (range.contains(myRange))
+                {
+                    List<InetAddress> preferred = DatabaseDescriptor.getEndpointSnitch().getSortedListByProximity(address, rangeAddresses.get(range));
+                    myRangeAddresses.putAll(myRange, preferred);
+                    break;
+                }
+            }
+            assert myRangeAddresses.keySet().contains(myRange);
+        }
+        return myRangeAddresses;
+    }
+
+    static Token<?> getBootstrapTokenFrom(InetAddress maxEndpoint)
+    {
+        Message message = new Message(FBUtilities.getLocalAddress(), StorageService.Verb.BOOTSTRAP_TOKEN, ArrayUtils.EMPTY_BYTE_ARRAY);
+        BootstrapTokenCallback btc = new BootstrapTokenCallback();
+        MessagingService.instance().sendRR(message, maxEndpoint, btc);
+        return btc.getToken();
+    }
+
+    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget)
+    {
+        return getWorkMap(rangesWithSourceTarget, FailureDetector.instance);
+    }
+
+    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget, IFailureDetector failureDetector)
+    {
+        /*
+         * Map whose key is the source node and the value is a map whose key is the
+         * target and value is the list of ranges to be sent to it.
+        */
+        Multimap<InetAddress, Range> sources = ArrayListMultimap.create();
+
+        // TODO look for contiguous ranges and map them to the same source
+        for (Range range : rangesWithSourceTarget.keySet())
+        {
+            for (InetAddress source : rangesWithSourceTarget.get(range))
+            {
+                if (failureDetector.isAlive(source))
+                {
+                    sources.put(source, range);
+                    break;
+                }
+            }
+        }
+        return sources;
+    }
+
+    public static class BootstrapTokenVerbHandler implements IVerbHandler
+    {
+        public void doVerb(Message message)
+        {
+            StorageService ss = StorageService.instance;
+            String tokenString = StorageService.getPartitioner().getTokenFactory().toString(ss.getBootstrapToken());
+            Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8));
+            MessagingService.instance().sendOneWay(response, message.getFrom());
+        }
+    }
+
+    private static class BootstrapTokenCallback implements IAsyncCallback
+    {
+        private volatile Token<?> token;
+        private final Condition condition = new SimpleCondition();
+
+        public Token<?> getToken()
+        {
+            try
+            {
+                condition.await();
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException(e);
+            }
+            return token;
+        }
+
+        public void response(Message msg)
+        {
+            token = StorageService.getPartitioner().getTokenFactory().fromString(new String(msg.getMessageBody(), Charsets.UTF_8));
+            condition.signalAll();
+        }
+    }
 }

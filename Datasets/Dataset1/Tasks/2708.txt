@@ -1,4 +1,6 @@
-CartesianTierPlotter ctp = new CartesianTierPlotter( CartesianTierPlotter.bestFit(miles, minTier, maxTier), projector, tierPrefix);
+// Not in Java 5: @Override
+
+package org.apache.lucene.search;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,117 +19,185 @@ CartesianTierPlotter ctp = new CartesianTierPlotter( CartesianTierPlotter.bestFi
  * limitations under the License.
  */
 
-package org.apache.lucene.spatial.tier;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.apache.lucene.search.Filter;
-import org.apache.lucene.spatial.tier.projections.CartesianTierPlotter;
-import org.apache.lucene.spatial.tier.projections.IProjector;
-import org.apache.lucene.spatial.tier.projections.SinusoidalProjector;
-import org.apache.lucene.spatial.geometry.LatLng;
-import org.apache.lucene.spatial.geometry.FloatLatLng;
-import org.apache.lucene.spatial.geometry.shape.LLRect;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.NRTManager; // javadocs
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.Directory;
 
-
-/**
- * <p><font color="red"><b>NOTE:</b> This API is still in
- * flux and might change in incompatible ways in the next
- * release.</font>
+/** Utility class to safely share {@link IndexSearcher} instances
+ *  across multiple threads, while periodically reopening.
+ *  This class ensures each IndexSearcher instance is not
+ *  closed until it is no longer needed.
+ *
+ *  <p>Use {@link #get} to obtain the current searcher, and
+ *  {@link #release} to release it, like this:
+ *
+ *  <pre>
+ *    IndexSearcher s = manager.get();
+ *    try {
+ *      // Do searching, doc retrieval, etc. with s
+ *    } finally {
+ *      manager.release(s);
+ *    }
+ *    // Do not use s after this!
+ *    s = null;
+ *  </pre>
+ *
+ *  <p>In addition you should periodically call {@link
+ *  #maybeReopen}.  While it's possible to call this just
+ *  before running each query, this is discouraged since it
+ *  penalizes the unlucky queries that do the reopen.  It's
+ *  better to  use a separate background thread, that
+ *  periodically calls maybeReopen.  Finally, be sure to
+ *  call {@link #close} once you are done.
+ *
+ *  <p><b>NOTE</b>: if you have an {@link IndexWriter}, it's
+ *  better to use {@link NRTManager} since that class pulls
+ *  near-real-time readers from the IndexWriter.
+ *
+ *  @lucene.experimental
  */
-public class CartesianPolyFilterBuilder {
 
-  // Finer granularity than 1 mile isn't accurate with
-  // standard java math.  Also, there's already a 2nd
-  // precise filter, if needed, in DistanceQueryBuilder,
-  // that will make the filtering exact.
-  public static final double MILES_FLOOR = 1.0;
+public class SearcherManager implements Closeable {
 
-  private IProjector projector = new SinusoidalProjector();
-  private final String tierPrefix;
-	private int minTier;
-	private int maxTier;
-  /**
-   * 
-   * @param tierPrefix The prefix for the name of the fields containing the tier info
-   * @param minTierIndexed The minimum tier level indexed
-   * @param maxTierIndexed The maximum tier level indexed
+  // Current searcher
+  private volatile IndexSearcher currentSearcher;
+  private final SearcherWarmer warmer;
+  private final AtomicBoolean reopening = new AtomicBoolean();
+  private final ExecutorService es;
+
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
    */
-  public CartesianPolyFilterBuilder( String tierPrefix, int minTierIndexed, int maxTierIndexed ) {
-    this.tierPrefix = tierPrefix;
-	this.minTier = minTierIndexed;
-	this.maxTier = maxTierIndexed;
+  public SearcherManager(Directory dir, SearcherWarmer warmer) throws IOException {
+    this(dir, warmer, null);
   }
-  
-  public Shape getBoxShape(double latitude, double longitude, double miles)
-  {  
-    if (miles < MILES_FLOOR) {
-      miles = MILES_FLOOR;
-    }
-    LLRect box1 = LLRect.createBox( new FloatLatLng( latitude, longitude ), miles, miles );
-    LatLng lowerLeft = box1.getLowerLeft();
-    LatLng upperRight = box1.getUpperRight();
 
-    double latUpperRight = upperRight.getLat();
-    double latLowerLeft = lowerLeft.getLat();
-    double longUpperRight = upperRight.getLng();
-    double longLowerLeft = lowerLeft.getLng();
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   * @param es optional ExecutorService so different segments can
+   *        be searched concurrently (see {@link
+   *        IndexSearcher#IndexSearcher(IndexReader,ExecutorService)}.  Pass null
+   *        to search segments sequentially.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer, ExecutorService es) throws IOException {
+    this.es = es;
+    currentSearcher = new IndexSearcher(IndexReader.open(dir), this.es);
+    this.warmer = warmer;
+  }
 
-    CartesianTierPlotter ctp = new CartesianTierPlotter( miles, projector, tierPrefix, minTier, maxTier );
-    Shape shape = new Shape(ctp.getTierLevelId());
+  /** You must call this, periodically, to perform a
+   *  reopen.  This calls {@link IndexReader#reopen} on the
+   *  underlying reader, and if that returns a new reader,
+   *  it's warmed (if you provided a {@link SearcherWarmer}
+   *  and then swapped into production.
+   *
+   *  <p><b>Threads</b>: it's fine for more than one thread to
+   *  call this at once.  Only the first thread will attempt
+   *  the reopen; subsequent threads will see that another
+   *  thread is already handling reopen and will return
+   *  immediately.  Note that this means if another thread
+   *  is already reopening then subsequent threads will
+   *  return right away without waiting for the reader
+   *  reopen to complete.</p>
+   *
+   *  <p>This method returns true if a new reader was in
+   *  fact opened.</p>
+   */
+  public boolean maybeReopen()
+    throws  IOException {
 
-    if (longUpperRight < longLowerLeft) { // Box cross the 180 meridian
-      addBoxes(shape, ctp, latLowerLeft, longLowerLeft, latUpperRight, LatLng.LONGITUDE_DEGREE_MAX);
-      addBoxes(shape, ctp, latLowerLeft, -LatLng.LONGITUDE_DEGREE_MIN, latUpperRight, longUpperRight);
-    } else {
-      addBoxes(shape, ctp, latLowerLeft, longLowerLeft, latUpperRight, longUpperRight);
-    }
- 
-    return shape; 
-  } 
-  
-  private void addBoxes(Shape shape, CartesianTierPlotter tierPlotter, double lat1, double long1, double lat2, double long2) {
-    double boxId1 = tierPlotter.getTierBoxId(lat1, long1);
-    double boxId2 = tierPlotter.getTierBoxId(lat2, long2);
-
-    double tierVert = tierPlotter.getTierVerticalPosDivider();
-
-    int LongIndex1 = (int) Math.round(boxId1);
-    int LatIndex1 = (int) Math.round((boxId1 - LongIndex1) * tierVert);
-
-    int LongIndex2 = (int) Math.round(boxId2);
-    int LatIndex2 = (int) Math.round((boxId2 - LongIndex2) * tierVert);
-
-    int startLong, endLong;
-    int startLat, endLat;
-
-    if (LongIndex1 > LongIndex2) {
-      startLong = LongIndex2;
-      endLong = LongIndex1;
-    } else {
-      startLong = LongIndex1;
-      endLong = LongIndex2;
+    if (currentSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
     }
 
-    if (LatIndex1 > LatIndex2) {
-      startLat = LatIndex2;
-      endLat = LatIndex1;
-    } else {
-      startLat = LatIndex1;
-      endLat = LatIndex2;
-    }
-
-    int LatIndex, LongIndex;
-    for (LongIndex = startLong; LongIndex <= endLong; LongIndex++) {
-      for (LatIndex = startLat; LatIndex <= endLat; LatIndex++) {
-        // create a boxId
-        double boxId = LongIndex + LatIndex / tierVert;
-        shape.addBox(boxId);
+    // Ensure only 1 thread does reopen at once; other
+    // threads just return immediately:
+    if (!reopening.getAndSet(true)) {
+      try {
+        IndexReader newReader = currentSearcher.getIndexReader().reopen();
+        if (newReader != currentSearcher.getIndexReader()) {
+          IndexSearcher newSearcher = new IndexSearcher(newReader, es);
+          if (warmer != null) {
+            warmer.warm(newSearcher);
+          }
+          swapSearcher(newSearcher);
+          return true;
+        } else {
+          return false;
+        }
+      } finally {
+        reopening.set(false);
       }
+    } else {
+      return false;
     }
   }
-  
-  public Filter getBoundingArea(double latitude, double longitude, double miles) 
-  {
-    Shape shape = getBoxShape(latitude, longitude, miles);
-    return new CartesianShapeFilter(shape, tierPrefix + shape.getTierId());
+
+  /** Obtain the current IndexSearcher.  You must match
+   *  every call to get with one call to {@link #release};
+   *  it's best to do so in a finally clause. */
+  public IndexSearcher get() {
+    IndexSearcher toReturn = currentSearcher;
+    if (toReturn == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
+    toReturn.getIndexReader().incRef();
+    return toReturn;
+  }    
+
+  /** Release the searcher previously obtained with {@link
+   *  #get}.
+   *
+   *  <p><b>NOTE</b>: it's safe to call this after {@link
+   *  #close}. */
+  public void release(IndexSearcher searcher)
+    throws IOException {
+    searcher.getIndexReader().decRef();
+  }
+
+  // Replaces old searcher with new one
+  private void swapSearcher(IndexSearcher newSearcher)
+    throws IOException {
+    IndexSearcher oldSearcher = currentSearcher;
+    if (oldSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
+    currentSearcher = newSearcher;
+    release(oldSearcher);
+  }
+
+  /** Close this SearcherManager to future searching.  Any
+   *  searches still in process in other threads won't be
+   *  affected, and they should still call {@link #release}
+   *  after they are done. */
+  @Override
+  public void close() throws IOException {
+    swapSearcher(null);
   }
 }

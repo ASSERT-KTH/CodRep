@@ -1,6 +1,6 @@
-bf = BloomFilter.getFilter(keyCount, 15);
+endPointSnitch = (DatacenterEndPointSnitch) StorageService.instance.getEndPointSnitch();
 
-package org.apache.cassandra.io;
+package org.apache.cassandra.locator;
 /*
  * 
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -23,147 +23,222 @@ package org.apache.cassandra.io;
  */
 
 
-import java.io.*;
-import java.util.ArrayList;
+import java.io.IOException;
+import java.io.IOError;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.Map.Entry;
 
-import org.apache.log4j.Logger;
-
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.*;
 
-public class SSTableWriter extends SSTable
+/**
+ * This Stategy is little diffrent than the Rack aware Statergy. If there is
+ * replication factor is N. We will make sure that (N-1)%2 of the nodes are in
+ * other Datacenter.... For example if we have 5 nodes this stategy will make
+ * sure to make 2 copies out of 5 in other dataceneter.
+ * <p/>
+ * This class also caches the EndPoints and invalidates the cache if there is a
+ * change in the number of tokens.
+ */
+public class DatacenterShardStategy extends AbstractReplicationStrategy
 {
-    private static Logger logger = Logger.getLogger(SSTableWriter.class);
+    private static Map<String, List<Token>> dcMap = new HashMap<String, List<Token>>();
+    private static Map<String, Integer> dcReplicationFactor = new HashMap<String, Integer>();
+    private static Map<String, Integer> quorumRepFactor = new HashMap<String, Integer>();
+    private static int locQFactor = 0;
+    private static DatacenterEndPointSnitch endPointSnitch;
+    ArrayList<Token> tokens;
 
-    private long keysWritten;
-    private BufferedRandomAccessFile dataFile;
-    private BufferedRandomAccessFile indexFile;
-    private DecoratedKey lastWrittenKey;
-    private BloomFilter bf;
+    private List<InetAddress> localEndPoints = new ArrayList<InetAddress>();
 
-    public SSTableWriter(String filename, long keyCount, IPartitioner partitioner) throws IOException
+    private List<InetAddress> getLocalEndPoints()
     {
-        super(filename, partitioner);
-        dataFile = new BufferedRandomAccessFile(path, "rw", (int)(DatabaseDescriptor.getFlushDataBufferSizeInMB() * 1024 * 1024));
-        indexFile = new BufferedRandomAccessFile(indexFilename(), "rw", (int)(DatabaseDescriptor.getFlushIndexBufferSizeInMB() * 1024 * 1024));
-        bf = new BloomFilter((int)keyCount, 15); // TODO fix long -> int cast
+        return new ArrayList<InetAddress>(localEndPoints);
     }
 
-    private long beforeAppend(DecoratedKey decoratedKey) throws IOException
+    private Map<String, Integer> getQuorumRepFactor()
     {
-        if (decoratedKey == null)
-        {
-            throw new IOException("Keys must not be null.");
-        }
-        if (lastWrittenKey != null && lastWrittenKey.compareTo(decoratedKey) > 0)
-        {
-            logger.info("Last written key : " + lastWrittenKey);
-            logger.info("Current key : " + decoratedKey);
-            logger.info("Writing into file " + path);
-            throw new IOException("Keys must be written in ascending order.");
-        }
-        return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
-    }
-
-    private void afterAppend(DecoratedKey decoratedKey, long position) throws IOException
-    {
-        String diskKey = partitioner.convertToDiskFormat(decoratedKey);
-        bf.add(diskKey);
-        lastWrittenKey = decoratedKey;
-        long indexPosition = indexFile.getFilePointer();
-        indexFile.writeUTF(diskKey);
-        indexFile.writeLong(position);
-        if (logger.isTraceEnabled())
-            logger.trace("wrote " + decoratedKey + " at " + position);
-
-        if (keysWritten++ % INDEX_INTERVAL != 0)
-            return;
-        if (indexPositions == null)
-        {
-            indexPositions = new ArrayList<KeyPosition>();
-        }
-        indexPositions.add(new KeyPosition(decoratedKey, indexPosition));
-        if (logger.isTraceEnabled())
-            logger.trace("wrote index of " + decoratedKey + " at " + indexPosition);
-    }
-
-    // TODO make this take a DataOutputStream and wrap the byte[] version to combine them
-    public void append(DecoratedKey decoratedKey, DataOutputBuffer buffer) throws IOException
-    {
-        long currentPosition = beforeAppend(decoratedKey);
-        dataFile.writeUTF(partitioner.convertToDiskFormat(decoratedKey));
-        int length = buffer.getLength();
-        assert length > 0;
-        dataFile.writeInt(length);
-        dataFile.write(buffer.getData(), 0, length);
-        afterAppend(decoratedKey, currentPosition);
-    }
-
-    public void append(DecoratedKey decoratedKey, byte[] value) throws IOException
-    {
-        long currentPosition = beforeAppend(decoratedKey);
-        dataFile.writeUTF(partitioner.convertToDiskFormat(decoratedKey));
-        assert value.length > 0;
-        dataFile.writeInt(value.length);
-        dataFile.write(value);
-        afterAppend(decoratedKey, currentPosition);
+        return new HashMap<String, Integer>(quorumRepFactor);
     }
 
     /**
-     * Renames temporary SSTable files to valid data, index, and bloom filter files
+     * This Method will get the required information of the EndPoint from the
+     * DataCenterEndPointSnitch and poopulates this singleton class.
      */
-    public SSTableReader closeAndOpenReader(double cacheFraction) throws IOException
+    private synchronized void loadEndPoints(TokenMetadata metadata) throws IOException
     {
-        // bloom filter
-        FileOutputStream fos = new FileOutputStream(filterFilename());
-        DataOutputStream stream = new DataOutputStream(fos);
-        BloomFilter.serializer().serialize(bf, stream);
-        stream.flush();
-        fos.getFD().sync();
-        stream.close();
-
-        // index
-        indexFile.getChannel().force(true);
-        indexFile.close();
-
-        // main data
-        dataFile.close(); // calls force
-
-        rename(indexFilename());
-        rename(filterFilename());
-        path = rename(path); // important to do this last since index & filter file names are derived from it
-
-        ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache = cacheFraction > 0
-                                                        ? SSTableReader.createKeyCache((int) (cacheFraction * keysWritten))
-                                                        : null;
-        return new SSTableReader(path, partitioner, indexPositions, bf, keyCache);
+        endPointSnitch = (DatacenterEndPointSnitch) StorageService.instance().getEndPointSnitch();
+        this.tokens = new ArrayList<Token>(tokens);
+        String localDC = endPointSnitch.getLocation(InetAddress.getLocalHost());
+        dcMap = new HashMap<String, List<Token>>();
+        for (Token token : this.tokens)
+        {
+            InetAddress endPoint = metadata.getEndPoint(token);
+            String dataCenter = endPointSnitch.getLocation(endPoint);
+            if (dataCenter.equals(localDC))
+            {
+                localEndPoints.add(endPoint);
+            }
+            List<Token> lst = dcMap.get(dataCenter);
+            if (lst == null)
+            {
+                lst = new ArrayList<Token>();
+            }
+            lst.add(token);
+            dcMap.put(dataCenter, lst);
+        }
+        for (Entry<String, List<Token>> entry : dcMap.entrySet())
+        {
+            List<Token> valueList = entry.getValue();
+            Collections.sort(valueList);
+            dcMap.put(entry.getKey(), valueList);
+        }
+        dcReplicationFactor = endPointSnitch.getMapReplicationFactor();
+        for (Entry<String, Integer> entry : dcReplicationFactor.entrySet())
+        {
+            String datacenter = entry.getKey();
+            int qFactor = (entry.getValue() / 2 + 1);
+            quorumRepFactor.put(datacenter, qFactor);
+            if (datacenter.equals(localDC))
+            {
+                locQFactor = qFactor;
+            }
+        }
     }
 
-    static String rename(String tmpFilename)
+    public DatacenterShardStategy(TokenMetadata tokenMetadata, int replicas)
+    throws UnknownHostException
     {
-        String filename = tmpFilename.replace("-" + SSTable.TEMPFILE_MARKER, "");
+        super(tokenMetadata, replicas);
+        if ((!(DatabaseDescriptor.getEndPointSnitch() instanceof DatacenterEndPointSnitch)))
+        {
+            throw new IllegalArgumentException("DatacenterShardStrategy requires DatacenterEndpointSnitch");
+        }
+    }
+
+    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata)
+    {
         try
         {
-            FBUtilities.renameWithConfirm(tmpFilename, filename);
+            return getNaturalEndpointsInternal(token, metadata);
         }
         catch (IOException e)
         {
             throw new IOError(e);
         }
-        return filename;
     }
 
-    public static SSTableReader renameAndOpen(String dataFileName) throws IOException
+    private ArrayList<InetAddress> getNaturalEndpointsInternal(Token searchToken, TokenMetadata metadata) throws IOException
     {
-        SSTableWriter.rename(indexFilename(dataFileName));
-        SSTableWriter.rename(filterFilename(dataFileName));
-        dataFileName = SSTableWriter.rename(dataFileName);
-        return SSTableReader.open(dataFileName, StorageService.getPartitioner(), DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName)));
+        ArrayList<InetAddress> endpoints = new ArrayList<InetAddress>();
+
+        if (metadata.sortedTokens().size() == 0)
+            return endpoints;
+
+        if (null == tokens || tokens.size() != metadata.sortedTokens().size())
+        {
+            loadEndPoints(metadata);
+        }
+
+        for (String dc : dcMap.keySet())
+        {
+            int foundCount = 0;
+            ArrayList<InetAddress> forloopReturn = new ArrayList<InetAddress>();
+            int replicas_ = dcReplicationFactor.get(dc);
+            List tokens = dcMap.get(dc);
+            boolean bOtherRack = false;
+            boolean doneDataCenterItr;
+            int index = Collections.binarySearch(tokens, searchToken);
+            if (index < 0)
+            {
+                index = (index + 1) * (-1);
+                if (index >= tokens.size())
+                {
+                    index = 0;
+                }
+            }
+            int totalNodes = tokens.size();
+            // Add the node at the index by default
+            InetAddress primaryHost = metadata.getEndPoint((Token) tokens.get(index));
+            forloopReturn.add(primaryHost);
+            foundCount++;
+            if (replicas_ == 1)
+            {
+                continue;
+            }
+
+            int startIndex = (index + 1) % totalNodes;
+            for (int i = startIndex, count = 1; count < totalNodes && foundCount < replicas_; ++count, i = (i + 1) % totalNodes)
+            {
+                InetAddress endPointOfIntrest = metadata.getEndPoint((Token) tokens.get(i));
+                if ((replicas_ - 1) > foundCount)
+                {
+                    forloopReturn.add(endPointOfIntrest);
+                    foundCount++;
+                    continue;
+                }
+                else
+                {
+                    doneDataCenterItr = true;
+                }
+                
+                // Now try to find one on a different rack
+                if (!bOtherRack)
+                {
+                    if (!endPointSnitch.isOnSameRack(primaryHost, endPointOfIntrest))
+                    {
+                        forloopReturn.add(metadata.getEndPoint((Token) tokens.get(i)));
+                        bOtherRack = true;
+                        foundCount++;
+                    }
+                }
+                // If both already found exit loop.
+                if (doneDataCenterItr && bOtherRack)
+                {
+                    break;
+                }
+            }
+
+            /*
+            * If we found N number of nodes we are good. This loop wil just
+            * exit. Otherwise just loop through the list and add until we
+            * have N nodes.
+            */
+            for (int i = startIndex, count = 1; count < totalNodes && foundCount < replicas_; ++count, i = (i + 1) % totalNodes)
+            {
+                Token t = (Token) tokens.get(i);
+                if (!forloopReturn.contains(metadata.getEndPoint(t)))
+                {
+                    forloopReturn.add(metadata.getEndPoint(t));
+                    foundCount++;
+                }
+            }
+            endpoints.addAll(forloopReturn);
+        }
+
+        return endpoints;
     }
 
+    /**
+     * This method will generate the QRH object and returns. If the Consistency
+     * level is DCQUORUM then it will return a DCQRH with a map of local rep
+     * factor alone. If the consistency level is DCQUORUMSYNC then it will
+     * return a DCQRH with a map of all the DC rep facor.
+     */
+    @Override
+    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level)
+    {
+        if (consistency_level == ConsistencyLevel.DCQUORUM)
+        {
+            return new DatacenterWriteResponseHandler(locQFactor);
+        }
+        else if (consistency_level == ConsistencyLevel.DCQUORUMSYNC)
+        {
+            return new DatacenterSyncWriteResponseHandler(getQuorumRepFactor());
+        }
+        return super.getWriteResponseHandler(blockFor, consistency_level);
+    }
 }

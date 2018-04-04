@@ -1,4 +1,4 @@
-static SimilarityFactory readSimilarity(SolrResourceLoader loader, Node node) {
+field.add("copySources", schema.getCopySources(f.getName()));
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,1094 +17,726 @@ static SimilarityFactory readSimilarity(SolrResourceLoader loader, Node node) {
  * limitations under the License.
  */
 
-package org.apache.solr.schema;
+package org.apache.solr.handler.admin;
+
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.*;
 
 import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.AnalyzerWrapper;
-import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.analysis.util.CharFilterFactory;
+import org.apache.lucene.analysis.util.TokenFilterFactory;
+import org.apache.lucene.analysis.util.TokenizerFactory;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.index.*;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.similarities.Similarity;
-import org.apache.lucene.util.Version;
-import org.apache.lucene.analysis.util.ResourceLoader;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.solr.analysis.TokenizerChain;
 import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.luke.FieldFlag;
+import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.util.DOMUtil;
-import org.apache.solr.util.SystemIdResolver;
-import org.apache.solr.core.SolrConfig;
-import org.apache.solr.core.Config;
-import org.apache.solr.core.SolrResourceLoader;
-import org.apache.solr.search.similarities.DefaultSimilarityFactory;
-import org.apache.solr.util.plugin.SolrCoreAware;
-import org.w3c.dom.*;
-import org.xml.sax.InputSource;
-
-import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
+import org.apache.solr.common.util.Base64;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.handler.RequestHandlerBase;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.update.SolrIndexWriter;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.schema.CopyField;
+import org.apache.solr.search.SolrIndexSearcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
+import static org.apache.lucene.index.FieldInfo.IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS;
+import static org.apache.lucene.index.FieldInfo.IndexOptions.DOCS_AND_FREQS;
+import static org.apache.lucene.index.FieldInfo.IndexOptions.DOCS_ONLY;
 
 /**
- * <code>IndexSchema</code> contains information about the valid fields in an index
- * and the types of those fields.
+ * This handler exposes the internal lucene index.  It is inspired by and 
+ * modeled on Luke, the Lucene Index Browser by Andrzej Bialecki.
+ *   http://www.getopt.org/luke/
  *
+ * For more documentation see:
+ *  http://wiki.apache.org/solr/LukeRequestHandler
  *
+ * @since solr 1.2
  */
-public final class IndexSchema {
-  public static final String DEFAULT_SCHEMA_FILE = "schema.xml";
-  public static final String LUCENE_MATCH_VERSION_PARAM = "luceneMatchVersion";
+public class LukeRequestHandler extends RequestHandlerBase
+{
+  private static Logger log = LoggerFactory.getLogger(LukeRequestHandler.class);
 
-  final static Logger log = LoggerFactory.getLogger(IndexSchema.class);
-  private final SolrConfig solrConfig;
-  private final String resourceName;
-  private String name;
-  private float version;
-  private final SolrResourceLoader loader;
+  public static final String NUMTERMS = "numTerms";
+  public static final String DOC_ID = "docId";
+  public static final String ID = "id";
+  public static final int DEFAULT_COUNT = 10;
 
-  private final HashMap<String, SchemaField> fields = new HashMap<String,SchemaField>();
+  static final int HIST_ARRAY_SIZE = 33;
 
+  private static enum ShowStyle {
+    ALL,
+    DOC,
+    SCHEMA,
+    INDEX;
 
-  private final HashMap<String, FieldType> fieldTypes = new HashMap<String,FieldType>();
-
-  private final List<SchemaField> fieldsWithDefaultValue = new ArrayList<SchemaField>();
-  private final Collection<SchemaField> requiredFields = new HashSet<SchemaField>();
-  private DynamicField[] dynamicFields;
-
-  private Analyzer analyzer;
-  private Analyzer queryAnalyzer;
-
-  private String defaultSearchFieldName=null;
-  private String queryParserDefaultOperator = "OR";
-
-
-  private final Map<String, List<CopyField>> copyFieldsMap = new HashMap<String, List<CopyField>>();
-  private DynamicCopy[] dynamicCopyFields;
-  /**
-   * keys are all fields copied to, count is num of copyField
-   * directives that target them.
-   */
-  private Map<SchemaField, Integer> copyFieldTargetCounts
-    = new HashMap<SchemaField, Integer>();
-
-    /**
-   * Constructs a schema using the specified resource name and stream.
-   * If the is stream is null, the resource loader will load the schema resource by name.
-   * @see SolrResourceLoader#openSchema
-   * By default, this follows the normal config path directory searching rules.
-   * @see SolrResourceLoader#openResource
-   */
-  public IndexSchema(SolrConfig solrConfig, String name, InputSource is) {
-    this.solrConfig = solrConfig;
-    if (name == null)
-      name = DEFAULT_SCHEMA_FILE;
-    this.resourceName = name;
-    loader = solrConfig.getResourceLoader();
-    try {
-      if (is == null) {
-        is = new InputSource(loader.openSchema(name));
-        is.setSystemId(SystemIdResolver.createSystemIdFromResourceName(name));
-      }
-      readSchema(is);
-      loader.inform( loader );
-    } catch (IOException e) {
-      throw new RuntimeException(e);
+    public static ShowStyle get(String v) {
+      if(v==null) return null;
+      if("schema".equalsIgnoreCase(v)) return SCHEMA;
+      if("index".equalsIgnoreCase(v))  return INDEX;
+      if("doc".equalsIgnoreCase(v))    return DOC;
+      if("all".equalsIgnoreCase(v))    return ALL;
+      throw new SolrException(ErrorCode.BAD_REQUEST, "Unknown Show Style: "+v);
     }
-  }
-  
-  /**
-   * @since solr 1.4
-   */
-  public SolrResourceLoader getResourceLoader()
-  {
-    return loader;
-  }
-  
-  /** Gets the name of the resource used to instantiate this schema. */
-  public String getResourceName() {
-    return resourceName;
-  }
-  
-  /** Gets the name of the schema as specified in the schema resource. */
-  public String getSchemaName() {
-    return name;
-  }
-  
-  /** The Default Lucene Match Version for this IndexSchema */
-  public Version getDefaultLuceneMatchVersion() {
-    return solrConfig.luceneMatchVersion;
-  }
-
-  float getVersion() {
-    return version;
-  }
-
-
-  /**
-   * Provides direct access to the Map containing all explicit
-   * (ie: non-dynamic) fields in the index, keyed on field name.
-   *
-   * <p>
-   * Modifying this Map (or any item in it) will affect the real schema
-   * </p>
-   * 
-   * <p>
-   * NOTE: this function is not thread safe.  However, it is safe to use within the standard
-   * <code>inform( SolrCore core )</code> function for <code>SolrCoreAware</code> classes.
-   * Outside <code>inform</code>, this could potentially throw a ConcurrentModificationException
-   * </p>
-   */
-  public Map<String,SchemaField> getFields() { return fields; }
-
-  /**
-   * Provides direct access to the Map containing all Field Types
-   * in the index, keyed on field type name.
-   *
-   * <p>
-   * Modifying this Map (or any item in it) will affect the real schema.  However if you 
-   * make any modifications, be sure to call {@link IndexSchema#refreshAnalyzers()} to
-   * update the Analyzers for the registered fields.
-   * </p>
-   * 
-   * <p>
-   * NOTE: this function is not thread safe.  However, it is safe to use within the standard
-   * <code>inform( SolrCore core )</code> function for <code>SolrCoreAware</code> classes.
-   * Outside <code>inform</code>, this could potentially throw a ConcurrentModificationException
-   * </p>
-   */
-  public Map<String,FieldType> getFieldTypes() { return fieldTypes; }
-
-  /**
-   * Provides direct access to the List containing all fields with a default value
-   */
-  public List<SchemaField> getFieldsWithDefaultValue() { return fieldsWithDefaultValue; }
-
-  /**
-   * Provides direct access to the List containing all required fields.  This
-   * list contains all fields with default values.
-   */
-  public Collection<SchemaField> getRequiredFields() { return requiredFields; }
-
-  private Similarity similarity;
-
-  /**
-   * Returns the Similarity used for this index
-   */
-  public Similarity getSimilarity() { return similarity; }
-
-  /**
-   * Returns the Analyzer used when indexing documents for this index
-   *
-   * <p>
-   * This Analyzer is field (and dynamic field) name aware, and delegates to
-   * a field specific Analyzer based on the field type.
-   * </p>
-   */
-  public Analyzer getAnalyzer() { return analyzer; }
-
-
-
-  /**
-   * Returns the Analyzer used when searching this index
-   *
-   * <p>
-   * This Analyzer is field (and dynamic field) name aware, and delegates to
-   * a field specific Analyzer based on the field type.
-   * </p>
-   */
-  public Analyzer getQueryAnalyzer() { return queryAnalyzer; }
-
-  
-  /**
-   * Name of the default search field specified in the schema file.
-   * <br/><b>Note:</b>Avoid calling this, try to use this method so that the 'df' param is consulted as an override:
-   * {@link org.apache.solr.search.QueryParsing#getDefaultField(IndexSchema, String)}
-   */
-  public String getDefaultSearchFieldName() {
-    return defaultSearchFieldName;
-  }
-
-  /**
-   * default operator ("AND" or "OR") for QueryParser
-   */
-  public String getQueryParserDefaultOperator() {
-    return queryParserDefaultOperator;
-  }
-
-  private SchemaField uniqueKeyField;
-
-  /**
-   * Unique Key field specified in the schema file
-   * @return null if this schema has no unique key field
-   */
-  public SchemaField getUniqueKeyField() { return uniqueKeyField; }
-
-  private String uniqueKeyFieldName;
-  private FieldType uniqueKeyFieldType;
-
-  /**
-   * The raw (field type encoded) value of the Unique Key field for
-   * the specified Document
-   * @return null if this schema has no unique key field
-   * @see #printableUniqueKey
-   */
-  public IndexableField getUniqueKeyField(org.apache.lucene.document.Document doc) {
-    return doc.getField(uniqueKeyFieldName);  // this should return null if name is null
-  }
-
-  /**
-   * The printable value of the Unique Key field for
-   * the specified Document
-   * @return null if this schema has no unique key field
-   */
-  public String printableUniqueKey(org.apache.lucene.document.Document doc) {
-    IndexableField f = doc.getField(uniqueKeyFieldName);
-    return f==null ? null : uniqueKeyFieldType.toExternal(f);
-  }
-
-  private SchemaField getIndexedField(String fname) {
-    SchemaField f = getFields().get(fname);
-    if (f==null) {
-      throw new RuntimeException("unknown field '" + fname + "'");
-    }
-    if (!f.indexed()) {
-      throw new RuntimeException("'"+fname+"' is not an indexed field:" + f);
-    }
-    return f;
-  }
-  
-  /**
-   * This will re-create the Analyzers.  If you make any modifications to
-   * the Field map ({@link IndexSchema#getFields()}, this function is required
-   * to synch the internally cached field analyzers.
-   * 
-   * @since solr 1.3
-   */
-  public void refreshAnalyzers()
-  {
-    analyzer = new SolrIndexAnalyzer();
-    queryAnalyzer = new SolrQueryAnalyzer();
-  }
-
-  private class SolrIndexAnalyzer extends AnalyzerWrapper {
-    protected final HashMap<String, Analyzer> analyzers;
-
-    SolrIndexAnalyzer() {
-      analyzers = analyzerCache();
-    }
-
-    protected HashMap<String, Analyzer> analyzerCache() {
-      HashMap<String, Analyzer> cache = new HashMap<String, Analyzer>();
-      for (SchemaField f : getFields().values()) {
-        Analyzer analyzer = f.getType().getAnalyzer();
-        cache.put(f.getName(), analyzer);
-      }
-      return cache;
-    }
-
-    @Override
-    protected Analyzer getWrappedAnalyzer(String fieldName) {
-      Analyzer analyzer = analyzers.get(fieldName);
-      return analyzer != null ? analyzer : getDynamicFieldType(fieldName).getAnalyzer();
-    }
-
-    @Override
-    protected TokenStreamComponents wrapComponents(String fieldName, TokenStreamComponents components) {
-      return components;
-    }
-  }
-
-  private class SolrQueryAnalyzer extends SolrIndexAnalyzer {
-    @Override
-    protected HashMap<String, Analyzer> analyzerCache() {
-      HashMap<String, Analyzer> cache = new HashMap<String, Analyzer>();
-       for (SchemaField f : getFields().values()) {
-        Analyzer analyzer = f.getType().getQueryAnalyzer();
-        cache.put(f.getName(), analyzer);
-      }
-      return cache;
-    }
-
-    @Override
-    protected Analyzer getWrappedAnalyzer(String fieldName) {
-      Analyzer analyzer = analyzers.get(fieldName);
-      return analyzer != null ? analyzer : getDynamicFieldType(fieldName).getQueryAnalyzer();
-    }
-  }
-
-  private void readSchema(InputSource is) {
-    log.info("Reading Solr Schema");
-
-    try {
-      // pass the config resource loader to avoid building an empty one for no reason:
-      // in the current case though, the stream is valid so we wont load the resource by name
-      Config schemaConf = new Config(loader, "schema", is, "/schema/");
-      Document document = schemaConf.getDocument();
-      final XPath xpath = schemaConf.getXPath();
-      final List<SchemaAware> schemaAware = new ArrayList<SchemaAware>();
-      Node nd = (Node) xpath.evaluate("/schema/@name", document, XPathConstants.NODE);
-      if (nd==null) {
-        log.warn("schema has no name!");
-      } else {
-        name = nd.getNodeValue();
-        log.info("Schema name=" + name);
-      }
-
-      version = schemaConf.getFloat("/schema/@version", 1.0f);
-
-
-      // load the Field Types
-
-      final FieldTypePluginLoader typeLoader 
-        = new FieldTypePluginLoader(this, fieldTypes, schemaAware);
-
-      String expression = "/schema/types/fieldtype | /schema/types/fieldType";
-      NodeList nodes = (NodeList) xpath.evaluate(expression, document, 
-                                                 XPathConstants.NODESET);
-      typeLoader.load( loader, nodes );
-
-      // load the Fields
-
-      // Hang on to the fields that say if they are required -- this lets us set a reasonable default for the unique key
-      Map<String,Boolean> explicitRequiredProp = new HashMap<String, Boolean>();
-      ArrayList<DynamicField> dFields = new ArrayList<DynamicField>();
-      expression = "/schema/fields/field | /schema/fields/dynamicField";
-      nodes = (NodeList) xpath.evaluate(expression, document, XPathConstants.NODESET);
-
-      for (int i=0; i<nodes.getLength(); i++) {
-        Node node = nodes.item(i);
-
-        NamedNodeMap attrs = node.getAttributes();
-
-        String name = DOMUtil.getAttr(attrs,"name","field definition");
-        log.trace("reading field def "+name);
-        String type = DOMUtil.getAttr(attrs,"type","field " + name);
-
-        FieldType ft = fieldTypes.get(type);
-        if (ft==null) {
-          throw new SolrException( SolrException.ErrorCode.BAD_REQUEST,"Unknown fieldtype '" + type + "' specified on field " + name);
-        }
-
-        Map<String,String> args = DOMUtil.toMapExcept(attrs, "name", "type");
-        if( args.get( "required" ) != null ) {
-          explicitRequiredProp.put( name, Boolean.valueOf( args.get( "required" ) ) );
-        }
-
-        SchemaField f = SchemaField.create(name,ft,args);
-
-        if (node.getNodeName().equals("field")) {
-          SchemaField old = fields.put(f.getName(),f);
-          if( old != null ) {
-            String msg = "[schema.xml] Duplicate field definition for '"
-              + f.getName() + "' [[["+old.toString()+"]]] and [[["+f.toString()+"]]]";
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, msg );
-          }
-          log.debug("field defined: " + f);
-          if( f.getDefaultValue() != null ) {
-            log.debug(name+" contains default value: " + f.getDefaultValue());
-            fieldsWithDefaultValue.add( f );
-          }
-          if (f.isRequired()) {
-            log.debug(name+" is required in this schema");
-            requiredFields.add(f);
-          }
-        } else if (node.getNodeName().equals("dynamicField")) {
-          // make sure nothing else has the same path
-          addDynamicField(dFields, f);
-        } else {
-          // we should never get here
-          throw new RuntimeException("Unknown field type");
-        }
-      }
-      
-    //fields with default values are by definition required
-    //add them to required fields, and we only have to loop once
-    // in DocumentBuilder.getDoc()
-    requiredFields.addAll(getFieldsWithDefaultValue());
-
-
-    // OK, now sort the dynamic fields largest to smallest size so we don't get
-    // any false matches.  We want to act like a compiler tool and try and match
-    // the largest string possible.
-    Collections.sort(dFields);
-
-    log.trace("Dynamic Field Ordering:" + dFields);
-
-    // stuff it in a normal array for faster access
-    dynamicFields = dFields.toArray(new DynamicField[dFields.size()]);
-
-    Node node = (Node) xpath.evaluate("/schema/similarity", document, XPathConstants.NODE);
-    SimilarityFactory simFactory = readSimilarity(loader, node);
-    if (simFactory == null) {
-      simFactory = new DefaultSimilarityFactory();
-    }
-    if (simFactory instanceof SchemaAware) {
-      ((SchemaAware)simFactory).inform(this);
-    } else {
-      // if the sim facotry isn't schema aware, then we are responsible for
-      // erroring if a field type is trying to specify a sim.
-      for (FieldType ft : fieldTypes.values()) {
-        if (null != ft.getSimilarity()) {
-          String msg = "FieldType '" + ft.getTypeName() + "' is configured with a similarity, but the global similarity does not support it: " + simFactory.getClass();
-          log.error(msg);
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, msg);
-        }
-      }
-    }
-    similarity = simFactory.getSimilarity();
-
-    node = (Node) xpath.evaluate("/schema/defaultSearchField/text()", document, XPathConstants.NODE);
-    if (node==null) {
-      log.debug("no default search field specified in schema.");
-    } else {
-      defaultSearchFieldName=node.getNodeValue().trim();
-      // throw exception if specified, but not found or not indexed
-      if (defaultSearchFieldName!=null) {
-        SchemaField defaultSearchField = getFields().get(defaultSearchFieldName);
-        if ((defaultSearchField == null) || !defaultSearchField.indexed()) {
-          String msg =  "default search field '" + defaultSearchFieldName + "' not defined or not indexed" ;
-          throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, msg );
-        }
-      }
-      log.info("default search field in schema is "+defaultSearchFieldName);
-    }
-
-    node = (Node) xpath.evaluate("/schema/solrQueryParser/@defaultOperator", document, XPathConstants.NODE);
-    if (node==null) {
-      log.debug("using default query parser operator (OR)");
-    } else {
-      queryParserDefaultOperator=node.getNodeValue().trim();
-      log.info("query parser default operator is "+queryParserDefaultOperator);
-    }
-
-    node = (Node) xpath.evaluate("/schema/uniqueKey/text()", document, XPathConstants.NODE);
-    if (node==null) {
-      log.warn("no uniqueKey specified in schema.");
-    } else {
-      uniqueKeyField=getIndexedField(node.getNodeValue().trim());
-      if (null != uniqueKeyField.getDefaultValue()) {
-        String msg = "uniqueKey field ("+uniqueKeyFieldName+
-          ") can not be configured with a default value ("+
-          uniqueKeyField.getDefaultValue()+")";
-        log.error(msg);
-        throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, msg );
-      }
-
-      if (!uniqueKeyField.stored()) {
-        log.error("uniqueKey is not stored - distributed search will not work");
-      }
-      if (uniqueKeyField.multiValued()) {
-        log.error("uniqueKey should not be multivalued");
-      }
-      uniqueKeyFieldName=uniqueKeyField.getName();
-      uniqueKeyFieldType=uniqueKeyField.getType();
-      log.info("unique key field: "+uniqueKeyFieldName);
-      
-      // Unless the uniqueKeyField is marked 'required=false' then make sure it exists
-      if( Boolean.FALSE != explicitRequiredProp.get( uniqueKeyFieldName ) ) {
-        uniqueKeyField.required = true;
-        requiredFields.add(uniqueKeyField);
-      }
-    }
-
-    /////////////// parse out copyField commands ///////////////
-    // Map<String,ArrayList<SchemaField>> cfields = new HashMap<String,ArrayList<SchemaField>>();
-    // expression = "/schema/copyField";
-    
-    dynamicCopyFields = new DynamicCopy[] {};
-    expression = "//copyField";
-    nodes = (NodeList) xpath.evaluate(expression, document, XPathConstants.NODESET);
-
-      for (int i=0; i<nodes.getLength(); i++) {
-        node = nodes.item(i);
-        NamedNodeMap attrs = node.getAttributes();
-
-        String source = DOMUtil.getAttr(attrs,"source","copyField definition");
-        String dest   = DOMUtil.getAttr(attrs,"dest",  "copyField definition");
-        String maxChars = DOMUtil.getAttr(attrs, "maxChars");
-        int maxCharsInt = CopyField.UNLIMITED;
-        if (maxChars != null) {
-          try {
-            maxCharsInt = Integer.parseInt(maxChars);
-          } catch (NumberFormatException e) {
-            log.warn("Couldn't parse maxChars attribute for copyField from "
-                    + source + " to " + dest + " as integer. The whole field will be copied.");
-          }
-        }
-
-        if (dest.equals(uniqueKeyFieldName)) {
-          String msg = "uniqueKey field ("+uniqueKeyFieldName+
-            ") can not be the dest of a copyField (src="+source+")";
-          log.error(msg);
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, msg);
-          
-        }
-
-        registerCopyField(source, dest, maxCharsInt);
-     }
-      
-      for (Map.Entry<SchemaField, Integer> entry : copyFieldTargetCounts.entrySet())    {
-        if (entry.getValue() > 1 && !entry.getKey().multiValued())  {
-          log.warn("Field " + entry.getKey().name + " is not multivalued "+
-                      "and destination for multiple copyFields ("+
-                      entry.getValue()+")");
-        }
-      }
-
-
-      //Run the callbacks on SchemaAware now that everything else is done
-      for (SchemaAware aware : schemaAware) {
-        aware.inform(this);
-      }
-    } catch (SolrException e) {
-      throw e;
-    } catch(Exception e) {
-      // unexpected exception...
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR,"Schema Parsing Failed: " + e.getMessage(), e);
-    }
-
-    // create the field analyzers
-    refreshAnalyzers();
-
-  }
-
-  private void addDynamicField(List<DynamicField> dFields, SchemaField f) {
-    boolean dup = isDuplicateDynField(dFields, f);
-    if( !dup ) {
-      addDynamicFieldNoDupCheck(dFields, f);
-    } else {
-      String msg = "[schema.xml] Duplicate DynamicField definition for '"
-              + f.getName() + "'";
-
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, msg);
-    }
-  }
-
-  /**
-   * Register one or more new Dynamic Field with the Schema.
-   * @param f The {@link org.apache.solr.schema.SchemaField}
-   */
-  public void registerDynamicField(SchemaField ... f) {
-    List<DynamicField> dynFields = new ArrayList<DynamicField>(Arrays.asList(dynamicFields));
-    for (SchemaField field : f) {
-      if (isDuplicateDynField(dynFields, field) == false) {
-        log.debug("dynamic field creation for schema field: " + field.getName());
-        addDynamicFieldNoDupCheck(dynFields, field);
-      } else {
-        log.debug("dynamic field already exists: dynamic field: [" + field.getName() + "]");
-      }
-    }
-    Collections.sort(dynFields);
-    dynamicFields = dynFields.toArray(new DynamicField[dynFields.size()]);
-  }
-
-  private void addDynamicFieldNoDupCheck(List<DynamicField> dFields, SchemaField f) {
-    dFields.add(new DynamicField(f));
-    log.debug("dynamic field defined: " + f);
-  }
-
-  private boolean isDuplicateDynField(List<DynamicField> dFields, SchemaField f) {
-    for( DynamicField df : dFields ) {
-      if( df.regex.equals( f.name ) ) return true;
-    }
-    return false;
-  }
-
-  public void registerCopyField( String source, String dest )
-  {
-    registerCopyField(source, dest, CopyField.UNLIMITED);
-  }
-
-  /**
-   * <p>
-   * NOTE: this function is not thread safe.  However, it is safe to use within the standard
-   * <code>inform( SolrCore core )</code> function for <code>SolrCoreAware</code> classes.
-   * Outside <code>inform</code>, this could potentially throw a ConcurrentModificationException
-   * </p>
-   * 
-   * @see SolrCoreAware
-   */
-  public void registerCopyField( String source, String dest, int maxChars )
-  {
-    boolean sourceIsPattern = isWildCard(source);
-    boolean destIsPattern   = isWildCard(dest);
-
-    log.debug("copyField source='"+source+"' dest='"+dest+"' maxChars='"+maxChars);
-    SchemaField d = getFieldOrNull(dest);
-    if(d == null){
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, "copyField destination :'"+dest+"' does not exist" );
-    }
-
-    if(sourceIsPattern) {
-      if( destIsPattern ) {
-        DynamicField df = null;
-        for( DynamicField dd : dynamicFields ) {
-          if( dd.regex.equals( dest ) ) {
-            df = dd;
-            break;
-          }
-        }
-        if( df == null ) {
-          throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, "copyField dynamic destination must match a dynamicField." );
-        }
-        registerDynamicCopyField(new DynamicDestCopy(source, df, maxChars ));
-      }
-      else {
-        registerDynamicCopyField(new DynamicCopy(source, d, maxChars));
-      }
-    } 
-    else if( destIsPattern ) {
-      String msg =  "copyField only supports a dynamic destination if the source is also dynamic" ;
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, msg );
-    }
-    else {
-      // retrieve the field to force an exception if it doesn't exist
-      SchemaField f = getField(source);
-
-      List<CopyField> copyFieldList = copyFieldsMap.get(source);
-      if (copyFieldList == null) {
-        copyFieldList = new ArrayList<CopyField>();
-        copyFieldsMap.put(source, copyFieldList);
-      }
-      copyFieldList.add(new CopyField(f, d, maxChars));
-
-      copyFieldTargetCounts.put(d, (copyFieldTargetCounts.containsKey(d) ? copyFieldTargetCounts.get(d) + 1 : 1));
-    }
-  }
-  
-  private void registerDynamicCopyField( DynamicCopy dcopy )
-  {
-    if( dynamicCopyFields == null ) {
-      dynamicCopyFields = new DynamicCopy[] {dcopy};
-    }
-    else {
-      DynamicCopy[] temp = new DynamicCopy[dynamicCopyFields.length+1];
-      System.arraycopy(dynamicCopyFields,0,temp,0,dynamicCopyFields.length);
-      temp[temp.length -1] = dcopy;
-      dynamicCopyFields = temp;
-    }
-    log.trace("Dynamic Copy Field:" + dcopy );
-  }
-
-  private static Object[] append(Object[] orig, Object item) {
-    Object[] newArr = (Object[])java.lang.reflect.Array.newInstance(orig.getClass().getComponentType(), orig.length+1);
-    System.arraycopy(orig, 0, newArr, 0, orig.length);
-    newArr[orig.length] = item;
-    return newArr;
-  }
-
-  static SimilarityFactory readSimilarity(ResourceLoader loader, Node node) {
-    if (node==null) {
-      return null;
-    } else {
-      SimilarityFactory similarityFactory;
-      final Object obj = loader.newInstance(((Element) node).getAttribute("class"), Object.class, "search.similarities.");
-      if (obj instanceof SimilarityFactory) {
-        // configure a factory, get a similarity back
-        SolrParams params = SolrParams.toSolrParams(DOMUtil.childNodesToNamedList(node));
-        similarityFactory = (SimilarityFactory)obj;
-        similarityFactory.init(params);
-      } else {
-        // just like always, assume it's a Similarity and get a ClassCastException - reasonable error handling
-        similarityFactory = new SimilarityFactory() {
-          @Override
-          public Similarity getSimilarity() {
-            return (Similarity) obj;
-          }
-        };
-      }
-      return similarityFactory;
-    }
-  }
-
-
-  static abstract class DynamicReplacement implements Comparable<DynamicReplacement> {
-    final static int STARTS_WITH=1;
-    final static int ENDS_WITH=2;
-
-    final String regex;
-    final int type;
-
-    final String str;
-
-    protected DynamicReplacement(String regex) {
-      this.regex = regex;
-      if (regex.startsWith("*")) {
-        type=ENDS_WITH;
-        str=regex.substring(1);
-      }
-      else if (regex.endsWith("*")) {
-        type=STARTS_WITH;
-        str=regex.substring(0,regex.length()-1);
-      }
-      else {
-        throw new RuntimeException("dynamic field name must start or end with *");
-      }
-    }
-
-    public boolean matches(String name) {
-      if (type==STARTS_WITH && name.startsWith(str)) return true;
-      else if (type==ENDS_WITH && name.endsWith(str)) return true;
-      else return false;
-    }
-
-    /**
-     * Sort order is based on length of regex.  Longest comes first.
-     * @param other The object to compare to.
-     * @return a negative integer, zero, or a positive integer
-     * as this object is less than, equal to, or greater than
-     * the specified object.
-     */
-    public int compareTo(DynamicReplacement other) {
-      return other.regex.length() - regex.length();
-    }
-  }
-
-
-  //
-  // Instead of storing a type, this could be implemented as a hierarchy
-  // with a virtual matches().
-  // Given how often a search will be done, however, speed is the overriding
-  // concern and I'm not sure which is faster.
-  //
-  final static class DynamicField extends DynamicReplacement {
-    final SchemaField prototype;
-
-    DynamicField(SchemaField prototype) {
-      super(prototype.name);
-      this.prototype=prototype;
-    }
-
-    SchemaField makeSchemaField(String name) {
-      // could have a cache instead of returning a new one each time, but it might
-      // not be worth it.
-      // Actually, a higher level cache could be worth it to avoid too many
-      // .startsWith() and .endsWith() comparisons.  it depends on how many
-      // dynamic fields there are.
-      return new SchemaField(prototype, name);
-    }
-
-    @Override
-    public String toString() {
-      return prototype.toString();
-    }
-  }
-
-  static class DynamicCopy extends DynamicReplacement {
-    final SchemaField targetField;
-    final int maxChars;
-
-    DynamicCopy(String regex, SchemaField targetField) {
-      this(regex, targetField, CopyField.UNLIMITED);
-    }
-
-    DynamicCopy(String regex, SchemaField targetField, int maxChars) {
-      super(regex);
-      this.targetField = targetField;
-      this.maxChars = maxChars;
-    }
-    
-    public SchemaField getTargetField( String sourceField )
-    {
-      return targetField;
-    }
-
-    @Override
-    public String toString() {
-      return targetField.toString();
-    }
-  }
-
-  static class DynamicDestCopy extends DynamicCopy 
-  {
-    final DynamicField dynamic;
-    
-    final int dtype;
-    final String dstr;
-    
-    DynamicDestCopy(String source, DynamicField dynamic) {
-      this(source, dynamic, CopyField.UNLIMITED);
-    }
-      
-    DynamicDestCopy(String source, DynamicField dynamic, int maxChars) {
-      super(source, dynamic.prototype, maxChars);
-      this.dynamic = dynamic;
-      
-      String dest = dynamic.regex;
-      if (dest.startsWith("*")) {
-        dtype=ENDS_WITH;
-        dstr=dest.substring(1);
-      }
-      else if (dest.endsWith("*")) {
-        dtype=STARTS_WITH;
-        dstr=dest.substring(0,dest.length()-1);
-      }
-      else {
-        throw new RuntimeException("dynamic copyField destination name must start or end with *");
-      }
-    }
-    
-    @Override
-    public SchemaField getTargetField( String sourceField )
-    {
-      String dyn = ( type==STARTS_WITH ) 
-        ? sourceField.substring( str.length() )
-        : sourceField.substring( 0, sourceField.length()-str.length() );
-      
-      String name = (dtype==STARTS_WITH) ? (dstr+dyn) : (dyn+dstr);
-      return dynamic.makeSchemaField( name );
-    }
-
-    @Override
-    public String toString() {
-      return targetField.toString();
-    }
-  }
-
-
-  public SchemaField[] getDynamicFieldPrototypes() {
-    SchemaField[] df = new SchemaField[dynamicFields.length];
-    for (int i=0;i<dynamicFields.length;i++) {
-      df[i] = dynamicFields[i].prototype;
-    }
-    return df;
-  }
-
-  public String getDynamicPattern(String fieldName) {
-   for (DynamicField df : dynamicFields) {
-     if (df.matches(fieldName)) return df.regex;
-   }
-   return  null; 
-  }
-  
-  /**
-   * Does the schema have the specified field defined explicitly, i.e.
-   * not as a result of a copyField declaration with a wildcard?  We
-   * consider it explicitly defined if it matches a field or dynamicField
-   * declaration.
-   * @param fieldName
-   * @return true if explicitly declared in the schema.
-   */
-  public boolean hasExplicitField(String fieldName) {
-    if(fields.containsKey(fieldName)) {
-      return true;
-    }
-
-    for (DynamicField df : dynamicFields) {
-      if (df.matches(fieldName)) return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * Is the specified field dynamic or not.
-   * @param fieldName
-   * @return true if the specified field is dynamic
-   */
-  public boolean isDynamicField(String fieldName) {
-    if(fields.containsKey(fieldName)) {
-      return false;
-    }
-
-    for (DynamicField df : dynamicFields) {
-      if (df.matches(fieldName)) return true;
-    }
-
-    return false;
-  }   
-
-  /**
-   * Returns the SchemaField that should be used for the specified field name, or
-   * null if none exists.
-   *
-   * @param fieldName may be an explicitly defined field or a name that
-   * matches a dynamic field.
-   * @see #getFieldType
-   * @see #getField(String)
-   * @return The {@link org.apache.solr.schema.SchemaField}
-   */
-  public SchemaField getFieldOrNull(String fieldName) {
-    SchemaField f = fields.get(fieldName);
-    if (f != null) return f;
-
-    for (DynamicField df : dynamicFields) {
-      if (df.matches(fieldName)) return df.makeSchemaField(fieldName);
-    }
-
-    return f;
-  }
-
-  /**
-   * Returns the SchemaField that should be used for the specified field name
-   *
-   * @param fieldName may be an explicitly defined field or a name that
-   * matches a dynamic field.
-   * @throws SolrException if no such field exists
-   * @see #getFieldType
-   * @see #getFieldOrNull(String)
-   * @return The {@link SchemaField}
-   */
-  public SchemaField getField(String fieldName) {
-    SchemaField f = getFieldOrNull(fieldName);
-    if (f != null) return f;
-
-
-    // Hmmm, default field could also be implemented with a dynamic field of "*".
-    // It would have to be special-cased and only used if nothing else matched.
-    /***  REMOVED -YCS
-    if (defaultFieldType != null) return new SchemaField(fieldName,defaultFieldType);
-    ***/
-    throw new SolrException( SolrException.ErrorCode.BAD_REQUEST,"undefined field: \""+fieldName+"\"");
-  }
-
-  /**
-   * Returns the FieldType for the specified field name.
-   *
-   * <p>
-   * This method exists because it can be more efficient then
-   * {@link #getField} for dynamic fields if a full SchemaField isn't needed.
-   * </p>
-   *
-   * @param fieldName may be an explicitly created field, or a name that
-   * excercies a dynamic field.
-   * @throws SolrException if no such field exists
-   * @see #getField(String)
-   * @see #getFieldTypeNoEx
-   */
-  public FieldType getFieldType(String fieldName) {
-    SchemaField f = fields.get(fieldName);
-    if (f != null) return f.getType();
-
-    return getDynamicFieldType(fieldName);
-  }
-
-  /**
-   * Given the name of a {@link org.apache.solr.schema.FieldType} (not to be confused with {@link #getFieldType(String)} which
-   * takes in the name of a field), return the {@link org.apache.solr.schema.FieldType}.
-   * @param fieldTypeName The name of the {@link org.apache.solr.schema.FieldType}
-   * @return The {@link org.apache.solr.schema.FieldType} or null.
-   */
-  public FieldType getFieldTypeByName(String fieldTypeName){
-    return fieldTypes.get(fieldTypeName);
-  }
-
-  /**
-   * Returns the FieldType for the specified field name.
-   *
-   * <p>
-   * This method exists because it can be more efficient then
-   * {@link #getField} for dynamic fields if a full SchemaField isn't needed.
-   * </p>
-   *
-   * @param fieldName may be an explicitly created field, or a name that
-   * excercies a dynamic field.
-   * @return null if field is not defined.
-   * @see #getField(String)
-   * @see #getFieldTypeNoEx
-   */
-  public FieldType getFieldTypeNoEx(String fieldName) {
-    SchemaField f = fields.get(fieldName);
-    if (f != null) return f.getType();
-    return dynFieldType(fieldName);
-  }
-
-
-  /**
-   * Returns the FieldType of the best matching dynamic field for
-   * the specified field name
-   *
-   * @param fieldName may be an explicitly created field, or a name that
-   * excercies a dynamic field.
-   * @throws SolrException if no such field exists
-   * @see #getField(String)
-   * @see #getFieldTypeNoEx
-   */
-  public FieldType getDynamicFieldType(String fieldName) {
-     for (DynamicField df : dynamicFields) {
-      if (df.matches(fieldName)) return df.prototype.getType();
-    }
-    throw new SolrException( SolrException.ErrorCode.BAD_REQUEST,"undefined field "+fieldName);
-  }
-
-  private FieldType dynFieldType(String fieldName) {
-     for (DynamicField df : dynamicFields) {
-      if (df.matches(fieldName)) return df.prototype.getType();
-    }
-    return null;
   };
 
 
-  /**
-   * Get all copy fields, both the static and the dynamic ones.
-   * @param destField
-   * @return Array of fields copied into this field
-   */
+  @Override
+  public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception
+  {
+    IndexSchema schema = req.getSchema();
+    SolrIndexSearcher searcher = req.getSearcher();
+    DirectoryReader reader = searcher.getIndexReader();
+    SolrParams params = req.getParams();
+    ShowStyle style = ShowStyle.get(params.get("show"));
 
-  public SchemaField[] getCopySources(String destField) {
-    SchemaField f = getField(destField);
-    if (!isCopyFieldTarget(f)) {
-      return new SchemaField[0];
+    // If no doc is given, show all fields and top terms
+
+    rsp.add("index", getIndexInfo(reader));
+
+    if(ShowStyle.INDEX==style) {
+      return; // that's all we need
     }
-    List<SchemaField> sf = new ArrayList<SchemaField>();
-    for (Map.Entry<String, List<CopyField>> cfs : copyFieldsMap.entrySet()) {
-      for (CopyField copyField : cfs.getValue()) {
-        if (copyField.getDestination().getName().equals(destField)) {
-          sf.add(copyField.getSource());
+
+
+    Integer docId = params.getInt( DOC_ID );
+    if( docId == null && params.get( ID ) != null ) {
+      // Look for something with a given solr ID
+      SchemaField uniqueKey = schema.getUniqueKeyField();
+      String v = uniqueKey.getType().toInternal( params.get(ID) );
+      Term t = new Term( uniqueKey.getName(), v );
+      docId = searcher.getFirstMatch( t );
+      if( docId < 0 ) {
+        throw new SolrException( SolrException.ErrorCode.NOT_FOUND, "Can't find document: "+params.get( ID ) );
+      }
+    }
+
+    // Read the document from the index
+    if( docId != null ) {
+      if( style != null && style != ShowStyle.DOC ) {
+        throw new SolrException(ErrorCode.BAD_REQUEST, "missing doc param for doc style");
+      }
+      Document doc = null;
+      try {
+        doc = reader.document( docId );
+      }
+      catch( Exception ex ) {}
+      if( doc == null ) {
+        throw new SolrException( SolrException.ErrorCode.NOT_FOUND, "Can't find document: "+docId );
+      }
+
+      SimpleOrderedMap<Object> info = getDocumentFieldsInfo( doc, docId, reader, schema );
+
+      SimpleOrderedMap<Object> docinfo = new SimpleOrderedMap<Object>();
+      docinfo.add( "docId", docId );
+      docinfo.add( "lucene", info );
+      docinfo.add( "solr", doc );
+      rsp.add( "doc", docinfo );
+    }
+    else if ( ShowStyle.SCHEMA == style ) {
+      rsp.add( "schema", getSchemaInfo( req.getSchema() ) );
+    }
+    else {
+      rsp.add( "fields", getIndexedFieldsInfo(req) ) ;
+    }
+
+    // Add some generally helpful information
+    NamedList<Object> info = new SimpleOrderedMap<Object>();
+    info.add( "key", getFieldFlagsKey() );
+    info.add( "NOTE", "Document Frequency (df) is not updated when a document is marked for deletion.  df values include deleted documents." );
+    rsp.add( "info", info );
+    rsp.setHttpCaching(false);
+  }
+
+
+
+  /**
+   * @return a string representing a IndexableField's flags.  
+   */
+  private static String getFieldFlags( IndexableField f )
+  {
+    IndexOptions opts = (f == null) ? null : f.fieldType().indexOptions();
+
+    StringBuilder flags = new StringBuilder();
+
+    flags.append( (f != null && f.fieldType().indexed())                     ? FieldFlag.INDEXED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().tokenized())                   ? FieldFlag.TOKENIZED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().stored())                      ? FieldFlag.STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().docValueType() != null)        ? FieldFlag.DOC_VALUES.getAbbreviation() : "-" );
+    flags.append( (false)                                          ? FieldFlag.MULTI_VALUED.getAbbreviation() : '-' ); // SchemaField Specific
+    flags.append( (f != null && f.fieldType().storeTermVectors())            ? FieldFlag.TERM_VECTOR_STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().storeTermVectorOffsets())   ? FieldFlag.TERM_VECTOR_OFFSET.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().storeTermVectorPositions()) ? FieldFlag.TERM_VECTOR_POSITION.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().omitNorms())                  ? FieldFlag.OMIT_NORMS.getAbbreviation() : '-' );
+
+    flags.append( (f != null && DOCS_ONLY == opts ) ?
+        FieldFlag.OMIT_TF.getAbbreviation() : '-' );
+
+    flags.append((f != null && DOCS_AND_FREQS == opts) ?
+        FieldFlag.OMIT_POSITIONS.getAbbreviation() : '-');
+    
+    flags.append((f != null && DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS == opts) ?
+        FieldFlag.STORE_OFFSETS_WITH_POSITIONS.getAbbreviation() : '-');
+
+    flags.append( (f != null && f.getClass().getSimpleName().equals("LazyField")) ? FieldFlag.LAZY.getAbbreviation() : '-' );
+    flags.append( (f != null && f.binaryValue()!=null)                      ? FieldFlag.BINARY.getAbbreviation() : '-' );
+    flags.append( (false)                                          ? FieldFlag.SORT_MISSING_FIRST.getAbbreviation() : '-' ); // SchemaField Specific
+    flags.append( (false)                                          ? FieldFlag.SORT_MISSING_LAST.getAbbreviation() : '-' ); // SchemaField Specific
+    return flags.toString();
+  }
+
+  /**
+   * @return a string representing a SchemaField's flags.  
+   */
+  private static String getFieldFlags( SchemaField f )
+  {
+    FieldType t = (f==null) ? null : f.getType();
+
+    // see: http://www.nabble.com/schema-field-properties-tf3437753.html#a9585549
+    boolean lazy = false; // "lazy" is purely a property of reading fields
+    boolean binary = false; // Currently not possible
+
+    StringBuilder flags = new StringBuilder();
+    flags.append( (f != null && f.indexed())             ? FieldFlag.INDEXED.getAbbreviation() : '-' );
+    flags.append( (t != null && t.isTokenized())         ? FieldFlag.TOKENIZED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.stored())              ? FieldFlag.STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.hasDocValues())        ? FieldFlag.DOC_VALUES.getAbbreviation() : "-" );
+    flags.append( (f != null && f.multiValued())         ? FieldFlag.MULTI_VALUED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeTermVector() )    ? FieldFlag.TERM_VECTOR_STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeTermOffsets() )   ? FieldFlag.TERM_VECTOR_OFFSET.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeTermPositions() ) ? FieldFlag.TERM_VECTOR_POSITION.getAbbreviation() : '-' );
+    flags.append( (f != null && f.omitNorms())           ? FieldFlag.OMIT_NORMS.getAbbreviation() : '-' );
+    flags.append( (f != null &&
+        f.omitTermFreqAndPositions() )        ? FieldFlag.OMIT_TF.getAbbreviation() : '-' );
+    flags.append( (f != null && f.omitPositions() )      ? FieldFlag.OMIT_POSITIONS.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeOffsetsWithPositions() )      ? FieldFlag.STORE_OFFSETS_WITH_POSITIONS.getAbbreviation() : '-' );
+    flags.append( (lazy)                                 ? FieldFlag.LAZY.getAbbreviation() : '-' );
+    flags.append( (binary)                               ? FieldFlag.BINARY.getAbbreviation() : '-' );
+    flags.append( (f != null && f.sortMissingFirst() )   ? FieldFlag.SORT_MISSING_FIRST.getAbbreviation() : '-' );
+    flags.append( (f != null && f.sortMissingLast() )    ? FieldFlag.SORT_MISSING_LAST.getAbbreviation() : '-' );
+    return flags.toString();
+  }
+
+  /**
+   * @return a key to what each character means
+   */
+  public static SimpleOrderedMap<String> getFieldFlagsKey() {
+    SimpleOrderedMap<String> key = new SimpleOrderedMap<String>();
+    for (FieldFlag f : FieldFlag.values()) {
+      key.add(String.valueOf(f.getAbbreviation()), f.getDisplay() );
+    }
+    return key;
+  }
+
+  private static SimpleOrderedMap<Object> getDocumentFieldsInfo( Document doc, int docId, IndexReader reader,
+                                                                 IndexSchema schema ) throws IOException
+  {
+    final CharsRef spare = new CharsRef();
+    SimpleOrderedMap<Object> finfo = new SimpleOrderedMap<Object>();
+    for( Object o : doc.getFields() ) {
+      Field field = (Field)o;
+      SimpleOrderedMap<Object> f = new SimpleOrderedMap<Object>();
+
+      SchemaField sfield = schema.getFieldOrNull( field.name() );
+      FieldType ftype = (sfield==null)?null:sfield.getType();
+
+      f.add( "type", (ftype==null)?null:ftype.getTypeName() );
+      f.add( "schema", getFieldFlags( sfield ) );
+      f.add( "flags", getFieldFlags( field ) );
+
+      Term t = new Term(field.name(), ftype!=null ? ftype.storedToIndexed(field) : field.stringValue());
+
+      f.add( "value", (ftype==null)?null:ftype.toExternal( field ) );
+
+      // TODO: this really should be "stored"
+      f.add( "internal", field.stringValue() );  // may be a binary number
+
+      BytesRef bytes = field.binaryValue();
+      if (bytes != null) {
+        f.add( "binary", Base64.byteArrayToBase64(bytes.bytes, bytes.offset, bytes.length));
+      }
+      f.add( "boost", field.boost() );
+      f.add( "docFreq", t.text()==null ? 0 : reader.docFreq( t ) ); // this can be 0 for non-indexed fields
+
+      // If we have a term vector, return that
+      if( field.fieldType().storeTermVectors() ) {
+        try {
+          Terms v = reader.getTermVector( docId, field.name() );
+          if( v != null ) {
+            SimpleOrderedMap<Integer> tfv = new SimpleOrderedMap<Integer>();
+            final TermsEnum termsEnum = v.iterator(null);
+            BytesRef text;
+            while((text = termsEnum.next()) != null) {
+              final int freq = (int) termsEnum.totalTermFreq();
+              UnicodeUtil.UTF8toUTF16(text, spare);
+              tfv.add(spare.toString(), freq);
+            }
+            f.add( "termVector", tfv );
+          }
+        }
+        catch( Exception ex ) {
+          log.warn( "error writing term vector", ex );
+        }
+      }
+
+      finfo.add( field.name(), f );
+    }
+    return finfo;
+  }
+
+  private static SimpleOrderedMap<Object> getIndexedFieldsInfo(SolrQueryRequest req)
+      throws Exception {
+
+    SolrIndexSearcher searcher = req.getSearcher();
+    SolrParams params = req.getParams();
+
+    Set<String> fields = null;
+    String fl = params.get(CommonParams.FL);
+    if (fl != null) {
+      fields = new TreeSet<String>(Arrays.asList(fl.split( "[,\\s]+" )));
+    }
+
+    AtomicReader reader = searcher.getAtomicReader();
+    IndexSchema schema = searcher.getSchema();
+
+    // Don't be tempted to put this in the loop below, the whole point here is to alphabetize the fields!
+    Set<String> fieldNames = new TreeSet<String>();
+    for(FieldInfo fieldInfo : reader.getFieldInfos()) {
+      fieldNames.add(fieldInfo.name);
+    }
+
+    // Walk the term enum and keep a priority queue for each map in our set
+    SimpleOrderedMap<Object> finfo = new SimpleOrderedMap<Object>();
+
+    for (String fieldName : fieldNames) {
+      if (fields != null && ! fields.contains(fieldName) && ! fields.contains("*")) {
+        continue; //we're not interested in this field Still an issue here
+      }
+
+      SimpleOrderedMap<Object> fieldMap = new SimpleOrderedMap<Object>();
+
+      SchemaField sfield = schema.getFieldOrNull( fieldName );
+      FieldType ftype = (sfield==null)?null:sfield.getType();
+
+      fieldMap.add( "type", (ftype==null)?null:ftype.getTypeName() );
+      fieldMap.add("schema", getFieldFlags(sfield));
+      if (sfield != null && schema.isDynamicField(sfield.getName()) && schema.getDynamicPattern(sfield.getName()) != null) {
+        fieldMap.add("dynamicBase", schema.getDynamicPattern(sfield.getName()));
+      }
+      Terms terms = reader.fields().terms(fieldName);
+      if (terms == null) { // Not indexed, so we need to report what we can (it made it through the fl param if specified)
+        finfo.add( fieldName, fieldMap );
+        continue;
+      }
+
+      if(sfield != null && sfield.indexed() ) {
+        // In the pre-4.0 days, this did a veeeery expensive range query. But we can be much faster now,
+        // so just do this all the time.
+        Document doc = getFirstLiveDoc(terms, reader);
+
+
+        if( doc != null ) {
+          // Found a document with this field
+          try {
+            IndexableField fld = doc.getField( fieldName );
+            if( fld != null ) {
+              fieldMap.add("index", getFieldFlags(fld));
+            }
+            else {
+              // it is a non-stored field...
+              fieldMap.add("index", "(unstored field)");
+            }
+          }
+          catch( Exception ex ) {
+            log.warn( "error reading field: "+fieldName );
+          }
+        }
+        fieldMap.add("docs", terms.getDocCount());
+
+      }
+      if (fields != null && (fields.contains(fieldName) || fields.contains("*"))) {
+        getDetailedFieldInfo(req, fieldName, fieldMap);
+      }
+      // Add the field
+      finfo.add( fieldName, fieldMap );
+    }
+    return finfo;
+  }
+
+  // Just get a document with the term in it, the first one will do!
+  // Is there a better way to do this? Shouldn't actually be very costly
+  // to do it this way.
+  private static Document getFirstLiveDoc(Terms terms, AtomicReader reader) throws IOException {
+    DocsEnum docsEnum = null;
+    TermsEnum termsEnum = terms.iterator(null);
+    BytesRef text;
+    // Deal with the chance that the first bunch of terms are in deleted documents. Is there a better way?
+    for (int idx = 0; idx < 1000 && docsEnum == null; ++idx) {
+      text = termsEnum.next();
+      if (text == null) { // Ran off the end of the terms enum without finding any live docs with that field in them.
+        return null;
+      }
+      docsEnum = termsEnum.docs(reader.getLiveDocs(), docsEnum, DocsEnum.FLAG_NONE);
+      if (docsEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+        return reader.document(docsEnum.docID());
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Return info from the index
+   */
+  private static SimpleOrderedMap<Object> getSchemaInfo( IndexSchema schema ) {
+    Map<String, List<String>> typeusemap = new TreeMap<String, List<String>>();
+    Map<String, Object> fields = new TreeMap<String, Object>();
+    SchemaField uniqueField = schema.getUniqueKeyField();
+    for( SchemaField f : schema.getFields().values() ) {
+      populateFieldInfo(schema, typeusemap, fields, uniqueField, f);
+    }
+
+    Map<String, Object> dynamicFields = new TreeMap<String, Object>();
+    for (SchemaField f : schema.getDynamicFieldPrototypes()) {
+      populateFieldInfo(schema, typeusemap, dynamicFields, uniqueField, f);
+    }
+    SimpleOrderedMap<Object> types = new SimpleOrderedMap<Object>();
+    Map<String, FieldType> sortedTypes = new TreeMap<String, FieldType>(schema.getFieldTypes());
+    for( FieldType ft : sortedTypes.values() ) {
+      SimpleOrderedMap<Object> field = new SimpleOrderedMap<Object>();
+      field.add("fields", typeusemap.get( ft.getTypeName() ) );
+      field.add("tokenized", ft.isTokenized() );
+      field.add("className", ft.getClass().getName());
+      field.add("indexAnalyzer", getAnalyzerInfo(ft.getAnalyzer()));
+      field.add("queryAnalyzer", getAnalyzerInfo(ft.getQueryAnalyzer()));
+      field.add("similarity", getSimilarityInfo(ft.getSimilarity()));
+      types.add( ft.getTypeName(), field );
+    }
+
+    // Must go through this to maintain binary compatbility. Putting a TreeMap into a resp leads to casting errors
+    SimpleOrderedMap<Object> finfo = new SimpleOrderedMap<Object>();
+
+    SimpleOrderedMap<Object> fieldsSimple = new SimpleOrderedMap<Object>();
+    for (Map.Entry<String, Object> ent : fields.entrySet()) {
+      fieldsSimple.add(ent.getKey(), ent.getValue());
+    }
+    finfo.add("fields", fieldsSimple);
+
+    SimpleOrderedMap<Object> dynamicSimple = new SimpleOrderedMap<Object>();
+    for (Map.Entry<String, Object> ent : dynamicFields.entrySet()) {
+      dynamicSimple.add(ent.getKey(), ent.getValue());
+    }
+    finfo.add("dynamicFields", dynamicSimple);
+
+    finfo.add("uniqueKeyField",
+        null == uniqueField ? null : uniqueField.getName());
+    finfo.add("defaultSearchField", schema.getDefaultSearchFieldName());
+    finfo.add("types", types);
+    return finfo;
+  }
+
+  private static SimpleOrderedMap<Object> getSimilarityInfo(Similarity similarity) {
+    SimpleOrderedMap<Object> toReturn = new SimpleOrderedMap<Object>();
+    if (similarity != null) {
+      toReturn.add("className", similarity.getClass().getName());
+      toReturn.add("details", similarity.toString());
+    }
+    return toReturn;
+  }
+
+  private static SimpleOrderedMap<Object> getAnalyzerInfo(Analyzer analyzer) {
+    SimpleOrderedMap<Object> aninfo = new SimpleOrderedMap<Object>();
+    aninfo.add("className", analyzer.getClass().getName());
+    if (analyzer instanceof TokenizerChain) {
+
+      TokenizerChain tchain = (TokenizerChain)analyzer;
+
+      CharFilterFactory[] cfiltfacs = tchain.getCharFilterFactories();
+      SimpleOrderedMap<Map<String, Object>> cfilters = new SimpleOrderedMap<Map<String, Object>>();
+      for (CharFilterFactory cfiltfac : cfiltfacs) {
+        Map<String, Object> tok = new HashMap<String, Object>();
+        String className = cfiltfac.getClass().getName();
+        tok.put("className", className);
+        tok.put("args", cfiltfac.getOriginalArgs());
+        cfilters.add(className.substring(className.lastIndexOf('.')+1), tok);
+      }
+      if (cfilters.size() > 0) {
+        aninfo.add("charFilters", cfilters);
+      }
+
+      SimpleOrderedMap<Object> tokenizer = new SimpleOrderedMap<Object>();
+      TokenizerFactory tfac = tchain.getTokenizerFactory();
+      tokenizer.add("className", tfac.getClass().getName());
+      tokenizer.add("args", tfac.getOriginalArgs());
+      aninfo.add("tokenizer", tokenizer);
+
+      TokenFilterFactory[] filtfacs = tchain.getTokenFilterFactories();
+      SimpleOrderedMap<Map<String, Object>> filters = new SimpleOrderedMap<Map<String, Object>>();
+      for (TokenFilterFactory filtfac : filtfacs) {
+        Map<String, Object> tok = new HashMap<String, Object>();
+        String className = filtfac.getClass().getName();
+        tok.put("className", className);
+        tok.put("args", filtfac.getOriginalArgs());
+        filters.add(className.substring(className.lastIndexOf('.')+1), tok);
+      }
+      if (filters.size() > 0) {
+        aninfo.add("filters", filters);
+      }
+    }
+    return aninfo;
+  }
+
+  private static void populateFieldInfo(IndexSchema schema,
+                                        Map<String, List<String>> typeusemap, Map<String, Object> fields,
+                                        SchemaField uniqueField, SchemaField f) {
+    FieldType ft = f.getType();
+    SimpleOrderedMap<Object> field = new SimpleOrderedMap<Object>();
+    field.add( "type", ft.getTypeName() );
+    field.add( "flags", getFieldFlags(f) );
+    if( f.isRequired() ) {
+      field.add( "required", f.isRequired() );
+    }
+    if( f.getDefaultValue() != null ) {
+      field.add( "default", f.getDefaultValue() );
+    }
+    if (f == uniqueField){
+      field.add("uniqueKey", true);
+    }
+    if (ft.getAnalyzer().getPositionIncrementGap(f.getName()) != 0) {
+      field.add("positionIncrementGap", ft.getAnalyzer().getPositionIncrementGap(f.getName()));
+    }
+    field.add("copyDests", toListOfStringDests(schema.getCopyFieldsList(f.getName())));
+    field.add("copySources", toListOfStrings(schema.getCopySources(f.getName())));
+
+
+    fields.put( f.getName(), field );
+
+    List<String> v = typeusemap.get( ft.getTypeName() );
+    if( v == null ) {
+      v = new ArrayList<String>();
+    }
+    v.add( f.getName() );
+    typeusemap.put( ft.getTypeName(), v );
+  }
+
+  /**
+   * @deprecated use {@link #getIndexInfo(DirectoryReader)} since you now have to explicitly pass the "fl" prameter
+   * and this was always called with "false" anyway from CoreAdminHandler
+   */
+  public static SimpleOrderedMap<Object> getIndexInfo(DirectoryReader reader, boolean detail) throws IOException {
+    return getIndexInfo(reader);
+  }
+  // This method just gets the top-most level of information. This was conflated with getting detailed info
+  // for *all* the fields, called from CoreAdminHandler etc.
+
+  public static SimpleOrderedMap<Object> getIndexInfo(DirectoryReader reader) throws IOException {
+    Directory dir = reader.directory();
+    SimpleOrderedMap<Object> indexInfo = new SimpleOrderedMap<Object>();
+
+    indexInfo.add("numDocs", reader.numDocs());
+    indexInfo.add("maxDoc", reader.maxDoc());
+    indexInfo.add("deletedDocs", reader.maxDoc() - reader.numDocs());
+
+    indexInfo.add("version", reader.getVersion());  // TODO? Is this different then: IndexReader.getCurrentVersion( dir )?
+    indexInfo.add("segmentCount", reader.leaves().size());
+    indexInfo.add("current", reader.isCurrent() );
+    indexInfo.add("hasDeletions", reader.hasDeletions() );
+    indexInfo.add("directory", dir );
+    indexInfo.add("userData", reader.getIndexCommit().getUserData());
+    String s = reader.getIndexCommit().getUserData().get(SolrIndexWriter.COMMIT_TIME_MSEC_KEY);
+    if (s != null) {
+      indexInfo.add("lastModified", new Date(Long.parseLong(s)));
+    }
+    return indexInfo;
+  }
+
+  // Get terribly detailed information about a particular field. This is a very expensive call, use it with caution
+  // especially on large indexes!
+  @SuppressWarnings("unchecked")
+  private static void getDetailedFieldInfo(SolrQueryRequest req, String field, SimpleOrderedMap<Object> fieldMap)
+      throws IOException {
+
+    SolrParams params = req.getParams();
+    int numTerms = params.getInt( NUMTERMS, DEFAULT_COUNT );
+
+    TopTermQueue tiq = new TopTermQueue(numTerms + 1);  // Something to collect the top N terms in.
+
+    final CharsRef spare = new CharsRef();
+
+    Fields fields = MultiFields.getFields(req.getSearcher().getIndexReader());
+
+    if (fields == null) { // No indexed fields
+      return;
+    }
+
+    Terms terms = fields.terms(field);
+    if (terms == null) {  // No terms in the field.
+      return;
+    }
+    TermsEnum termsEnum = terms.iterator(null);
+    BytesRef text;
+    int[] buckets = new int[HIST_ARRAY_SIZE];
+    while ((text = termsEnum.next()) != null) {
+      int freq = termsEnum.docFreq();  // This calculation seems odd, but it gives the same results as it used to.
+      int slot = 32 - Integer.numberOfLeadingZeros(Math.max(0, freq - 1));
+      buckets[slot] = buckets[slot] + 1;
+      if (freq > tiq.minFreq) {
+        UnicodeUtil.UTF8toUTF16(text, spare);
+        String t = spare.toString();
+        tiq.distinctTerms = new Long(terms.size()).intValue();
+
+        tiq.add(new TopTermQueue.TermInfo(new Term(field, t), termsEnum.docFreq()));
+        if (tiq.size() > numTerms) { // if tiq full
+          tiq.pop(); // remove lowest in tiq
+          tiq.minFreq = tiq.getTopTermInfo().docFreq;
         }
       }
     }
-    return sf.toArray(new SchemaField[sf.size()]);
+    tiq.histogram.add(buckets);
+    fieldMap.add("distinct", tiq.distinctTerms);
+
+    // Include top terms
+    fieldMap.add("topTerms", tiq.toNamedList(req.getSearcher().getSchema()));
+
+    // Add a histogram
+    fieldMap.add("histogram", tiq.histogram.toNamedList());
   }
 
-  /**
-   * Get all copy fields for a specified source field, both static
-   * and dynamic ones.
-   * @param sourceField
-   * @return List of CopyFields to copy to.
-   * @since solr 1.4
-   */
-  // This is useful when we need the maxSize param of each CopyField
-  public List<CopyField> getCopyFieldsList(final String sourceField){
-    final List<CopyField> result = new ArrayList<CopyField>();
-    for (DynamicCopy dynamicCopy : dynamicCopyFields) {
-      if (dynamicCopy.matches(sourceField)) {
-        result.add(new CopyField(getField(sourceField), dynamicCopy.getTargetField(sourceField), dynamicCopy.maxChars));
-      }
+  private static List<String> toListOfStrings(SchemaField[] raw) {
+    List<String> result = new ArrayList<String>(raw.length);
+    for (SchemaField f : raw) {
+      result.add(f.getName());
     }
-    List<CopyField> fixedCopyFields = copyFieldsMap.get(sourceField);
-    if (fixedCopyFields != null)
-    {
-      result.addAll(fixedCopyFields);
-    }
-
     return result;
   }
-  
-  /**
-   * Check if a field is used as the destination of a copyField operation 
-   * 
-   * @since solr 1.3
-   */
-  public boolean isCopyFieldTarget( SchemaField f )
+  private static List<String> toListOfStringDests(List<CopyField> raw) {
+    List<String> result = new ArrayList<String>(raw.size());
+    for (CopyField f : raw) {
+      result.add(f.getDestination().getName());
+    }
+    return result;
+  }
+
+  //////////////////////// SolrInfoMBeans methods //////////////////////
+
+  @Override
+  public String getDescription() {
+    return "Lucene Index Browser.  Inspired and modeled after Luke: http://www.getopt.org/luke/";
+  }
+
+  @Override
+  public String getSource() {
+    return "$URL$";
+  }
+
+  @Override
+  public URL[] getDocs() {
+    try {
+      return new URL[] { new URL("http://wiki.apache.org/solr/LukeRequestHandler") };
+    }
+    catch( MalformedURLException ex ) { return null; }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+
+  static class TermHistogram
   {
-    return copyFieldTargetCounts.containsKey( f );
+    int _maxBucket = -1;
+    int _buckets[] = new int[HIST_ARRAY_SIZE];
+    public void add(int[] buckets) {
+      for (int idx = 0; idx < buckets.length; ++idx) {
+        if (buckets[idx] != 0) _maxBucket = idx;
+      }
+      for (int idx = 0; idx <= _maxBucket; ++idx) {
+        _buckets[idx] = buckets[idx];
+      }
+    }
+    // TODO? should this be a list or a map?
+    public NamedList<Integer> toNamedList()
+    {
+      NamedList<Integer> nl = new NamedList<Integer>();
+      for( int bucket = 0; bucket <= _maxBucket; bucket++ ) {
+        nl.add( ""+ (1 << bucket), _buckets[bucket] );
+      }
+      return nl;
+    }
   }
-
   /**
-   * Is the given field name a wildcard?  I.e. does it begin or end with *?
-   * @param name
-   * @return true/false
+   * Private internal class that counts up frequent terms
    */
-  private static boolean isWildCard(String name) {
-    return  name.startsWith("*") || name.endsWith("*");
-  }
+  private static class TopTermQueue extends PriorityQueue
+  {
+    static class TermInfo {
+      TermInfo(Term t, int df) {
+        term = t;
+        docFreq = df;
+      }
+      int docFreq;
+      Term term;
+    }
 
+    public int minFreq = 0;
+    public int distinctTerms = 0;
+    public TermHistogram histogram;
+
+
+    TopTermQueue(int size) {
+      super(size);
+      histogram = new TermHistogram();
+    }
+
+    @Override
+    protected final boolean lessThan(Object a, Object b) {
+      TermInfo termInfoA = (TermInfo)a;
+      TermInfo termInfoB = (TermInfo)b;
+      return termInfoA.docFreq < termInfoB.docFreq;
+    }
+
+    /**
+     * This is a destructive call... the queue is empty at the end
+     */
+    public NamedList<Integer> toNamedList( IndexSchema schema )
+    {
+      // reverse the list..
+      List<TermInfo> aslist = new LinkedList<TermInfo>();
+      while( size() > 0 ) {
+        aslist.add( 0, (TermInfo)pop() );
+      }
+
+      NamedList<Integer> list = new NamedList<Integer>();
+      for (TermInfo i : aslist) {
+        String txt = i.term.text();
+        SchemaField ft = schema.getFieldOrNull( i.term.field() );
+        if( ft != null ) {
+          txt = ft.getType().indexedToReadable( txt );
+        }
+        list.add( txt, i.docFreq );
+      }
+      return list;
+    }
+    public TermInfo getTopTermInfo() {
+      return (TermInfo)top();
+    }
+  }
 }

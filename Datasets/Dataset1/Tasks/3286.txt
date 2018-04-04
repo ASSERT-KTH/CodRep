@@ -1,8 +1,8 @@
-for (final AtomicReaderContext ctx : reader.leaves()) {
+import org.apache.lucene.util.DoubleBarrelLRUCache;
 
-package org.apache.lucene.index;
+package org.apache.lucene.index.codecs.preflex;
 
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -20,360 +20,314 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.codecs.FieldInfosWriter;
-import org.apache.lucene.codecs.FieldsConsumer;
-import org.apache.lucene.codecs.PerDocConsumer;
-import org.apache.lucene.codecs.StoredFieldsWriter;
-import org.apache.lucene.codecs.TermVectorsWriter;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.InfoStream;
+import org.apache.lucene.util.CloseableThreadLocal;
+import org.apache.lucene.util.cache.DoubleBarrelLRUCache;
 
-/**
- * The SegmentMerger class combines two or more Segments, represented by an IndexReader ({@link #add},
- * into a single Segment.  After adding the appropriate readers, call the merge method to combine the
- * segments.
- *
- * @see #merge
- * @see #add
+/** This stores a monotonically increasing set of <Term, TermInfo> pairs in a
+ * Directory.  Pairs are accessed either by Term or by ordinal position the
+ * set
+ * @deprecated This class has been replaced by
+ * FormatPostingsTermsDictReader, except for reading old segments. 
+ * @lucene.experimental
  */
-final class SegmentMerger {
+@Deprecated
+public final class TermInfosReader {
   private final Directory directory;
-  private final int termIndexInterval;
+  private final String segment;
+  private final FieldInfos fieldInfos;
 
-  private final Codec codec;
-  
-  private final IOContext context;
-  
-  private final MergeState mergeState = new MergeState();
-  private final FieldInfos.Builder fieldInfosBuilder;
+  private final CloseableThreadLocal<ThreadResources> threadResources = new CloseableThreadLocal<ThreadResources>();
+  private final SegmentTermEnum origEnum;
+  private final long size;
 
-  // note, just like in codec apis Directory 'dir' is NOT the same as segmentInfo.dir!!
-  SegmentMerger(SegmentInfo segmentInfo, InfoStream infoStream, Directory dir, int termIndexInterval,
-                MergeState.CheckAbort checkAbort, PayloadProcessorProvider payloadProcessorProvider,
-                FieldInfos.FieldNumbers fieldNumbers, IOContext context) {
-    mergeState.segmentInfo = segmentInfo;
-    mergeState.infoStream = infoStream;
-    mergeState.readers = new ArrayList<AtomicReader>();
-    mergeState.checkAbort = checkAbort;
-    mergeState.payloadProcessorProvider = payloadProcessorProvider;
-    directory = dir;
-    this.termIndexInterval = termIndexInterval;
-    this.codec = segmentInfo.getCodec();
-    this.context = context;
-    this.fieldInfosBuilder = new FieldInfos.Builder(fieldNumbers);
+  private final Term[] indexTerms;
+  private final TermInfo[] indexInfos;
+  private final long[] indexPointers;
+  
+  private final int totalIndexInterval;
+
+  private final static int DEFAULT_CACHE_SIZE = 1024;
+  
+  // Just adds term's ord to TermInfo
+  private final static class TermInfoAndOrd extends TermInfo {
+    final int termOrd;
+    public TermInfoAndOrd(TermInfo ti, int termOrd) {
+      super(ti);
+      this.termOrd = termOrd;
+    }
   }
+
+  private final DoubleBarrelLRUCache<Term,TermInfoAndOrd> termsCache = new DoubleBarrelLRUCache<Term,TermInfoAndOrd>(DEFAULT_CACHE_SIZE);
 
   /**
-   * Add an IndexReader to the collection of readers that are to be merged
-   * @param reader
+   * Per-thread resources managed by ThreadLocal
    */
-  final void add(IndexReader reader) {
-    for (final AtomicReaderContext ctx : reader.getTopReaderContext().leaves()) {
-      final AtomicReader r = ctx.reader();
-      mergeState.readers.add(r);
-    }
+  private static final class ThreadResources {
+    SegmentTermEnum termEnum;
   }
+  
+  TermInfosReader(Directory dir, String seg, FieldInfos fis, int readBufferSize, int indexDivisor)
+       throws CorruptIndexException, IOException {
+    boolean success = false;
 
-  final void add(SegmentReader reader) {
-    mergeState.readers.add(reader);
-  }
-
-  /**
-   * Merges the readers specified by the {@link #add} method into the directory passed to the constructor
-   * @return The number of documents that were merged
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  final MergeState merge() throws IOException {
-    // NOTE: it's important to add calls to
-    // checkAbort.work(...) if you make any changes to this
-    // method that will spend alot of time.  The frequency
-    // of this check impacts how long
-    // IndexWriter.close(false) takes to actually stop the
-    // threads.
-    
-    mergeState.segmentInfo.setDocCount(setDocMaps());
-    mergeDocValuesAndNormsFieldInfos();
-    setMatchingSegmentReaders();
-    int numMerged = mergeFields();
-    assert numMerged == mergeState.segmentInfo.getDocCount();
-
-    final SegmentWriteState segmentWriteState = new SegmentWriteState(mergeState.infoStream, directory, mergeState.segmentInfo,
-                                                                      mergeState.fieldInfos, termIndexInterval, null, context);
-    mergeTerms(segmentWriteState);
-    mergePerDoc(segmentWriteState);
-    
-    if (mergeState.fieldInfos.hasNorms()) {
-      mergeNorms(segmentWriteState);
+    if (indexDivisor < 1 && indexDivisor != -1) {
+      throw new IllegalArgumentException("indexDivisor must be -1 (don't load terms index) or greater than 0: got " + indexDivisor);
     }
 
-    if (mergeState.fieldInfos.hasVectors()) {
-      numMerged = mergeVectors();
-      assert numMerged == mergeState.segmentInfo.getDocCount();
-    }
-    
-    // write the merged infos
-    FieldInfosWriter fieldInfosWriter = codec.fieldInfosFormat().getFieldInfosWriter();
-    fieldInfosWriter.write(directory, mergeState.segmentInfo.name, mergeState.fieldInfos, context);
+    try {
+      directory = dir;
+      segment = seg;
+      fieldInfos = fis;
 
-    return mergeState;
-  }
+      origEnum = new SegmentTermEnum(directory.openInput(IndexFileNames.segmentFileName(segment, PreFlexCodec.TERMS_EXTENSION),
+                                                         readBufferSize), fieldInfos, false);
+      size = origEnum.size;
 
-  private void setMatchingSegmentReaders() {
-    // If the i'th reader is a SegmentReader and has
-    // identical fieldName -> number mapping, then this
-    // array will be non-null at position i:
-    int numReaders = mergeState.readers.size();
-    mergeState.matchingSegmentReaders = new SegmentReader[numReaders];
 
-    // If this reader is a SegmentReader, and all of its
-    // field name -> number mappings match the "merged"
-    // FieldInfos, then we can do a bulk copy of the
-    // stored fields:
-    for (int i = 0; i < numReaders; i++) {
-      AtomicReader reader = mergeState.readers.get(i);
-      // TODO: we may be able to broaden this to
-      // non-SegmentReaders, since FieldInfos is now
-      // required?  But... this'd also require exposing
-      // bulk-copy (TVs and stored fields) API in foreign
-      // readers..
-      if (reader instanceof SegmentReader) {
-        SegmentReader segmentReader = (SegmentReader) reader;
-        boolean same = true;
-        FieldInfos segmentFieldInfos = segmentReader.getFieldInfos();
-        for (FieldInfo fi : segmentFieldInfos) {
-          FieldInfo other = mergeState.fieldInfos.fieldInfo(fi.number);
-          if (other == null || !other.name.equals(fi.name)) {
-            same = false;
-            break;
+      if (indexDivisor != -1) {
+        // Load terms index
+        totalIndexInterval = origEnum.indexInterval * indexDivisor;
+        final SegmentTermEnum indexEnum = new SegmentTermEnum(directory.openInput(IndexFileNames.segmentFileName(segment, PreFlexCodec.TERMS_INDEX_EXTENSION),
+                                                                                  readBufferSize), fieldInfos, true);
+
+        try {
+          int indexSize = 1+((int)indexEnum.size-1)/indexDivisor;  // otherwise read index
+
+          indexTerms = new Term[indexSize];
+          indexInfos = new TermInfo[indexSize];
+          indexPointers = new long[indexSize];
+        
+          for (int i = 0; indexEnum.next(); i++) {
+            indexTerms[i] = indexEnum.term();
+            indexInfos[i] = indexEnum.termInfo();
+            indexPointers[i] = indexEnum.indexPointer;
+        
+            for (int j = 1; j < indexDivisor; j++)
+              if (!indexEnum.next())
+                break;
           }
-        }
-        if (same) {
-          mergeState.matchingSegmentReaders[i] = segmentReader;
-          mergeState.matchedCount++;
-        }
-      }
-    }
-
-    if (mergeState.infoStream.isEnabled("SM")) {
-      mergeState.infoStream.message("SM", "merge store matchedCount=" + mergeState.matchedCount + " vs " + mergeState.readers.size());
-      if (mergeState.matchedCount != mergeState.readers.size()) {
-        mergeState.infoStream.message("SM", "" + (mergeState.readers.size() - mergeState.matchedCount) + " non-bulk merges");
-      }
-    }
-  }
-  
-  // returns an updated typepromoter (tracking type and size) given a previous one,
-  // and a newly encountered docvalues
-  private TypePromoter mergeDocValuesType(TypePromoter previous, DocValues docValues) {
-    TypePromoter incoming = TypePromoter.create(docValues.getType(),  docValues.getValueSize());
-    if (previous == null) {
-      previous = TypePromoter.getIdentityPromoter();
-    }
-    return previous.promote(incoming);
-  }
-
-  // NOTE: this is actually merging all the fieldinfos
-  public void mergeDocValuesAndNormsFieldInfos() throws IOException {
-    // mapping from all docvalues fields found to their promoted types
-    // this is because FieldInfos does not store the
-    // valueSize
-    Map<FieldInfo,TypePromoter> docValuesTypes = new HashMap<FieldInfo,TypePromoter>();
-    Map<FieldInfo,TypePromoter> normValuesTypes = new HashMap<FieldInfo,TypePromoter>();
-
-    for (AtomicReader reader : mergeState.readers) {
-      FieldInfos readerFieldInfos = reader.getFieldInfos();
-      for (FieldInfo fi : readerFieldInfos) {
-        FieldInfo merged = fieldInfosBuilder.add(fi);
-        // update the type promotion mapping for this reader
-        if (fi.hasDocValues()) {
-          TypePromoter previous = docValuesTypes.get(merged);
-          docValuesTypes.put(merged, mergeDocValuesType(previous, reader.docValues(fi.name))); 
-        }
-        if (fi.hasNorms()) {
-          TypePromoter previous = normValuesTypes.get(merged);
-          normValuesTypes.put(merged, mergeDocValuesType(previous, reader.normValues(fi.name))); 
-        }
-      }
-    }
-    updatePromoted(normValuesTypes, true);
-    updatePromoted(docValuesTypes, false);
-    mergeState.fieldInfos = fieldInfosBuilder.finish();
-  }
-  
-  protected void updatePromoted(Map<FieldInfo,TypePromoter> infoAndPromoter, boolean norms) {
-    // update any promoted doc values types:
-    for (Map.Entry<FieldInfo,TypePromoter> e : infoAndPromoter.entrySet()) {
-      FieldInfo fi = e.getKey();
-      TypePromoter promoter = e.getValue();
-      if (promoter == null) {
-        if (norms) {
-          fi.setNormValueType(null);
-        } else {
-          fi.setDocValuesType(null);
+        } finally {
+          indexEnum.close();
         }
       } else {
-        assert promoter != TypePromoter.getIdentityPromoter();
-        if (norms) {
-          if (fi.getNormType() != promoter.type() && !fi.omitsNorms()) {
-            // reset the type if we got promoted
-            fi.setNormValueType(promoter.type());
-          }  
-        } else {
-          if (fi.getDocValuesType() != promoter.type()) {
-            // reset the type if we got promoted
-            fi.setDocValuesType(promoter.type());
-          }
-        }
+        // Do not load terms index:
+        totalIndexInterval = -1;
+        indexTerms = null;
+        indexInfos = null;
+        indexPointers = null;
       }
-    }
-  }
-
-
-  /**
-   *
-   * @return The number of documents in all of the readers
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  private int mergeFields() throws IOException {
-    final StoredFieldsWriter fieldsWriter = codec.storedFieldsFormat().fieldsWriter(directory, mergeState.segmentInfo, context);
-    
-    try {
-      return fieldsWriter.merge(mergeState);
-    } finally {
-      fieldsWriter.close();
-    }
-  }
-
-  /**
-   * Merge the TermVectors from each of the segments into the new one.
-   * @throws IOException
-   */
-  private final int mergeVectors() throws IOException {
-    final TermVectorsWriter termVectorsWriter = codec.termVectorsFormat().vectorsWriter(directory, mergeState.segmentInfo, context);
-    
-    try {
-      return termVectorsWriter.merge(mergeState);
-    } finally {
-      termVectorsWriter.close();
-    }
-  }
-
-  // NOTE: removes any "all deleted" readers from mergeState.readers
-  private int setDocMaps() throws IOException {
-    final int numReaders = mergeState.readers.size();
-
-    // Remap docIDs
-    mergeState.docMaps = new MergeState.DocMap[numReaders];
-    mergeState.docBase = new int[numReaders];
-    mergeState.readerPayloadProcessor = new PayloadProcessorProvider.ReaderPayloadProcessor[numReaders];
-    mergeState.currentPayloadProcessor = new PayloadProcessorProvider.PayloadProcessor[numReaders];
-
-    int docBase = 0;
-
-    int i = 0;
-    while(i < mergeState.readers.size()) {
-
-      final AtomicReader reader = mergeState.readers.get(i);
-
-      mergeState.docBase[i] = docBase;
-      final MergeState.DocMap docMap = MergeState.DocMap.build(reader);
-      mergeState.docMaps[i] = docMap;
-      docBase += docMap.numDocs();
-
-      if (mergeState.payloadProcessorProvider != null) {
-        mergeState.readerPayloadProcessor[i] = mergeState.payloadProcessorProvider.getReaderProcessor(reader);
-      }
-
-      i++;
-    }
-
-    return docBase;
-  }
-
-  private final void mergeTerms(SegmentWriteState segmentWriteState) throws IOException {
-    
-    final List<Fields> fields = new ArrayList<Fields>();
-    final List<ReaderSlice> slices = new ArrayList<ReaderSlice>();
-
-    int docBase = 0;
-
-    for(int readerIndex=0;readerIndex<mergeState.readers.size();readerIndex++) {
-      final AtomicReader reader = mergeState.readers.get(readerIndex);
-      final Fields f = reader.fields();
-      final int maxDoc = reader.maxDoc();
-      if (f != null) {
-        slices.add(new ReaderSlice(docBase, maxDoc, readerIndex));
-        fields.add(f);
-      }
-      docBase += maxDoc;
-    }
-
-    final FieldsConsumer consumer = codec.postingsFormat().fieldsConsumer(segmentWriteState);
-    boolean success = false;
-    try {
-      consumer.merge(mergeState,
-                     new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
-                                     slices.toArray(ReaderSlice.EMPTY_ARRAY)));
       success = true;
     } finally {
-      if (success) {
-        IOUtils.close(consumer);
-      } else {
-        IOUtils.closeWhileHandlingException(consumer);
+      // With lock-less commits, it's entirely possible (and
+      // fine) to hit a FileNotFound exception above. In
+      // this case, we want to explicitly close any subset
+      // of things that were opened so that we don't have to
+      // wait for a GC to do so.
+      if (!success) {
+        close();
       }
     }
   }
 
-  private void mergePerDoc(SegmentWriteState segmentWriteState) throws IOException {
-      final PerDocConsumer docsConsumer = codec.docValuesFormat()
-          .docsConsumer(new PerDocWriteState(segmentWriteState));
-      // TODO: remove this check when 3.x indexes are no longer supported
-      // (3.x indexes don't have docvalues)
-      if (docsConsumer == null) {
-        return;
-      }
-      boolean success = false;
-      try {
-        docsConsumer.merge(mergeState);
-        success = true;
-      } finally {
-        if (success) {
-          IOUtils.close(docsConsumer);
-        } else {
-          IOUtils.closeWhileHandlingException(docsConsumer);
-        }
-      }
+  public int getSkipInterval() {
+    return origEnum.skipInterval;
   }
   
-  private void mergeNorms(SegmentWriteState segmentWriteState) throws IOException {
-    final PerDocConsumer docsConsumer = codec.normsFormat()
-        .docsConsumer(new PerDocWriteState(segmentWriteState));
-    // TODO: remove this check when 3.x indexes are no longer supported
-    // (3.x indexes don't have docvalues)
-    if (docsConsumer == null) {
-      return;
+  public int getMaxSkipLevels() {
+    return origEnum.maxSkipLevels;
+  }
+
+  final void close() throws IOException {
+    if (origEnum != null)
+      origEnum.close();
+    threadResources.close();
+  }
+
+  /** Returns the number of term/value pairs in the set. */
+  final long size() {
+    return size;
+  }
+
+  private ThreadResources getThreadResources() {
+    ThreadResources resources = threadResources.get();
+    if (resources == null) {
+      resources = new ThreadResources();
+      resources.termEnum = terms();
+      threadResources.set(resources);
     }
-    boolean success = false;
-    try {
-      docsConsumer.merge(mergeState);
-      success = true;
-    } finally {
-      if (success) {
-        IOUtils.close(docsConsumer);
+    return resources;
+  }
+
+
+  /** Returns the offset of the greatest index entry which is less than or equal to term.*/
+  private final int getIndexOffset(Term term) {
+    int lo = 0;					  // binary search indexTerms[]
+    int hi = indexTerms.length - 1;
+
+    while (hi >= lo) {
+      int mid = (lo + hi) >>> 1;
+      int delta = term.compareTo(indexTerms[mid]);
+      if (delta < 0)
+	hi = mid - 1;
+      else if (delta > 0)
+	lo = mid + 1;
+      else
+	return mid;
+    }
+    return hi;
+  }
+
+  private final void seekEnum(SegmentTermEnum enumerator, int indexOffset) throws IOException {
+    enumerator.seek(indexPointers[indexOffset],
+                    ((long) indexOffset * totalIndexInterval) - 1,
+                    indexTerms[indexOffset], indexInfos[indexOffset]);
+  }
+
+  /** Returns the TermInfo for a Term in the set, or null. */
+  TermInfo get(Term term) throws IOException {
+    return get(term, false);
+  }
+  
+  /** Returns the TermInfo for a Term in the set, or null. */
+  private TermInfo get(Term term, boolean mustSeekEnum) throws IOException {
+    if (size == 0) return null;
+
+    ensureIndexIsRead();
+
+    TermInfoAndOrd tiOrd = termsCache.get(term);
+    ThreadResources resources = getThreadResources();
+
+    if (!mustSeekEnum && tiOrd != null) {
+      return tiOrd;
+    }
+
+    return seekEnum(resources.termEnum, term, tiOrd);
+  }
+
+  TermInfo seekEnum(SegmentTermEnum enumerator, Term term) throws IOException {
+    return seekEnum(enumerator, term, termsCache.get(term));
+  }
+
+  TermInfo seekEnum(SegmentTermEnum enumerator, Term term, TermInfoAndOrd tiOrd) throws IOException {
+
+    // optimize sequential access: first try scanning cached enum w/o seeking
+    if (enumerator.term() != null                 // term is at or past current
+	&& ((enumerator.prev() != null && term.compareTo(enumerator.prev())> 0)
+	    || term.compareTo(enumerator.term()) >= 0)) {
+      int enumOffset = (int)(enumerator.position/totalIndexInterval)+1;
+      if (indexTerms.length == enumOffset	  // but before end of block
+    || term.compareTo(indexTerms[enumOffset]) < 0) {
+       // no need to seek
+
+        final TermInfo ti;
+
+        int numScans = enumerator.scanTo(term);
+        if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0) {
+          ti = enumerator.termInfo();
+          if (numScans > 1) {
+            // we only  want to put this TermInfo into the cache if
+            // scanEnum skipped more than one dictionary entry.
+            // This prevents RangeQueries or WildcardQueries to 
+            // wipe out the cache when they iterate over a large numbers
+            // of terms in order
+            if (tiOrd == null) {
+              termsCache.put(term, new TermInfoAndOrd(ti, (int) enumerator.position));
+            } else {
+              assert sameTermInfo(ti, tiOrd, enumerator);
+              assert (int) enumerator.position == tiOrd.termOrd;
+            }
+          }
+        } else {
+          ti = null;
+        }
+
+        return ti;
+      }  
+    }
+
+    // random-access: must seek
+    final int indexPos;
+    if (tiOrd != null) {
+      indexPos = tiOrd.termOrd / totalIndexInterval;
+    } else {
+      // Must do binary search:
+      indexPos = getIndexOffset(term);
+    }
+
+    seekEnum(enumerator, indexPos);
+    enumerator.scanTo(term);
+    final TermInfo ti;
+    if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0) {
+      ti = enumerator.termInfo();
+      if (tiOrd == null) {
+        termsCache.put(term, new TermInfoAndOrd(ti, (int) enumerator.position));
       } else {
-        IOUtils.closeWhileHandlingException(docsConsumer);
+        assert sameTermInfo(ti, tiOrd, enumerator);
+        assert (int) enumerator.position == tiOrd.termOrd;
       }
+    } else {
+      ti = null;
     }
+    return ti;
+  }
+
+  // called only from asserts
+  private final boolean sameTermInfo(TermInfo ti1, TermInfo ti2, SegmentTermEnum enumerator) {
+    if (ti1.docFreq != ti2.docFreq) {
+      return false;
+    }
+    if (ti1.freqPointer != ti2.freqPointer) {
+      return false;
+    }
+    if (ti1.proxPointer != ti2.proxPointer) {
+      return false;
+    }
+    // skipOffset is only valid when docFreq >= skipInterval:
+    if (ti1.docFreq >= enumerator.skipInterval &&
+        ti1.skipOffset != ti2.skipOffset) {
+      return false;
+    }
+    return true;
+  }
+
+  private void ensureIndexIsRead() {
+    if (indexTerms == null) {
+      throw new IllegalStateException("terms index was not loaded when this reader was created");
+    }
+  }
+
+  /** Returns the position of a Term in the set or -1. */
+  final long getPosition(Term term) throws IOException {
+    if (size == 0) return -1;
+
+    ensureIndexIsRead();
+    int indexOffset = getIndexOffset(term);
+    
+    SegmentTermEnum enumerator = getThreadResources().termEnum;
+    seekEnum(enumerator, indexOffset);
+
+    while(term.compareTo(enumerator.term()) > 0 && enumerator.next()) {}
+
+    if (term.compareTo(enumerator.term()) == 0)
+      return enumerator.position;
+    else
+      return -1;
+  }
+
+  /** Returns an enumeration of all the Terms and TermInfos in the set. */
+  public SegmentTermEnum terms() {
+    return (SegmentTermEnum)origEnum.clone();
+  }
+
+  /** Returns an enumeration of terms starting at or after the named term. */
+  public SegmentTermEnum terms(Term term) throws IOException {
+    get(term, true);
+    return (SegmentTermEnum)getThreadResources().termEnum.clone();
   }
 }

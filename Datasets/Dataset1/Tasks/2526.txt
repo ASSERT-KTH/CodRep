@@ -1,4 +1,4 @@
-logger.debug("Deleted {}", desc);
+private final int gcBefore = (int) (System.currentTimeMillis() / 1000) - cfs.metadata.getGcGraceSeconds();
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -8,273 +8,203 @@ logger.debug("Deleted {}", desc);
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
-package org.apache.cassandra.io.sstable;
-
-import java.io.File;
-import java.io.FilenameFilter;
-import java.io.IOError;
-import java.io.IOException;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.commitlog.ReplayPosition;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.io.util.BufferedRandomAccessFile;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.EstimatedHistogram;
-import org.apache.cassandra.utils.Pair;
-
-/**
- * This class is built on top of the SequenceFile. It stores
- * data on disk in sorted fashion. However the sorting is upto
- * the application. This class expects keys to be handed to it
- * in sorted order.
  *
- * A separate index file is maintained as well, containing the
- * SSTable keys and the offset into the SSTable at which they are found.
- * Every 1/indexInterval key is read into memory when the SSTable is opened.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Finally, a bloom filter file is also kept for the keys in each SSTable.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-public abstract class SSTable
+package org.apache.cassandra.db;
+
+import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import org.apache.cassandra.db.columniterator.IColumnIterator;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.sstable.SSTableScanner;
+import org.apache.cassandra.utils.ReducingIterator;
+import org.apache.commons.collections.IteratorUtils;
+
+import com.google.common.base.Function;
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterators;
+
+public class RowIteratorFactory
 {
-    static final Logger logger = LoggerFactory.getLogger(SSTable.class);
 
-    // TODO: replace with 'Component' objects
-    public static final String COMPONENT_DATA = Component.Type.DATA.repr;
-    public static final String COMPONENT_INDEX = Component.Type.PRIMARY_INDEX.repr;
-    public static final String COMPONENT_FILTER = Component.Type.FILTER.repr;
-    public static final String COMPONENT_STATS = Component.Type.STATS.repr;
+    private static final int RANGE_FILE_BUFFER_SIZE = 256 * 1024;
 
-    public static final String TEMPFILE_MARKER = "tmp";
-
-    public final Descriptor descriptor;
-    protected final Set<Component> components;
-    public final CFMetaData metadata;
-    public final IPartitioner partitioner;
-
-    public final ReplayPosition replayPosition;
-
-    protected final EstimatedHistogram estimatedRowSize;
-    protected final EstimatedHistogram estimatedColumnCount;
-
-    protected SSTable(Descriptor descriptor, CFMetaData metadata, ReplayPosition replayPosition, IPartitioner partitioner)
+    private static final Comparator<IColumnIterator> COMPARE_BY_KEY = new Comparator<IColumnIterator>()
     {
-        this(descriptor, new HashSet<Component>(), metadata, replayPosition, partitioner);
-    }
-
-    protected SSTable(Descriptor descriptor, Set<Component> components, CFMetaData metadata, ReplayPosition replayPosition, IPartitioner partitioner)
-    {
-        this(descriptor, components, metadata, replayPosition, partitioner, defaultRowHistogram(), defaultColumnHistogram());
-    }
-
-    protected SSTable(Descriptor descriptor, Set<Component> components, CFMetaData metadata, ReplayPosition replayPosition, IPartitioner partitioner, EstimatedHistogram rowSizes, EstimatedHistogram columnCounts)
-    {
-        assert descriptor != null;
-        assert components != null;
-        assert metadata != null;
-        assert replayPosition != null;
-        assert partitioner != null;
-        assert rowSizes != null;
-        assert columnCounts != null;
-
-        this.descriptor = descriptor;
-        Set<Component> dataComponents = new HashSet<Component>(components);
-        for (Component component : components)
-            assert component.type != Component.Type.COMPACTED_MARKER;
-        this.components = Collections.unmodifiableSet(dataComponents);
-        this.metadata = metadata;
-        this.replayPosition = replayPosition;
-        this.partitioner = partitioner;
-        estimatedRowSize = rowSizes;
-        estimatedColumnCount = columnCounts;
-    }
-
-    static EstimatedHistogram defaultColumnHistogram()
-    {
-        return new EstimatedHistogram(114);
-    }
-
-    static EstimatedHistogram defaultRowHistogram()
-    {
-        return new EstimatedHistogram(150);
-    }
-
-    public EstimatedHistogram getEstimatedRowSize()
-    {
-        return estimatedRowSize;
-    }
-
-    public EstimatedHistogram getEstimatedColumnCount()
-    {
-        return estimatedColumnCount;
-    }
-
-    /**
-     * We use a ReferenceQueue to manage deleting files that have been compacted
-     * and for which no more SSTable references exist.  But this is not guaranteed
-     * to run for each such file because of the semantics of the JVM gc.  So,
-     * we write a marker to `compactedFilename` when a file is compacted;
-     * if such a marker exists on startup, the file should be removed.
-     *
-     * This method will also remove SSTables that are marked as temporary.
-     *
-     * @return true if the file was deleted
-     */
-    public static boolean delete(Descriptor desc, Set<Component> components)
-    {
-        try
+        public int compare(IColumnIterator o1, IColumnIterator o2)
         {
-            // remove the DATA component first if it exists
-            if (components.contains(Component.DATA))
-                FileUtils.deleteWithConfirm(desc.filenameFor(Component.DATA));
-            for (Component component : components)
+            return DecoratedKey.comparator.compare(o1.getKey(), o2.getKey());
+        }
+    };
+
+    
+    /**
+     * Get a row iterator over the provided memtables and sstables, between the provided keys
+     * and filtered by the queryfilter.
+     * @param memtables Memtables pending flush.
+     * @param sstables SStables to scan through.
+     * @param startWith Start at this key
+     * @param stopAt Stop and this key
+     * @param filter Used to decide which columns to pull out
+     * @param comparator
+     * @return A row iterator following all the given restrictions
+     */
+    public static RowIterator getIterator(final Collection<Memtable> memtables,
+                                          final Collection<SSTableReader> sstables,
+                                          final DecoratedKey startWith,
+                                          final DecoratedKey stopAt,
+                                          final QueryFilter filter,
+                                          final AbstractType comparator,
+                                          final ColumnFamilyStore cfs
+    )
+    {
+        // fetch data from current memtable, historical memtables, and SSTables in the correct order.
+        final List<Iterator<IColumnIterator>> iterators = new ArrayList<Iterator<IColumnIterator>>();
+        // we iterate through memtables with a priority queue to avoid more sorting than necessary.
+        // this predicate throws out the rows before the start of our range.
+        Predicate<IColumnIterator> p = new Predicate<IColumnIterator>()
+        {
+            public boolean apply(IColumnIterator row)
             {
-                if (component.equals(Component.DATA) || component.equals(Component.COMPACTED_MARKER))
-                    continue;
-                FileUtils.deleteWithConfirm(desc.filenameFor(component));
+                return startWith.compareTo(row.getKey()) <= 0
+                       && (stopAt.isEmpty() || row.getKey().compareTo(stopAt) <= 0);
             }
-            // remove the COMPACTED_MARKER component last if it exists
-            FileUtils.delete(desc.filenameFor(Component.COMPACTED_MARKER));
-        }
-        catch (IOException e)
+        };
+
+        // memtables
+        for (Memtable memtable : memtables)
         {
-            throw new IOError(e);
+            iterators.add(Iterators.filter(Iterators.transform(memtable.getEntryIterator(startWith),
+                                                               new ConvertToColumnIterator(filter, comparator)), p));
         }
-        logger.info("Deleted " + desc);
-        return true;
-    }
 
-    public String getFilename()
-    {
-        return descriptor.filenameFor(COMPONENT_DATA);
-    }
-
-    public String getColumnFamilyName()
-    {
-        return descriptor.cfname;
-    }
-
-    public String getTableName()
-    {
-        return descriptor.ksname;
-    }
-
-    /**
-     * @return A Descriptor,Component pair, or null if not a valid sstable component.
-     */
-    public static Pair<Descriptor,Component> tryComponentFromFilename(File dir, String name)
-    {
-        try
-        {
-            return Component.fromFilename(dir, name);
-        }
-        catch (Exception e)
-        {
-            if (!"snapshots".equals(name) && !"backups".equals(name))
-                logger.warn("Invalid file '{}' in data directory {}.", name, dir);
-            return null;
-        }
-    }
-
-    /**
-     * Discovers existing components for the descriptor. Slow: only intended for use outside the critical path.
-     */
-    static Set<Component> componentsFor(final Descriptor desc, final boolean liveOnly)
-    {
-        final Set<Component> components = new HashSet<Component>();
-        desc.directory.list(new FilenameFilter()
-        {
-            public boolean accept(File dir, String name)
-            {
-                Pair<Descriptor,Component> component = tryComponentFromFilename(dir, name);
-                if (component != null && component.left.equals(desc) && (!liveOnly || !component.left.temporary))
-                    components.add(component.right);
-                return false;
-            }
-        });
-        return components;
-    }
-
-    /** @return An estimate of the number of keys contained in the given data file. */
-    static long estimateRowsFromData(Descriptor desc, BufferedRandomAccessFile dfile) throws IOException
-    {
-        // collect sizes for the first 1000 keys, or first 100 megabytes of data
-        final int SAMPLES_CAP = 1000, BYTES_CAP = (int)Math.min(100000000, dfile.length());
-        int keys = 0;
-        long dataPosition = 0;
-        while (dataPosition < BYTES_CAP && keys < SAMPLES_CAP)
-        {
-            dfile.seek(dataPosition);
-            ByteBufferUtil.skipShortLength(dfile);
-            long dataSize = SSTableReader.readRowSize(dfile, desc);
-            dataPosition = dfile.getFilePointer() + dataSize;
-            keys++;
-        }
-        dfile.seek(0);
-        return dfile.length() / (dataPosition / keys);
-    }
-
-    /** @return An estimate of the number of keys contained in the given index file. */
-    static long estimateRowsFromIndex(BufferedRandomAccessFile ifile) throws IOException
-    {
-        // collect sizes for the first 10000 keys, or first 10 megabytes of data
-        final int SAMPLES_CAP = 10000, BYTES_CAP = (int)Math.min(10000000, ifile.length());
-        int keys = 0;
-        while (ifile.getFilePointer() < BYTES_CAP && keys < SAMPLES_CAP)
-        {
-            ByteBufferUtil.skipShortLength(ifile);
-            FileUtils.skipBytesFully(ifile, 8);
-            keys++;
-        }
-        assert keys > 0 && ifile.getFilePointer() > 0 && ifile.length() > 0;
-        long estimatedRows = ifile.length() / (ifile.getFilePointer() / keys);
-        ifile.seek(0);
-        return estimatedRows;
-    }
-
-    public static long getTotalBytes(Iterable<SSTableReader> sstables)
-    {
-        long sum = 0;
+        // sstables
         for (SSTableReader sstable : sstables)
         {
-            sum += sstable.length();
+            final SSTableScanner scanner = sstable.getScanner(RANGE_FILE_BUFFER_SIZE, filter);
+            scanner.seekTo(startWith);
+            assert scanner instanceof Closeable; // otherwise we leak FDs
+            iterators.add(scanner);
         }
-        return sum;
-    }
 
-    public long bytesOnDisk()
-    {
-        long bytes = 0;
-        for (Component component : components)
+        Iterator<IColumnIterator> collated = IteratorUtils.collatedIterator(COMPARE_BY_KEY, iterators);
+        final Memtable firstMemtable = memtables.iterator().next();
+
+        // reduce rows from all sources into a single row
+        ReducingIterator<IColumnIterator, Row> reduced = new ReducingIterator<IColumnIterator, Row>(collated)
         {
-            bytes += new File(descriptor.filenameFor(component)).length();
-        }
-        return bytes;
+            private final int gcBefore = (int) (System.currentTimeMillis() / 1000) - cfs.metadata.gcGraceSeconds;
+            private final List<IColumnIterator> colIters = new ArrayList<IColumnIterator>();
+            private DecoratedKey key;
+
+            public void reduce(IColumnIterator current)
+            {
+                this.colIters.add(current);
+                this.key = current.getKey();
+            }
+
+            @Override
+            protected boolean isEqual(IColumnIterator o1, IColumnIterator o2)
+            {
+                return COMPARE_BY_KEY.compare(o1, o2) == 0;
+            }
+
+            protected Row getReduced()
+            {
+                Comparator<IColumn> colComparator = filter.filter.getColumnComparator(comparator);
+                Iterator<IColumn> colCollated = IteratorUtils.collatedIterator(colComparator, colIters);
+
+                ColumnFamily returnCF = null;
+                
+                // First check if this row is in the rowCache. If it is we can skip the rest
+                ColumnFamily cached = cfs.getRawCachedRow(key);
+                if (cached != null)
+                {
+                    QueryFilter keyFilter = new QueryFilter(key, filter.path, filter.filter);
+                    returnCF = cfs.filterColumnFamily(cached, keyFilter, gcBefore);
+                }
+                else
+                {
+                    returnCF = firstMemtable.getColumnFamily(key);            
+                    // TODO this is a little subtle: the Memtable ColumnIterator has to be a shallow clone of the source CF,
+                    // with deletion times set correctly, so we can use it as the "base" CF to add query results to.
+                    // (for sstable ColumnIterators we do not care if it is a shallow clone or not.)
+                    returnCF = returnCF == null ? ColumnFamily.create(firstMemtable.getTableName(), filter.getColumnFamilyName())
+                            : returnCF.cloneMeShallow();
+
+                    if (colCollated.hasNext())
+                    {
+                        filter.collectCollatedColumns(returnCF, colCollated, gcBefore);
+                    }
+                    else
+                    {
+                        returnCF = null;
+                    }
+                }
+
+                Row rv = new Row(key, returnCF);
+                colIters.clear();
+                key = null;
+                return rv;
+            }
+        };
+
+        return new RowIterator(reduced, iterators);
     }
 
-    @Override
-    public String toString()
+    /** 
+     * Used when locks are required before getting the entry iterator.
+     * @param memtable Memtable to get iterator from
+     * @param startWith Start at this key position
+     * @return entry iterator for the current memtable
+     */
+    private static Iterator<Map.Entry<DecoratedKey, ColumnFamily>> memtableEntryIterator(Memtable memtable, DecoratedKey startWith)
     {
-        return getClass().getSimpleName() + "(" +
-               "path='" + getFilename() + '\'' +
-               ')';
+        Table.flusherLock.readLock().lock();
+        try
+        {
+            return memtable.getEntryIterator(startWith);
+        }
+        finally
+        {
+            Table.flusherLock.readLock().unlock();
+        }
     }
+
+    /**
+     * Get a ColumnIterator for a specific key in the memtable.
+     */
+    private static class ConvertToColumnIterator implements Function<Map.Entry<DecoratedKey, ColumnFamily>, IColumnIterator>
+    {
+        private QueryFilter filter;
+        private AbstractType comparator;
+
+        public ConvertToColumnIterator(QueryFilter filter, AbstractType comparator)
+        {
+            this.filter = filter;
+            this.comparator = comparator;
+        }
+
+        public IColumnIterator apply(final Entry<DecoratedKey, ColumnFamily> entry)
+        {
+            return filter.getMemtableColumnIterator(entry.getValue(), entry.getKey(), comparator);
+        }
+    }
+
 }

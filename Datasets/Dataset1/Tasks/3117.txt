@@ -1,13 +1,12 @@
-if (del.super_column == null && DatabaseDescriptor.getColumnFamilyType(rm.table_, cfName) == ColumnFamilyType.Super)
+if(queryShape.relate(cShape) == SpatialRelation.DISJOINT)
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,356 +17,180 @@ if (del.super_column == null && DatabaseDescriptor.getColumnFamilyType(rm.table_
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.lucene.spatial.prefix;
 
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import com.spatial4j.core.shape.Shape;
+import com.spatial4j.core.shape.SpatialRelation;
+import org.apache.lucene.index.*;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.spatial.prefix.tree.Node;
+import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.OpenBitSet;
+import org.apache.lucene.util.StringHelper;
+
 import java.io.IOException;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import java.nio.ByteBuffer;
+import java.util.LinkedList;
 
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.commons.lang.StringUtils;
+/**
+ * Performs a spatial intersection filter against a field indexed with {@link SpatialPrefixTree}, a Trie.
+ * SPT yields terms (grids) at length 1 and at greater lengths corresponding to greater precisions.
+ * This filter recursively traverses each grid length and uses methods on {@link Shape} to efficiently know
+ * that all points at a prefix fit in the shape or not to either short-circuit unnecessary traversals or to efficiently
+ * load all enclosed points.
+ *
+ * @lucene.internal
+ */
+public class RecursivePrefixTreeFilter extends Filter {
 
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.ICompactSerializer;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.service.*;
-import org.apache.cassandra.thrift.ColumnOrSuperColumn;
-import org.apache.cassandra.thrift.Deletion;
-import org.apache.cassandra.thrift.Mutation;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.concurrent.StageManager;
+  /* TODOs for future:
 
-public class RowMutation
-{
-    private static ICompactSerializer<RowMutation> serializer_;
-    public static final String HINT = "HINT";
+Can a polygon query shape be optimized / made-simpler at recursive depths (e.g. intersection of shape + cell box)
 
-    static
-    {
-        serializer_ = new RowMutationSerializer();
-    }   
+RE "scan" threshold:
+  // IF configured to do so, we could use term.freq() as an estimate on the number of places at this depth.  OR, perhaps
+  //  make estimates based on the total known term count at this level?
+  if (!scan) {
+    //Make some estimations on how many points there are at this level and how few there would need to be to set
+    // !scan to false.
+    long termsThreshold = (long) estimateNumberIndexedTerms(cell.length(),queryShape.getDocFreqExpenseThreshold(cell));
+    long thisOrd = termsEnum.ord();
+    scan = (termsEnum.seek(thisOrd+termsThreshold+1) == TermsEnum.SeekStatus.END
+            || !cell.contains(termsEnum.term()));
+    termsEnum.seek(thisOrd);//return to last position
+  }
 
-    public static ICompactSerializer<RowMutation> serializer()
-    {
-        return serializer_;
-    }
+  */
 
-    private String table_;
-    private byte[] key_;
-    protected Map<String, ColumnFamily> modifications_ = new HashMap<String, ColumnFamily>();
+  private final String fieldName;
+  private final SpatialPrefixTree grid;
+  private final Shape queryShape;
+  private final int prefixGridScanLevel;//at least one less than grid.getMaxLevels()
+  private final int detailLevel;
 
-    public RowMutation(String table, byte[] key)
-    {
-        table_ = table;
-        key_ = key;
-    }
+  public RecursivePrefixTreeFilter(String fieldName, SpatialPrefixTree grid, Shape queryShape, int prefixGridScanLevel,
+                             int detailLevel) {
+    this.fieldName = fieldName;
+    this.grid = grid;
+    this.queryShape = queryShape;
+    this.prefixGridScanLevel = Math.max(1,Math.min(prefixGridScanLevel,grid.getMaxLevels()-1));
+    this.detailLevel = detailLevel;
+    assert detailLevel <= grid.getMaxLevels();
+  }
 
-    public RowMutation(String table, Row row)
-    {
-        table_ = table;
-        key_ = row.key.key;
-        add(row.cf);
-    }
+  @Override
+  public DocIdSet getDocIdSet(AtomicReaderContext ctx, Bits acceptDocs) throws IOException {
+    AtomicReader reader = ctx.reader();
+    OpenBitSet bits = new OpenBitSet(reader.maxDoc());
+    Terms terms = reader.terms(fieldName);
+    if (terms == null)
+      return null;
+    TermsEnum termsEnum = terms.iterator(null);
+    DocsEnum docsEnum = null;//cached for termsEnum.docs() calls
+    Node scanCell = null;
 
-    protected RowMutation(String table, byte[] key, Map<String, ColumnFamily> modifications)
-    {
-        table_ = table;
-        key_ = key;
-        modifications_ = modifications;
-    }
+    //cells is treated like a stack. LinkedList conveniently has bulk add to beginning. It's in sorted order so that we
+    //  always advance forward through the termsEnum index.
+    LinkedList<Node> cells = new LinkedList<Node>(
+        grid.getWorldNode().getSubCells(queryShape) );
 
-    public String getTable()
-    {
-        return table_;
-    }
-
-    public byte[] key()
-    {
-        return key_;
-    }
-
-    public Set<String> columnFamilyNames()
-    {
-        return modifications_.keySet();
-    }
-    
-    public Collection<ColumnFamily> getColumnFamilies()
-    {
-        return modifications_.values();
-    }
-
-    void addHints(byte[] key, byte[] host) throws IOException
-    {
-        QueryPath path = new QueryPath(HintedHandOffManager.HINTS_CF, key, host);
-        add(path, ArrayUtils.EMPTY_BYTE_ARRAY, System.currentTimeMillis());
-    }
-
-    /*
-     * Specify a column family name and the corresponding column
-     * family object.
-     * param @ cf - column family name
-     * param @ columnFamily - the column family.
-    */
-    public void add(ColumnFamily columnFamily)
-    {
-        assert columnFamily != null;
-        if (modifications_.containsKey(columnFamily.name()))
-        {
-            throw new IllegalArgumentException("ColumnFamily " + columnFamily.name() + " is already being modified");
-        }
-        modifications_.put(columnFamily.name(), columnFamily);
-    }
-
-    /** should only be called by commitlog replay code */
-    public void removeColumnFamily(String cfName)
-    {
-        modifications_.remove(cfName);
-    }
-    
-    public boolean isEmpty()
-    {
-        return modifications_.isEmpty();
-    }
-
-    /*
-     * Specify a column name and a corresponding value for
-     * the column. Column name is specified as <column family>:column.
-     * This will result in a ColumnFamily associated with
-     * <column family> as name and a Column with <column>
-     * as name. The column can be further broken up
-     * as super column name : columnname  in case of super columns
-     *
-     * param @ cf - column name as <column family>:<column>
-     * param @ value - value associated with the column
-     * param @ timestamp - timestamp associated with this data.
-     * param @ timeToLive - ttl for the column, 0 for standard (non expiring) columns
-    */
-    public void add(QueryPath path, byte[] value, long timestamp, int timeToLive)
-    {
-        ColumnFamily columnFamily = modifications_.get(path.columnFamilyName);
-        if (columnFamily == null)
-        {
-            columnFamily = ColumnFamily.create(table_, path.columnFamilyName);
-        }
-        columnFamily.addColumn(path, value, timestamp, timeToLive);
-        modifications_.put(path.columnFamilyName, columnFamily);
-    }
-
-    public void add(QueryPath path, byte[] value, long timestamp)
-    {
-        add(path, value, timestamp, 0);
-    }
-
-    public void delete(QueryPath path, long timestamp)
-    {
-        assert path.columnFamilyName != null;
-        String cfName = path.columnFamilyName;
-
-        int localDeleteTime = (int) (System.currentTimeMillis() / 1000);
-
-        ColumnFamily columnFamily = modifications_.get(cfName);
-        if (columnFamily == null)
-            columnFamily = ColumnFamily.create(table_, cfName);
-
-        if (path.superColumnName == null && path.columnName == null)
-        {
-            columnFamily.delete(localDeleteTime, timestamp);
-        }
-        else if (path.columnName == null)
-        {
-            SuperColumn sc = new SuperColumn(path.superColumnName, DatabaseDescriptor.getSubComparator(table_, cfName));
-            sc.markForDeleteAt(localDeleteTime, timestamp);
-            columnFamily.addColumn(sc);
-        }
-        else
-        {
-            columnFamily.deleteColumn(path, localDeleteTime, timestamp);
+    //This is a recursive algorithm that starts with one or more "big" cells, and then recursively dives down into the
+    // first such cell that intersects with the query shape.  It's a depth first traversal because we don't move onto
+    // the next big cell (breadth) until we're completely done considering all smaller cells beneath it. For a given
+    // cell, if it's *within* the query shape then we can conveniently short-circuit the depth traversal and
+    // grab all documents assigned to this cell/term.  For an intersection of the cell and query shape, we either
+    // recursively step down another grid level or we decide heuristically (via prefixGridScanLevel) that there aren't
+    // that many points, and so we scan through all terms within this cell (i.e. the term starts with the cell's term),
+    // seeing which ones are within the query shape.
+    while(!cells.isEmpty()) {
+      final Node cell = cells.removeFirst();
+      final BytesRef cellTerm = new BytesRef(cell.getTokenBytes());
+      TermsEnum.SeekStatus seekStat = termsEnum.seekCeil(cellTerm);
+      if (seekStat == TermsEnum.SeekStatus.END)
+        break;
+      if (seekStat == TermsEnum.SeekStatus.NOT_FOUND)
+        continue;
+      if (cell.getLevel() == detailLevel || cell.isLeaf()) {
+        docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+        addDocs(docsEnum,bits);
+      } else {//any other intersection
+        //If the next indexed term is the leaf marker, then add all of them
+        BytesRef nextCellTerm = termsEnum.next();
+        assert StringHelper.startsWith(nextCellTerm, cellTerm);
+        scanCell = grid.getNode(nextCellTerm.bytes, nextCellTerm.offset, nextCellTerm.length, scanCell);
+        if (scanCell.isLeaf()) {
+          docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+          addDocs(docsEnum,bits);
+          termsEnum.next();//move pointer to avoid potential redundant addDocs() below
         }
 
-        modifications_.put(cfName, columnFamily);
-    }
+        //Decide whether to continue to divide & conquer, or whether it's time to scan through terms beneath this cell.
+        // Scanning is a performance optimization trade-off.
+        boolean scan = cell.getLevel() >= prefixGridScanLevel;//simple heuristic
 
-    /*
-     * This is equivalent to calling commit. Applies the changes to
-     * to the table that is obtained by calling Table.open().
-    */
-    public void apply() throws IOException
-    {
-        Table.open(table_).apply(this, getSerializedBuffer(), true);
-    }
+        if (!scan) {
+          //Divide & conquer
+          cells.addAll(0, cell.getSubCells(queryShape));//add to beginning
+        } else {
+          //Scan through all terms within this cell to see if they are within the queryShape. No seek()s.
+          for(BytesRef term = termsEnum.term(); term != null && StringHelper.startsWith(term,cellTerm); term = termsEnum.next()) {
+            scanCell = grid.getNode(term.bytes, term.offset, term.length, scanCell);
+            int termLevel = scanCell.getLevel();
+            if (termLevel > detailLevel)
+              continue;
+            if (termLevel == detailLevel || scanCell.isLeaf()) {
+              //TODO should put more thought into implications of box vs point
+              Shape cShape = termLevel == grid.getMaxLevels() ? scanCell.getCenter() : scanCell.getShape();
+              if(queryShape.relate(cShape, grid.getSpatialContext()) == SpatialRelation.DISJOINT)
+                continue;
 
-    /*
-     * This is equivalent to calling commit. Applies the changes to
-     * to the table that is obtained by calling Table.open().
-    */
-    void applyBinary() throws IOException, ExecutionException, InterruptedException
-    {
-        Table.open(table_).load(this);
-    }
-
-    public Message makeRowMutationMessage() throws IOException
-    {
-        return makeRowMutationMessage(StorageService.Verb.MUTATION);
-    }
-
-    public Message makeRowMutationMessage(StorageService.Verb verb) throws IOException
-    {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        DataOutputStream dos = new DataOutputStream(bos);
-        serializer().serialize(this, dos);
-        return new Message(FBUtilities.getLocalAddress(), StageManager.MUTATION_STAGE, verb, bos.toByteArray());
-    }
-
-    public static RowMutation getRowMutationFromMutations(String keyspace, byte[] key, Map<String, List<Mutation>> cfmap)
-    {
-        RowMutation rm = new RowMutation(keyspace, key);
-        for (Map.Entry<String, List<Mutation>> entry : cfmap.entrySet())
-        {
-            String cfName = entry.getKey();
-            for (Mutation mutation : entry.getValue())
-            {
-                if (mutation.deletion != null)
-                {
-                    deleteColumnOrSuperColumnToRowMutation(rm, cfName, mutation.deletion);
-                }
-                else
-                {
-                    addColumnOrSuperColumnToRowMutation(rm, cfName, mutation.column_or_supercolumn);
-                }
+              docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+              addDocs(docsEnum,bits);
             }
+          }//term loop
         }
-        return rm;
-    }
-    
-    public static RowMutation getRowMutation(String table, byte[] key, Map<String, List<ColumnOrSuperColumn>> cfmap)
-    {
-        RowMutation rm = new RowMutation(table, key);
-        for (Map.Entry<String, List<ColumnOrSuperColumn>> entry : cfmap.entrySet())
-        {
-            String cfName = entry.getKey();
-            for (ColumnOrSuperColumn cosc : entry.getValue())
-            {
-                if (cosc.column == null)
-                {
-                    assert cosc.super_column != null;
-                    for (org.apache.cassandra.thrift.Column column : cosc.super_column.columns)
-                    {
-                        rm.add(new QueryPath(cfName, cosc.super_column.name, column.name), column.value, column.timestamp, column.ttl);
-                    }
-                }
-                else
-                {
-                    assert cosc.super_column == null;
-                    rm.add(new QueryPath(cfName, null, cosc.column.name), cosc.column.value, cosc.column.timestamp, cosc.column.ttl);
-                }
-            }
-        }
-        return rm;
-    }
-    
-    public DataOutputBuffer getSerializedBuffer() throws IOException
-    {
-        DataOutputBuffer buffer = new DataOutputBuffer();
-        RowMutation.serializer().serialize(this, buffer);
-        return buffer;
-    }
+      }
+    }//cell loop
 
-    public String toString()
-    {
-        return "RowMutation(" +
-               "table='" + table_ + '\'' +
-               ", key='" + FBUtilities.bytesToHex(key_) + '\'' +
-               ", modifications=[" + StringUtils.join(modifications_.values(), ", ") + "]" +
-               ')';
-    }
+    return bits;
+  }
 
-    private static void addColumnOrSuperColumnToRowMutation(RowMutation rm, String cfName, ColumnOrSuperColumn cosc)
-    {
-        if (cosc.column == null)
-        {
-            for (org.apache.cassandra.thrift.Column column : cosc.super_column.columns)
-            {
-                rm.add(new QueryPath(cfName, cosc.super_column.name, column.name), column.value, column.timestamp);
-            }
-        }
-        else
-        {
-            rm.add(new QueryPath(cfName, null, cosc.column.name), cosc.column.value, cosc.column.timestamp);
-        }
+  private void addDocs(DocsEnum docsEnum, OpenBitSet bits) throws IOException {
+    int docid;
+    while ((docid = docsEnum.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      bits.fastSet(docid);
     }
+  }
 
-    private static void deleteColumnOrSuperColumnToRowMutation(RowMutation rm, String cfName, Deletion del)
-    {
-        if (del.predicate != null && del.predicate.column_names != null)
-        {
-            for(byte[] c : del.predicate.column_names)
-            {
-                if (del.super_column == null && DatabaseDescriptor.getColumnFamilyType(rm.table_, cfName).equals("Super"))
-                    rm.delete(new QueryPath(cfName, c), del.timestamp);
-                else
-                    rm.delete(new QueryPath(cfName, del.super_column, c), del.timestamp);
-            }
-        }
-        else
-        {
-            rm.delete(new QueryPath(cfName, del.super_column), del.timestamp);
-        }
-    }
-}
+  @Override
+  public String toString() {
+    return "GeoFilter{fieldName='" + fieldName + '\'' + ", shape=" + queryShape + '}';
+  }
 
-class RowMutationSerializer implements ICompactSerializer<RowMutation>
-{
-    private void freezeTheMaps(Map<String, ColumnFamily> map, DataOutputStream dos) throws IOException
-    {
-        int size = map.size();
-        dos.writeInt(size);
-        if (size > 0)
-        {
-            for (Map.Entry<String,ColumnFamily> entry : map.entrySet())
-            {
-                dos.writeUTF(entry.getKey());
-                ColumnFamily.serializer().serialize(entry.getValue(), dos);
-            }
-        }
-    }
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
 
-    public void serialize(RowMutation rm, DataOutputStream dos) throws IOException
-    {
-        dos.writeUTF(rm.getTable());
-        FBUtilities.writeShortByteArray(rm.key(), dos);
+    RecursivePrefixTreeFilter that = (RecursivePrefixTreeFilter) o;
 
-        /* serialize the modifications_ in the mutation */
-        freezeTheMaps(rm.modifications_, dos);
-    }
+    if (!fieldName.equals(that.fieldName)) return false;
+    //note that we don't need to look at grid since for the same field it should be the same
+    if (prefixGridScanLevel != that.prefixGridScanLevel) return false;
+    if (detailLevel != that.detailLevel) return false;
+    if (!queryShape.equals(that.queryShape)) return false;
 
-    private Map<String, ColumnFamily> defreezeTheMaps(DataInputStream dis) throws IOException
-    {
-        Map<String, ColumnFamily> map = new HashMap<String, ColumnFamily>();
-        int size = dis.readInt();
-        for (int i = 0; i < size; ++i)
-        {
-            String key = dis.readUTF();
-            ColumnFamily cf = ColumnFamily.serializer().deserialize(dis);
-            map.put(key, cf);
-        }
-        return map;
-    }
+    return true;
+  }
 
-    public RowMutation deserialize(DataInputStream dis) throws IOException
-    {
-        String table = dis.readUTF();
-        byte[] key = FBUtilities.readShortByteArray(dis);
-        Map<String, ColumnFamily> modifications = defreezeTheMaps(dis);
-        return new RowMutation(table, key, modifications);
-    }
+  @Override
+  public int hashCode() {
+    int result = fieldName.hashCode();
+    result = 31 * result + queryShape.hashCode();
+    result = 31 * result + detailLevel;
+    return result;
+  }
 }

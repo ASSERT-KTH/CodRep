@@ -1,7 +1,8 @@
-throw new SolrException(ErrorCode.BAD_REQUEST, "Error instantiating exchange rate provider "+exchangeRateProviderClass+": " + e.getMessage(), e);
+buffer.append(segmentsFile).append(":").append(segmentInfos.getVersion());
 
-package org.apache.solr.schema;
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -18,1025 +19,1016 @@ package org.apache.solr.schema;
  * limitations under the License.
  */
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.Currency;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.ParserConfigurationException;
-import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
-import javax.xml.xpath.XPathExpressionException;
-import javax.xml.xpath.XPathFactory;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldSelector;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.Lock;
+import org.apache.lucene.store.LockObtainFailedException;
+import org.apache.lucene.index.codecs.CodecProvider;
+import org.apache.lucene.index.codecs.PerDocValues;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.MapBackedSet;
 
-import org.apache.lucene.analysis.util.ResourceLoader;
-import org.apache.lucene.analysis.util.ResourceLoaderAware;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexableField;
-import org.apache.lucene.queries.function.FunctionValues;
-import org.apache.lucene.queries.function.ValueSource;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.Filter;
-import org.apache.lucene.search.FieldValueFilter;
-import org.apache.lucene.queries.ChainedFilter;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.SolrException.ErrorCode;
-import org.apache.solr.response.TextResponseWriter;
-import org.apache.solr.response.XMLWriter;
-import org.apache.solr.search.QParser;
-import org.apache.solr.search.SolrConstantScoreQuery;
-import org.apache.solr.search.function.ValueSourceRangeFilter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.w3c.dom.Document;
-import org.w3c.dom.NamedNodeMap;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
-import org.xml.sax.SAXException;
-
-/**
- * Field type for support of monetary values.
- * <p>
- * See <a href="http://wiki.apache.org/solr/CurrencyField">http://wiki.apache.org/solr/CurrencyField</a>
+/** 
+ * An IndexReader which reads indexes with multiple segments.
  */
-public class CurrencyField extends FieldType implements SchemaAware, ResourceLoaderAware {
-  protected static final String PARAM_DEFAULT_CURRENCY      = "defaultCurrency";
-  protected static final String PARAM_RATE_PROVIDER_CLASS   = "providerClass";
-  protected static final Object PARAM_PRECISION_STEP        = "precisionStep";
-  protected static final String DEFAULT_RATE_PROVIDER_CLASS = "solr.FileExchangeRateProvider";
-  protected static final String DEFAULT_DEFAULT_CURRENCY    = "USD";
-  protected static final String DEFAULT_PRECISION_STEP      = "0";
-  protected static final String FIELD_SUFFIX_AMOUNT_RAW     = "_amount_raw";
-  protected static final String FIELD_SUFFIX_CURRENCY       = "_currency";
+class DirectoryReader extends IndexReader implements Cloneable {
+  protected Directory directory;
+  protected boolean readOnly;
+  
+  protected CodecProvider codecs;
 
-  private IndexSchema schema;
-  protected FieldType fieldTypeCurrency;
-  protected FieldType fieldTypeAmountRaw;
-  private String exchangeRateProviderClass;
-  private String defaultCurrency;
-  private ExchangeRateProvider provider;
-  public static Logger log = LoggerFactory.getLogger(CurrencyField.class);
+  IndexWriter writer;
 
-  /**
-   * A wrapper arround <code>Currency.getInstance</code> that returns null
-   * instead of throwing <code>IllegalArgumentException</code>
-   * if the specified Currency does not exist in this JVM.
-   *
-   * @see Currency#getInstance(String)
-   */
-  public static Currency getCurrency(final String code) {
-    try {
-      return Currency.getInstance(code);
-    } catch (IllegalArgumentException e) {
-      /* :NOOP: */
-    }
-    return null;
-  }
+  private IndexDeletionPolicy deletionPolicy;
+  private Lock writeLock;
+  private final SegmentInfos segmentInfos;
+  private boolean stale;
+  private final int termInfosIndexDivisor;
 
-  @Override
-  protected void init(IndexSchema schema, Map<String, String> args) {
-    super.init(schema, args);
-    if (this.isMultiValued()) { 
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, 
-                              "CurrencyField types can not be multiValued: " + 
-                              this.typeName);
-    }
-    this.schema = schema;
-    this.exchangeRateProviderClass = args.get(PARAM_RATE_PROVIDER_CLASS);
-    this.defaultCurrency = args.get(PARAM_DEFAULT_CURRENCY);
+  private boolean rollbackHasChanges;
 
-    if (this.defaultCurrency == null) {
-      this.defaultCurrency = DEFAULT_DEFAULT_CURRENCY;
-    }
-    
-    if (this.exchangeRateProviderClass == null) {
-      this.exchangeRateProviderClass = DEFAULT_RATE_PROVIDER_CLASS;
-    }
+  private SegmentReader[] subReaders;
+  private ReaderContext topLevelReaderContext;
+  private int[] starts;                           // 1st docno for each segment
+  private int maxDoc = 0;
+  private int numDocs = -1;
+  private boolean hasDeletions = false;
 
-    if (null == getCurrency(this.defaultCurrency)) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Default currency code is not supported by this JVM: " + this.defaultCurrency);
-    }
+  // Max version in index as of when we opened; this can be
+  // > our current segmentInfos version in case we were
+  // opened on a past IndexCommit:
+  private long maxIndexVersion;
 
-    String precisionStepString = args.get(PARAM_PRECISION_STEP);
-    if (precisionStepString == null) {
-      precisionStepString = DEFAULT_PRECISION_STEP;
-    }
+  private final boolean applyAllDeletes;
 
-    // Initialize field type for amount
-    fieldTypeAmountRaw = new TrieLongField();
-    fieldTypeAmountRaw.setTypeName("amount_raw_type_tlong");
-    Map<String,String> map = new HashMap<String,String>(1);
-    map.put("precisionStep", precisionStepString);
-    fieldTypeAmountRaw.init(schema, map);
-    
-    // Initialize field type for currency string
-    fieldTypeCurrency = new StrField();
-    fieldTypeCurrency.setTypeName("currency_type_string");
-    fieldTypeCurrency.init(schema, new HashMap<String,String>());
-    
-    args.remove(PARAM_RATE_PROVIDER_CLASS);
-    args.remove(PARAM_DEFAULT_CURRENCY);
-    args.remove(PARAM_PRECISION_STEP);
-
-    try {
-      Class<? extends ExchangeRateProvider> c = schema.getResourceLoader().findClass(exchangeRateProviderClass, ExchangeRateProvider.class);
-      provider = c.newInstance();
-      provider.init(args);
-    } catch (Exception e) {
-      throw new SolrException(ErrorCode.BAD_REQUEST, "Error instantiating exhange rate provider "+exchangeRateProviderClass+": " + e.getMessage(), e);
-    }
-  }
-
-  @Override
-  public boolean isPolyField() {
-    return true;
-  }
-
-  @Override
-  public void checkSchemaField(final SchemaField field) throws SolrException {
-    super.checkSchemaField(field);
-    if (field.multiValued()) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, 
-                              "CurrencyFields can not be multiValued: " + 
-                              field.getName());
-    }
-  }
-
-  @Override
-  public List<IndexableField> createFields(SchemaField field, Object externalVal, float boost) {
-    CurrencyValue value = CurrencyValue.parse(externalVal.toString(), defaultCurrency);
-
-    List<IndexableField> f = new ArrayList<IndexableField>();
-    SchemaField amountField = getAmountField(field);
-    f.add(amountField.createField(String.valueOf(value.getAmount()), amountField.indexed() && !amountField.omitNorms() ? boost : 1F));
-    SchemaField currencyField = getCurrencyField(field);
-    f.add(currencyField.createField(value.getCurrencyCode(), currencyField.indexed() && !currencyField.omitNorms() ? boost : 1F));
-
-    if (field.stored()) {
-      org.apache.lucene.document.FieldType customType = new org.apache.lucene.document.FieldType();
-      assert !customType.omitNorms();
-      customType.setStored(true);
-      String storedValue = externalVal.toString().trim();
-      if (storedValue.indexOf(",") < 0) {
-        storedValue += "," + defaultCurrency;
+//  static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly,
+//      final int termInfosIndexDivisor) throws CorruptIndexException, IOException {
+//    return open(directory, deletionPolicy, commit, readOnly, termInfosIndexDivisor, null);
+//  }
+  
+  static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly,
+                          final int termInfosIndexDivisor, CodecProvider codecs) throws CorruptIndexException, IOException {
+    final CodecProvider codecProvider = codecs == null ? CodecProvider.getDefault()
+        : codecs;
+    return (IndexReader) new SegmentInfos.FindSegmentsFile(directory) {
+      @Override
+      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
+        SegmentInfos infos = new SegmentInfos(codecProvider);
+        infos.read(directory, segmentFileName, codecProvider);
+        return new DirectoryReader(directory, infos, deletionPolicy, readOnly, termInfosIndexDivisor, codecProvider);
       }
-      f.add(createField(field.getName(), storedValue, customType, 1F));
+    }.run(commit);
+  }
+
+  /** Construct reading the named set of readers. */
+//  DirectoryReader(Directory directory, SegmentInfos sis, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor) throws IOException {
+//    this(directory, sis, deletionPolicy, readOnly, termInfosIndexDivisor, null);
+//  }
+  
+  /** Construct reading the named set of readers. */
+  DirectoryReader(Directory directory, SegmentInfos sis, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor, CodecProvider codecs) throws IOException {
+    this.directory = directory;
+    this.readOnly = readOnly;
+    this.segmentInfos = sis;
+    this.deletionPolicy = deletionPolicy;
+    this.termInfosIndexDivisor = termInfosIndexDivisor;
+    if (codecs == null) {
+      this.codecs = CodecProvider.getDefault();
+    } else {
+      this.codecs = codecs;
+    }
+    readerFinishedListeners = new MapBackedSet<ReaderFinishedListener>(new ConcurrentHashMap<ReaderFinishedListener,Boolean>());
+    applyAllDeletes = false;
+
+    // To reduce the chance of hitting FileNotFound
+    // (and having to retry), we open segments in
+    // reverse because IndexWriter merges & deletes
+    // the newest segments first.
+
+    SegmentReader[] readers = new SegmentReader[sis.size()];
+    for (int i = sis.size()-1; i >= 0; i--) {
+      boolean success = false;
+      try {
+        readers[i] = SegmentReader.get(readOnly, sis.info(i), termInfosIndexDivisor, IOContext.READ);
+        readers[i].readerFinishedListeners = readerFinishedListeners;
+        success = true;
+      } finally {
+        if (!success) {
+          // Close all readers we had opened:
+          for(i++;i<sis.size();i++) {
+            try {
+              readers[i].close();
+            } catch (Throwable ignore) {
+              // keep going - we want to clean up as much as possible
+            }
+          }
+        }
+      }
     }
 
-    return f;
+    initialize(readers);
   }
 
-  private SchemaField getAmountField(SchemaField field) {
-    return schema.getField(field.getName() + POLY_FIELD_SEPARATOR + FIELD_SUFFIX_AMOUNT_RAW);
-  }
+  // Used by near real-time search
+  DirectoryReader(IndexWriter writer, SegmentInfos infos, CodecProvider codecs, boolean applyAllDeletes) throws IOException {
+    this.directory = writer.getDirectory();
+    this.readOnly = true;
+    this.applyAllDeletes = applyAllDeletes;       // saved for reopen
 
-  private SchemaField getCurrencyField(SchemaField field) {
-    return schema.getField(field.getName() + POLY_FIELD_SEPARATOR + FIELD_SUFFIX_CURRENCY);
-  }
-
-  private void createDynamicCurrencyField(String suffix, FieldType type) {
-    String name = "*" + POLY_FIELD_SEPARATOR + suffix;
-    Map<String, String> props = new HashMap<String, String>();
-    props.put("indexed", "true");
-    props.put("stored", "false");
-    props.put("multiValued", "false");
-    props.put("omitNorms", "true");
-    int p = SchemaField.calcProps(name, type, props);
-    schema.registerDynamicFields(SchemaField.create(name, type, p, null));
-  }
-
-  /**
-   * When index schema is informed, add dynamic fields "*____currency" and "*____amount_raw". 
-   * 
-   * {@inheritDoc}
-   * 
-   * @param schema {@inheritDoc}
-   */
-  @Override
-  public void inform(IndexSchema schema) {
-    this.schema = schema;
-    createDynamicCurrencyField(FIELD_SUFFIX_CURRENCY,   fieldTypeCurrency);
-    createDynamicCurrencyField(FIELD_SUFFIX_AMOUNT_RAW, fieldTypeAmountRaw);
-  }
-
-  /**
-   * Load the currency config when resource loader initialized.
-   *
-   * @param resourceLoader The resource loader.
-   */
-  @Override
-  public void inform(ResourceLoader resourceLoader) {
-    provider.inform(resourceLoader);
-    boolean reloaded = provider.reload();
-    if(!reloaded) {
-      log.warn("Failed reloading currencies");
+    this.termInfosIndexDivisor = writer.getConfig().getReaderTermsIndexDivisor();
+    if (codecs == null) {
+      this.codecs = CodecProvider.getDefault();
+    } else {
+      this.codecs = codecs;
     }
-  }
+    readerFinishedListeners = writer.getReaderFinishedListeners();
 
-  @Override
-  public Query getFieldQuery(QParser parser, SchemaField field, String externalVal) {
-    CurrencyValue value = CurrencyValue.parse(externalVal, defaultCurrency);
-    CurrencyValue valueDefault;
-    valueDefault = value.convertTo(provider, defaultCurrency);
+    // IndexWriter synchronizes externally before calling
+    // us, which ensures infos will not change; so there's
+    // no need to process segments in reverse order
+    final int numSegments = infos.size();
 
-    return getRangeQuery(parser, field, valueDefault, valueDefault, true, true);
-  }
+    List<SegmentReader> readers = new ArrayList<SegmentReader>();
+    final Directory dir = writer.getDirectory();
 
-  /**
-   * <p>
-   * Returns a ValueSource over this field in which the numeric value for 
-   * each document represents the indexed value as converted to the default 
-   * currency for the field, normalized to it's most granular form based 
-   * on the default fractional digits.
-   * </p>
-   * <p>
-   * For example: If the default Currency specified for a field is 
-   * <code>USD</code>, then the values returned by this value source would 
-   * represent the equivilent number of "cents" (ie: value in dollars * 100) 
-   * after converting each document's native currency to USD -- because the 
-   * default fractional digits for <code>USD</code> is "<code>2</code>".  
-   * So for a document whose indexed value was currently equivilent to 
-   * "<code>5.43,USD</code>" using the the exchange provider for this field, 
-   * this ValueSource would return a value of "<code>543</code>"
-   * </p>
-   *
-   * @see #PARAM_DEFAULT_CURRENCY
-   * @see #DEFAULT_DEFAULT_CURRENCY
-   * @see Currency#getDefaultFractionDigits
-   * @see #getConvertedValueSource
-   */
-  public RawCurrencyValueSource getValueSource(SchemaField field, 
-                                               QParser parser) {
-    field.checkFieldCacheSource(parser);
-    return new RawCurrencyValueSource(field, defaultCurrency, parser);
-  }
-
-  /**
-   * <p>
-   * Returns a ValueSource over this field in which the numeric value for 
-   * each document represents the value from the underlying 
-   * <code>RawCurrencyValueSource</code> as converted to the specified target 
-   * Currency.
-   * </p>
-   * <p>
-   * For example: If the <code>targetCurrencyCode</code> param is set to
-   * <code>USD</code>, then the values returned by this value source would 
-   * represent the equivilent number of dollars after converting each 
-   * document's raw value to <code>USD</code>.  So for a document whose 
-   * indexed value was currently equivilent to "<code>5.43,USD</code>" 
-   * using the the exchange provider for this field, this ValueSource would 
-   * return a value of "<code>5.43</code>"
-   * </p>
-   *
-   * @param targetCurrencyCode The target currency for the resulting value source, if null the defaultCurrency for this field type will be used
-   * @param source the raw ValueSource to wrap
-   * @see #PARAM_DEFAULT_CURRENCY
-   * @see #DEFAULT_DEFAULT_CURRENCY
-   * @see #getValueSource
-   */
-  public ValueSource getConvertedValueSource(String targetCurrencyCode, 
-                                             RawCurrencyValueSource source) {
-    if (null == targetCurrencyCode) { 
-      targetCurrencyCode = defaultCurrency; 
+    segmentInfos = (SegmentInfos) infos.clone();
+    int infosUpto = 0;
+    for (int i=0;i<numSegments;i++) {
+      boolean success = false;
+      try {
+        final SegmentInfo info = infos.info(i);
+        assert info.dir == dir;
+        final SegmentReader reader = writer.readerPool.getReadOnlyClone(info, IOContext.READ);
+        if (reader.numDocs() > 0 || writer.getKeepFullyDeletedSegments()) {
+          reader.readerFinishedListeners = readerFinishedListeners;
+          readers.add(reader);
+          infosUpto++;
+        } else {
+          reader.close();
+          segmentInfos.remove(infosUpto);
+        }
+        success = true;
+      } finally {
+        if (!success) {
+          // Close all readers we had opened:
+          for(SegmentReader reader : readers) {
+            try {
+              reader.close();
+            } catch (Throwable ignore) {
+              // keep going - we want to clean up as much as possible
+            }
+          }
+        }
+      }
     }
-    return new ConvertedCurrencyValueSource(targetCurrencyCode, 
-                                            source);
+
+    this.writer = writer;
+
+    initialize(readers.toArray(new SegmentReader[readers.size()]));
   }
 
-  @Override
-  public Query getRangeQuery(QParser parser, SchemaField field, String part1, String part2, final boolean minInclusive, final boolean maxInclusive) {
-      final CurrencyValue p1 = CurrencyValue.parse(part1, defaultCurrency);
-      final CurrencyValue p2 = CurrencyValue.parse(part2, defaultCurrency);
+  /** This constructor is only used for {@link #reopen()} */
+  DirectoryReader(Directory directory, SegmentInfos infos, SegmentReader[] oldReaders, int[] oldStarts,
+                  boolean readOnly, boolean doClone, int termInfosIndexDivisor, CodecProvider codecs,
+                  Collection<ReaderFinishedListener> readerFinishedListeners) throws IOException {
+    this.directory = directory;
+    this.readOnly = readOnly;
+    this.segmentInfos = infos;
+    this.termInfosIndexDivisor = termInfosIndexDivisor;
+    this.readerFinishedListeners = readerFinishedListeners;
+    applyAllDeletes = false;
 
-      if (p1 != null && p2 != null && !p1.getCurrencyCode().equals(p2.getCurrencyCode())) {
-          throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
-                  "Cannot parse range query " + part1 + " to " + part2 +
-                          ": range queries only supported when upper and lower bound have same currency.");
+    if (codecs == null) {
+      this.codecs = CodecProvider.getDefault();
+    } else {
+      this.codecs = codecs;
+    }
+    
+
+    // we put the old SegmentReaders in a map, that allows us
+    // to lookup a reader using its segment name
+    Map<String,Integer> segmentReaders = new HashMap<String,Integer>();
+
+    if (oldReaders != null) {
+      // create a Map SegmentName->SegmentReader
+      for (int i = 0; i < oldReaders.length; i++) {
+        segmentReaders.put(oldReaders[i].getSegmentName(), Integer.valueOf(i));
+      }
+    }
+    
+    SegmentReader[] newReaders = new SegmentReader[infos.size()];
+    
+    // remember which readers are shared between the old and the re-opened
+    // DirectoryReader - we have to incRef those readers
+    boolean[] readerShared = new boolean[infos.size()];
+    
+    for (int i = infos.size() - 1; i>=0; i--) {
+      // find SegmentReader for this segment
+      Integer oldReaderIndex = segmentReaders.get(infos.info(i).name);
+      if (oldReaderIndex == null) {
+        // this is a new segment, no old SegmentReader can be reused
+        newReaders[i] = null;
+      } else {
+        // there is an old reader for this segment - we'll try to reopen it
+        newReaders[i] = oldReaders[oldReaderIndex.intValue()];
       }
 
-      return getRangeQuery(parser, field, p1, p2, minInclusive, maxInclusive);
-  }
+      boolean success = false;
+      try {
+        SegmentReader newReader;
+        if (newReaders[i] == null || infos.info(i).getUseCompoundFile() != newReaders[i].getSegmentInfo().getUseCompoundFile()) {
 
-  public Query getRangeQuery(QParser parser, SchemaField field, final CurrencyValue p1, final CurrencyValue p2, final boolean minInclusive, final boolean maxInclusive) {
-    String currencyCode = (p1 != null) ? p1.getCurrencyCode() :
-                          (p2 != null) ? p2.getCurrencyCode() : defaultCurrency;
+          // We should never see a totally new segment during cloning
+          assert !doClone;
 
-    // ValueSourceRangeFilter doesn't check exists(), so we have to
-    final Filter docsWithValues = new FieldValueFilter(getAmountField(field).getName());
-    final Filter vsRangeFilter = new ValueSourceRangeFilter
-      (new RawCurrencyValueSource(field, currencyCode, parser),
-       p1 == null ? null : p1.getAmount() + "", 
-       p2 == null ? null : p2.getAmount() + "",
-       minInclusive, maxInclusive);
-    final Filter docsInRange = new ChainedFilter
-      (new Filter [] { docsWithValues, vsRangeFilter }, ChainedFilter.AND);
-
-    return new SolrConstantScoreQuery(docsInRange);
-    
-  }
-
-  @Override
-  public SortField getSortField(SchemaField field, boolean reverse) {
-    // Convert all values to default currency for sorting.
-    return (new RawCurrencyValueSource(field, defaultCurrency, null)).getSortField(reverse);
-  }
-
-  public void write(XMLWriter xmlWriter, String name, IndexableField field) throws IOException {
-    xmlWriter.writeStr(name, field.stringValue(), false);
-  }
-
-  @Override
-  public void write(TextResponseWriter writer, String name, IndexableField field) throws IOException {
-    writer.writeStr(name, field.stringValue(), true);
-  }
-
-  public ExchangeRateProvider getProvider() {
-    return provider;
-  }
-
-  /**
-   * <p>
-   * A value source whose values represent the "normal" values
-   * in the specified target currency.
-   * </p>
-   * @see RawCurrencyValueSource
-   */
-  class ConvertedCurrencyValueSource extends ValueSource {
-    private final Currency targetCurrency;
-    private final RawCurrencyValueSource source;
-    private final double rate;
-    public ConvertedCurrencyValueSource(String targetCurrencyCode, 
-                                        RawCurrencyValueSource source) {
-      this.source = source;
-      this.targetCurrency = getCurrency(targetCurrencyCode);
-      if (null == targetCurrency) {
-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Currency code not supported by this JVM: " + targetCurrencyCode);
+          // this is a new reader; in case we hit an exception we can close it safely
+          newReader = SegmentReader.get(readOnly, infos.info(i), termInfosIndexDivisor, IOContext.READ);
+          newReader.readerFinishedListeners = readerFinishedListeners;
+        } else {
+          newReader = newReaders[i].reopenSegment(infos.info(i), doClone, readOnly);
+          assert newReader.readerFinishedListeners == readerFinishedListeners;
+        }
+        if (newReader == newReaders[i]) {
+          // this reader will be shared between the old and the new one,
+          // so we must incRef it
+          readerShared[i] = true;
+          newReader.incRef();
+        } else {
+          readerShared[i] = false;
+          newReaders[i] = newReader;
+        }
+        success = true;
+      } finally {
+        if (!success) {
+          for (i++; i < infos.size(); i++) {
+            if (newReaders[i] != null) {
+              try {
+                if (!readerShared[i]) {
+                  // this is a new subReader that is not used by the old one,
+                  // we can close it
+                  newReaders[i].close();
+                } else {
+                  // this subReader is also used by the old reader, so instead
+                  // closing we must decRef it
+                  newReaders[i].decRef();
+                }
+              } catch (IOException ignore) {
+                // keep going - we want to clean up as much as possible
+              }
+            }
+          }
+        }
       }
-      // the target digits & currency of our source, 
-      // become the source digits & currency of ourselves
-      this.rate = provider.getExchangeRate
-        (source.getTargetCurrency().getCurrencyCode(), 
-         targetCurrency.getCurrencyCode());
-    }
-
-    @Override
-    public FunctionValues getValues(Map context, AtomicReaderContext reader) 
-      throws IOException {
-      final FunctionValues amounts = source.getValues(context, reader);
-      // the target digits & currency of our source, 
-      // become the source digits & currency of ourselves
-      final String sourceCurrencyCode = source.getTargetCurrency().getCurrencyCode();
-      final int sourceFractionDigits = source.getTargetCurrency().getDefaultFractionDigits();
-      final double divisor = Math.pow(10D, targetCurrency.getDefaultFractionDigits());
-      return new FunctionValues() {
-        @Override
-        public boolean exists(int doc) {
-          return amounts.exists(doc);
-        }
-        @Override
-        public long longVal(int doc) {
-          return (long) doubleVal(doc);
-        }
-        @Override
-        public int intVal(int doc) {
-          return (int) doubleVal(doc);
-        }
-
-        @Override
-        public double doubleVal(int doc) {
-          return CurrencyValue.convertAmount(rate, sourceCurrencyCode, amounts.longVal(doc), targetCurrency.getCurrencyCode()) / divisor;
-        }
-
-        @Override
-        public float floatVal(int doc) {
-          return CurrencyValue.convertAmount(rate, sourceCurrencyCode, amounts.longVal(doc), targetCurrency.getCurrencyCode()) / ((float)divisor);
-        }
-
-        @Override
-        public String strVal(int doc) {
-          return Double.toString(doubleVal(doc));
-        }
-
-        @Override
-        public String toString(int doc) {
-          return name() + '(' + strVal(doc) + ')';
-        }
-      };
-    }
-    public String name() {
-      return "currency";
-    }
-
-    @Override
-    public String description() {
-      return name() + "(" + source.getField().getName() + "," + targetCurrency.getCurrencyCode()+")";
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
-
-      ConvertedCurrencyValueSource that = (ConvertedCurrencyValueSource) o;
-
-      return !(source != null ? !source.equals(that.source) : that.source != null) &&
-        (rate == that.rate) && 
-        !(targetCurrency != null ? !targetCurrency.equals(that.targetCurrency) : that.targetCurrency != null);
-
-    }
-
-    @Override
-    public int hashCode() {
-      int result = targetCurrency != null ? targetCurrency.hashCode() : 0;
-      result = 31 * result + (source != null ? source.hashCode() : 0);
-      result = 31 * (int) Double.doubleToLongBits(rate);
-      return result;
-    }
-  }
-
-  /**
-   * <p>
-   * A value source whose values represent the "raw" (ie: normalized using 
-   * the number of default fractional digits) values in the specified 
-   * target currency).
-   * </p>
-   * <p>
-   * For example: if the specified target currency is "<code>USD</code>" 
-   * then the numeric values are the number of pennies in the value 
-   * (ie: <code>$n * 100</code>) since the number of defalt fractional 
-   * digits for <code>USD</code> is "<code>2</code>")
-   * </p>
-   * @see ConvertedCurrencyValueSource
-   */
-  class RawCurrencyValueSource extends ValueSource {
-    private static final long serialVersionUID = 1L;
-    private final Currency targetCurrency;
-    private ValueSource currencyValues;
-    private ValueSource amountValues;
-    private final SchemaField sf;
-
-    public RawCurrencyValueSource(SchemaField sfield, String targetCurrencyCode, QParser parser) {
-      this.sf = sfield;
-      this.targetCurrency = getCurrency(targetCurrencyCode);
-      if (null == targetCurrency) {
-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Currency code not supported by this JVM: " + targetCurrencyCode);
-      }
-
-      SchemaField amountField = schema.getField(sf.getName() + POLY_FIELD_SEPARATOR + FIELD_SUFFIX_AMOUNT_RAW);
-      SchemaField currencyField = schema.getField(sf.getName() + POLY_FIELD_SEPARATOR + FIELD_SUFFIX_CURRENCY);
-
-      currencyValues = currencyField.getType().getValueSource(currencyField, parser);
-      amountValues = amountField.getType().getValueSource(amountField, parser);
-    }
+    }    
     
-    public SchemaField getField() { return sf; }
-    public Currency getTargetCurrency() { return targetCurrency; }
-
-    @Override
-    public FunctionValues getValues(Map context, AtomicReaderContext reader) throws IOException {
-      final FunctionValues amounts = amountValues.getValues(context, reader);
-      final FunctionValues currencies = currencyValues.getValues(context, reader);
-
-      return new FunctionValues() {
-        private final int MAX_CURRENCIES_TO_CACHE = 256;
-        private final int[] fractionDigitCache = new int[MAX_CURRENCIES_TO_CACHE];
-        private final String[] currencyOrdToCurrencyCache = new String[MAX_CURRENCIES_TO_CACHE];
-        private final double[] exchangeRateCache = new double[MAX_CURRENCIES_TO_CACHE];
-        private int targetFractionDigits = -1;
-        private int targetCurrencyOrd = -1;
-        private boolean initializedCache;
-
-        private String getDocCurrencyCode(int doc, int currencyOrd) {
-          if (currencyOrd < MAX_CURRENCIES_TO_CACHE) {
-            String currency = currencyOrdToCurrencyCache[currencyOrd];
-
-            if (currency == null) {
-              currencyOrdToCurrencyCache[currencyOrd] = currency = currencies.strVal(doc);
-            }
-            
-            if (currency == null) {
-              currency = defaultCurrency;
-            }
-
-            if (targetCurrencyOrd == -1 && 
-                currency.equals(targetCurrency.getCurrencyCode() )) {
-              targetCurrencyOrd = currencyOrd;
-            }
-
-            return currency;
-          } else {
-            return currencies.strVal(doc);
-          }
-        }
-        /** throws a (Server Error) SolrException if the code is not valid */
-        private Currency getDocCurrency(int doc, int currencyOrd) {
-          String code = getDocCurrencyCode(doc, currencyOrd);
-          Currency c = getCurrency(code);
-          if (null == c) {
-            throw new SolrException
-              (SolrException.ErrorCode.SERVER_ERROR, 
-               "Currency code of document is not supported by this JVM: "+code);
-          }
-          return c;
-        }
-
-        @Override
-        public boolean exists(int doc) {
-          return amounts.exists(doc);
-        }
-        
-        @Override
-        public long longVal(int doc) {
-          long amount = amounts.longVal(doc);
-          // bail fast using whatever ammounts defaults to if no value
-          // (if we don't do this early, currencyOrd may be < 0, 
-          // causing index bounds exception
-          if ( ! exists(doc) ) {
-            return amount;
-          }
-
-          if (!initializedCache) {
-            for (int i = 0; i < fractionDigitCache.length; i++) {
-              fractionDigitCache[i] = -1;
-            }
-
-            initializedCache = true;
-          }
-
-          int currencyOrd = currencies.ordVal(doc);
-
-          if (currencyOrd == targetCurrencyOrd) {
-            return amount;
-          }
-
-          double exchangeRate;
-          int sourceFractionDigits;
-
-          if (targetFractionDigits == -1) {
-            targetFractionDigits = targetCurrency.getDefaultFractionDigits();
-          }
-
-          if (currencyOrd < MAX_CURRENCIES_TO_CACHE) {
-            exchangeRate = exchangeRateCache[currencyOrd];
-
-            if (exchangeRate <= 0.0) {
-              String sourceCurrencyCode = getDocCurrencyCode(doc, currencyOrd);
-              exchangeRate = exchangeRateCache[currencyOrd] = provider.getExchangeRate(sourceCurrencyCode, targetCurrency.getCurrencyCode());
-            }
-
-            sourceFractionDigits = fractionDigitCache[currencyOrd];
-
-            if (sourceFractionDigits == -1) {
-              sourceFractionDigits = fractionDigitCache[currencyOrd] = getDocCurrency(doc, currencyOrd).getDefaultFractionDigits();
-            }
-          } else {
-            Currency source = getDocCurrency(doc, currencyOrd);
-            exchangeRate = provider.getExchangeRate(source.getCurrencyCode(), targetCurrency.getCurrencyCode());
-            sourceFractionDigits = source.getDefaultFractionDigits();
-          }
-
-          return CurrencyValue.convertAmount(exchangeRate, sourceFractionDigits, amount, targetFractionDigits);
-        }
-
-        @Override
-        public int intVal(int doc) {
-          return (int) longVal(doc);
-        }
-
-        @Override
-        public double doubleVal(int doc) {
-          return (double) longVal(doc);
-        }
-
-        @Override
-        public float floatVal(int doc) {
-          return (float) longVal(doc);
-        }
-
-        @Override
-        public String strVal(int doc) {
-          return Long.toString(longVal(doc));
-        }
-
-        @Override
-        public String toString(int doc) {
-          return name() + '(' + amounts.toString(doc) + ',' + currencies.toString(doc) + ')';
-        }
-      };
-    }
-
-    public String name() {
-      return "rawcurrency";
-    }
-
-    @Override
-    public String description() {
-      return name() + "(" + sf.getName() + 
-        ",target="+targetCurrency.getCurrencyCode()+")";
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
-
-      RawCurrencyValueSource that = (RawCurrencyValueSource) o;
-
-      return !(amountValues != null ? !amountValues.equals(that.amountValues) : that.amountValues != null) &&
-              !(currencyValues != null ? !currencyValues.equals(that.currencyValues) : that.currencyValues != null) &&
-              !(targetCurrency != null ? !targetCurrency.equals(that.targetCurrency) : that.targetCurrency != null);
-
-    }
-
-    @Override
-    public int hashCode() {
-      int result = targetCurrency != null ? targetCurrency.hashCode() : 0;
-      result = 31 * result + (currencyValues != null ? currencyValues.hashCode() : 0);
-      result = 31 * result + (amountValues != null ? amountValues.hashCode() : 0);
-      return result;
-    }
-  }
-}
-
-/**
- * Configuration for currency. Provides currency exchange rates.
- */
-class FileExchangeRateProvider implements ExchangeRateProvider {
-  public static Logger log = LoggerFactory.getLogger(FileExchangeRateProvider.class);
-  protected static final String PARAM_CURRENCY_CONFIG       = "currencyConfig";
-
-  // Exchange rate map, maps Currency Code -> Currency Code -> Rate
-  private Map<String, Map<String, Double>> rates = new HashMap<String, Map<String, Double>>();
-
-  private String currencyConfigFile;
-  private ResourceLoader loader;
-
-  /**
-   * Returns the currently known exchange rate between two currencies. If a direct rate has been loaded,
-   * it is used. Otherwise, if a rate is known to convert the target currency to the source, the inverse
-   * exchange rate is computed.
-   *
-   * @param sourceCurrencyCode The source currency being converted from.
-   * @param targetCurrencyCode The target currency being converted to.
-   * @return The exchange rate.
-   * @throws SolrException if the requested currency pair cannot be found
-   */
-  @Override
-  public double getExchangeRate(String sourceCurrencyCode, String targetCurrencyCode) {
-    if (sourceCurrencyCode == null || targetCurrencyCode == null) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Cannot get exchange rate; currency was null.");
-    }
-    
-    if (sourceCurrencyCode.equals(targetCurrencyCode)) {
-      return 1.0;
-    }
-
-    Double directRate = lookupRate(sourceCurrencyCode, targetCurrencyCode);
-
-    if (directRate != null) {
-      return directRate;
-    }
-
-    Double symmetricRate = lookupRate(targetCurrencyCode, sourceCurrencyCode);
-
-    if (symmetricRate != null) {
-      return 1.0 / symmetricRate;
-    }
-
-    throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "No available conversion rate between " + sourceCurrencyCode + " to " + targetCurrencyCode);
+    // initialize the readers to calculate maxDoc before we try to reuse the old normsCache
+    initialize(newReaders);
   }
 
-  /**
-   * Looks up the current known rate, if any, between the source and target currencies.
-   *
-   * @param sourceCurrencyCode The source currency being converted from.
-   * @param targetCurrencyCode The target currency being converted to.
-   * @return The exchange rate, or null if no rate has been registered.
-   */
-  private Double lookupRate(String sourceCurrencyCode, String targetCurrencyCode) {
-    Map<String, Double> rhs = rates.get(sourceCurrencyCode);
-
-    if (rhs != null) {
-      return rhs.get(targetCurrencyCode);
-    }
-
-    return null;
-  }
-
-  /**
-   * Registers the specified exchange rate.
-   *
-   * @param ratesMap           The map to add rate to
-   * @param sourceCurrencyCode The source currency.
-   * @param targetCurrencyCode The target currency.
-   * @param rate               The known exchange rate.
-   */
-  private void addRate(Map<String, Map<String, Double>> ratesMap, String sourceCurrencyCode, String targetCurrencyCode, double rate) {
-    Map<String, Double> rhs = ratesMap.get(sourceCurrencyCode);
-
-    if (rhs == null) {
-      rhs = new HashMap<String, Double>();
-      ratesMap.put(sourceCurrencyCode, rhs);
-    }
-
-    rhs.put(targetCurrencyCode, rate);
-  }
-
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) return true;
-    if (o == null || getClass() != o.getClass()) return false;
-
-    FileExchangeRateProvider that = (FileExchangeRateProvider) o;
-
-    return !(rates != null ? !rates.equals(that.rates) : that.rates != null);
-  }
-
-  @Override
-  public int hashCode() {
-    return rates != null ? rates.hashCode() : 0;
-  }
-
+  /** {@inheritDoc} */
   @Override
   public String toString() {
-    return "["+this.getClass().getName()+" : " + rates.size() + " rates.]";
-  }
-
-  @Override
-  public Set<String> listAvailableCurrencies() {
-    Set<String> currencies = new HashSet<String>();
-    for(String from : rates.keySet()) {
-      currencies.add(from);
-      for(String to : rates.get(from).keySet()) {
-        currencies.add(to);
-      }
+    final StringBuilder buffer = new StringBuilder();
+    if (hasChanges) {
+      buffer.append("*");
     }
-    return currencies;
+    buffer.append(getClass().getSimpleName());
+    buffer.append('(');
+    final String segmentsFile = segmentInfos.getCurrentSegmentFileName();
+    if (segmentsFile != null) {
+      buffer.append(segmentsFile);
+    }
+    if (writer != null) {
+      buffer.append(":nrt");
+    }
+    for(int i=0;i<subReaders.length;i++) {
+      buffer.append(' ');
+      buffer.append(subReaders[i]);
+    }
+    buffer.append(')');
+    return buffer.toString();
   }
 
-  @Override
-  public boolean reload() throws SolrException {
-    InputStream is = null;
-    Map<String, Map<String, Double>> tmpRates = new HashMap<String, Map<String, Double>>();
-    try {
-      log.info("Reloading exchange rates from file "+this.currencyConfigFile);
+  private void initialize(SegmentReader[] subReaders) throws IOException {
+    this.subReaders = subReaders;
+    starts = new int[subReaders.length + 1];    // build starts array
+    final AtomicReaderContext[] subReaderCtx = new AtomicReaderContext[subReaders.length];
+    topLevelReaderContext = new CompositeReaderContext(this, subReaderCtx, subReaderCtx);
+    final List<Fields> subFields = new ArrayList<Fields>();
+    
+    for (int i = 0; i < subReaders.length; i++) {
+      starts[i] = maxDoc;
+      subReaderCtx[i] = new AtomicReaderContext(topLevelReaderContext, subReaders[i], i, maxDoc, i, maxDoc);
+      maxDoc += subReaders[i].maxDoc();      // compute maxDocs
 
-      is = loader.openResource(currencyConfigFile);
-      javax.xml.parsers.DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-      try {
-        dbf.setXIncludeAware(true);
-        dbf.setNamespaceAware(true);
-      } catch (UnsupportedOperationException e) {
-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "XML parser doesn't support XInclude option", e);
+      if (subReaders[i].hasDeletions()) {
+        hasDeletions = true;
       }
       
-      try {
-        Document doc = dbf.newDocumentBuilder().parse(is);
-        XPathFactory xpathFactory = XPathFactory.newInstance();
-        XPath xpath = xpathFactory.newXPath();
-        
-        // Parse exchange rates.
-        NodeList nodes = (NodeList) xpath.evaluate("/currencyConfig/rates/rate", doc, XPathConstants.NODESET);
-        
-        for (int i = 0; i < nodes.getLength(); i++) {
-          Node rateNode = nodes.item(i);
-          NamedNodeMap attributes = rateNode.getAttributes();
-          Node from = attributes.getNamedItem("from");
-          Node to = attributes.getNamedItem("to");
-          Node rate = attributes.getNamedItem("rate");
-          
-          if (from == null || to == null || rate == null) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Exchange rate missing attributes (required: from, to, rate) " + rateNode);
-          }
-          
-          String fromCurrency = from.getNodeValue();
-          String toCurrency = to.getNodeValue();
-          Double exchangeRate;
-          
-          if (null == CurrencyField.getCurrency(fromCurrency)) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Specified 'from' currency not supported in this JVM: " + fromCurrency);
-          }
-          if (null == CurrencyField.getCurrency(toCurrency)) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Specified 'to' currency not supported in this JVM: " + toCurrency);
-          }
-          
-          try {
-            exchangeRate = Double.parseDouble(rate.getNodeValue());
-          } catch (NumberFormatException e) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Could not parse exchange rate: " + rateNode, e);
-          }
-          
-          addRate(tmpRates, fromCurrency, toCurrency, exchangeRate);
-        }
-      } catch (SAXException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error parsing currency config.", e);
-      } catch (IOException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error parsing currency config.", e);
-      } catch (ParserConfigurationException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error parsing currency config.", e);
-      } catch (XPathExpressionException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error parsing currency config.", e);
-      }
-    } catch (IOException e) {
-      throw new SolrException(ErrorCode.SERVER_ERROR, "Error while opening Currency configuration file "+currencyConfigFile, e);
-    } finally {
-      try {
-        if (is != null) {
-          is.close();
-        }
-      } catch (IOException e) {
-        e.printStackTrace();
+      final Fields f = subReaders[i].fields();
+      if (f != null) {
+        subFields.add(f);
       }
     }
-    // Atomically swap in the new rates map, if it loaded successfully
-    this.rates = tmpRates;
-    return true;
+    starts[subReaders.length] = maxDoc;
+
+    if (!readOnly) {
+      maxIndexVersion = SegmentInfos.readCurrentVersion(directory, codecs);
+    }
   }
 
   @Override
-  public void init(Map<String,String> params) throws SolrException {
-    this.currencyConfigFile = params.get(PARAM_CURRENCY_CONFIG);
-    if(currencyConfigFile == null) {
-      throw new SolrException(ErrorCode.NOT_FOUND, "Missing required configuration "+PARAM_CURRENCY_CONFIG);
-    }
-    
-    // Removing config params custom to us
-    params.remove(PARAM_CURRENCY_CONFIG);
+  public Bits getLiveDocs() {
+    throw new UnsupportedOperationException("please use MultiFields.getLiveDocs, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level Bits liveDocs");
   }
 
   @Override
-  public void inform(ResourceLoader loader) throws SolrException {
-    if(loader == null) {
-      throw new SolrException(ErrorCode.SERVER_ERROR, "Needs ResourceLoader in order to load config file");
-    }
-    this.loader = loader;
-    reload();
-  }
-}
-
-/**
- * Represents a Currency field value, which includes a long amount and ISO currency code.
- */
-class CurrencyValue {
-  private long amount;
-  private String currencyCode;
-
-  /**
-   * Constructs a new currency value.
-   *
-   * @param amount       The amount.
-   * @param currencyCode The currency code.
-   */
-  public CurrencyValue(long amount, String currencyCode) {
-    this.amount = amount;
-    this.currencyCode = currencyCode;
-  }
-
-  /**
-   * Constructs a new currency value by parsing the specific input.
-   * <p/>
-   * Currency values are expected to be in the format &lt;amount&gt;,&lt;currency code&gt;,
-   * for example, "500,USD" would represent 5 U.S. Dollars.
-   * <p/>
-   * If no currency code is specified, the default is assumed.
-   *
-   * @param externalVal The value to parse.
-   * @param defaultCurrency The default currency.
-   * @return The parsed CurrencyValue.
-   */
-  public static CurrencyValue parse(String externalVal, String defaultCurrency) {
-    if (externalVal == null) {
-      return null;
-    }
-    String amount = externalVal;
-    String code = defaultCurrency;
-
-    if (externalVal.contains(",")) {
-      String[] amountAndCode = externalVal.split(",");
-      amount = amountAndCode[0];
-      code = amountAndCode[1];
-    }
-
-    if (amount.equals("*")) {
-      return null;
-    }
-    
-    Currency currency = CurrencyField.getCurrency(code);
-
-    if (currency == null) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Currency code not supported by this JVM: " + code);
-    }
-
+  public final synchronized Object clone() {
     try {
-      double value = Double.parseDouble(amount);
-      long currencyValue = Math.round(value * Math.pow(10.0, currency.getDefaultFractionDigits()));
-
-      return new CurrencyValue(currencyValue, code);
-    } catch (NumberFormatException e) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+      return clone(readOnly); // Preserve current readOnly
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
     }
   }
 
-  /**
-   * The amount of the CurrencyValue.
-   *
-   * @return The amount.
-   */
-  public long getAmount() {
-    return amount;
+  @Override
+  public final synchronized IndexReader clone(boolean openReadOnly) throws CorruptIndexException, IOException {
+    DirectoryReader newReader = doReopen((SegmentInfos) segmentInfos.clone(), true, openReadOnly);
+
+    if (this != newReader) {
+      newReader.deletionPolicy = deletionPolicy;
+    }
+    newReader.writer = writer;
+    // If we're cloning a non-readOnly reader, move the
+    // writeLock (if there is one) to the new reader:
+    if (!openReadOnly && writeLock != null) {
+      // In near real-time search, reader is always readonly
+      assert writer == null;
+      newReader.writeLock = writeLock;
+      newReader.hasChanges = hasChanges;
+      newReader.hasDeletions = hasDeletions;
+      writeLock = null;
+      hasChanges = false;
+    }
+    assert newReader.readerFinishedListeners != null;
+
+    return newReader;
   }
 
-  /**
-   * The ISO currency code of the CurrencyValue.
-   *
-   * @return The currency code.
-   */
-  public String getCurrencyCode() {
-    return currencyCode;
+  @Override
+  public final IndexReader reopen() throws CorruptIndexException, IOException {
+    // Preserve current readOnly
+    return doReopen(readOnly, null);
   }
 
-  /**
-   * Performs a currency conversion & unit conversion.
-   *
-   * @param exchangeRates      Exchange rates to apply.
-   * @param sourceCurrencyCode The source currency code.
-   * @param sourceAmount       The source amount.
-   * @param targetCurrencyCode The target currency code.
-   * @return The converted indexable units after the exchange rate and currency fraction digits are applied.
-   */
-  public static long convertAmount(ExchangeRateProvider exchangeRates, String sourceCurrencyCode, long sourceAmount, String targetCurrencyCode) {
-    double exchangeRate = exchangeRates.getExchangeRate(sourceCurrencyCode, targetCurrencyCode);
-    return convertAmount(exchangeRate, sourceCurrencyCode, sourceAmount, targetCurrencyCode);
+  @Override
+  public final IndexReader reopen(boolean openReadOnly) throws CorruptIndexException, IOException {
+    return doReopen(openReadOnly, null);
   }
 
-  /**
-   * Performs a currency conversion & unit conversion.
-   *
-   * @param exchangeRate         Exchange rate to apply.
-   * @param sourceFractionDigits The fraction digits of the source.
-   * @param sourceAmount         The source amount.
-   * @param targetFractionDigits The fraction digits of the target.
-   * @return The converted indexable units after the exchange rate and currency fraction digits are applied.
-   */
-  public static long convertAmount(final double exchangeRate, final int sourceFractionDigits, final long sourceAmount, final int targetFractionDigits) {
-    int digitDelta = targetFractionDigits - sourceFractionDigits;
-    double value = ((double) sourceAmount * exchangeRate);
+  @Override
+  public final IndexReader reopen(final IndexCommit commit) throws CorruptIndexException, IOException {
+    return doReopen(true, commit);
+  }
 
-    if (digitDelta != 0) {
-      if (digitDelta < 0) {
-        for (int i = 0; i < -digitDelta; i++) {
-          value *= 0.1;
+  private final IndexReader doReopenFromWriter(boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+    assert readOnly;
+
+    if (!openReadOnly) {
+      throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() can only be reopened with openReadOnly=true (got false)");
+    }
+
+    if (commit != null) {
+      throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() cannot currently accept a commit");
+    }
+
+    // TODO: right now we *always* make a new reader; in
+    // the future we could have write make some effort to
+    // detect that no changes have occurred
+    IndexReader reader = writer.getReader(applyAllDeletes);
+    reader.readerFinishedListeners = readerFinishedListeners;
+    return reader;
+  }
+
+  private IndexReader doReopen(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+    ensureOpen();
+
+    assert commit == null || openReadOnly;
+
+    // If we were obtained by writer.getReader(), re-ask the
+    // writer to get a new reader.
+    if (writer != null) {
+      return doReopenFromWriter(openReadOnly, commit);
+    } else {
+      return doReopenNoWriter(openReadOnly, commit);
+    }
+  }
+
+  private synchronized IndexReader doReopenNoWriter(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+
+    if (commit == null) {
+      if (hasChanges) {
+        // We have changes, which means we are not readOnly:
+        assert readOnly == false;
+        // and we hold the write lock:
+        assert writeLock != null;
+        // so no other writer holds the write lock, which
+        // means no changes could have been done to the index:
+        assert isCurrent();
+
+        if (openReadOnly) {
+          return clone(openReadOnly);
+        } else {
+          return this;
         }
-      } else {
-        for (int i = 0; i < digitDelta; i++) {
-          value *= 10.0;
+      } else if (isCurrent()) {
+        if (openReadOnly != readOnly) {
+          // Just fallback to clone
+          return clone(openReadOnly);
+        } else {
+          return this;
+        }
+      }
+    } else {
+      if (directory != commit.getDirectory())
+        throw new IOException("the specified commit does not match the specified Directory");
+      if (segmentInfos != null && commit.getSegmentsFileName().equals(segmentInfos.getCurrentSegmentFileName())) {
+        if (readOnly != openReadOnly) {
+          // Just fallback to clone
+          return clone(openReadOnly);
+        } else {
+          return this;
         }
       }
     }
 
-    return (long) value;
+    return (IndexReader) new SegmentInfos.FindSegmentsFile(directory) {
+      @Override
+      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
+        final SegmentInfos infos = new SegmentInfos(codecs);
+        infos.read(directory, segmentFileName, codecs);
+        return doReopen(infos, false, openReadOnly);
+      }
+    }.run(commit);
   }
 
-  /**
-   * Performs a currency conversion & unit conversion.
-   *
-   * @param exchangeRate       Exchange rate to apply.
-   * @param sourceCurrencyCode The source currency code.
-   * @param sourceAmount       The source amount.
-   * @param targetCurrencyCode The target currency code.
-   * @return The converted indexable units after the exchange rate and currency fraction digits are applied.
-   */
-  public static long convertAmount(double exchangeRate, String sourceCurrencyCode, long sourceAmount, String targetCurrencyCode) {
-    if (targetCurrencyCode.equals(sourceCurrencyCode)) {
-      return sourceAmount;
-    }
-
-    int sourceFractionDigits = Currency.getInstance(sourceCurrencyCode).getDefaultFractionDigits();
-    Currency targetCurrency = Currency.getInstance(targetCurrencyCode);
-    int targetFractionDigits = targetCurrency.getDefaultFractionDigits();
-    return convertAmount(exchangeRate, sourceFractionDigits, sourceAmount, targetFractionDigits);
+  private synchronized DirectoryReader doReopen(SegmentInfos infos, boolean doClone, boolean openReadOnly) throws CorruptIndexException, IOException {
+    DirectoryReader reader;
+    reader = new DirectoryReader(directory, infos, subReaders, starts, openReadOnly, doClone, termInfosIndexDivisor, codecs, readerFinishedListeners);
+    return reader;
   }
 
-  /**
-   * Returns a new CurrencyValue that is the conversion of this CurrencyValue to the specified currency.
-   *
-   * @param exchangeRates      The exchange rate provider.
-   * @param targetCurrencyCode The target currency code to convert this CurrencyValue to.
-   * @return The converted CurrencyValue.
-   */
-  public CurrencyValue convertTo(ExchangeRateProvider exchangeRates, String targetCurrencyCode) {
-    return new CurrencyValue(convertAmount(exchangeRates, this.getCurrencyCode(), this.getAmount(), targetCurrencyCode), targetCurrencyCode);
+  /** Version number when this IndexReader was opened. */
+  @Override
+  public long getVersion() {
+    ensureOpen();
+    return segmentInfos.getVersion();
   }
 
   @Override
-  public String toString() {
-    return String.valueOf(amount) + "," + currencyCode;
+  public TermFreqVector[] getTermFreqVectors(int n) throws IOException {
+    ensureOpen();
+    int i = readerIndex(n);        // find segment num
+    return subReaders[i].getTermFreqVectors(n - starts[i]); // dispatch to segment
+  }
+
+  @Override
+  public TermFreqVector getTermFreqVector(int n, String field)
+      throws IOException {
+    ensureOpen();
+    int i = readerIndex(n);        // find segment num
+    return subReaders[i].getTermFreqVector(n - starts[i], field);
+  }
+
+
+  @Override
+  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+    int i = readerIndex(docNumber);        // find segment num
+    subReaders[i].getTermFreqVector(docNumber - starts[i], field, mapper);
+  }
+
+  @Override
+  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+    int i = readerIndex(docNumber);        // find segment num
+    subReaders[i].getTermFreqVector(docNumber - starts[i], mapper);
+  }
+
+  /**
+   * Checks is the index is optimized (if it has a single segment and no deletions)
+   * @return <code>true</code> if the index is optimized; <code>false</code> otherwise
+   */
+  @Override
+  public boolean isOptimized() {
+    ensureOpen();
+    return segmentInfos.size() == 1 && !hasDeletions();
+  }
+
+  @Override
+  public int numDocs() {
+    // Don't call ensureOpen() here (it could affect performance)
+
+    // NOTE: multiple threads may wind up init'ing
+    // numDocs... but that's harmless
+    if (numDocs == -1) {        // check cache
+      int n = 0;                // cache miss--recompute
+      for (int i = 0; i < subReaders.length; i++)
+        n += subReaders[i].numDocs();      // sum from readers
+      numDocs = n;
+    }
+    return numDocs;
+  }
+
+  @Override
+  public int maxDoc() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return maxDoc;
+  }
+
+  // inherit javadoc
+  @Override
+  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+    ensureOpen();
+    int i = readerIndex(n);                          // find segment num
+    return subReaders[i].document(n - starts[i], fieldSelector);    // dispatch to segment reader
+  }
+
+  @Override
+  public boolean hasDeletions() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return hasDeletions;
+  }
+
+  @Override
+  protected void doDelete(int n) throws CorruptIndexException, IOException {
+    numDocs = -1;                             // invalidate cache
+    int i = readerIndex(n);                   // find segment num
+    subReaders[i].deleteDocument(n - starts[i]);      // dispatch to segment reader
+    hasDeletions = true;
+  }
+
+  @Override
+  protected void doUndeleteAll() throws CorruptIndexException, IOException {
+    for (int i = 0; i < subReaders.length; i++)
+      subReaders[i].undeleteAll();
+
+    hasDeletions = false;
+    numDocs = -1;                                 // invalidate cache
+  }
+
+  private int readerIndex(int n) {    // find reader for doc n:
+    return readerIndex(n, this.starts, this.subReaders.length);
+  }
+  
+  final static int readerIndex(int n, int[] starts, int numSubReaders) {    // find reader for doc n:
+    int lo = 0;                                      // search starts array
+    int hi = numSubReaders - 1;                  // for first element less
+
+    while (hi >= lo) {
+      int mid = (lo + hi) >>> 1;
+      int midValue = starts[mid];
+      if (n < midValue)
+        hi = mid - 1;
+      else if (n > midValue)
+        lo = mid + 1;
+      else {                                      // found a match
+        while (mid+1 < numSubReaders && starts[mid+1] == midValue) {
+          mid++;                                  // scan to last match
+        }
+        return mid;
+      }
+    }
+    return hi;
+  }
+
+  @Override
+  public boolean hasNorms(String field) throws IOException {
+    ensureOpen();
+    for (int i = 0; i < subReaders.length; i++) {
+      if (subReaders[i].hasNorms(field)) return true;
+    }
+    return false;
+  }
+
+  @Override
+  public synchronized byte[] norms(String field) throws IOException {
+    ensureOpen();
+    throw new UnsupportedOperationException("please use MultiNorms.norms, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level norms");
+  }
+
+  @Override
+  protected void doSetNorm(int n, String field, byte value)
+    throws CorruptIndexException, IOException {
+    int i = readerIndex(n);                           // find segment num
+    subReaders[i].setNorm(n-starts[i], field, value); // dispatch
+  }
+
+  @Override
+  public int docFreq(Term t) throws IOException {
+    ensureOpen();
+    int total = 0;          // sum freqs in segments
+    for (int i = 0; i < subReaders.length; i++)
+      total += subReaders[i].docFreq(t);
+    return total;
+  }
+
+  @Override
+  public int docFreq(String field, BytesRef term) throws IOException {
+    ensureOpen();
+    int total = 0;          // sum freqs in segments
+    for (int i = 0; i < subReaders.length; i++) {
+      total += subReaders[i].docFreq(field, term);
+    }
+    return total;
+  }
+
+  @Override
+  public Fields fields() throws IOException {
+    throw new UnsupportedOperationException("please use MultiFields.getFields, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level Fields");
+  }
+
+  /**
+   * Tries to acquire the WriteLock on this directory. this method is only valid if this IndexReader is directory
+   * owner.
+   *
+   * @throws StaleReaderException  if the index has changed since this reader was opened
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws org.apache.lucene.store.LockObtainFailedException
+   *                               if another writer has this index open (<code>write.lock</code> could not be
+   *                               obtained)
+   * @throws IOException           if there is a low-level IO error
+   */
+  @Override
+  protected void acquireWriteLock() throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
+
+    if (readOnly) {
+      // NOTE: we should not reach this code w/ the core
+      // IndexReader classes; however, an external subclass
+      // of IndexReader could reach this.
+      throw new UnsupportedOperationException("This IndexReader cannot make any changes to the index (it was opened with readOnly = true)");
+    }
+
+    if (segmentInfos != null) {
+      ensureOpen();
+      if (stale)
+        throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
+
+      if (writeLock == null) {
+        Lock writeLock = directory.makeLock(IndexWriter.WRITE_LOCK_NAME);
+        if (!writeLock.obtain(IndexWriterConfig.WRITE_LOCK_TIMEOUT)) // obtain write lock
+          throw new LockObtainFailedException("Index locked for write: " + writeLock);
+        this.writeLock = writeLock;
+
+        // we have to check whether index has changed since this reader was opened.
+        // if so, this reader is no longer valid for deletion
+        if (SegmentInfos.readCurrentVersion(directory, codecs) > maxIndexVersion) {
+          stale = true;
+          this.writeLock.release();
+          this.writeLock = null;
+          throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
+        }
+      }
+    }
+  }
+
+  /**
+   * Commit changes resulting from delete, undeleteAll, or setNorm operations
+   * <p/>
+   * If an exception is hit, then either no changes or all changes will have been committed to the index (transactional
+   * semantics).
+   *
+   * @throws IOException if there is a low-level IO error
+   */
+  @Override
+  protected void doCommit(Map<String,String> commitUserData) throws IOException {
+    // poll subreaders for changes
+    for (int i = 0; !hasChanges && i < subReaders.length; i++) {
+      hasChanges |= subReaders[i].hasChanges;
+    }
+    
+    if (hasChanges) {
+      segmentInfos.setUserData(commitUserData);
+      // Default deleter (for backwards compatibility) is
+      // KeepOnlyLastCommitDeleter:
+      IndexFileDeleter deleter = new IndexFileDeleter(directory,
+                                                      deletionPolicy == null ? new KeepOnlyLastCommitDeletionPolicy() : deletionPolicy,
+                                                      segmentInfos, null, codecs);
+      segmentInfos.updateGeneration(deleter.getLastSegmentInfos());
+      segmentInfos.changed();
+
+      // Checkpoint the state we are about to change, in
+      // case we have to roll back:
+      startCommit();
+
+      final List<SegmentInfo> rollbackSegments = segmentInfos.createBackupSegmentInfos(false);
+
+      boolean success = false;
+      try {
+        for (int i = 0; i < subReaders.length; i++)
+          subReaders[i].commit();
+
+        // Remove segments that contain only 100% deleted
+        // docs:
+        segmentInfos.pruneDeletedSegments();
+
+        // Sync all files we just wrote
+        directory.sync(segmentInfos.files(directory, false));
+        segmentInfos.commit(directory);
+        success = true;
+      } finally {
+
+        if (!success) {
+
+          // Rollback changes that were made to
+          // SegmentInfos but failed to get [fully]
+          // committed.  This way this reader instance
+          // remains consistent (matched to what's
+          // actually in the index):
+          rollbackCommit();
+
+          // Recompute deletable files & remove them (so
+          // partially written .del files, etc, are
+          // removed):
+          deleter.refresh();
+
+          // Restore all SegmentInfos (in case we pruned some)
+          segmentInfos.rollbackSegmentInfos(rollbackSegments);
+        }
+      }
+
+      // Have the deleter remove any now unreferenced
+      // files due to this commit:
+      deleter.checkpoint(segmentInfos, true);
+      deleter.close();
+
+      maxIndexVersion = segmentInfos.getVersion();
+
+      if (writeLock != null) {
+        writeLock.release();  // release write lock
+        writeLock = null;
+      }
+    }
+    hasChanges = false;
+  }
+
+  void startCommit() {
+    rollbackHasChanges = hasChanges;
+    for (int i = 0; i < subReaders.length; i++) {
+      subReaders[i].startCommit();
+    }
+  }
+
+  void rollbackCommit() {
+    hasChanges = rollbackHasChanges;
+    for (int i = 0; i < subReaders.length; i++) {
+      subReaders[i].rollbackCommit();
+    }
+  }
+
+  @Override
+  public long getUniqueTermCount() throws IOException {
+    throw new UnsupportedOperationException("");
+  }
+
+  @Override
+  public Map<String,String> getCommitUserData() {
+    ensureOpen();
+    return segmentInfos.getUserData();
+  }
+
+  /**
+   * Check whether this IndexReader is still using the current (i.e., most recently committed) version of the index.  If
+   * a writer has committed any changes to the index since this reader was opened, this will return <code>false</code>,
+   * in which case you must open a new IndexReader in order
+   * to see the changes.  Use {@link IndexWriter#commit} to
+   * commit changes to the index.
+   *
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException           if there is a low-level IO error
+   */
+  @Override
+  public boolean isCurrent() throws CorruptIndexException, IOException {
+    ensureOpen();
+    if (writer == null || writer.isClosed()) {
+      // we loaded SegmentInfos from the directory
+      return SegmentInfos.readCurrentVersion(directory, codecs) == segmentInfos.getVersion();
+    } else {
+      return writer.nrtIsCurrent(segmentInfos);
+    }
+  }
+
+  @Override
+  protected synchronized void doClose() throws IOException {
+    IOException ioe = null;
+    for (int i = 0; i < subReaders.length; i++) {
+      // try to close each reader, even if an exception is thrown
+      try {
+        subReaders[i].decRef();
+      } catch (IOException e) {
+        if (ioe == null) ioe = e;
+      }
+    }
+
+    if (writer != null) {
+      // Since we just closed, writer may now be able to
+      // delete unused files:
+      writer.deleteUnusedFiles();
+    }
+
+    // throw the first exception
+    if (ioe != null) throw ioe;
+  }
+
+  @Override
+  public Collection<String> getFieldNames (IndexReader.FieldOption fieldNames) {
+    ensureOpen();
+    return getFieldNames(fieldNames, this.subReaders);
+  }
+  
+  static Collection<String> getFieldNames (IndexReader.FieldOption fieldNames, IndexReader[] subReaders) {
+    // maintain a unique set of field names
+    Set<String> fieldSet = new HashSet<String>();
+    for (IndexReader reader : subReaders) {
+      Collection<String> names = reader.getFieldNames(fieldNames);
+      fieldSet.addAll(names);
+    }
+    return fieldSet;
+  }
+  
+  @Override
+  public ReaderContext getTopReaderContext() {
+    return topLevelReaderContext;
+  }
+  
+  @Override
+  public IndexReader[] getSequentialSubReaders() {
+    return subReaders;
+  }
+
+  /** Returns the directory this index resides in. */
+  @Override
+  public Directory directory() {
+    // Don't ensureOpen here -- in certain cases, when a
+    // cloned/reopened reader needs to commit, it may call
+    // this method on the closed original reader
+    return directory;
+  }
+
+  @Override
+  public int getTermInfosIndexDivisor() {
+    return termInfosIndexDivisor;
+  }
+
+  /**
+   * Expert: return the IndexCommit that this reader has opened.
+   * <p/>
+   * @lucene.experimental
+   */
+  @Override
+  public IndexCommit getIndexCommit() throws IOException {
+    return new ReaderCommit(segmentInfos, directory);
+  }
+
+  /** @see org.apache.lucene.index.IndexReader#listCommits */
+  public static List<IndexCommit> listCommits(Directory dir) throws IOException {
+    return listCommits(dir, CodecProvider.getDefault());
+  }
+
+  /** @see org.apache.lucene.index.IndexReader#listCommits */
+  public static List<IndexCommit> listCommits(Directory dir, CodecProvider codecs) throws IOException {
+    final String[] files = dir.listAll();
+
+    List<IndexCommit> commits = new ArrayList<IndexCommit>();
+
+    SegmentInfos latest = new SegmentInfos(codecs);
+    latest.read(dir, codecs);
+    final long currentGen = latest.getGeneration();
+
+    commits.add(new ReaderCommit(latest, dir));
+
+    for(int i=0;i<files.length;i++) {
+
+      final String fileName = files[i];
+
+      if (fileName.startsWith(IndexFileNames.SEGMENTS) &&
+          !fileName.equals(IndexFileNames.SEGMENTS_GEN) &&
+          SegmentInfos.generationFromSegmentsFileName(fileName) < currentGen) {
+
+        SegmentInfos sis = new SegmentInfos(codecs);
+        try {
+          // IOException allowed to throw there, in case
+          // segments_N is corrupt
+          sis.read(dir, fileName, codecs);
+        } catch (FileNotFoundException fnfe) {
+          // LUCENE-948: on NFS (and maybe others), if
+          // you have writers switching back and forth
+          // between machines, it's very likely that the
+          // dir listing will be stale and will claim a
+          // file segments_X exists when in fact it
+          // doesn't.  So, we catch this and handle it
+          // as if the file does not exist
+          sis = null;
+        }
+
+        if (sis != null)
+          commits.add(new ReaderCommit(sis, dir));
+      }
+    }
+
+    // Ensure that the commit points are sorted in ascending order.
+    Collections.sort(commits);
+
+    return commits;
+  }  
+  
+  private static final class ReaderCommit extends IndexCommit {
+    private String segmentsFileName;
+    Collection<String> files;
+    Directory dir;
+    long generation;
+    long version;
+    final boolean isOptimized;
+    final Map<String,String> userData;
+
+    ReaderCommit(SegmentInfos infos, Directory dir) throws IOException {
+      segmentsFileName = infos.getCurrentSegmentFileName();
+      this.dir = dir;
+      userData = infos.getUserData();
+      files = Collections.unmodifiableCollection(infos.files(dir, true));
+      version = infos.getVersion();
+      generation = infos.getGeneration();
+      isOptimized = infos.size() == 1 && !infos.info(0).hasDeletions();
+    }
+
+    @Override
+    public String toString() {
+      return "DirectoryReader.ReaderCommit(" + segmentsFileName + ")";
+    }
+
+    @Override
+    public boolean isOptimized() {
+      return isOptimized;
+    }
+
+    @Override
+    public String getSegmentsFileName() {
+      return segmentsFileName;
+    }
+
+    @Override
+    public Collection<String> getFileNames() {
+      return files;
+    }
+
+    @Override
+    public Directory getDirectory() {
+      return dir;
+    }
+
+    @Override
+    public long getVersion() {
+      return version;
+    }
+
+    @Override
+    public long getGeneration() {
+      return generation;
+    }
+
+    @Override
+    public boolean isDeleted() {
+      return false;
+    }
+
+    @Override
+    public Map<String,String> getUserData() {
+      return userData;
+    }
+
+    @Override
+    public void delete() {
+      throw new UnsupportedOperationException("This IndexCommit does not support deletions");
+    }
+  }
+
+  @Override
+  public PerDocValues perDocValues() throws IOException {
+    throw new UnsupportedOperationException("please use MultiPerDocValues#getPerDocs, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level Fields");
   }
 }

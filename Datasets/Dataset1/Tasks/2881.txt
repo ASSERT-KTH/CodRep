@@ -1,96 +1,101 @@
-final Migration m = Migration.deserialize(col.value(), message.getVersion());
+SSTableWriter writer = new SSTableWriter(datafile.getAbsolutePath(), entries.size());
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p/>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p/>
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+/*
+* Licensed to the Apache Software Foundation (ASF) under one
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership.  The ASF licenses this file
+* to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*    http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
 
-package org.apache.cassandra.db;
+package org.apache.cassandra.io.sstable;
 
-import java.io.IOError;
+import java.io.File;
 import java.io.IOException;
-import java.util.Collection;
-import java.util.UUID;
+import java.util.*;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.service.StorageService;
 
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.migration.Migration;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.utils.UUIDGen;
-import org.apache.cassandra.utils.WrappedRunnable;
-
-public class DefinitionsUpdateResponseVerbHandler implements IVerbHandler
+public class SSTableUtils
 {
-    private static final Logger logger = LoggerFactory.getLogger(DefinitionsUpdateResponseVerbHandler.class);
+    // first configured table and cf
+    public static String TABLENAME = "Keyspace1";
+    public static String CFNAME = "Standard1";
 
-    /** someone sent me their data definitions */
-    public void doVerb(final Message message)
+    public static ColumnFamily createCF(IClock mfda, int ldt, IColumn... cols)
     {
-        try
-        {
-            // these are the serialized row mutations that I must apply.
-            // check versions at every step along the way to make sure migrations are not applied out of order.
-            Collection<Column> cols = MigrationManager.makeColumns(message);
-            for (Column col : cols)
-            {
-                final UUID version = UUIDGen.getUUID(col.name());
-                if (version.timestamp() > DatabaseDescriptor.getDefsVersion().timestamp())
-                {
-                    final Migration m = Migration.deserialize(col.value());
-                    assert m.getVersion().equals(version);
-                    StageManager.getStage(Stage.MIGRATION).submit(new WrappedRunnable()
-                    {
-                        @Override
-                        protected void runMayThrow() throws Exception
-                        {
-                            // check to make sure the current version is before this one.
-                            if (DatabaseDescriptor.getDefsVersion().timestamp() == version.timestamp())
-                                logger.debug("Not appling (equal) " + version.toString());
-                            else if (DatabaseDescriptor.getDefsVersion().timestamp() > version.timestamp())
-                                logger.debug("Not applying (before)" + version.toString());
-                            else
-                            {
-                                logger.debug("Applying {} from {}", m.getClass().getSimpleName(), message.getFrom());
-                                try
-                                {
-                                    m.apply();
-                                    // update gossip, but don't contact nodes directly
-                                    m.passiveAnnounce();
-                                }
-                                catch (ConfigurationException ex)
-                                {
-                                    // Trying to apply the same migration twice. This happens as a result of gossip.
-                                    logger.debug("Migration not applied " + ex.getMessage());
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        }
-        catch (IOException ex)
-        {
-            throw new IOError(ex);
-        }
+        ColumnFamily cf = ColumnFamily.create(TABLENAME, CFNAME);
+        cf.delete(ldt, mfda);
+        for (IColumn col : cols)
+            cf.addColumn(col);
+        return cf;
     }
+
+    public static File tempSSTableFile(String tablename, String cfname) throws IOException
+    {
+        File tempdir = File.createTempFile(tablename, cfname);
+        if(!tempdir.delete() || !tempdir.mkdir())
+            throw new IOException("Temporary directory creation failed.");
+        tempdir.deleteOnExit();
+        File tabledir = new File(tempdir, tablename);
+        tabledir.mkdir();
+        tabledir.deleteOnExit();
+        File datafile = new File(new Descriptor(tabledir, tablename, cfname, 0, false).filenameFor("Data.db"));
+        if (!datafile.createNewFile())
+            throw new IOException("unable to create file " + datafile);
+        datafile.deleteOnExit();
+        return datafile;
+    }
+
+    public static SSTableReader writeSSTable(Set<String> keys) throws IOException
+    {
+        Map<String, ColumnFamily> map = new HashMap<String, ColumnFamily>();
+        for (String key : keys)
+        {
+            ColumnFamily cf = ColumnFamily.create(TABLENAME, CFNAME);
+            cf.addColumn(new Column(key.getBytes(), key.getBytes(), new TimestampClock(0)));
+            map.put(key, cf);
+        }
+        return writeSSTable(map);
+    }
+
+    public static SSTableReader writeSSTable(Map<String, ColumnFamily> entries) throws IOException
+    {
+        Map<byte[], byte[]> map = new HashMap<byte[], byte[]>();
+        for (Map.Entry<String, ColumnFamily> entry : entries.entrySet())
+        {
+            DataOutputBuffer buffer = new DataOutputBuffer();
+            ColumnFamily.serializer().serializeWithIndexes(entry.getValue(), buffer);
+            map.put(entry.getKey().getBytes(), Arrays.copyOf(buffer.getData(), buffer.getLength()));
+        }
+        return writeRawSSTable(TABLENAME, CFNAME, map);
+    }
+
+    public static SSTableReader writeRawSSTable(String tablename, String cfname, Map<byte[], byte[]> entries) throws IOException
+    {
+        File datafile = tempSSTableFile(tablename, cfname);
+        SSTableWriter writer = new SSTableWriter(datafile.getAbsolutePath(), entries.size(), StorageService.getPartitioner());
+        SortedMap<DecoratedKey, byte[]> sortedEntries = new TreeMap<DecoratedKey, byte[]>();
+        for (Map.Entry<byte[], byte[]> entry : entries.entrySet())
+            sortedEntries.put(writer.partitioner.decorateKey(entry.getKey()), entry.getValue());
+        for (Map.Entry<DecoratedKey, byte[]> entry : sortedEntries.entrySet())
+            writer.append(entry.getKey(), entry.getValue());
+        new File(writer.indexFilename()).deleteOnExit();
+        new File(writer.filterFilename()).deleteOnExit();
+        return writer.closeAndOpenReader();
+    }
+
 }

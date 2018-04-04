@@ -1,8 +1,28 @@
-throw new IllegalStateException("field \"" + term.field() + "\" was indexed without position data; cannot run SpanTermQuery (term=" + term.text() + ")");
+samplingParams.setSamplingThreshold(11000); //force sampling
 
-package org.apache.lucene.search.spans;
+package org.apache.lucene.facet.search.sampling;
 
-/**
+import java.util.List;
+import java.util.Random;
+
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TermQuery;
+
+import org.apache.lucene.search.MultiCollector;
+import org.apache.lucene.facet.search.BaseTestTopK;
+import org.apache.lucene.facet.search.FacetsAccumulator;
+import org.apache.lucene.facet.search.FacetsCollector;
+import org.apache.lucene.facet.search.ScoredDocIDs;
+import org.apache.lucene.facet.search.ScoredDocIdCollector;
+import org.apache.lucene.facet.search.params.FacetRequest;
+import org.apache.lucene.facet.search.params.FacetRequest.ResultMode;
+import org.apache.lucene.facet.search.params.FacetSearchParams;
+import org.apache.lucene.facet.search.results.FacetResult;
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,86 +39,119 @@ package org.apache.lucene.search.spans;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexReader.AtomicReaderContext;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.util.ToStringUtils;
-
-import java.io.IOException;
-import java.util.Set;
-
-/** Matches spans containing a term. */
-public class SpanTermQuery extends SpanQuery {
-  protected Term term;
-
-  /** Construct a SpanTermQuery matching the named term's spans. */
-  public SpanTermQuery(Term term) { this.term = term; }
-
-  /** Return the term whose spans are matched. */
-  public Term getTerm() { return term; }
-
-  @Override
-  public String getField() { return term.field(); }
+public abstract class BaseSampleTestTopK extends BaseTestTopK {
+  
+  /** Number of top results */
+  protected static final int K = 2; 
+  
+  /** since there is a chance that this test would fail even if the code is correct, retry the sampling */
+  protected static final int RETRIES = 10;
   
   @Override
-  public void extractTerms(Set<Term> terms) {
-    terms.add(term);
-  }
-
-  @Override
-  public String toString(String field) {
-    StringBuilder buffer = new StringBuilder();
-    if (term.field().equals(field))
-      buffer.append(term.text());
-    else
-      buffer.append(term.toString());
-    buffer.append(ToStringUtils.boost(getBoost()));
-    return buffer.toString();
-  }
-
-  @Override
-  public int hashCode() {
-    final int prime = 31;
-    int result = super.hashCode();
-    result = prime * result + ((term == null) ? 0 : term.hashCode());
-    return result;
-  }
-
-  @Override
-  public boolean equals(Object obj) {
-    if (this == obj)
-      return true;
-    if (!super.equals(obj))
-      return false;
-    if (getClass() != obj.getClass())
-      return false;
-    SpanTermQuery other = (SpanTermQuery) obj;
-    if (term == null) {
-      if (other.term != null)
-        return false;
-    } else if (!term.equals(other.term))
-      return false;
-    return true;
-  }
-
-  @Override
-  public Spans getSpans(final AtomicReaderContext context) throws IOException {
-    final IndexReader reader = context.reader;
-    final DocsAndPositionsEnum postings = reader.termPositionsEnum(reader.getLiveDocs(),
-                                                                   term.field(),
-                                                                   term.bytes());
-
-    if (postings != null) {
-      return new TermSpans(postings, term);
-    } else {
-      if (reader.termDocsEnum(reader.getLiveDocs(), term.field(), term.bytes()) != null) {
-        // term does exist, but has no positions
-        throw new IllegalStateException("field \"" + term.field() + "\" was indexed with Field.omitTermFreqAndPositions=true; cannot run SpanTermQuery (term=" + term.text() + ")");
+  protected FacetSearchParams searchParamsWithRequests(int numResults, int partitionSize) {
+    FacetSearchParams res = super.searchParamsWithRequests(numResults, partitionSize);
+    for (FacetRequest req : res.getFacetRequests()) {
+      // randomize the way we aggregate results
+      if (random().nextBoolean()) {
+        req.setResultMode(ResultMode.GLOBAL_FLAT);
       } else {
-        // term does not exist
-        return TermSpans.EMPTY_TERM_SPANS;
+        req.setResultMode(ResultMode.PER_NODE_IN_TREE);
       }
     }
+    return res;
+  }
+  
+  protected abstract FacetsAccumulator getSamplingAccumulator(Sampler sampler,
+      TaxonomyReader taxoReader, IndexReader indexReader,
+      FacetSearchParams searchParams);
+  
+  /**
+   * Try out faceted search with sampling enabled and complements either disabled or enforced
+   * Lots of randomly generated data is being indexed, and later on a "90% docs" faceted search
+   * is performed. The results are compared to non-sampled ones.
+   */
+  public void testCountUsingSampling() throws Exception {
+    boolean useRandomSampler = random().nextBoolean();
+    for (int partitionSize : partitionSizes) {
+      try {
+        initIndex(partitionSize);
+        // Get all of the documents and run the query, then do different
+        // facet counts and compare to control
+        Query q = new TermQuery(new Term(CONTENT_FIELD, BETA)); // 90% of the docs
+        ScoredDocIdCollector docCollector = ScoredDocIdCollector.create(indexReader.maxDoc(), false);
+        
+        FacetSearchParams expectedSearchParams = searchParamsWithRequests(K, partitionSize); 
+        FacetsCollector fc = new FacetsCollector(expectedSearchParams, indexReader, taxoReader);
+        
+        searcher.search(q, MultiCollector.wrap(docCollector, fc));
+        
+        List<FacetResult> expectedResults = fc.getFacetResults();
+        
+        FacetSearchParams samplingSearchParams = searchParamsWithRequests(K, partitionSize); 
+        
+        // try several times in case of failure, because the test has a chance to fail 
+        // if the top K facets are not sufficiently common with the sample set
+        for (int nTrial=0; nTrial<RETRIES; nTrial++) {
+          try {
+            // complement with sampling!
+            final Sampler sampler = createSampler(nTrial, docCollector.getScoredDocIDs(), useRandomSampler);
+            
+            assertSampling(expectedResults, q, sampler, samplingSearchParams, false);
+            assertSampling(expectedResults, q, sampler, samplingSearchParams, true);
+            
+            break; // succeeded
+          } catch (NotSameResultError e) {
+            if (nTrial>=RETRIES-1) {
+              throw e; // no more retries allowed, must fail
+            }
+          }
+        }
+      } finally { 
+        closeAll();
+      }
+    }
+  }
+  
+  private void assertSampling(List<FacetResult> expected, Query q, Sampler sampler, FacetSearchParams params, boolean complement) throws Exception {
+    FacetsCollector samplingFC = samplingCollector(complement, sampler, params);
+    
+    searcher.search(q, samplingFC);
+    List<FacetResult> sampledResults = samplingFC.getFacetResults();
+    
+    assertSameResults(expected, sampledResults);
+  }
+  
+  private FacetsCollector samplingCollector(
+      final boolean complement,
+      final Sampler sampler,
+      FacetSearchParams samplingSearchParams) {
+    FacetsCollector samplingFC = new FacetsCollector(samplingSearchParams, indexReader, taxoReader) {
+      @Override
+      protected FacetsAccumulator initFacetsAccumulator(
+          FacetSearchParams facetSearchParams, IndexReader indexReader,
+          TaxonomyReader taxonomyReader) {
+        FacetsAccumulator acc = getSamplingAccumulator(sampler, taxonomyReader, indexReader, facetSearchParams);
+        acc.setComplementThreshold(complement ? FacetsAccumulator.FORCE_COMPLEMENT : FacetsAccumulator.DISABLE_COMPLEMENT);
+        return acc;
+      }
+    };
+    return samplingFC;
+  }
+  
+  private Sampler createSampler(int nTrial, ScoredDocIDs scoredDocIDs, boolean useRandomSampler) {
+    SamplingParams samplingParams = new SamplingParams();
+    
+    final double retryFactor = Math.pow(1.01, nTrial);
+    samplingParams.setSampleRatio(0.8 * retryFactor);
+    samplingParams.setMinSampleSize((int) (100 * retryFactor));
+    samplingParams.setMaxSampleSize((int) (10000 * retryFactor));
+    samplingParams.setOversampleFactor(5.0 * retryFactor);
+
+    samplingParams.setSampingThreshold(11000); //force sampling 
+    Sampler sampler = useRandomSampler ? 
+        new RandomSampler(samplingParams, new Random(random().nextLong())) :
+          new RepeatableSampler(samplingParams);
+    assertTrue("must enable sampling for this test!",sampler.shouldSample(scoredDocIDs));
+    return sampler;
   }
 }

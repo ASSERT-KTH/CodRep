@@ -1,8 +1,8 @@
-private IndexReader doReopen(boolean doClone) throws CorruptIndexException, IOException {
+IndexInput in = readState.directory.openInput(idFileName, readState.context);
 
-package org.apache.lucene.index;
+package org.apache.lucene.codecs.ramonly;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,664 +19,561 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.FieldSelector;
-import org.apache.lucene.document.FieldSelectorResult;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.util.MapBackedSet;
-
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsConsumer;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.codecs.TermsConsumer;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IOUtils;
 
-/** An IndexReader which reads multiple, parallel indexes.  Each index added
- * must have the same number of documents, but typically each contains
- * different fields.  Each document contains the union of the fields of all
- * documents with the same document number.  When searching, matches for a
- * query term are from the first index added that has the field.
+/** Stores all postings data in RAM, but writes a small
+ *  token (header + single int) to identify which "slot" the
+ *  index is using in RAM HashMap.
  *
- * <p>This is useful, e.g., with collections that have large fields which
- * change rarely and small fields that change more frequently.  The smaller
- * fields may be re-indexed in a new index and both indexes may be searched
- * together.
- *
- * <p><strong>Warning:</strong> It is up to you to make sure all indexes
- * are created and modified the same way. For example, if you add
- * documents to one index, you need to add the same documents in the
- * same order to the other indexes. <em>Failure to do so will result in
- * undefined behavior</em>.
- */
-public class ParallelReader extends IndexReader {
-  private List<IndexReader> readers = new ArrayList<IndexReader>();
-  private List<Boolean> decrefOnClose = new ArrayList<Boolean>(); // remember which subreaders to decRef on close
-  boolean incRefReaders = false;
-  private SortedMap<String,IndexReader> fieldToReader = new TreeMap<String,IndexReader>();
-  private Map<IndexReader,Collection<String>> readerToFields = new HashMap<IndexReader,Collection<String>>();
-  private List<IndexReader> storedFieldReaders = new ArrayList<IndexReader>();
+ *  NOTE: this codec sorts terms by reverse-unicode-order! */
 
-  private int maxDoc;
-  private int numDocs;
-  private boolean hasDeletions;
+public final class RAMOnlyPostingsFormat extends PostingsFormat {
 
- /** Construct a ParallelReader. 
-  * <p>Note that all subreaders are closed if this ParallelReader is closed.</p>
-  */
-  public ParallelReader() throws IOException { this(true); }
-   
- /** Construct a ParallelReader. 
-  * @param closeSubReaders indicates whether the subreaders should be closed
-  * when this ParallelReader is closed
-  */
-  public ParallelReader(boolean closeSubReaders) throws IOException {
-    super();
-    this.incRefReaders = !closeSubReaders;
-    readerFinishedListeners = new MapBackedSet<ReaderFinishedListener>(new ConcurrentHashMap<ReaderFinishedListener,Boolean>());
-  }
-
-  /** {@inheritDoc} */
-  @Override
-  public String toString() {
-    final StringBuilder buffer = new StringBuilder("ParallelReader(");
-    final Iterator<IndexReader> iter = readers.iterator();
-    if (iter.hasNext()) {
-      buffer.append(iter.next());
-    }
-    while (iter.hasNext()) {
-      buffer.append(", ").append(iter.next());
-    }
-    buffer.append(')');
-    return buffer.toString();
-  }
-
- /** Add an IndexReader.
-  * @throws IOException if there is a low-level IO error
-  */
-  public void add(IndexReader reader) throws IOException {
-    ensureOpen();
-    add(reader, false);
-  }
-
- /** Add an IndexReader whose stored fields will not be returned.  This can
-  * accelerate search when stored fields are only needed from a subset of
-  * the IndexReaders.
-  *
-  * @throws IllegalArgumentException if not all indexes contain the same number
-  *     of documents
-  * @throws IllegalArgumentException if not all indexes have the same value
-  *     of {@link IndexReader#maxDoc()}
-  * @throws IOException if there is a low-level IO error
-  */
-  public void add(IndexReader reader, boolean ignoreStoredFields)
-    throws IOException {
-
-    ensureOpen();
-    if (readers.size() == 0) {
-      this.maxDoc = reader.maxDoc();
-      this.numDocs = reader.numDocs();
-      this.hasDeletions = reader.hasDeletions();
-    }
-
-    if (reader.maxDoc() != maxDoc)                // check compatibility
-      throw new IllegalArgumentException
-        ("All readers must have same maxDoc: "+maxDoc+"!="+reader.maxDoc());
-    if (reader.numDocs() != numDocs)
-      throw new IllegalArgumentException
-        ("All readers must have same numDocs: "+numDocs+"!="+reader.numDocs());
-
-    Collection<String> fields = reader.getFieldNames(IndexReader.FieldOption.ALL);
-    readerToFields.put(reader, fields);
-    for (final String field : fields) {                         // update fieldToReader map
-      if (fieldToReader.get(field) == null)
-        fieldToReader.put(field, reader);
-    }
-
-    if (!ignoreStoredFields)
-      storedFieldReaders.add(reader);             // add to storedFieldReaders
-    readers.add(reader);
-    
-    if (incRefReaders) {
-      reader.incRef();
-    }
-    decrefOnClose.add(Boolean.valueOf(incRefReaders));
-  }
-  
-  @Override
-  public synchronized Object clone() {
-    // doReopen calls ensureOpen
-    try {
-      return doReopen(true);
-    } catch (Exception ex) {
-      throw new RuntimeException(ex);
-    }
-  }
-  
-  /**
-   * Tries to reopen the subreaders.
-   * <br>
-   * If one or more subreaders could be re-opened (i. e. subReader.reopen() 
-   * returned a new instance != subReader), then a new ParallelReader instance 
-   * is returned, otherwise null is returned.
-   * <p>
-   * A re-opened instance might share one or more subreaders with the old 
-   * instance. Index modification operations result in undefined behavior
-   * when performed before the old instance is closed.
-   * (see {@link IndexReader#openIfChanged}).
-   * <p>
-   * If subreaders are shared, then the reference count of those
-   * readers is increased to ensure that the subreaders remain open
-   * until the last referring reader is closed.
-   * 
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error 
-   */
-  @Override
-  protected synchronized IndexReader doOpenIfChanged() throws CorruptIndexException, IOException {
-    // doReopen calls ensureOpen
-    return doReopen(false);
-  }
-    
-  protected IndexReader doReopen(boolean doClone) throws CorruptIndexException, IOException {
-    ensureOpen();
-    
-    boolean reopened = false;
-    List<IndexReader> newReaders = new ArrayList<IndexReader>();
-    
-    boolean success = false;
-    
-    try {
-      for (final IndexReader oldReader : readers) {
-        IndexReader newReader = null;
-        if (doClone) {
-          newReader = (IndexReader) oldReader.clone();
-          reopened = true;
+  // For fun, test that we can override how terms are
+  // sorted, and basic things still work -- this comparator
+  // sorts in reversed unicode code point order:
+  private static final Comparator<BytesRef> reverseUnicodeComparator = new Comparator<BytesRef>() {
+      @Override
+      public int compare(BytesRef t1, BytesRef t2) {
+        byte[] b1 = t1.bytes;
+        byte[] b2 = t2.bytes;
+        int b1Stop;
+        int b1Upto = t1.offset;
+        int b2Upto = t2.offset;
+        if (t1.length < t2.length) {
+          b1Stop = t1.offset + t1.length;
         } else {
-          newReader = IndexReader.openIfChanged(oldReader);
-          if (newReader != null) {
-            reopened = true;
-          } else {
-            newReader = oldReader;
+          b1Stop = t1.offset + t2.length;
+        }
+        while(b1Upto < b1Stop) {
+          final int bb1 = b1[b1Upto++] & 0xff;
+          final int bb2 = b2[b2Upto++] & 0xff;
+          if (bb1 != bb2) {
+            //System.out.println("cmp 1=" + t1 + " 2=" + t2 + " return " + (bb2-bb1));
+            return bb2 - bb1;
           }
         }
-        newReaders.add(newReader);
+
+        // One is prefix of another, or they are equal
+        return t2.length-t1.length;
       }
-      success = true;
-    } finally {
-      if (!success && reopened) {
-        for (int i = 0; i < newReaders.size(); i++) {
-          IndexReader r = newReaders.get(i);
-          if (r != readers.get(i)) {
-            try {
-              r.close();
-            } catch (IOException ignore) {
-              // keep going - we want to clean up as much as possible
-            }
-          }
-        }
+
+      @Override
+      public boolean equals(Object other) {
+        return this == other;
       }
+    };
+
+  public RAMOnlyPostingsFormat() {
+    super("RAMOnly");
+  }
+    
+  // Postings state:
+  static class RAMPostings extends FieldsProducer {
+    final Map<String,RAMField> fieldToTerms = new TreeMap<String,RAMField>();
+
+    @Override
+    public Terms terms(String field) {
+      return fieldToTerms.get(field);
     }
 
-    if (reopened) {
-      List<Boolean> newDecrefOnClose = new ArrayList<Boolean>();
-      ParallelReader pr = new ParallelReader();
-      for (int i = 0; i < readers.size(); i++) {
-        IndexReader oldReader = readers.get(i);
-        IndexReader newReader = newReaders.get(i);
-        if (newReader == oldReader) {
-          newDecrefOnClose.add(Boolean.TRUE);
-          newReader.incRef();
+    @Override
+    public int size() {
+      return fieldToTerms.size();
+    }
+
+    @Override
+    public Iterator<String> iterator() {
+      return Collections.unmodifiableSet(fieldToTerms.keySet()).iterator();
+    }
+
+    @Override
+    public void close() {
+    }
+  } 
+
+  static class RAMField extends Terms {
+    final String field;
+    final SortedMap<String,RAMTerm> termToDocs = new TreeMap<String,RAMTerm>();
+    long sumTotalTermFreq;
+    long sumDocFreq;
+    int docCount;
+    final FieldInfo info;
+
+    RAMField(String field, FieldInfo info) {
+      this.field = field;
+      this.info = info;
+    }
+
+    @Override
+    public long size() {
+      return termToDocs.size();
+    }
+
+    @Override
+    public long getSumTotalTermFreq() {
+      return sumTotalTermFreq;
+    }
+      
+    @Override
+    public long getSumDocFreq() throws IOException {
+      return sumDocFreq;
+    }
+      
+    @Override
+    public int getDocCount() throws IOException {
+      return docCount;
+    }
+
+    @Override
+    public TermsEnum iterator(TermsEnum reuse) {
+      return new RAMTermsEnum(RAMOnlyPostingsFormat.RAMField.this);
+    }
+
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return reverseUnicodeComparator;
+    }
+
+    @Override
+    public boolean hasOffsets() {
+      return info.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+    }
+
+    @Override
+    public boolean hasPositions() {
+      return info.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+    }
+    
+    @Override
+    public boolean hasPayloads() {
+      return info.hasPayloads();
+    }
+  }
+
+  static class RAMTerm {
+    final String term;
+    long totalTermFreq;
+    final List<RAMDoc> docs = new ArrayList<RAMDoc>();
+    public RAMTerm(String term) {
+      this.term = term;
+    }
+  }
+
+  static class RAMDoc {
+    final int docID;
+    final int[] positions;
+    byte[][] payloads;
+
+    public RAMDoc(int docID, int freq) {
+      this.docID = docID;
+      positions = new int[freq];
+    }
+  }
+
+  // Classes for writing to the postings state
+  private static class RAMFieldsConsumer extends FieldsConsumer {
+
+    private final RAMPostings postings;
+    private final RAMTermsConsumer termsConsumer = new RAMTermsConsumer();
+
+    public RAMFieldsConsumer(RAMPostings postings) {
+      this.postings = postings;
+    }
+
+    @Override
+    public TermsConsumer addField(FieldInfo field) {
+      if (field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
+        throw new UnsupportedOperationException("this codec cannot index offsets");
+      }
+      RAMField ramField = new RAMField(field.name, field);
+      postings.fieldToTerms.put(field.name, ramField);
+      termsConsumer.reset(ramField);
+      return termsConsumer;
+    }
+
+    @Override
+    public void close() {
+      // TODO: finalize stuff
+    }
+  }
+
+  private static class RAMTermsConsumer extends TermsConsumer {
+    private RAMField field;
+    private final RAMPostingsWriterImpl postingsWriter = new RAMPostingsWriterImpl();
+    RAMTerm current;
+      
+    void reset(RAMField field) {
+      this.field = field;
+    }
+      
+    @Override
+    public PostingsConsumer startTerm(BytesRef text) {
+      final String term = text.utf8ToString();
+      current = new RAMTerm(term);
+      postingsWriter.reset(current);
+      return postingsWriter;
+    }
+
+      
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+
+    @Override
+    public void finishTerm(BytesRef text, TermStats stats) {
+      assert stats.docFreq > 0;
+      assert stats.docFreq == current.docs.size();
+      current.totalTermFreq = stats.totalTermFreq;
+      field.termToDocs.put(current.term, current);
+    }
+
+    @Override
+    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) {
+      field.sumTotalTermFreq = sumTotalTermFreq;
+      field.sumDocFreq = sumDocFreq;
+      field.docCount = docCount;
+    }
+  }
+
+  static class RAMPostingsWriterImpl extends PostingsConsumer {
+    private RAMTerm term;
+    private RAMDoc current;
+    private int posUpto = 0;
+
+    public void reset(RAMTerm term) {
+      this.term = term;
+    }
+
+    @Override
+    public void startDoc(int docID, int freq) {
+      current = new RAMDoc(docID, freq);
+      term.docs.add(current);
+      posUpto = 0;
+    }
+
+    @Override
+    public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) {
+      assert startOffset == -1;
+      assert endOffset == -1;
+      current.positions[posUpto] = position;
+      if (payload != null && payload.length > 0) {
+        if (current.payloads == null) {
+          current.payloads = new byte[current.positions.length][];
+        }
+        byte[] bytes = current.payloads[posUpto] = new byte[payload.length];
+        System.arraycopy(payload.bytes, payload.offset, bytes, 0, payload.length);
+      }
+      posUpto++;
+    }
+
+    @Override
+    public void finishDoc() {
+      assert posUpto == current.positions.length;
+    }
+  }
+
+  static class RAMTermsEnum extends TermsEnum {
+    Iterator<String> it;
+    String current;
+    private final RAMField ramField;
+
+    public RAMTermsEnum(RAMField field) {
+      this.ramField = field;
+    }
+      
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+
+    @Override
+    public BytesRef next() {
+      if (it == null) {
+        if (current == null) {
+          it = ramField.termToDocs.keySet().iterator();
         } else {
-          // this is a new subreader instance, so on close() we don't
-          // decRef but close it 
-          newDecrefOnClose.add(Boolean.FALSE);
-        }
-        pr.add(newReader, !storedFieldReaders.contains(oldReader));
-      }
-      pr.decrefOnClose = newDecrefOnClose;
-      pr.incRefReaders = incRefReaders;
-      return pr;
-    } else {
-      // No subreader was refreshed
-      return null;
-    }
-  }
-
-
-  @Override
-  public int numDocs() {
-    // Don't call ensureOpen() here (it could affect performance)
-    return numDocs;
-  }
-
-  @Override
-  public int maxDoc() {
-    // Don't call ensureOpen() here (it could affect performance)
-    return maxDoc;
-  }
-
-  @Override
-  public boolean hasDeletions() {
-    ensureOpen();
-    return hasDeletions;
-  }
-
-  // check first reader
-  @Override
-  public boolean isDeleted(int n) {
-    // Don't call ensureOpen() here (it could affect performance)
-    if (readers.size() > 0)
-      return readers.get(0).isDeleted(n);
-    return false;
-  }
-
-  /** {@inheritDoc} */
-  @Deprecated @Override
-  protected void doDelete(int n) throws CorruptIndexException, IOException {
-    for (final IndexReader reader : readers) {
-      reader.deleteDocument(n);
-    }
-    hasDeletions = true;
-  }
-
-  /** {@inheritDoc} */
-  @Deprecated @Override
-  protected void doUndeleteAll() throws CorruptIndexException, IOException {
-    for (final IndexReader reader : readers) {
-      reader.undeleteAll();
-    }
-    hasDeletions = false;
-  }
-
-  // append fields from storedFieldReaders
-  @Override
-  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
-    ensureOpen();
-    Document result = new Document();
-    for (final IndexReader reader: storedFieldReaders) {
-
-      boolean include = (fieldSelector==null);
-      if (!include) {
-        Collection<String> fields = readerToFields.get(reader);
-        for (final String field : fields)
-          if (fieldSelector.accept(field) != FieldSelectorResult.NO_LOAD) {
-            include = true;
-            break;
-          }
-      }
-      if (include) {
-        List<Fieldable> fields = reader.document(n, fieldSelector).getFields();
-        for (Fieldable field : fields) {
-          result.add(field);
+          it = ramField.termToDocs.tailMap(current).keySet().iterator();
         }
       }
-    }
-    return result;
-  }
-
-  // get all vectors
-  @Override
-  public TermFreqVector[] getTermFreqVectors(int n) throws IOException {
-    ensureOpen();
-    ArrayList<TermFreqVector> results = new ArrayList<TermFreqVector>();
-    for (final Map.Entry<String,IndexReader> e: fieldToReader.entrySet()) {
-
-      String field = e.getKey();
-      IndexReader reader = e.getValue();
-      TermFreqVector vector = reader.getTermFreqVector(n, field);
-      if (vector != null)
-        results.add(vector);
-    }
-    return results.toArray(new TermFreqVector[results.size()]);
-  }
-
-  @Override
-  public TermFreqVector getTermFreqVector(int n, String field)
-    throws IOException {
-    ensureOpen();
-    IndexReader reader = fieldToReader.get(field);
-    return reader==null ? null : reader.getTermFreqVector(n, field);
-  }
-
-
-  @Override
-  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
-    ensureOpen();
-    IndexReader reader = fieldToReader.get(field);
-    if (reader != null) {
-      reader.getTermFreqVector(docNumber, field, mapper); 
-    }
-  }
-
-  @Override
-  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
-    ensureOpen();
-
-    for (final Map.Entry<String,IndexReader> e : fieldToReader.entrySet()) {
-
-      String field = e.getKey();
-      IndexReader reader = e.getValue();
-      reader.getTermFreqVector(docNumber, field, mapper);
-    }
-
-  }
-
-  @Override
-  public boolean hasNorms(String field) throws IOException {
-    ensureOpen();
-    IndexReader reader = fieldToReader.get(field);
-    return reader==null ? false : reader.hasNorms(field);
-  }
-
-  @Override
-  public byte[] norms(String field) throws IOException {
-    ensureOpen();
-    IndexReader reader = fieldToReader.get(field);
-    return reader==null ? null : reader.norms(field);
-  }
-
-  @Override
-  public void norms(String field, byte[] result, int offset)
-    throws IOException {
-    ensureOpen();
-    IndexReader reader = fieldToReader.get(field);
-    if (reader!=null)
-      reader.norms(field, result, offset);
-  }
-
-  /** {@inheritDoc} */
-  @Deprecated @Override
-  protected void doSetNorm(int n, String field, byte value)
-    throws CorruptIndexException, IOException {
-    IndexReader reader = fieldToReader.get(field);
-    if (reader!=null)
-      reader.doSetNorm(n, field, value);
-  }
-
-  @Override
-  public TermEnum terms() throws IOException {
-    ensureOpen();
-    return new ParallelTermEnum();
-  }
-
-  @Override
-  public TermEnum terms(Term term) throws IOException {
-    ensureOpen();
-    return new ParallelTermEnum(term);
-  }
-
-  @Override
-  public int docFreq(Term term) throws IOException {
-    ensureOpen();
-    IndexReader reader = fieldToReader.get(term.field());
-    return reader==null ? 0 : reader.docFreq(term);
-  }
-
-  @Override
-  public TermDocs termDocs(Term term) throws IOException {
-    ensureOpen();
-    return new ParallelTermDocs(term);
-  }
-
-  @Override
-  public TermDocs termDocs() throws IOException {
-    ensureOpen();
-    return new ParallelTermDocs();
-  }
-
-  @Override
-  public TermPositions termPositions() throws IOException {
-    ensureOpen();
-    return new ParallelTermPositions();
-  }
-  
-  /**
-   * Checks recursively if all subreaders are up to date. 
-   */
-  @Override
-  public boolean isCurrent() throws CorruptIndexException, IOException {
-    ensureOpen();
-    for (final IndexReader reader : readers) {
-      if (!reader.isCurrent()) {
-        return false;
-      }
-    }
-    
-    // all subreaders are up to date
-    return true;
-  }
-
-  @Deprecated
-  @Override
-  public boolean isOptimized() {
-    ensureOpen();
-    for (final IndexReader reader : readers) {
-      if (!reader.isOptimized()) {
-        return false;
-      }
-    }
-    
-    // all subindexes are optimized
-    return true;
-  }
-
-  /** Not implemented.
-   * @throws UnsupportedOperationException
-   */
-  @Override
-  public long getVersion() {
-    throw new UnsupportedOperationException("ParallelReader does not support this method.");
-  }
-
-  // for testing
-  IndexReader[] getSubReaders() {
-    return readers.toArray(new IndexReader[readers.size()]);
-  }
-
-  /** {@inheritDoc} */
-  @Deprecated @Override
-  protected void doCommit(Map<String,String> commitUserData) throws IOException {
-    for (final IndexReader reader : readers)
-      reader.commit(commitUserData);
-  }
-
-  @Override
-  protected synchronized void doClose() throws IOException {
-    for (int i = 0; i < readers.size(); i++) {
-      if (decrefOnClose.get(i).booleanValue()) {
-        readers.get(i).decRef();
+      if (it.hasNext()) {
+        current = it.next();
+        return new BytesRef(current);
       } else {
-        readers.get(i).close();
-      }
-    }
-  }
-
-  @Override
-  public Collection<String> getFieldNames (IndexReader.FieldOption fieldNames) {
-    ensureOpen();
-    Set<String> fieldSet = new HashSet<String>();
-    for (final IndexReader reader : readers) {
-      Collection<String> names = reader.getFieldNames(fieldNames);
-      fieldSet.addAll(names);
-    }
-    return fieldSet;
-  }
-
-  private class ParallelTermEnum extends TermEnum {
-    private String field;
-    private Iterator<String> fieldIterator;
-    private TermEnum termEnum;
-
-    public ParallelTermEnum() throws IOException {
-      try {
-        field = fieldToReader.firstKey();
-      } catch(NoSuchElementException e) {
-        // No fields, so keep field == null, termEnum == null
-        return;
-      }
-      if (field != null)
-        termEnum = fieldToReader.get(field).terms();
-    }
-
-    public ParallelTermEnum(Term term) throws IOException {
-      field = term.field();
-      IndexReader reader = fieldToReader.get(field);
-      if (reader!=null)
-        termEnum = reader.terms(term);
-    }
-
-    @Override
-    public boolean next() throws IOException {
-      if (termEnum==null)
-        return false;
-
-      // another term in this field?
-      if (termEnum.next() && termEnum.term().field()==field)
-        return true;                              // yes, keep going
-
-      termEnum.close();                           // close old termEnum
-
-      // find the next field with terms, if any
-      if (fieldIterator==null) {
-        fieldIterator = fieldToReader.tailMap(field).keySet().iterator();
-        fieldIterator.next();                     // Skip field to get next one
-      }
-      while (fieldIterator.hasNext()) {
-        field = fieldIterator.next();
-        termEnum = fieldToReader.get(field).terms(new Term(field));
-        Term term = termEnum.term();
-        if (term!=null && term.field()==field)
-          return true;
-        else
-          termEnum.close();
-      }
- 
-      return false;                               // no more fields
-    }
-
-    @Override
-    public Term term() {
-      if (termEnum==null)
         return null;
+      }
+    }
 
-      return termEnum.term();
+    @Override
+    public SeekStatus seekCeil(BytesRef term, boolean useCache) {
+      current = term.utf8ToString();
+      it = null;
+      if (ramField.termToDocs.containsKey(current)) {
+        return SeekStatus.FOUND;
+      } else {
+        if (current.compareTo(ramField.termToDocs.lastKey()) > 0) {
+          return SeekStatus.END;
+        } else {
+          return SeekStatus.NOT_FOUND;
+        }
+      }
+    }
+
+    @Override
+    public void seekExact(long ord) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long ord() {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public BytesRef term() {
+      // TODO: reuse BytesRef
+      return new BytesRef(current);
     }
 
     @Override
     public int docFreq() {
-      if (termEnum==null)
-        return 0;
-
-      return termEnum.docFreq();
+      return ramField.termToDocs.get(current).docs.size();
     }
 
     @Override
-    public void close() throws IOException {
-      if (termEnum!=null)
-        termEnum.close();
+    public long totalTermFreq() {
+      return ramField.termToDocs.get(current).totalTermFreq;
     }
-  }
-
-  // wrap a TermDocs in order to support seek(Term)
-  private class ParallelTermDocs implements TermDocs {
-    protected TermDocs termDocs;
-
-    public ParallelTermDocs() {}
-    public ParallelTermDocs(Term term) throws IOException {
-      if (term == null)
-        termDocs = readers.isEmpty() ? null : readers.get(0).termDocs(null);
-      else
-        seek(term);
-    }
-
-    public int doc() { return termDocs.doc(); }
-    public int freq() { return termDocs.freq(); }
-
-    public void seek(Term term) throws IOException {
-      IndexReader reader = fieldToReader.get(term.field());
-      termDocs = reader!=null ? reader.termDocs(term) : null;
-    }
-
-    public void seek(TermEnum termEnum) throws IOException {
-      seek(termEnum.term());
-    }
-
-    public boolean next() throws IOException {
-      if (termDocs==null)
-        return false;
-
-      return termDocs.next();
-    }
-
-    public int read(final int[] docs, final int[] freqs) throws IOException {
-      if (termDocs==null)
-        return 0;
-
-      return termDocs.read(docs, freqs);
-    }
-
-    public boolean skipTo(int target) throws IOException {
-      if (termDocs==null)
-        return false;
-
-      return termDocs.skipTo(target);
-    }
-
-    public void close() throws IOException {
-      if (termDocs!=null)
-        termDocs.close();
-    }
-
-  }
-
-  private class ParallelTermPositions
-    extends ParallelTermDocs implements TermPositions {
-
-    public ParallelTermPositions() {}
-    public ParallelTermPositions(Term term) throws IOException { seek(term); }
 
     @Override
-    public void seek(Term term) throws IOException {
-      IndexReader reader = fieldToReader.get(term.field());
-      termDocs = reader!=null ? reader.termPositions(term) : null;
+    public DocsEnum docs(Bits liveDocs, DocsEnum reuse, int flags) {
+      return new RAMDocsEnum(ramField.termToDocs.get(current), liveDocs);
     }
 
-    public int nextPosition() throws IOException {
-      // It is an error to call this if there is no next position, e.g. if termDocs==null
-      return ((TermPositions)termDocs).nextPosition();
-    }
-
-    public int getPayloadLength() {
-      return ((TermPositions)termDocs).getPayloadLength();
-    }
-
-    public byte[] getPayload(byte[] data, int offset) throws IOException {
-      return ((TermPositions)termDocs).getPayload(data, offset);
-    }
-
-
-    // TODO: Remove warning after API has been finalized
-    public boolean isPayloadAvailable() {
-      return ((TermPositions) termDocs).isPayloadAvailable();
+    @Override
+    public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, int flags) {
+      return new RAMDocsAndPositionsEnum(ramField.termToDocs.get(current), liveDocs);
     }
   }
 
-  @Override
-  public void addReaderFinishedListener(ReaderFinishedListener listener) {
-    super.addReaderFinishedListener(listener);
-    for (IndexReader reader : readers) {
-      reader.addReaderFinishedListener(listener);
+  private static class RAMDocsEnum extends DocsEnum {
+    private final RAMTerm ramTerm;
+    private final Bits liveDocs;
+    private RAMDoc current;
+    int upto = -1;
+    int posUpto = 0;
+
+    public RAMDocsEnum(RAMTerm ramTerm, Bits liveDocs) {
+      this.ramTerm = ramTerm;
+      this.liveDocs = liveDocs;
+    }
+
+    @Override
+    public int advance(int targetDocID) {
+      do {
+        nextDoc();
+      } while (upto < ramTerm.docs.size() && current.docID < targetDocID);
+      return NO_MORE_DOCS;
+    }
+
+    // TODO: override bulk read, for better perf
+    @Override
+    public int nextDoc() {
+      while(true) {
+        upto++;
+        if (upto < ramTerm.docs.size()) {
+          current = ramTerm.docs.get(upto);
+          if (liveDocs == null || liveDocs.get(current.docID)) {
+            posUpto = 0;
+            return current.docID;
+          }
+        } else {
+          return NO_MORE_DOCS;
+        }
+      }
+    }
+
+    @Override
+    public int freq() throws IOException {
+      return current.positions.length;
+    }
+
+    @Override
+    public int docID() {
+      return current.docID;
     }
   }
 
+  private static class RAMDocsAndPositionsEnum extends DocsAndPositionsEnum {
+    private final RAMTerm ramTerm;
+    private final Bits liveDocs;
+    private RAMDoc current;
+    int upto = -1;
+    int posUpto = 0;
+
+    public RAMDocsAndPositionsEnum(RAMTerm ramTerm, Bits liveDocs) {
+      this.ramTerm = ramTerm;
+      this.liveDocs = liveDocs;
+    }
+
+    @Override
+    public int advance(int targetDocID) {
+      do {
+        nextDoc();
+      } while (upto < ramTerm.docs.size() && current.docID < targetDocID);
+      return NO_MORE_DOCS;
+    }
+
+    // TODO: override bulk read, for better perf
+    @Override
+    public int nextDoc() {
+      while(true) {
+        upto++;
+        if (upto < ramTerm.docs.size()) {
+          current = ramTerm.docs.get(upto);
+          if (liveDocs == null || liveDocs.get(current.docID)) {
+            posUpto = 0;
+            return current.docID;
+          }
+        } else {
+          return NO_MORE_DOCS;
+        }
+      }
+    }
+
+    @Override
+    public int freq() throws IOException {
+      return current.positions.length;
+    }
+
+    @Override
+    public int docID() {
+      return current.docID;
+    }
+
+    @Override
+    public int nextPosition() {
+      return current.positions[posUpto++];
+    }
+
+    @Override
+    public int startOffset() {
+      return -1;
+    }
+
+    @Override
+    public int endOffset() {
+      return -1;
+    }
+
+    @Override
+    public BytesRef getPayload() {
+      if (current.payloads != null && current.payloads[posUpto-1] != null) {
+        return new BytesRef(current.payloads[posUpto-1]);
+      } else {
+        return null;
+      }
+    }
+  }
+
+  // Holds all indexes created, keyed by the ID assigned in fieldsConsumer
+  private final Map<Integer,RAMPostings> state = new HashMap<Integer,RAMPostings>();
+
+  private final AtomicInteger nextID = new AtomicInteger();
+
+  private final String RAM_ONLY_NAME = "RAMOnly";
+  private final static int VERSION_START = 0;
+  private final static int VERSION_LATEST = VERSION_START;
+
+  private static final String ID_EXTENSION = "id";
+
   @Override
-  public void removeReaderFinishedListener(ReaderFinishedListener listener) {
-    super.removeReaderFinishedListener(listener);
-    for (IndexReader reader : readers) {
-      reader.removeReaderFinishedListener(listener);
+  public FieldsConsumer fieldsConsumer(SegmentWriteState writeState) throws IOException {
+    final int id = nextID.getAndIncrement();
+
+    // TODO -- ok to do this up front instead of
+    // on close....?  should be ok?
+    // Write our ID:
+    final String idFileName = IndexFileNames.segmentFileName(writeState.segmentInfo.name, writeState.segmentSuffix, ID_EXTENSION);
+    IndexOutput out = writeState.directory.createOutput(idFileName, writeState.context);
+    boolean success = false;
+    try {
+      CodecUtil.writeHeader(out, RAM_ONLY_NAME, VERSION_LATEST);
+      out.writeVInt(id);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(out);
+      } else {
+        IOUtils.close(out);
+      }
+    }
+    
+    final RAMPostings postings = new RAMPostings();
+    final RAMFieldsConsumer consumer = new RAMFieldsConsumer(postings);
+
+    synchronized(state) {
+      state.put(id, postings);
+    }
+    return consumer;
+  }
+
+  @Override
+  public FieldsProducer fieldsProducer(SegmentReadState readState)
+    throws IOException {
+
+    // Load our ID:
+    final String idFileName = IndexFileNames.segmentFileName(readState.segmentInfo.name, readState.segmentSuffix, ID_EXTENSION);
+    IndexInput in = readState.dir.openInput(idFileName, readState.context);
+    boolean success = false;
+    final int id;
+    try {
+      CodecUtil.checkHeader(in, RAM_ONLY_NAME, VERSION_START, VERSION_LATEST);
+      id = in.readVInt();
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(in);
+      } else {
+        IOUtils.close(in);
+      }
+    }
+    
+    synchronized(state) {
+      return state.get(id);
     }
   }
 }
-
-
-
-

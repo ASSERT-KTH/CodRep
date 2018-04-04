@@ -1,14 +1,13 @@
-DocsEnum de = te.docs(null, null);
+in.reset(0);
 
-package org.apache.lucene.codecs.appending;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,152 +18,188 @@ package org.apache.lucene.codecs.appending;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.Random;
+package org.apache.cassandra.streaming;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.codecs.appending.AppendingCodec;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum.SeekStatus;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.index.TieredMergePolicy;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.store.RAMDirectory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.Version;
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.util.Collections;
 
-public class TestAppendingCodec extends LuceneTestCase {
-  
-    private static class AppendingIndexOutputWrapper extends IndexOutput {
-    IndexOutput wrapped;
-    
-    public AppendingIndexOutputWrapper(IndexOutput wrapped) {
-      this.wrapped = wrapped;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.compaction.AbstractCompactedRow;
+import org.apache.cassandra.db.compaction.CompactionController;
+import org.apache.cassandra.db.compaction.PrecompactedRow;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.BytesReadTracker;
+import org.apache.cassandra.utils.Pair;
+
+public class IncomingStreamReader
+{
+    private static final Logger logger = LoggerFactory.getLogger(IncomingStreamReader.class);
+
+    protected final PendingFile localFile;
+    protected final PendingFile remoteFile;
+    protected final StreamInSession session;
+    private final Socket socket;
+
+    public IncomingStreamReader(StreamHeader header, Socket socket) throws IOException
+    {
+        this.socket = socket;
+        InetSocketAddress remoteAddress = (InetSocketAddress)socket.getRemoteSocketAddress();
+        session = StreamInSession.get(remoteAddress.getAddress(), header.sessionId);
+        session.addFiles(header.pendingFiles);
+        // set the current file we are streaming so progress shows up in jmx
+        session.setCurrentFile(header.file);
+        session.setTable(header.table);
+        // pendingFile gets the new context for the local node.
+        remoteFile = header.file;
+        localFile = remoteFile != null ? StreamIn.getContextMapping(remoteFile) : null;
     }
 
-    @Override
-    public void close() throws IOException {
-      wrapped.close();
+    public void read() throws IOException
+    {
+        if (remoteFile != null)
+        {
+            if (logger.isDebugEnabled())
+            {
+                logger.debug("Receiving stream");
+                logger.debug("Creating file for {} with {} estimated keys",
+                             localFile.getFilename(),
+                             remoteFile.estimatedKeys);
+            }
+
+            assert remoteFile.estimatedKeys > 0;
+            SSTableReader reader = null;
+            logger.debug("Estimated keys {}", remoteFile.estimatedKeys);
+            DataInputStream dis = new DataInputStream(socket.getInputStream());
+            try
+            {
+                reader = streamIn(dis, localFile, remoteFile);
+            }
+            catch (IOException ex)
+            {
+                retry();
+                throw ex;
+            }
+            finally
+            {
+                dis.close();
+            }
+
+            session.finished(remoteFile, reader);
+        }
+
+        session.closeIfFinished();
     }
 
-    @Override
-    public void flush() throws IOException {
-      wrapped.flush();
+    private SSTableReader streamIn(DataInput input, PendingFile localFile, PendingFile remoteFile) throws IOException
+    {
+        ColumnFamilyStore cfs = Table.open(localFile.desc.ksname).getColumnFamilyStore(localFile.desc.cfname);
+        DecoratedKey key;
+        SSTableWriter writer = new SSTableWriter(localFile.getFilename(), remoteFile.estimatedKeys);
+        CompactionController controller = null;
+
+        try
+        {
+            BytesReadTracker in = new BytesReadTracker(input);
+
+            for (Pair<Long, Long> section : localFile.sections)
+            {
+                long length = section.right - section.left;
+                long bytesRead = 0;
+                while (bytesRead < length)
+                {
+                    in.reset();
+                    key = SSTableReader.decodeKey(StorageService.getPartitioner(), localFile.desc, ByteBufferUtil.readWithShortLength(in));
+                    long dataSize = SSTableReader.readRowSize(in, localFile.desc);
+                    ColumnFamily cf = null;
+                    if (cfs.metadata.getDefaultValidator().isCommutative())
+                    {
+                        // take care of counter column family
+                        if (controller == null)
+                            controller = new CompactionController(cfs, Collections.<SSTableReader>emptyList(), Integer.MAX_VALUE, true);
+                        SSTableIdentityIterator iter = new SSTableIdentityIterator(cfs.metadata, in, key, 0, dataSize, true);
+                        AbstractCompactedRow row = controller.getCompactedRow(iter);
+                        writer.append(row);
+                        // row append does not update the max timestamp on its own
+                        writer.updateMaxTimestamp(row.maxTimestamp());
+
+                        if (row instanceof PrecompactedRow)
+                        {
+                            // we do not purge so we should not get a null here
+                            cf = ((PrecompactedRow)row).getFullColumnFamily();
+                        }
+                    }
+                    else
+                    {
+                        // skip BloomFilter
+                        IndexHelper.skipBloomFilter(in);
+                        // skip Index
+                        IndexHelper.skipIndex(in);
+
+                        // restore ColumnFamily
+                        cf = ColumnFamily.create(cfs.metadata);
+                        ColumnFamily.serializer().deserializeFromSSTableNoColumns(cf, in);
+                        ColumnFamily.serializer().deserializeColumns(in, cf, true, true);
+
+                        // write key and cf
+                        writer.append(key, cf);
+                    }
+
+                    // update cache
+                    ColumnFamily cached = cfs.getRawCachedRow(key);
+                    if (cached != null)
+                    {
+                        switch (remoteFile.type)
+                        {
+                            case AES:
+                                if (dataSize > DatabaseDescriptor.getInMemoryCompactionLimit())
+                                {
+                                    // We have a key in cache for a very big row, that is fishy. We don't fail here however because that would prevent the sstable
+                                    // from being build (and there is no real point anyway), so we just invalidate the row for correction and log a warning.
+                                    logger.warn("Found a cached row over the in memory compaction limit during post-streaming rebuilt; it is highly recommended to avoid huge row on column family with row cache enabled.");
+                                    cfs.invalidateCachedRow(key);
+                                }
+                                else
+                                {
+                                    assert cf != null;
+                                    cfs.updateRowCache(key, cf);
+                                }
+                                break;
+                            default:
+                                cfs.invalidateCachedRow(key);
+                                break;
+                        }
+                    }
+
+                    bytesRead += in.getBytesRead();
+                    remoteFile.progress += in.getBytesRead();
+                }
+            }
+            return writer.closeAndOpenReader();
+        }
+        finally
+        {
+            writer.cleanupIfNecessary();
+        }
     }
 
-    @Override
-    public long getFilePointer() {
-      return wrapped.getFilePointer();
-    }
+    private void retry() throws IOException
+    {
+        /* Ask the source node to re-stream this file. */
+        session.retry(remoteFile);
 
-    @Override
-    public long length() throws IOException {
-      return wrapped.length();
+        /* Delete the orphaned file. */
+        FileUtils.deleteWithConfirm(new File(localFile.getFilename()));
     }
-
-    @Override
-    public void seek(long pos) throws IOException {
-      throw new UnsupportedOperationException("seek() is unsupported");
-    }
-
-    @Override
-    public void writeByte(byte b) throws IOException {
-      wrapped.writeByte(b);
-    }
-
-    @Override
-    public void writeBytes(byte[] b, int offset, int length) throws IOException {
-      wrapped.writeBytes(b, offset, length);
-    }
-    
-  }
-  
-  @SuppressWarnings("serial")
-  private static class AppendingRAMDirectory extends MockDirectoryWrapper {
-
-    public AppendingRAMDirectory(Random random, Directory delegate) {
-      super(random, delegate);
-    }
-
-    @Override
-    public IndexOutput createOutput(String name, IOContext context) throws IOException {
-      return new AppendingIndexOutputWrapper(super.createOutput(name, context));
-    }
-    
-  }
-  
-  private static final String text = "the quick brown fox jumped over the lazy dog";
-
-  public void testCodec() throws Exception {
-    Directory dir = new AppendingRAMDirectory(random(), new RAMDirectory());
-    IndexWriterConfig cfg = new IndexWriterConfig(Version.LUCENE_40, new MockAnalyzer(random()));
-    
-    cfg.setCodec(new AppendingCodec());
-    ((TieredMergePolicy)cfg.getMergePolicy()).setUseCompoundFile(false);
-    IndexWriter writer = new IndexWriter(dir, cfg);
-    Document doc = new Document();
-    FieldType storedTextType = new FieldType(TextField.TYPE_STORED);
-    storedTextType.setStoreTermVectors(true);
-    storedTextType.setStoreTermVectorPositions(true);
-    storedTextType.setStoreTermVectorOffsets(true);
-    doc.add(newField("f", text, storedTextType));
-    writer.addDocument(doc);
-    writer.commit();
-    writer.addDocument(doc);
-    writer.forceMerge(1);
-    writer.close();
-    IndexReader reader = DirectoryReader.open(dir, 1);
-    assertEquals(2, reader.numDocs());
-    Document doc2 = reader.document(0);
-    assertEquals(text, doc2.get("f"));
-    Fields fields = MultiFields.getFields(reader);
-    Terms terms = fields.terms("f");
-    assertNotNull(terms);
-    TermsEnum te = terms.iterator(null);
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("quick")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("brown")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("fox")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("jumped")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("over")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("lazy")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("dog")));
-    assertEquals(SeekStatus.FOUND, te.seekCeil(new BytesRef("the")));
-    DocsEnum de = te.docs(null, null, true);
-    assertTrue(de.advance(0) != DocIdSetIterator.NO_MORE_DOCS);
-    assertEquals(2, de.freq());
-    assertTrue(de.advance(1) != DocIdSetIterator.NO_MORE_DOCS);
-    assertTrue(de.advance(2) == DocIdSetIterator.NO_MORE_DOCS);
-    reader.close();
-  }
-  
-  public void testCompoundFile() throws Exception {
-    Directory dir = new AppendingRAMDirectory(random(), new RAMDirectory());
-    IndexWriterConfig cfg = new IndexWriterConfig(Version.LUCENE_40, new MockAnalyzer(random()));
-    TieredMergePolicy mp = new TieredMergePolicy();
-    mp.setUseCompoundFile(true);
-    mp.setNoCFSRatio(1.0);
-    cfg.setMergePolicy(mp);
-    cfg.setCodec(new AppendingCodec());
-    IndexWriter writer = new IndexWriter(dir, cfg);
-    Document doc = new Document();
-    writer.addDocument(doc);
-    writer.close();
-    assertTrue(dir.fileExists("_0.cfs"));
-    dir.close();
-  }
 }

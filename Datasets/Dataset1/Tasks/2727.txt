@@ -1,13 +1,14 @@
-if (!result.isDigestQuery())
+Query rewritten = new ToParentBlockJoinQuery(origChildQuery,
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.search.join;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,195 +19,478 @@ if (!result.isDigestQuery())
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.ComplexExplanation;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Explanation;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.Weight;
+import org.apache.lucene.search.grouping.TopGroups;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
-import java.io.IOError;
 import java.io.IOException;
-import java.util.*;
-
-import org.apache.cassandra.db.*;
-import java.net.InetAddress;
-import java.nio.ByteBuffer;
-
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.FBUtilities;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Locale;
+import java.util.Set;
 
 /**
- * Turns ReadResponse messages into Row objects, resolving to the most recent
- * version and setting up read repairs as necessary.
+ * This query requires that you index
+ * children and parent docs as a single block, using the
+ * {@link IndexWriter#addDocuments IndexWriter.addDocuments()} or {@link
+ * IndexWriter#updateDocuments IndexWriter.updateDocuments()} API.  In each block, the
+ * child documents must appear first, ending with the parent
+ * document.  At search time you provide a Filter
+ * identifying the parents, however this Filter must provide
+ * an {@link FixedBitSet} per sub-reader.
+ *
+ * <p>Once the block index is built, use this query to wrap
+ * any sub-query matching only child docs and join matches in that
+ * child document space up to the parent document space.
+ * You can then use this Query as a clause with
+ * other queries in the parent document space.</p>
+ *
+ * <p>See {@link ToChildBlockJoinQuery} if you need to join
+ * in the reverse order.
+ *
+ * <p>The child documents must be orthogonal to the parent
+ * documents: the wrapped child query must never
+ * return a parent document.</p>
+ *
+ * If you'd like to retrieve {@link TopGroups} for the
+ * resulting query, use the {@link ToParentBlockJoinCollector}.
+ * Note that this is not necessary, ie, if you simply want
+ * to collect the parent documents and don't need to see
+ * which child documents matched under that parent, then
+ * you can use any collector.
+ *
+ * <p><b>NOTE</b>: If the overall query contains parent-only
+ * matches, for example you OR a parent-only query with a
+ * joined child-only query, then the resulting collected documents
+ * will be correct, however the {@link TopGroups} you get
+ * from {@link ToParentBlockJoinCollector} will not contain every
+ * child for parents that had matched.
+ *
+ * <p>See {@link org.apache.lucene.search.join} for an
+ * overview. </p>
+ *
+ * @lucene.experimental
  */
-public class ReadResponseResolver implements IResponseResolver<Row>
-{
-	private static Logger logger_ = LoggerFactory.getLogger(ReadResponseResolver.class);
-    private final String table;
-    private final Map<Message, ReadResponse> results = new NonBlockingHashMap<Message, ReadResponse>();
+public class ToParentBlockJoinQuery extends Query {
 
-    public ReadResponseResolver(String table)
-    {
-        this.table = table;
+  private final Filter parentsFilter;
+  private final Query childQuery;
+
+  // If we are rewritten, this is the original childQuery we
+  // were passed; we use this for .equals() and
+  // .hashCode().  This makes rewritten query equal the
+  // original, so that user does not have to .rewrite() their
+  // query before searching:
+  private final Query origChildQuery;
+  private final ScoreMode scoreMode;
+
+  /** Create a ToParentBlockJoinQuery.
+   * 
+   * @param childQuery Query matching child documents.
+   * @param parentsFilter Filter (must produce FixedBitSet
+   * per-segment, like {@link FixedBitSetCachingWrapperFilter})
+   * identifying the parent documents.
+   * @param scoreMode How to aggregate multiple child scores
+   * into a single parent score.
+   **/
+  public ToParentBlockJoinQuery(Query childQuery, Filter parentsFilter, ScoreMode scoreMode) {
+    super();
+    this.origChildQuery = childQuery;
+    this.childQuery = childQuery;
+    this.parentsFilter = parentsFilter;
+    this.scoreMode = scoreMode;
+  }
+
+  private ToParentBlockJoinQuery(Query origChildQuery, Query childQuery, Filter parentsFilter, ScoreMode scoreMode) {
+    super();
+    this.origChildQuery = origChildQuery;
+    this.childQuery = childQuery;
+    this.parentsFilter = parentsFilter;
+    this.scoreMode = scoreMode;
+  }
+
+  @Override
+  public Weight createWeight(IndexSearcher searcher) throws IOException {
+    return new BlockJoinWeight(this, childQuery.createWeight(searcher), parentsFilter, scoreMode);
+  }
+
+  private static class BlockJoinWeight extends Weight {
+    private final Query joinQuery;
+    private final Weight childWeight;
+    private final Filter parentsFilter;
+    private final ScoreMode scoreMode;
+
+    public BlockJoinWeight(Query joinQuery, Weight childWeight, Filter parentsFilter, ScoreMode scoreMode) {
+      super();
+      this.joinQuery = joinQuery;
+      this.childWeight = childWeight;
+      this.parentsFilter = parentsFilter;
+      this.scoreMode = scoreMode;
+    }
+
+    @Override
+    public Query getQuery() {
+      return joinQuery;
+    }
+
+    @Override
+    public float getValueForNormalization() throws IOException {
+      return childWeight.getValueForNormalization() * joinQuery.getBoost() * joinQuery.getBoost();
+    }
+
+    @Override
+    public void normalize(float norm, float topLevelBoost) {
+      childWeight.normalize(norm, topLevelBoost * joinQuery.getBoost());
+    }
+
+    // NOTE: acceptDocs applies (and is checked) only in the
+    // parent document space
+    @Override
+    public Scorer scorer(AtomicReaderContext readerContext, boolean scoreDocsInOrder,
+        boolean topScorer, Bits acceptDocs) throws IOException {
+
+      // Pass scoreDocsInOrder true, topScorer false to our sub and the live docs:
+      final Scorer childScorer = childWeight.scorer(readerContext, true, false, readerContext.reader().getLiveDocs());
+
+      if (childScorer == null) {
+        // No matches
+        return null;
+      }
+
+      final int firstChildDoc = childScorer.nextDoc();
+      if (firstChildDoc == DocIdSetIterator.NO_MORE_DOCS) {
+        // No matches
+        return null;
+      }
+
+      // NOTE: we cannot pass acceptDocs here because this
+      // will (most likely, justifiably) cause the filter to
+      // not return a FixedBitSet but rather a
+      // BitsFilteredDocIdSet.  Instead, we filter by
+      // acceptDocs when we score:
+      final DocIdSet parents = parentsFilter.getDocIdSet(readerContext, null);
+
+      if (parents == null) {
+        // No matches
+        return null;
+      }
+      if (!(parents instanceof FixedBitSet)) {
+        throw new IllegalStateException("parentFilter must return FixedBitSet; got " + parents);
+      }
+
+      return new BlockJoinScorer(this, childScorer, (FixedBitSet) parents, firstChildDoc, scoreMode, acceptDocs);
+    }
+
+    @Override
+    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
+      BlockJoinScorer scorer = (BlockJoinScorer) scorer(context, true, false, context.reader().getLiveDocs());
+      if (scorer != null && scorer.advance(doc) == doc) {
+        return scorer.explain(context.docBase);
+      }
+      return new ComplexExplanation(false, 0.0f, "Not a match");
+    }
+
+    @Override
+    public boolean scoresDocsOutOfOrder() {
+      return false;
+    }
+  }
+
+  static class BlockJoinScorer extends Scorer {
+    private final Scorer childScorer;
+    private final FixedBitSet parentBits;
+    private final ScoreMode scoreMode;
+    private final Bits acceptDocs;
+    private int parentDoc = -1;
+    private int prevParentDoc;
+    private float parentScore;
+    private int parentFreq;
+    private int nextChildDoc;
+    private int[] pendingChildDocs;
+    private float[] pendingChildScores;
+    private int childDocUpto;
+
+    public BlockJoinScorer(Weight weight, Scorer childScorer, FixedBitSet parentBits, int firstChildDoc, ScoreMode scoreMode, Bits acceptDocs) {
+      super(weight);
+      //System.out.println("Q.init firstChildDoc=" + firstChildDoc);
+      this.parentBits = parentBits;
+      this.childScorer = childScorer;
+      this.scoreMode = scoreMode;
+      this.acceptDocs = acceptDocs;
+      nextChildDoc = firstChildDoc;
+    }
+
+    @Override
+    public Collection<ChildScorer> getChildren() {
+      return Collections.singleton(new ChildScorer(childScorer, "BLOCK_JOIN"));
+    }
+
+    int getChildCount() {
+      return childDocUpto;
+    }
+
+    int getParentDoc() {
+      return parentDoc;
+    }
+
+    int[] swapChildDocs(int[] other) {
+      final int[] ret = pendingChildDocs;
+      if (other == null) {
+        pendingChildDocs = new int[5];
+      } else {
+        pendingChildDocs = other;
+      }
+      return ret;
+    }
+
+    float[] swapChildScores(float[] other) {
+      if (scoreMode == ScoreMode.None) {
+        throw new IllegalStateException("ScoreMode is None; you must pass trackScores=false to ToParentBlockJoinCollector");
+      }
+      final float[] ret = pendingChildScores;
+      if (other == null) {
+        pendingChildScores = new float[5];
+      } else {
+        pendingChildScores = other;
+      }
+      return ret;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      //System.out.println("Q.nextDoc() nextChildDoc=" + nextChildDoc);
+      // Loop until we hit a parentDoc that's accepted
+      while (true) {
+        if (nextChildDoc == NO_MORE_DOCS) {
+          //System.out.println("  end");
+          return parentDoc = NO_MORE_DOCS;
+        }
+
+        // Gather all children sharing the same parent as
+        // nextChildDoc
+
+        parentDoc = parentBits.nextSetBit(nextChildDoc);
+
+        // Parent & child docs are supposed to be
+        // orthogonal:
+        if (nextChildDoc == parentDoc) {
+          throw new IllegalStateException("child query must only match non-parent docs, but parent docID=" + nextChildDoc + " matched childScorer=" + childScorer.getClass());
+        }
+
+        //System.out.println("  parentDoc=" + parentDoc);
+        assert parentDoc != -1;
+
+        //System.out.println("  nextChildDoc=" + nextChildDoc);
+        if (acceptDocs != null && !acceptDocs.get(parentDoc)) {
+          // Parent doc not accepted; skip child docs until
+          // we hit a new parent doc:
+          do {
+            nextChildDoc = childScorer.nextDoc();
+          } while (nextChildDoc < parentDoc);
+
+          // Parent & child docs are supposed to be
+          // orthogonal:
+          if (nextChildDoc == parentDoc) {
+            throw new IllegalStateException("child query must only match non-parent docs, but parent docID=" + nextChildDoc + " matched childScorer=" + childScorer.getClass());
+          }
+
+          continue;
+        }
+
+        float totalScore = 0;
+        float maxScore = Float.NEGATIVE_INFINITY;
+
+        childDocUpto = 0;
+        parentFreq = 0;
+        do {
+
+          //System.out.println("  c=" + nextChildDoc);
+          if (pendingChildDocs != null && pendingChildDocs.length == childDocUpto) {
+            pendingChildDocs = ArrayUtil.grow(pendingChildDocs);
+          }
+          if (pendingChildScores != null && scoreMode != ScoreMode.None && pendingChildScores.length == childDocUpto) {
+            pendingChildScores = ArrayUtil.grow(pendingChildScores);
+          }
+          if (pendingChildDocs != null) {
+            pendingChildDocs[childDocUpto] = nextChildDoc;
+          }
+          if (scoreMode != ScoreMode.None) {
+            // TODO: specialize this into dedicated classes per-scoreMode
+            final float childScore = childScorer.score();
+            final int childFreq = childScorer.freq();
+            if (pendingChildScores != null) {
+              pendingChildScores[childDocUpto] = childScore;
+            }
+            maxScore = Math.max(childScore, maxScore);
+            totalScore += childScore;
+            parentFreq += childFreq;
+          }
+          childDocUpto++;
+          nextChildDoc = childScorer.nextDoc();
+        } while (nextChildDoc < parentDoc);
+
+        // Parent & child docs are supposed to be
+        // orthogonal:
+        if (nextChildDoc == parentDoc) {
+          throw new IllegalStateException("child query must only match non-parent docs, but parent docID=" + nextChildDoc + " matched childScorer=" + childScorer.getClass());
+        }
+
+        switch(scoreMode) {
+        case Avg:
+          parentScore = totalScore / childDocUpto;
+          break;
+        case Max:
+          parentScore = maxScore;
+          break;
+        case Total:
+          parentScore = totalScore;
+          break;
+        case None:
+          break;
+        }
+
+        //System.out.println("  return parentDoc=" + parentDoc + " childDocUpto=" + childDocUpto);
+        return parentDoc;
+      }
+    }
+
+    @Override
+    public int docID() {
+      return parentDoc;
+    }
+
+    @Override
+    public float score() throws IOException {
+      return parentScore;
     }
     
-    /*
-      * This method for resolving read data should look at the timestamps of each
-      * of the columns that are read and should pick up columns with the latest
-      * timestamp. For those columns where the timestamp is not the latest a
-      * repair request should be scheduled.
-      *
-      */
-	public Row resolve(Collection<Message> responses) throws DigestMismatchException, IOException
-    {
-        if (logger_.isDebugEnabled())
-            logger_.debug("resolving " + responses.size() + " responses");
+    @Override
+    public int freq() {
+      return parentFreq;
+    }
 
-        long startTime = System.currentTimeMillis();
-		List<ColumnFamily> versions = new ArrayList<ColumnFamily>(responses.size());
-		List<InetAddress> endpoints = new ArrayList<InetAddress>(responses.size());
-		DecoratedKey key = null;
-		ByteBuffer digest = FBUtilities.EMPTY_BYTE_BUFFER;
-		boolean isDigestQuery = false;
-        
-        /*
-		 * Populate the list of rows from each of the messages
-		 * Check to see if there is a digest query. If a digest 
-         * query exists then we need to compare the digest with 
-         * the digest of the data that is received.
-        */
-		for (Message message : responses)
-		{
-            ReadResponse result = results.get(message);
-            if (result == null)
-                continue; // arrived after quorum already achieved
-            if (result.isDigestQuery())
-            {
-                digest = result.digest();
-                isDigestQuery = true;
-            }
-            else
-            {
-                versions.add(result.row().cf);
-                endpoints.add(message.getFrom());
-                key = result.row().key;
-            }
-        }
+    @Override
+    public int advance(int parentTarget) throws IOException {
 
-		// If there was a digest query compare it with all the data digests
-		// If there is a mismatch then throw an exception so that read repair can happen.
-        if (isDigestQuery)
-        {
-            
-            for (ColumnFamily cf : versions)
-            {
-                if (!ColumnFamily.digest(cf).equals(digest))
-                {
-                    /* Wrap the key as the context in this exception */
-                    String s = String.format("Mismatch for key %s (%s vs %s)", key, FBUtilities.bytesToHex(ColumnFamily.digest(cf)), FBUtilities.bytesToHex(digest));
-                    throw new DigestMismatchException(s);
-                }
-            }
-            if (logger_.isDebugEnabled())
-                logger_.debug("digests verified");
-        }
+      //System.out.println("Q.advance parentTarget=" + parentTarget);
+      if (parentTarget == NO_MORE_DOCS) {
+        return parentDoc = NO_MORE_DOCS;
+      }
 
-        ColumnFamily resolved;
-        if (versions.size() > 1)
-        {
-            resolved = resolveSuperset(versions);
-            if (logger_.isDebugEnabled())
-                logger_.debug("versions merged");
-            maybeScheduleRepairs(resolved, table, key, versions, endpoints);
-        }
-        else
-        {
-            resolved = versions.get(0);
-        }
+      if (parentTarget == 0) {
+        // Callers should only be passing in a docID from
+        // the parent space, so this means this parent
+        // has no children (it got docID 0), so it cannot
+        // possibly match.  We must handle this case
+        // separately otherwise we pass invalid -1 to
+        // prevSetBit below:
+        return nextDoc();
+      }
 
-        if (logger_.isDebugEnabled())
-            logger_.debug("resolve: " + (System.currentTimeMillis() - startTime) + " ms.");
-		return new Row(key, resolved);
-	}
+      prevParentDoc = parentBits.prevSetBit(parentTarget-1);
+
+      //System.out.println("  rolled back to prevParentDoc=" + prevParentDoc + " vs parentDoc=" + parentDoc);
+      assert prevParentDoc >= parentDoc;
+      if (prevParentDoc > nextChildDoc) {
+        nextChildDoc = childScorer.advance(prevParentDoc);
+        // System.out.println("  childScorer advanced to child docID=" + nextChildDoc);
+      //} else {
+        //System.out.println("  skip childScorer advance");
+      }
+
+      // Parent & child docs are supposed to be orthogonal:
+      if (nextChildDoc == prevParentDoc) {
+        throw new IllegalStateException("child query must only match non-parent docs, but parent docID=" + nextChildDoc + " matched childScorer=" + childScorer.getClass());
+      }
+
+      final int nd = nextDoc();
+      //System.out.println("  return nextParentDoc=" + nd);
+      return nd;
+    }
+
+    public Explanation explain(int docBase) throws IOException {
+      int start = docBase + prevParentDoc + 1; // +1 b/c prevParentDoc is previous parent doc
+      int end = docBase + parentDoc - 1; // -1 b/c parentDoc is parent doc
+      return new ComplexExplanation(
+          true, score(), String.format(Locale.ROOT, "Score based on child doc range from %d to %d", start, end)
+      );
+    }
+
+    @Override
+    public long cost() {
+      return childScorer.cost();
+    }
 
     /**
-     * For each row version, compare with resolved (the superset of all row versions);
-     * if it is missing anything, send a mutation to the endpoint it come from.
+     * Instructs this scorer to keep track of the child docIds and score ids for retrieval purposes.
      */
-    public static void maybeScheduleRepairs(ColumnFamily resolved, String table, DecoratedKey key, List<ColumnFamily> versions, List<InetAddress> endpoints)
-    {
-        for (int i = 0; i < versions.size(); i++)
-        {
-            ColumnFamily diffCf = ColumnFamily.diff(versions.get(i), resolved);
-            if (diffCf == null) // no repair needs to happen
-                continue;
-
-            // create and send the row mutation message based on the diff
-            RowMutation rowMutation = new RowMutation(table, key.key);
-            rowMutation.add(diffCf);
-            RowMutationMessage rowMutationMessage = new RowMutationMessage(rowMutation);
-            Message repairMessage;
-            try
-            {
-                repairMessage = rowMutationMessage.makeRowMutationMessage(StorageService.Verb.READ_REPAIR);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-            MessagingService.instance.sendOneWay(repairMessage, endpoints.get(i));
-        }
+    public void trackPendingChildHits() {
+      pendingChildDocs = new int[5];
+      if (scoreMode != ScoreMode.None) {
+        pendingChildScores = new float[5];
+      }
     }
+  }
 
-    static ColumnFamily resolveSuperset(List<ColumnFamily> versions)
-    {
-        assert versions.size() > 0;
-        ColumnFamily resolved = null;
-        for (ColumnFamily cf : versions)
-        {
-            if (cf != null)
-            {
-                resolved = cf.cloneMe();
-                break;
-            }
-        }
-        if (resolved == null)
-            return null;
-        for (ColumnFamily cf : versions)
-        {
-            resolved.resolve(cf);
-        }
-        return resolved;
-    }
+  @Override
+  public void extractTerms(Set<Term> terms) {
+    childQuery.extractTerms(terms);
+  }
 
-    public void preprocess(Message message)
-    {
-        byte[] body = message.getMessageBody();
-        ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
-        try
-        {
-            ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
-            results.put(message, result);
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
+  @Override
+  public Query rewrite(IndexReader reader) throws IOException {
+    final Query childRewrite = childQuery.rewrite(reader);
+    if (childRewrite != childQuery) {
+      Query rewritten = new ToParentBlockJoinQuery(childQuery,
+                                childRewrite,
+                                parentsFilter,
+                                scoreMode);
+      rewritten.setBoost(getBoost());
+      return rewritten;
+    } else {
+      return this;
     }
+  }
 
-    public boolean isDataPresent(Collection<Message> responses)
-	{
-        for (Message message : responses)
-        {
-            ReadResponse result = results.get(message);
-            if (result == null)
-                continue; // arrived concurrently
-            if (result.isDigestQuery())
-                return true;
-        }
-        return false;
+  @Override
+  public String toString(String field) {
+    return "ToParentBlockJoinQuery ("+childQuery.toString()+")";
+  }
+
+  @Override
+  public boolean equals(Object _other) {
+    if (_other instanceof ToParentBlockJoinQuery) {
+      final ToParentBlockJoinQuery other = (ToParentBlockJoinQuery) _other;
+      return origChildQuery.equals(other.origChildQuery) &&
+        parentsFilter.equals(other.parentsFilter) &&
+        scoreMode == other.scoreMode && 
+        super.equals(other);
+    } else {
+      return false;
     }
+  }
+
+  @Override
+  public int hashCode() {
+    final int prime = 31;
+    int hash = super.hashCode();
+    hash = prime * hash + origChildQuery.hashCode();
+    hash = prime * hash + scoreMode.hashCode();
+    hash = prime * hash + parentsFilter.hashCode();
+    return hash;
+  }
 }

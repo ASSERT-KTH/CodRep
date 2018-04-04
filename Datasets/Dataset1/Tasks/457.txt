@@ -1,6 +1,6 @@
-public PulsingPostingsWriter(int maxPositions, PostingsWriterBase wrappedPostingsWriter) {
+public final void visitDocument(int n, StoredFieldVisitor visitor) throws IOException {
 
-package org.apache.lucene.codecs.pulsing;
+package org.apache.lucene.codecs.lucene40;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,402 +20,224 @@ package org.apache.lucene.codecs.pulsing;
  */
 
 import java.io.IOException;
-import java.util.List;
-import java.util.ArrayList;
 
 import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.PostingsWriterBase;
-import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.RAMOutputStream;
-import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentInfo;
+import org.apache.lucene.index.StoredFieldVisitor;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.IOUtils;
 
-// TODO: we now inline based on total TF of the term,
-// but it might be better to inline by "net bytes used"
-// so that a term that has only 1 posting but a huge
-// payload would not be inlined.  Though this is
-// presumably rare in practice...
+import java.io.Closeable;
 
-/** 
- * Writer for the pulsing format. 
- * <p>
- * Wraps another postings implementation and decides 
- * (based on total number of occurrences), whether a terms 
- * postings should be inlined into the term dictionary,
- * or passed through to the wrapped writer.
- *
- * @lucene.experimental */
-public final class PulsingPostingsWriter extends PostingsWriterBase {
+import static org.apache.lucene.codecs.lucene40.Lucene40StoredFieldsWriter.*;
 
-  final static String CODEC = "PulsedPostingsWriter";
+/**
+ * Class responsible for access to stored document fields.
+ * <p/>
+ * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
+ * 
+ * @see Lucene40StoredFieldsFormat
+ * @lucene.internal
+ */
+public final class Lucene40StoredFieldsReader extends StoredFieldsReader implements Cloneable, Closeable {
+  private final FieldInfos fieldInfos;
+  private final IndexInput fieldsStream;
+  private final IndexInput indexStream;
+  private int numTotalDocs;
+  private int size;
+  private boolean closed;
 
-  // To add a new version, increment from the last one, and
-  // change VERSION_CURRENT to point to your new version:
-  final static int VERSION_START = 0;
-
-  final static int VERSION_CURRENT = VERSION_START;
-
-  private IndexOutput termsOut;
-
-  private IndexOptions indexOptions;
-  private boolean storePayloads;
-
-  private static class PendingTerm {
-    private final byte[] bytes;
-    public PendingTerm(byte[] bytes) {
-      this.bytes = bytes;
-    }
-  }
-
-  private final List<PendingTerm> pendingTerms = new ArrayList<PendingTerm>();
-
-  // one entry per position
-  private final Position[] pending;
-  private int pendingCount = 0;                           // -1 once we've hit too many positions
-  private Position currentDoc;                    // first Position entry of current doc
-
-  private static final class Position {
-    BytesRef payload;
-    int termFreq;                                 // only incremented on first position for a given doc
-    int pos;
-    int docID;
-    int startOffset;
-    int endOffset;
-  }
-
-  // TODO: -- lazy init this?  ie, if every single term
-  // was inlined (eg for a "primary key" field) then we
-  // never need to use this fallback?  Fallback writer for
-  // non-inlined terms:
-  final PostingsWriterBase wrappedPostingsWriter;
-
-  /** If the total number of positions (summed across all docs
-   *  for this term) is <= maxPositions, then the postings are
-   *  inlined into terms dict */
-  public PulsingPostingsWriter(int maxPositions, PostingsWriterBase wrappedPostingsWriter) throws IOException {
-    pending = new Position[maxPositions];
-    for(int i=0;i<maxPositions;i++) {
-      pending[i] = new Position();
-    }
-
-    // We simply wrap another postings writer, but only call
-    // on it when tot positions is >= the cutoff:
-    this.wrappedPostingsWriter = wrappedPostingsWriter;
-  }
-
+  /** Returns a cloned FieldsReader that shares open
+   *  IndexInputs with the original one.  It is the caller's
+   *  job not to close the original FieldsReader until all
+   *  clones are called (eg, currently SegmentReader manages
+   *  this logic). */
   @Override
-  public void start(IndexOutput termsOut) throws IOException {
-    this.termsOut = termsOut;
-    CodecUtil.writeHeader(termsOut, CODEC, VERSION_CURRENT);
-    termsOut.writeVInt(pending.length); // encode maxPositions in header
-    wrappedPostingsWriter.start(termsOut);
+  public Lucene40StoredFieldsReader clone() {
+    ensureOpen();
+    return new Lucene40StoredFieldsReader(fieldInfos, numTotalDocs, size, (IndexInput)fieldsStream.clone(), (IndexInput)indexStream.clone());
+  }
+  
+  // Used only by clone
+  private Lucene40StoredFieldsReader(FieldInfos fieldInfos, int numTotalDocs, int size, IndexInput fieldsStream, IndexInput indexStream) {
+    this.fieldInfos = fieldInfos;
+    this.numTotalDocs = numTotalDocs;
+    this.size = size;
+    this.fieldsStream = fieldsStream;
+    this.indexStream = indexStream;
   }
 
-  @Override
-  public void startTerm() {
-    if (DEBUG) System.out.println("PW   startTerm");
-    assert pendingCount == 0;
-  }
-
-  // TODO: -- should we NOT reuse across fields?  would
-  // be cleaner
-
-  // Currently, this instance is re-used across fields, so
-  // our parent calls setField whenever the field changes
-  @Override
-  public void setField(FieldInfo fieldInfo) {
-    this.indexOptions = fieldInfo.getIndexOptions();
-    if (DEBUG) System.out.println("PW field=" + fieldInfo.name + " indexOptions=" + indexOptions);
-    storePayloads = fieldInfo.hasPayloads();
-    wrappedPostingsWriter.setField(fieldInfo);
-    //DEBUG = BlockTreeTermsWriter.DEBUG;
-  }
-
-  private boolean DEBUG;
-
-  @Override
-  public void startDoc(int docID, int termDocFreq) throws IOException {
-    assert docID >= 0: "got docID=" + docID;
-
-    /*
-    if (termID != -1) {
-      if (docID == 0) {
-        baseDocID = termID;
-      } else if (baseDocID + docID != termID) {
-        throw new RuntimeException("WRITE: baseDocID=" + baseDocID + " docID=" + docID + " termID=" + termID);
-      }
-    }
-    */
-
-    if (DEBUG) System.out.println("PW     doc=" + docID);
-
-    if (pendingCount == pending.length) {
-      push();
-      if (DEBUG) System.out.println("PW: wrapped.finishDoc");
-      wrappedPostingsWriter.finishDoc();
-    }
-
-    if (pendingCount != -1) {
-      assert pendingCount < pending.length;
-      currentDoc = pending[pendingCount];
-      currentDoc.docID = docID;
-      if (indexOptions == IndexOptions.DOCS_ONLY) {
-        pendingCount++;
-      } else if (indexOptions == IndexOptions.DOCS_AND_FREQS) { 
-        pendingCount++;
-        currentDoc.termFreq = termDocFreq;
-      } else {
-        currentDoc.termFreq = termDocFreq;
-      }
-    } else {
-      // We've already seen too many docs for this term --
-      // just forward to our fallback writer
-      wrappedPostingsWriter.startDoc(docID, termDocFreq);
-    }
-  }
-
-  @Override
-  public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException {
-
-    if (DEBUG) System.out.println("PW       pos=" + position + " payload=" + (payload == null ? "null" : payload.length + " bytes"));
-    if (pendingCount == pending.length) {
-      push();
-    }
-
-    if (pendingCount == -1) {
-      // We've already seen too many docs for this term --
-      // just forward to our fallback writer
-      wrappedPostingsWriter.addPosition(position, payload, startOffset, endOffset);
-    } else {
-      // buffer up
-      final Position pos = pending[pendingCount++];
-      pos.pos = position;
-      pos.startOffset = startOffset;
-      pos.endOffset = endOffset;
-      pos.docID = currentDoc.docID;
-      if (payload != null && payload.length > 0) {
-        if (pos.payload == null) {
-          pos.payload = BytesRef.deepCopyOf(payload);
-        } else {
-          pos.payload.copyBytes(payload);
-        }
-      } else if (pos.payload != null) {
-        pos.payload.length = 0;
-      }
-    }
-  }
-
-  @Override
-  public void finishDoc() throws IOException {
-    if (DEBUG) System.out.println("PW     finishDoc");
-    if (pendingCount == -1) {
-      wrappedPostingsWriter.finishDoc();
-    }
-  }
-
-  private final RAMOutputStream buffer = new RAMOutputStream();
-
-  // private int baseDocID;
-
-  /** Called when we are done adding docs to this term */
-  @Override
-  public void finishTerm(TermStats stats) throws IOException {
-    if (DEBUG) System.out.println("PW   finishTerm docCount=" + stats.docFreq + " pendingCount=" + pendingCount + " pendingTerms.size()=" + pendingTerms.size());
-
-    assert pendingCount > 0 || pendingCount == -1;
-
-    if (pendingCount == -1) {
-      wrappedPostingsWriter.finishTerm(stats);
-      // Must add null entry to record terms that our
-      // wrapped postings impl added
-      pendingTerms.add(null);
-    } else {
-
-      // There were few enough total occurrences for this
-      // term, so we fully inline our postings data into
-      // terms dict, now:
-
-      // TODO: it'd be better to share this encoding logic
-      // in some inner codec that knows how to write a
-      // single doc / single position, etc.  This way if a
-      // given codec wants to store other interesting
-      // stuff, it could use this pulsing codec to do so
-
-      if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
-        int lastDocID = 0;
-        int pendingIDX = 0;
-        int lastPayloadLength = -1;
-        int lastOffsetLength = -1;
-        while(pendingIDX < pendingCount) {
-          final Position doc = pending[pendingIDX];
-
-          final int delta = doc.docID - lastDocID;
-          lastDocID = doc.docID;
-
-          if (DEBUG) System.out.println("  write doc=" + doc.docID + " freq=" + doc.termFreq);
-
-          if (doc.termFreq == 1) {
-            buffer.writeVInt((delta<<1)|1);
-          } else {
-            buffer.writeVInt(delta<<1);
-            buffer.writeVInt(doc.termFreq);
-          }
-
-          int lastPos = 0;
-          int lastOffset = 0;
-          for(int posIDX=0;posIDX<doc.termFreq;posIDX++) {
-            final Position pos = pending[pendingIDX++];
-            assert pos.docID == doc.docID;
-            final int posDelta = pos.pos - lastPos;
-            lastPos = pos.pos;
-            if (DEBUG) System.out.println("    write pos=" + pos.pos);
-            final int payloadLength = pos.payload == null ? 0 : pos.payload.length;
-            if (storePayloads) {
-              if (payloadLength != lastPayloadLength) {
-                buffer.writeVInt((posDelta << 1)|1);
-                buffer.writeVInt(payloadLength);
-                lastPayloadLength = payloadLength;
-              } else {
-                buffer.writeVInt(posDelta << 1);
-              }
-            } else {
-              buffer.writeVInt(posDelta);
-            }
-            
-            if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
-              //System.out.println("write=" + pos.startOffset + "," + pos.endOffset);
-              int offsetDelta = pos.startOffset - lastOffset;
-              int offsetLength = pos.endOffset - pos.startOffset;
-              if (offsetLength != lastOffsetLength) {
-                buffer.writeVInt(offsetDelta << 1 | 1);
-                buffer.writeVInt(offsetLength);
-              } else {
-                buffer.writeVInt(offsetDelta << 1);
-              }
-              lastOffset = pos.startOffset;
-              lastOffsetLength = offsetLength;             
-            }
-            
-            if (payloadLength > 0) {
-              assert storePayloads;
-              buffer.writeBytes(pos.payload.bytes, 0, pos.payload.length);
-            }
-          }
-        }
-      } else if (indexOptions == IndexOptions.DOCS_AND_FREQS) {
-        int lastDocID = 0;
-        for(int posIDX=0;posIDX<pendingCount;posIDX++) {
-          final Position doc = pending[posIDX];
-          final int delta = doc.docID - lastDocID;
-          assert doc.termFreq != 0;
-          if (doc.termFreq == 1) {
-            buffer.writeVInt((delta<<1)|1);
-          } else {
-            buffer.writeVInt(delta<<1);
-            buffer.writeVInt(doc.termFreq);
-          }
-          lastDocID = doc.docID;
-        }
-      } else if (indexOptions == IndexOptions.DOCS_ONLY) {
-        int lastDocID = 0;
-        for(int posIDX=0;posIDX<pendingCount;posIDX++) {
-          final Position doc = pending[posIDX];
-          buffer.writeVInt(doc.docID - lastDocID);
-          lastDocID = doc.docID;
-        }
-      }
-
-      final byte[] bytes = new byte[(int) buffer.getFilePointer()];
-      buffer.writeTo(bytes, 0);
-      pendingTerms.add(new PendingTerm(bytes));
-      buffer.reset();
-    }
-
-    pendingCount = 0;
-  }
-
-  @Override
-  public void close() throws IOException {
-    wrappedPostingsWriter.close();
-  }
-
-  @Override
-  public void flushTermsBlock(int start, int count) throws IOException {
-    if (DEBUG) System.out.println("PW: flushTermsBlock start=" + start + " count=" + count + " pendingTerms.size()=" + pendingTerms.size());
-    int wrappedCount = 0;
-    assert buffer.getFilePointer() == 0;
-    assert start >= count;
-
-    final int limit = pendingTerms.size() - start + count;
-
-    for(int idx=pendingTerms.size()-start; idx<limit; idx++) {
-      final PendingTerm term = pendingTerms.get(idx);
-      if (term == null) {
-        wrappedCount++;
-      } else {
-        buffer.writeVInt(term.bytes.length);
-        buffer.writeBytes(term.bytes, 0, term.bytes.length);
-      }
-    }
-
-    termsOut.writeVInt((int) buffer.getFilePointer());
-    buffer.writeTo(termsOut);
-    buffer.reset();
-
-    // TDOO: this could be somewhat costly since
-    // pendingTerms.size() could be biggish?
-    int futureWrappedCount = 0;
-    final int limit2 = pendingTerms.size();
-    for(int idx=limit;idx<limit2;idx++) {
-      if (pendingTerms.get(idx) == null) {
-        futureWrappedCount++;
-      }
-    }
-
-    // Remove the terms we just wrote:
-    pendingTerms.subList(pendingTerms.size()-start, limit).clear();
-
-    if (DEBUG) System.out.println("PW:   len=" + buffer.getFilePointer() + " fp=" + termsOut.getFilePointer() + " futureWrappedCount=" + futureWrappedCount + " wrappedCount=" + wrappedCount);
-    // TODO: can we avoid calling this if all terms
-    // were inlined...?  Eg for a "primary key" field, the
-    // wrapped codec is never invoked...
-    wrappedPostingsWriter.flushTermsBlock(futureWrappedCount+wrappedCount, wrappedCount);
-  }
-
-  // Pushes pending positions to the wrapped codec
-  private void push() throws IOException {
-    if (DEBUG) System.out.println("PW now push @ " + pendingCount + " wrapped=" + wrappedPostingsWriter);
-    assert pendingCount == pending.length;
+  public Lucene40StoredFieldsReader(Directory d, SegmentInfo si, FieldInfos fn, IOContext context) throws IOException {
+    final String segment = si.name;
+    boolean success = false;
+    fieldInfos = fn;
+    try {
+      fieldsStream = d.openInput(IndexFileNames.segmentFileName(segment, "", FIELDS_EXTENSION), context);
+      final String indexStreamFN = IndexFileNames.segmentFileName(segment, "", FIELDS_INDEX_EXTENSION);
+      indexStream = d.openInput(indexStreamFN, context);
       
-    wrappedPostingsWriter.startTerm();
-      
-    // Flush all buffered docs
-    if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
-      Position doc = null;
-      for(Position pos : pending) {
-        if (doc == null) {
-          doc = pos;
-          if (DEBUG) System.out.println("PW: wrapped.startDoc docID=" + doc.docID + " tf=" + doc.termFreq);
-          wrappedPostingsWriter.startDoc(doc.docID, doc.termFreq);
-        } else if (doc.docID != pos.docID) {
-          assert pos.docID > doc.docID;
-          if (DEBUG) System.out.println("PW: wrapped.finishDoc");
-          wrappedPostingsWriter.finishDoc();
-          doc = pos;
-          if (DEBUG) System.out.println("PW: wrapped.startDoc docID=" + doc.docID + " tf=" + doc.termFreq);
-          wrappedPostingsWriter.startDoc(doc.docID, doc.termFreq);
-        }
-        if (DEBUG) System.out.println("PW:   wrapped.addPos pos=" + pos.pos);
-        wrappedPostingsWriter.addPosition(pos.pos, pos.payload, pos.startOffset, pos.endOffset);
+      CodecUtil.checkHeader(indexStream, CODEC_NAME_IDX, VERSION_START, VERSION_CURRENT);
+      CodecUtil.checkHeader(fieldsStream, CODEC_NAME_DAT, VERSION_START, VERSION_CURRENT);
+      assert HEADER_LENGTH_DAT == fieldsStream.getFilePointer();
+      assert HEADER_LENGTH_IDX == indexStream.getFilePointer();
+      final long indexSize = indexStream.length() - HEADER_LENGTH_IDX;
+      this.size = (int) (indexSize >> 3);
+      // Verify two sources of "maxDoc" agree:
+      if (this.size != si.getDocCount()) {
+        throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + this.size + " but segmentInfo shows " + si.getDocCount());
       }
-      //wrappedPostingsWriter.finishDoc();
-    } else {
-      for(Position doc : pending) {
-        wrappedPostingsWriter.startDoc(doc.docID, indexOptions == IndexOptions.DOCS_ONLY ? 0 : doc.termFreq);
+      numTotalDocs = (int) (indexSize >> 3);
+      success = true;
+    } finally {
+      // With lock-less commits, it's entirely possible (and
+      // fine) to hit a FileNotFound exception above. In
+      // this case, we want to explicitly close any subset
+      // of things that were opened so that we don't have to
+      // wait for a GC to do so.
+      if (!success) {
+        close();
       }
     }
-    pendingCount = -1;
+  }
+
+  /**
+   * @throws AlreadyClosedException if this FieldsReader is closed
+   */
+  private void ensureOpen() throws AlreadyClosedException {
+    if (closed) {
+      throw new AlreadyClosedException("this FieldsReader is closed");
+    }
+  }
+
+  /**
+   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams.
+   * This means that the Fields values will not be accessible.
+   *
+   * @throws IOException
+   */
+  public final void close() throws IOException {
+    if (!closed) {
+      IOUtils.close(fieldsStream, indexStream);
+      closed = true;
+    }
+  }
+
+  public final int size() {
+    return size;
+  }
+
+  private void seekIndex(int docID) throws IOException {
+    indexStream.seek(HEADER_LENGTH_IDX + docID * 8L);
+  }
+
+  public final void visitDocument(int n, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+    seekIndex(n);
+    fieldsStream.seek(indexStream.readLong());
+
+    final int numFields = fieldsStream.readVInt();
+    for (int fieldIDX = 0; fieldIDX < numFields; fieldIDX++) {
+      int fieldNumber = fieldsStream.readVInt();
+      FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
+      
+      int bits = fieldsStream.readByte() & 0xFF;
+      assert bits <= (FIELD_IS_NUMERIC_MASK | FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
+
+      switch(visitor.needsField(fieldInfo)) {
+        case YES:
+          readField(visitor, fieldInfo, bits);
+          break;
+        case NO: 
+          skipField(bits);
+          break;
+        case STOP: 
+          return;
+      }
+    }
+  }
+
+  private void readField(StoredFieldVisitor visitor, FieldInfo info, int bits) throws IOException {
+    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
+    if (numeric != 0) {
+      switch(numeric) {
+        case FIELD_IS_NUMERIC_INT:
+          visitor.intField(info, fieldsStream.readInt());
+          return;
+        case FIELD_IS_NUMERIC_LONG:
+          visitor.longField(info, fieldsStream.readLong());
+          return;
+        case FIELD_IS_NUMERIC_FLOAT:
+          visitor.floatField(info, Float.intBitsToFloat(fieldsStream.readInt()));
+          return;
+        case FIELD_IS_NUMERIC_DOUBLE:
+          visitor.doubleField(info, Double.longBitsToDouble(fieldsStream.readLong()));
+          return;
+        default:
+          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
+      }
+    } else { 
+      final int length = fieldsStream.readVInt();
+      byte bytes[] = new byte[length];
+      fieldsStream.readBytes(bytes, 0, length);
+      if ((bits & FIELD_IS_BINARY) != 0) {
+        visitor.binaryField(info, bytes, 0, bytes.length);
+      } else {
+        visitor.stringField(info, new String(bytes, 0, bytes.length, IOUtils.CHARSET_UTF_8));
+      }
+    }
+  }
+  
+  private void skipField(int bits) throws IOException {
+    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
+    if (numeric != 0) {
+      switch(numeric) {
+        case FIELD_IS_NUMERIC_INT:
+        case FIELD_IS_NUMERIC_FLOAT:
+          fieldsStream.readInt();
+          return;
+        case FIELD_IS_NUMERIC_LONG:
+        case FIELD_IS_NUMERIC_DOUBLE:
+          fieldsStream.readLong();
+          return;
+        default: 
+          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
+      }
+    } else {
+      final int length = fieldsStream.readVInt();
+      fieldsStream.seek(fieldsStream.getFilePointer() + length);
+    }
+  }
+
+  /** Returns the length in bytes of each raw document in a
+   *  contiguous range of length numDocs starting with
+   *  startDocID.  Returns the IndexInput (the fieldStream),
+   *  already seeked to the starting point for startDocID.*/
+  public final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
+    seekIndex(startDocID);
+    long startOffset = indexStream.readLong();
+    long lastOffset = startOffset;
+    int count = 0;
+    while (count < numDocs) {
+      final long offset;
+      final int docID = startDocID + count + 1;
+      assert docID <= numTotalDocs;
+      if (docID < numTotalDocs) 
+        offset = indexStream.readLong();
+      else
+        offset = fieldsStream.length();
+      lengths[count++] = (int) (offset-lastOffset);
+      lastOffset = offset;
+    }
+
+    fieldsStream.seek(startOffset);
+
+    return fieldsStream;
   }
 }

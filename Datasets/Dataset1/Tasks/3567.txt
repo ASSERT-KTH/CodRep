@@ -1,6 +1,6 @@
 writer.shutdown();
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,90 +19,177 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.LuceneTestCase;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.lucene.analysis.*;
+import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
+import org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.store.RAMDirectory;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.TestUtil;
+import org.junit.Before;
 
-public class TestPositiveScoresOnlyCollector extends LuceneTestCase {
-
-  private static final class SimpleScorer extends Scorer {
-    private int idx = -1;
-    
-    public SimpleScorer(Weight weight) {
-      super(weight);
-    }
-    
-    @Override public float score() {
-      return idx == scores.length ? Float.NaN : scores[idx];
-    }
-    
-    @Override public int freq() {
-      return 1;
+/**
+ * This testcase tests whether multi-level skipping is being used
+ * to reduce I/O while skipping through posting lists.
+ * 
+ * Skipping in general is already covered by several other
+ * testcases.
+ * 
+ */
+public class TestMultiLevelSkipList extends LuceneTestCase {
+  
+  class CountingRAMDirectory extends MockDirectoryWrapper {
+    public CountingRAMDirectory(Directory delegate) {
+      super(random(), delegate);
     }
 
-    @Override public int docID() { return idx; }
-
-    @Override public int nextDoc() {
-      return ++idx != scores.length ? idx : NO_MORE_DOCS;
-    }
-    
-    @Override public int advance(int target) {
-      idx = target;
-      return idx < scores.length ? idx : NO_MORE_DOCS;
-    }
-    
     @Override
-    public long cost() {
-      return scores.length;
-    } 
+    public IndexInput openInput(String fileName, IOContext context) throws IOException {
+      IndexInput in = super.openInput(fileName, context);
+      if (fileName.endsWith(".frq"))
+        in = new CountingStream(in);
+      return in;
+    }
+  }
+  
+  @Override
+  @Before
+  public void setUp() throws Exception {
+    super.setUp();
+    counter = 0;
   }
 
-  // The scores must have positive as well as negative values
-  private static final float[] scores = new float[] { 0.7767749f, -1.7839992f,
-      8.9925785f, 7.9608946f, -0.07948637f, 2.6356435f, 7.4950366f, 7.1490803f,
-      -8.108544f, 4.961808f, 2.2423935f, -7.285586f, 4.6699767f };
-
-  public void testNegativeScores() throws Exception {
-  
-    // The Top*Collectors previously filtered out documents with <= scores. This
-    // behavior has changed. This test checks that if PositiveOnlyScoresFilter
-    // wraps one of these collectors, documents with <= 0 scores are indeed
-    // filtered.
-    
-    int numPositiveScores = 0;
-    for (int i = 0; i < scores.length; i++) {
-      if (scores[i] > 0) {
-        ++numPositiveScores;
-      }
+  public void testSimpleSkip() throws IOException {
+    Directory dir = new CountingRAMDirectory(new RAMDirectory());
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new PayloadAnalyzer()).setCodec(TestUtil.alwaysPostingsFormat(new Lucene41PostingsFormat())).setMergePolicy(newLogMergePolicy()));
+    Term term = new Term("test", "a");
+    for (int i = 0; i < 5000; i++) {
+      Document d1 = new Document();
+      d1.add(newTextField(term.field(), term.text(), Field.Store.NO));
+      writer.addDocument(d1);
     }
-    
-    Directory directory = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), directory);
-    writer.addDocument(new Document());
     writer.commit();
-    IndexReader ir = writer.getReader();
+    writer.forceMerge(1);
     writer.close();
-    IndexSearcher searcher = newSearcher(ir);
-    Weight fake = new TermQuery(new Term("fake", "weight")).createWeight(searcher);
-    Scorer s = new SimpleScorer(fake);
-    TopDocsCollector<ScoreDoc> tdc = TopScoreDocCollector.create(scores.length, true);
-    Collector c = new PositiveScoresOnlyCollector(tdc);
-    LeafCollector ac = c.getLeafCollector(ir.leaves().get(0));
-    ac.setScorer(s);
-    while (s.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-      ac.collect(0);
+
+    AtomicReader reader = getOnlySegmentReader(DirectoryReader.open(dir));
+    
+    for (int i = 0; i < 2; i++) {
+      counter = 0;
+      DocsAndPositionsEnum tp = reader.termPositionsEnum(term);
+      checkSkipTo(tp, 14, 185); // no skips
+      checkSkipTo(tp, 17, 190); // one skip on level 0
+      checkSkipTo(tp, 287, 200); // one skip on level 1, two on level 0
+    
+      // this test would fail if we had only one skip level,
+      // because than more bytes would be read from the freqStream
+      checkSkipTo(tp, 4800, 250);// one skip on level 2
     }
-    TopDocs td = tdc.topDocs();
-    ScoreDoc[] sd = td.scoreDocs;
-    assertEquals(numPositiveScores, td.totalHits);
-    for (int i = 0; i < sd.length; i++) {
-      assertTrue("only positive scores should return: " + sd[i].score, sd[i].score > 0);
-    }
-    ir.close();
-    directory.close();
   }
-  
+
+  public void checkSkipTo(DocsAndPositionsEnum tp, int target, int maxCounter) throws IOException {
+    tp.advance(target);
+    if (maxCounter < counter) {
+      fail("Too many bytes read: " + counter + " vs " + maxCounter);
+    }
+
+    assertEquals("Wrong document " + tp.docID() + " after skipTo target " + target, target, tp.docID());
+    assertEquals("Frequency is not 1: " + tp.freq(), 1,tp.freq());
+    tp.nextPosition();
+    BytesRef b = tp.getPayload();
+    assertEquals(1, b.length);
+    assertEquals("Wrong payload for the target " + target + ": " + b.bytes[b.offset], (byte) target, b.bytes[b.offset]);
+  }
+
+  private static class PayloadAnalyzer extends Analyzer {
+    private final AtomicInteger payloadCount = new AtomicInteger(-1);
+    @Override
+    public TokenStreamComponents createComponents(String fieldName) {
+      Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, true);
+      return new TokenStreamComponents(tokenizer, new PayloadFilter(payloadCount, tokenizer));
+    }
+
+  }
+
+  private static class PayloadFilter extends TokenFilter {
+    
+    PayloadAttribute payloadAtt;
+    private AtomicInteger payloadCount;
+    
+    protected PayloadFilter(AtomicInteger payloadCount , TokenStream input) {
+      super(input);
+      this.payloadCount = payloadCount;
+      payloadAtt = addAttribute(PayloadAttribute.class);
+    }
+
+    @Override
+    public boolean incrementToken() throws IOException {
+      boolean hasNext = input.incrementToken();
+      if (hasNext) {
+        payloadAtt.setPayload(new BytesRef(new byte[] { (byte) payloadCount.incrementAndGet() }));
+      } 
+      return hasNext;
+    }
+
+  }
+
+  private int counter = 0;
+
+  // Simply extends IndexInput in a way that we are able to count the number
+  // of bytes read
+  class CountingStream extends IndexInput {
+    private IndexInput input;
+
+    CountingStream(IndexInput input) {
+      super("CountingStream(" + input + ")");
+      this.input = input;
+    }
+
+    @Override
+    public byte readByte() throws IOException {
+      TestMultiLevelSkipList.this.counter++;
+      return this.input.readByte();
+    }
+
+    @Override
+    public void readBytes(byte[] b, int offset, int len) throws IOException {
+      TestMultiLevelSkipList.this.counter += len;
+      this.input.readBytes(b, offset, len);
+    }
+
+    @Override
+    public void close() throws IOException {
+      this.input.close();
+    }
+
+    @Override
+    public long getFilePointer() {
+      return this.input.getFilePointer();
+    }
+
+    @Override
+    public void seek(long pos) throws IOException {
+      this.input.seek(pos);
+    }
+
+    @Override
+    public long length() {
+      return this.input.length();
+    }
+
+    @Override
+    public CountingStream clone() {
+      return new CountingStream(this.input.clone());
+    }
+
+  }
 }

@@ -1,791 +1,925 @@
-return cfmd.getReadRepairChance() > random.nextDouble();
+import org.apache.derby.iapi.services.sanity.SanityManager;
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/*
+
+   Derby - Class org.apache.derby.jdbc.EmbedXAResource
+
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
  */
 
-package org.apache.cassandra.service;
+package org.apache.derby.jdbc;
 
-import java.io.*;
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
-import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.concurrent.*;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
-
-import com.google.common.collect.Iterables;
-import com.google.common.collect.Multimap;
-import static com.google.common.base.Charsets.UTF_8;
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.commons.lang.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 
 
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.locator.AbstractReplicationStrategy;
-import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.net.IAsyncCallback;
-import org.apache.cassandra.net.IAsyncResult;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.thrift.*;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.LatencyTracker;
-import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.utils.WrappedRunnable;
-import org.apache.cassandra.db.filter.QueryFilter;
+import javax.transaction.xa.XAResource;
+import javax.transaction.xa.Xid;
+import javax.transaction.xa.XAException;
 
-public class StorageProxy implements StorageProxyMBean
-{
-    private static final Logger logger = LoggerFactory.getLogger(StorageProxy.class);
+import org.apache.derby.iapi.error.ExceptionSeverity;
+import org.apache.derby.iapi.error.StandardException;
+import org.apache.derby.iapi.jdbc.BrokeredConnection;
+import org.apache.derby.iapi.jdbc.ResourceAdapter;
+import org.apache.derby.iapi.reference.SQLState;
+import org.apache.derby.iapi.services.context.ContextManager;
+import org.apache.derby.iapi.services.context.ContextService;
+import org.apache.derby.iapi.services.info.JVMInfo;
+import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+import org.apache.derby.iapi.store.access.TransactionController;
+import org.apache.derby.iapi.store.access.XATransactionController;
+import org.apache.derby.iapi.store.access.xa.XAResourceManager;
+import org.apache.derby.iapi.store.access.xa.XAXactId;
+import org.apache.derby.impl.jdbc.EmbedConnection;
+import org.apache.derby.impl.jdbc.TransactionResourceImpl;
+import org.apache.derby.shared.common.sanity.SanityManager;
+import org.apache.derby.iapi.services.property.PropertyUtil;
+import org.apache.derby.iapi.reference.Property;
 
-    private static final Random random = new Random();
-    // mbean stuff
-    private static final LatencyTracker readStats = new LatencyTracker();
-    private static final LatencyTracker rangeStats = new LatencyTracker();
-    private static final LatencyTracker writeStats = new LatencyTracker();
-    private static boolean hintedHandoffEnabled = DatabaseDescriptor.hintedHandoffEnabled();
-    private static final String UNREACHABLE = "UNREACHABLE";
+/**
+ * Implements XAResource
+ */
+class EmbedXAResource implements XAResource {
 
-    private StorageProxy() {}
-    static
-    {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(new StorageProxy(), new ObjectName("org.apache.cassandra.db:type=StorageProxy"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /**
-     * Use this method to have these RowMutations applied
-     * across all replicas. This method will take care
-     * of the possibility of a replica being down and hint
-     * the data across to some other replica.
-     *
-     * @param mutations the mutations to be applied across the replicas
-     * @param consistency_level the consistency level for the operation
-    */
-    public static void mutate(List<RowMutation> mutations, ConsistencyLevel consistency_level) throws UnavailableException, TimeoutException
-    {
-        long startTime = System.nanoTime();
-        ArrayList<IWriteResponseHandler> responseHandlers = new ArrayList<IWriteResponseHandler>();
-
-        RowMutation mostRecentRowMutation = null;
-        StorageService ss = StorageService.instance;
-        
-        try
-        {
-            for (RowMutation rm : mutations)
-            {
-                mostRecentRowMutation = rm;
-                String table = rm.getTable();
-                AbstractReplicationStrategy rs = Table.open(table).replicationStrategy;
-
-                List<InetAddress> naturalEndpoints = ss.getNaturalEndpoints(table, rm.key());
-                Collection<InetAddress> writeEndpoints = ss.getTokenMetadata().getWriteEndpoints(StorageService.getPartitioner().getToken(rm.key()), table, naturalEndpoints);
-                Multimap<InetAddress, InetAddress> hintedEndpoints = rs.getHintedEndpoints(writeEndpoints);
-                
-                // send out the writes, as in mutate() above, but this time with a callback that tracks responses
-                final IWriteResponseHandler responseHandler = rs.getWriteResponseHandler(writeEndpoints, hintedEndpoints, consistency_level);
-                responseHandler.assureSufficientLiveNodes();
-
-                responseHandlers.add(responseHandler);
-                Message unhintedMessage = null;
-                for (Map.Entry<InetAddress, Collection<InetAddress>> entry : hintedEndpoints.asMap().entrySet())
-                {
-                    InetAddress destination = entry.getKey();
-                    Collection<InetAddress> targets = entry.getValue();
-
-                    if (targets.size() == 1 && targets.iterator().next().equals(destination))
-                    {
-                        // unhinted writes
-                        if (destination.equals(FBUtilities.getLocalAddress()))
-                        {
-                            insertLocalMessage(rm, responseHandler);
-                        }
-                        else
-                        {
-                            // belongs on a different server.  send it there.
-                            if (unhintedMessage == null)
-                            {
-                                unhintedMessage = rm.makeRowMutationMessage();
-                                MessagingService.instance.addCallback(responseHandler, unhintedMessage.getMessageId());
-                            }
-                            if (logger.isDebugEnabled())
-                                logger.debug("insert writing key " + FBUtilities.bytesToHex(rm.key()) + " to " + unhintedMessage.getMessageId() + "@" + destination);
-                            MessagingService.instance.sendOneWay(unhintedMessage, destination);
-                        }
-                    }
-                    else
-                    {
-                        // hinted
-                        Message hintedMessage = rm.makeRowMutationMessage();
-                        for (InetAddress target : targets)
-                        {
-                            if (!target.equals(destination))
-                            {
-                                addHintHeader(hintedMessage, target);
-                                if (logger.isDebugEnabled())
-                                    logger.debug("insert writing key " + FBUtilities.bytesToHex(rm.key()) + " to " + hintedMessage.getMessageId() + "@" + destination + " for " + target);
-                            }
-                        }
-                        responseHandler.addHintCallback(hintedMessage, destination);
-                        MessagingService.instance.sendOneWay(hintedMessage, destination);
-                    }
-                }
-            }
-            // wait for writes.  throws timeoutexception if necessary
-            for (IWriteResponseHandler responseHandler : responseHandlers)
-            {
-                responseHandler.get();
-            }
-        }
-        catch (IOException e)
-        {
-            if (mostRecentRowMutation == null)
-                throw new RuntimeException("no mutations were seen but found an error during write anyway", e);
-            else
-                throw new RuntimeException("error writing key " + FBUtilities.bytesToHex(mostRecentRowMutation.key()), e);
-        }
-        finally
-        {
-            writeStats.addNano(System.nanoTime() - startTime);
-        }
-
-    }
-
-    private static void addHintHeader(Message message, InetAddress target) throws IOException
-    {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        DataOutputStream dos = new DataOutputStream(bos);
-        byte[] previousHints = message.getHeader(RowMutation.HINT);
-        if (previousHints != null)
-        {
-            dos.write(previousHints);
-        }
-        FBUtilities.writeShortByteArray(ByteBuffer.wrap(target.getHostAddress().getBytes(UTF_8)), dos);
-        message.setHeader(RowMutation.HINT, bos.toByteArray());
-    }
-
-    private static void insertLocalMessage(final RowMutation rm, final IWriteResponseHandler responseHandler)
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("insert writing local " + rm.toString(true));
-        Runnable runnable = new WrappedRunnable()
-        {
-            public void runMayThrow() throws IOException
-            {
-                rm.apply();
-                responseHandler.response(null);
-            }
-        };
-        StageManager.getStage(Stage.MUTATION).execute(runnable);
-    }
-
-    /**
-     * Performs the actual reading of a row out of the StorageService, fetching
-     * a specific set of column names from a given column family.
-     */
-    public static List<Row> readProtocol(List<ReadCommand> commands, ConsistencyLevel consistency_level)
-            throws IOException, UnavailableException, TimeoutException, InvalidRequestException
-    {
-        if (StorageService.instance.isBootstrapMode())
-            throw new InvalidRequestException("This node cannot accept reads until it has bootstrapped");
-        long startTime = System.nanoTime();
-
-        List<Row> rows;
-        if (consistency_level == ConsistencyLevel.ONE)
-        {
-            rows = weakRead(commands);
-        }
-        else
-        {
-            assert consistency_level.getValue() >= ConsistencyLevel.QUORUM.getValue();
-            rows = strongRead(commands, consistency_level);
-        }
-
-        readStats.addNano(System.nanoTime() - startTime);
-        return rows;
-    }
-
-    private static List<Row> weakRead(List<ReadCommand> commands) throws IOException, UnavailableException, TimeoutException
-    {
-        List<Row> rows = new ArrayList<Row>();
-
-        // send off all the commands asynchronously
-        List<Future<Object>> localFutures = null;
-        List<IAsyncResult> remoteResults = null;
-        for (ReadCommand command: commands)
-        {
-            InetAddress endPoint = StorageService.instance.findSuitableEndpoint(command.table, command.key);
-            if (endPoint.equals(FBUtilities.getLocalAddress()))
-            {
-                if (logger.isDebugEnabled())
-                    logger.debug("weakread reading " + command + " locally");
-
-                if (localFutures == null)
-                    localFutures = new ArrayList<Future<Object>>();
-                Callable<Object> callable = new weakReadLocalCallable(command);
-                localFutures.add(StageManager.getStage(Stage.READ).submit(callable));
-            }
-            else
-            {
-                if (remoteResults == null)
-                    remoteResults = new ArrayList<IAsyncResult>();
-                Message message = command.makeReadMessage();
-                if (logger.isDebugEnabled())
-                    logger.debug("weakread reading " + command + " from " + message.getMessageId() + "@" + endPoint);
-                if (randomlyReadRepair(command))
-                    message.setHeader(ReadCommand.DO_REPAIR, ReadCommand.DO_REPAIR.getBytes());
-                remoteResults.add(MessagingService.instance.sendRR(message, endPoint));
-            }
-        }
-
-        // wait for results
-        if (localFutures != null)
-        {
-            for (Future<Object> future : localFutures)
-            {
-                Row row;
-                try
-                {
-                    row = (Row) future.get();
-                }
-                catch (Exception e)
-                {
-                    throw new RuntimeException(e);
-                }
-                rows.add(row);
-            }
-        }
-        if (remoteResults != null)
-        {
-            for (IAsyncResult iar: remoteResults)
-            {
-                byte[] body;
-                body = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-                ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
-                ReadResponse response = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
-                if (response.row() != null)
-                    rows.add(response.row());
-            }
-        }
-
-        return rows;
-    }
-
-    /*
-     * This function executes the read protocol.
-        // 1. Get the N nodes from storage service where the data needs to be
-        // replicated
-        // 2. Construct a message for read\write
-         * 3. Set one of the messages to get the data and the rest to get the digest
-        // 4. SendRR ( to all the nodes above )
-        // 5. Wait for a response from at least X nodes where X <= N and the data node
-         * 6. If the digest matches return the data.
-         * 7. else carry out read repair by getting data from all the nodes.
-        // 5. return success
-     */
-    private static List<Row> strongRead(List<ReadCommand> commands, ConsistencyLevel consistency_level) throws IOException, UnavailableException, TimeoutException
-    {
-        List<QuorumResponseHandler<Row>> quorumResponseHandlers = new ArrayList<QuorumResponseHandler<Row>>();
-        List<InetAddress[]> commandEndpoints = new ArrayList<InetAddress[]>();
-        List<Row> rows = new ArrayList<Row>();
-
-        // send out read requests
-        for (ReadCommand command: commands)
-        {
-            assert !command.isDigestQuery();
-            ReadCommand readMessageDigestOnly = command.copy();
-            readMessageDigestOnly.setDigestQuery(true);
-            Message message = command.makeReadMessage();
-            Message messageDigestOnly = readMessageDigestOnly.makeReadMessage();
-
-            InetAddress dataPoint = StorageService.instance.findSuitableEndpoint(command.table, command.key);
-            List<InetAddress> endpointList = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
-
-            InetAddress[] endpoints = new InetAddress[endpointList.size()];
-            Message messages[] = new Message[endpointList.size()];
-            // data-request message is sent to dataPoint, the node that will actually get
-            // the data for us. The other replicas are only sent a digest query.
-            int n = 0;
-            for (InetAddress endpoint : endpointList)
-            {
-                Message m = endpoint.equals(dataPoint) ? message : messageDigestOnly;
-                endpoints[n] = endpoint;
-                messages[n++] = m;
-                if (logger.isDebugEnabled())
-                    logger.debug("strongread reading " + (m == message ? "data" : "digest") + " for " + command + " from " + m.getMessageId() + "@" + endpoint);
-            }
-            AbstractReplicationStrategy rs = Table.open(command.table).replicationStrategy;
-            QuorumResponseHandler<Row> quorumResponseHandler = rs.getQuorumResponseHandler(new ReadResponseResolver(command.table), consistency_level);
-            MessagingService.instance.sendRR(messages, endpoints, quorumResponseHandler);
-            quorumResponseHandlers.add(quorumResponseHandler);
-            commandEndpoints.add(endpoints);
-        }
-
-        // read results and make a second pass for any digest mismatches
-        List<QuorumResponseHandler<Row>> repairResponseHandlers = null;
-        for (int i = 0; i < commands.size(); i++)
-        {
-            QuorumResponseHandler<Row> quorumResponseHandler = quorumResponseHandlers.get(i);
-            Row row;
-            ReadCommand command = commands.get(i);
-            try
-            {
-                long startTime2 = System.currentTimeMillis();
-                row = quorumResponseHandler.get();
-                if (row != null)
-                    rows.add(row);
-
-                if (logger.isDebugEnabled())
-                    logger.debug("quorumResponseHandler: " + (System.currentTimeMillis() - startTime2) + " ms.");
-            }
-            catch (DigestMismatchException ex)
-            {
-                AbstractReplicationStrategy rs = Table.open(command.table).replicationStrategy;
-                QuorumResponseHandler<Row> qrhRepair = rs.getQuorumResponseHandler(new ReadResponseResolver(command.table), ConsistencyLevel.QUORUM);
-                if (logger.isDebugEnabled())
-                    logger.debug("Digest mismatch:", ex);
-                Message messageRepair = command.makeReadMessage();
-                MessagingService.instance.sendRR(messageRepair, commandEndpoints.get(i), qrhRepair);
-                if (repairResponseHandlers == null)
-                    repairResponseHandlers = new ArrayList<QuorumResponseHandler<Row>>();
-                repairResponseHandlers.add(qrhRepair);
-            }
-        }
-
-        // read the results for the digest mismatch retries
-        if (repairResponseHandlers != null)
-        {
-            for (QuorumResponseHandler<Row> handler : repairResponseHandlers)
-            {
-                try
-                {
-                    Row row = handler.get();
-                    if (row != null)
-                        rows.add(row);
-                }
-                catch (DigestMismatchException e)
-                {
-                    throw new AssertionError(e); // full data requested from each node here, no digests should be sent
-                }
-            }
-        }
-
-        return rows;
-    }
-
-    /*
-    * This function executes the read protocol locally.  Consistency checks are performed in the background.
-    */
-
-    public static List<Row> getRangeSlice(RangeSliceCommand command, ConsistencyLevel consistency_level)
-    throws IOException, UnavailableException, TimeoutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug(command.toString());
-        long startTime = System.nanoTime();
-
-        List<AbstractBounds> ranges = getRestrictedRanges(command.range);
-        // now scan until we have enough results
-        List<Row> rows = new ArrayList<Row>(command.max_keys);
-        for (AbstractBounds range : ranges)
-        {
-            List<InetAddress> liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(command.keyspace, range.right);
-
-            if (consistency_level == ConsistencyLevel.ONE && liveEndpoints.contains(FBUtilities.getLocalAddress())) 
-            {
-                if (logger.isDebugEnabled())
-                    logger.debug("local range slice");
-                ColumnFamilyStore cfs = Table.open(command.keyspace).getColumnFamilyStore(command.column_family);
-                try 
-                {
-                    rows.addAll(cfs.getRangeSlice(command.super_column,
-                                                  range,
-                                                  command.max_keys,
-                                                  QueryFilter.getFilter(command.predicate, cfs.getComparator())));
-                } 
-                catch (ExecutionException e) 
-                {
-                    throw new RuntimeException(e.getCause());
-                } 
-                catch (InterruptedException e) 
-                {
-                    throw new AssertionError(e);
-                }           
-            }
-            else 
-            {
-                DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getLocalAddress(), liveEndpoints);
-                RangeSliceCommand c2 = new RangeSliceCommand(command.keyspace, command.column_family, command.super_column, command.predicate, range, command.max_keys);
-                Message message = c2.getMessage();
-
-                // collect replies and resolve according to consistency level
-                RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(command.keyspace, liveEndpoints);
-                AbstractReplicationStrategy rs = Table.open(command.keyspace).replicationStrategy;
-                QuorumResponseHandler<List<Row>> handler = rs.getQuorumResponseHandler(resolver, consistency_level);
-                // TODO bail early if live endpoints can't satisfy requested consistency level
-                for (InetAddress endpoint : liveEndpoints) 
-                {
-                    MessagingService.instance.sendRR(message, endpoint, handler);
-                    if (logger.isDebugEnabled())
-                        logger.debug("reading " + c2 + " from " + message.getMessageId() + "@" + endpoint);
-                }
-                // TODO read repair on remaining replicas?
-
-                // if we're done, great, otherwise, move to the next range
-                try 
-                {
-                    if (logger.isDebugEnabled()) 
-                    {
-                        for (Row row : handler.get()) 
-                        {
-                            logger.debug("range slices read " + row.key);
-                        }
-                    }
-                    rows.addAll(handler.get());
-                } 
-                catch (DigestMismatchException e) 
-                {
-                    throw new AssertionError(e); // no digests in range slices yet
-                }
-            }
-          
-            if (rows.size() >= command.max_keys)
-                break;
-        }
-
-        rangeStats.addNano(System.nanoTime() - startTime);
-        return rows.size() > command.max_keys ? rows.subList(0, command.max_keys) : rows;
-    }
-
-    /**
-     * initiate a request/response session with each live node to check whether or not everybody is using the same 
-     * migration id. This is useful for determining if a schema change has propagated through the cluster. Disagreement
-     * is assumed if any node fails to respond.
-     */
-    public static Map<String, List<String>> describeSchemaVersions()
-    {
-        final String myVersion = DatabaseDescriptor.getDefsVersion().toString();
-        final Map<InetAddress, UUID> versions = new ConcurrentHashMap<InetAddress, UUID>();
-        final Set<InetAddress> liveHosts = Gossiper.instance.getLiveMembers();
-        final Message msg = new Message(FBUtilities.getLocalAddress(), StorageService.Verb.SCHEMA_CHECK, ArrayUtils.EMPTY_BYTE_ARRAY);
-        final CountDownLatch latch = new CountDownLatch(liveHosts.size());
-        // an empty message acts as a request to the SchemaCheckVerbHandler.
-        MessagingService.instance.sendRR(msg, liveHosts.toArray(new InetAddress[]{}), new IAsyncCallback() 
-        {
-            public void response(Message msg)
-            {
-                // record the response from the remote node.
-                logger.debug("Received schema check response from " + msg.getFrom().getHostAddress());
-                UUID theirVersion = UUID.fromString(new String(msg.getMessageBody()));
-                versions.put(msg.getFrom(), theirVersion);
-                latch.countDown();
-            }
-        });
-        
-        try
-        {
-            // wait for as long as possible. timeout-1s if possible.
-            latch.await(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-        } 
-        catch (InterruptedException ex) 
-        {
-            throw new AssertionError("This latch shouldn't have been interrupted.");
-        }
-        
-        logger.debug("My version is " + myVersion);
-        
-        // maps versions to hosts that are on that version.
-        Map<String, List<String>> results = new HashMap<String, List<String>>();
-        Iterable<InetAddress> allHosts = Iterables.concat(Gossiper.instance.getLiveMembers(), Gossiper.instance.getUnreachableMembers());
-        for (InetAddress host : allHosts)
-        {
-            UUID version = versions.get(host);
-            String stringVersion = version == null ? UNREACHABLE : version.toString();
-            List<String> hosts = results.get(stringVersion);
-            if (hosts == null)
-            {
-                hosts = new ArrayList<String>();
-                results.put(stringVersion, hosts);
-            }
-            hosts.add(host.getHostAddress());
-        }
-        if (results.get(UNREACHABLE) != null)
-            logger.debug("Hosts not in agreement. Didn't get a response from everybody: " + StringUtils.join(results.get(UNREACHABLE), ","));
-        // check for version disagreement. log the hosts that don't agree.
-        for (Map.Entry<String, List<String>> entry : results.entrySet())
-        {
-            if (entry.getKey().equals(UNREACHABLE) || entry.getKey().equals(myVersion))
-                continue;
-            for (String host : entry.getValue())
-                logger.debug("%s disagrees (%s)", host, entry.getKey());
-        }
-        
-        if (results.size() == 1)
-            logger.debug("Schemas are in agreement.");
-        
-        return results;
-    }
-
-    /**
-     * Compute all ranges we're going to query, in sorted order. Nodes can be replica destinations for many ranges,
-     * so we need to restrict each scan to the specific range we want, or else we'd get duplicate results.
-     */
-    static List<AbstractBounds> getRestrictedRanges(final AbstractBounds queryRange)
-    {
-        // special case for bounds containing exactly 1 (non-minimum) token
-        if (queryRange instanceof Bounds && queryRange.left.equals(queryRange.right) && !queryRange.left.equals(StorageService.getPartitioner().getMinimumToken()))
-        {
-            if (logger.isDebugEnabled())
-                logger.debug("restricted single token match for query " + queryRange);
-            return Collections.singletonList(queryRange);
-        }
-
-        TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadata();
-
-        List<AbstractBounds> ranges = new ArrayList<AbstractBounds>();
-        // divide the queryRange into pieces delimited by the ring and minimum tokens
-        Iterator<Token> ringIter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), queryRange.left, true);
-        AbstractBounds remainder = queryRange;
-        while (ringIter.hasNext())
-        {
-            Token token = ringIter.next();
-            if (remainder == null || !remainder.contains(token))
-                // no more splits
-                break;
-            Pair<AbstractBounds,AbstractBounds> splits = remainder.split(token);
-            if (splits.left != null)
-                ranges.add(splits.left);
-            remainder = splits.right;
-        }
-        if (remainder != null)
-            ranges.add(remainder);
-        if (logger.isDebugEnabled())
-            logger.debug("restricted ranges for query " + queryRange + " are " + ranges);
-
-        return ranges;
+    private EmbedPooledConnection con;
+    private ResourceAdapter ra;
+    private XAXactId currentXid;    
+    /** The value of the transaction timeout on this resource. */
+    private int timeoutSeconds;
+    
+    EmbedXAResource (EmbedPooledConnection con, ResourceAdapter ra) {
+        this.con = con;
+        this.ra = ra;
+        // Setup the default value for the transaction timeout.
+        this.timeoutSeconds = 0;
     }
     
-    private static boolean randomlyReadRepair(ReadCommand command)
-    {
-        CFMetaData cfmd = DatabaseDescriptor.getTableMetaData(command.table).get(command.getColumnFamilyName());
-        return cfmd.readRepairChance > random.nextDouble();
-    }
-
-    public long getReadOperations()
-    {
-        return readStats.getOpCount();
-    }
-
-    public long getTotalReadLatencyMicros()
-    {
-        return readStats.getTotalLatencyMicros();
-    }
-
-    public double getRecentReadLatencyMicros()
-    {
-        return readStats.getRecentLatencyMicros();
-    }
-
-    public long getRangeOperations()
-    {
-        return rangeStats.getOpCount();
-    }
-
-    public long getTotalRangeLatencyMicros()
-    {
-        return rangeStats.getTotalLatencyMicros();
-    }
-
-    public double getRecentRangeLatencyMicros()
-    {
-        return rangeStats.getRecentLatencyMicros();
-    }
-
-    public long getWriteOperations()
-    {
-        return writeStats.getOpCount();
-    }
-
-    public long getTotalWriteLatencyMicros()
-    {
-        return writeStats.getTotalLatencyMicros();
-    }
-
-    public double getRecentWriteLatencyMicros()
-    {
-        return writeStats.getRecentLatencyMicros();
-    }
-
-    public static List<Row> scan(String keyspace, String column_family, IndexClause index_clause, SlicePredicate column_predicate, ConsistencyLevel consistency_level)
-    throws IOException, TimeoutException
-    {
-        IPartitioner p = StorageService.getPartitioner();
-
-        Token leftToken = index_clause.start_key == null ? p.getMinimumToken() : p.getToken(index_clause.start_key);
-        List<AbstractBounds> ranges = getRestrictedRanges(new Bounds(leftToken, p.getMinimumToken()));
-        logger.debug("scan ranges are " + StringUtils.join(ranges, ","));
-
-        // now scan until we have enough results
-        List<Row> rows = new ArrayList<Row>(index_clause.count);
-        for (AbstractBounds range : ranges)
-        {
-            List<InetAddress> liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(keyspace, range.right);
-            DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getLocalAddress(), liveEndpoints);
-
-            // collect replies and resolve according to consistency level
-            RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(keyspace, liveEndpoints);
-            AbstractReplicationStrategy rs = Table.open(keyspace).replicationStrategy;
-            QuorumResponseHandler<List<Row>> handler = rs.getQuorumResponseHandler(resolver, consistency_level);
-            // TODO bail early if live endpoints can't satisfy requested consistency level
-            IndexScanCommand command = new IndexScanCommand(keyspace, column_family, index_clause, column_predicate, range);
-            Message message = command.getMessage();
-            for (InetAddress endpoint : liveEndpoints)
-            {
-                MessagingService.instance.sendRR(message, endpoint, handler);
-                if (logger.isDebugEnabled())
-                    logger.debug("reading " + command + " from " + message.getMessageId() + "@" + endpoint);
+    /**
+     * Commit the global transaction specified by xid.
+     * @param xid A global transaction identifier
+     * @param onePhase If true, the resource manager should use a one-phase
+     * commit protocol to commit the work done on behalf of xid.
+     *
+     * @exception XAException An error has occurred. Possible XAExceptions are
+     * XA_HEURHAZ, XA_HEURCOM, XA_HEURRB, XA_HEURMIX, XAER_RMERR,
+     * XAER_RMFAIL, XAER_NOTA, XAER_INVAL, or XAER_PROTO.  
+     * <P>If the resource manager did not commit the transaction and
+     * the paramether onePhase is set to true, the resource manager 
+     * may throw one of the XA_RB* exceptions. Upon return, the
+     * resource manager has rolled back the branch's work and has 
+     * released all held resources.
+     */    
+    public final synchronized void commit(Xid xid, boolean onePhase) 
+                                            throws XAException {
+        checkXAActive();
+        // ensure immtable and correct equals method.
+        XAXactId xid_im = new XAXactId(xid);
+        XATransactionState tranState = getTransactionState(xid_im);
+        
+        if (tranState == null) {
+            XAResourceManager rm = ra.getXAResourceManager();
+            ContextManager inDoubtCM = rm.find(xid);
+            // RM also does not know about this xid.
+            if (inDoubtCM == null)
+                throw new XAException(XAException.XAER_NOTA);
+            ContextService csf = ContextService.getFactory();
+            csf.setCurrentContextManager(inDoubtCM);
+            try {
+                rm.commit(inDoubtCM, xid_im, onePhase);
+                
+                // close the connection/transaction since it can never
+                // be used again. DERBY-4856 No extended diagnostic information needed.
+                inDoubtCM.cleanupOnError(StandardException.closeException(),
+                        false);
+                return;
+            } catch (StandardException se) {
+                // The rm threw an exception, clean it up in the approprate
+                // context.  There is no transactionResource to handle the
+                // exception for us.
+                inDoubtCM.cleanupOnError(se, con.isActive());
+                throw wrapInXAException(se);
+            } finally {
+                csf.resetCurrentContextManager(inDoubtCM);
             }
-
-            List<Row> theseRows;
-            try
-            {
-                theseRows = handler.get();
-            }
-            catch (DigestMismatchException e)
-            {
-                throw new RuntimeException(e);
-            }
-            rows.addAll(theseRows);
-            if (logger.isDebugEnabled())
-            {
-                for (Row row : theseRows)
-                    logger.debug("read " + row);
-            }
-            if (rows.size() >= index_clause.count)
-                return rows.subList(0, index_clause.count);
+            
         }
-
-        return rows;
-    }
-
-    public boolean getHintedHandoffEnabled()
-    {
-        return hintedHandoffEnabled;
-    }
-
-    public void setHintedHandoffEnabled(boolean b)
-    {
-        hintedHandoffEnabled = b;
-    }
-
-    public static boolean isHintedHandoffEnabled()
-    {
-        return hintedHandoffEnabled;
-    }
-
-    static class weakReadLocalCallable implements Callable<Object>
-    {
-        private ReadCommand command;
-
-        weakReadLocalCallable(ReadCommand command)
-        {
-            this.command = command;
-        }
-
-        public Object call() throws IOException
-        {
-            if (logger.isDebugEnabled())
-                logger.debug("weakreadlocal reading " + command);
-
-            Table table = Table.open(command.table);
-            Row row = command.getRow(table);
-
-            // Do the consistency checks in the background
-            if (randomlyReadRepair(command))
-            {
-                List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
-                if (endpoints.size() > 1)
-                    StorageService.instance.doConsistencyCheck(row, endpoints, command);
+        
+        synchronized (tranState) {
+            checkUserCredentials(tranState.creatingResource);
+            
+            // Check the transaction is no associated with
+            // any XAResource.
+            switch (tranState.associationState) {
+                case XATransactionState.T0_NOT_ASSOCIATED:
+                    break;
+                    
+                case XATransactionState.TRO_FAIL:
+                    throw new XAException(tranState.rollbackOnlyCode);
+                    
+                default:
+                    throw new XAException(XAException.XAER_PROTO);
             }
-
-            return row;
+            
+            if (tranState.suspendedList != null && tranState.suspendedList.size() != 0)
+                throw new XAException(XAException.XAER_PROTO);
+            
+            if (tranState.isPrepared == onePhase)
+                throw new XAException(XAException.XAER_PROTO);
+            
+            try {
+                tranState.xa_commit(onePhase);
+            } catch (SQLException sqle) {
+                throw wrapInXAException(sqle);
+            } finally {
+                returnConnectionToResource(tranState, xid_im);
+            }
         }
     }
 
     /**
-     * Performs the truncate operatoin, which effectively deletes all data from
-     * the column family cfname
-     * @param keyspace
-     * @param cfname
-     * @throws UnavailableException If some of the hosts in the ring are down.
-     * @throws TimeoutException
-     * @throws IOException
+     * Ends the work performed on behalf of a transaction branch. The resource
+     * manager disassociates the XA resource from the transaction branch
+     * specified and let the transaction be completed.
+     *
+     * <p> If TMSUSPEND is specified in flags, the transaction branch is
+     * temporarily suspended in incomplete state. The transaction context
+     * is in suspened state and must be resumed via start with TMRESUME
+     * specified.
+     *
+     * <p> If TMFAIL is specified, the portion of work has failed. The
+     * resource manager may mark the transaction as rollback-only
+     *
+     * <p> If TMSUCCESS is specified, the portion of work has completed
+     * successfully.
+     *
+     * @param xid A global transaction identifier that is the same as what was
+     * used previously in the start method.
+     * @param flags One of TMSUCCESS, TMFAIL, or TMSUSPEND
+     *
+     * @exception XAException An error has occurred.
+     * Possible XAException values are XAER_RMERR, XAER_RMFAILED, XAER_NOTA,
+     * XAER_INVAL, XAER_PROTO, or XA_RB*.
      */
-    public static void truncateBlocking(String keyspace, String cfname) throws UnavailableException, TimeoutException, IOException
-    {
-        logger.debug("Starting a blocking truncate operation on keyspace {}, CF ", keyspace, cfname);
-        if (isAnyHostDown())
-        {
-            logger.info("Cannot perform truncate, some hosts are down");
-            // Since the truncate operation is so aggressive and is typically only
-            // invoked by an admin, for simplicity we require that all nodes are up
-            // to perform the operation.
-            throw new UnavailableException();
+    public final synchronized void end(Xid xid, int flags) throws XAException {
+        checkXAActive();
+        
+        try {
+            // It is possible that the isolation level state in connection
+            // handle has gotten out of sync with the real isolation level.
+            // This can happen if SLQ instead of JDBC api has been used to
+            // set the isolation level. The code below will check if isolation
+            // was set using JDBC or SQL and if yes, then it will update the
+            // isolation state in BrokeredConnection with EmbedConnection's
+            // isolation level.
+            if (con.currentConnectionHandle != null)
+                con.currentConnectionHandle.getIsolationUptoDate();
+        } catch (SQLException sqle) {
+            throw wrapInXAException(sqle);
         }
-
-        Set<InetAddress> allEndpoints = Gossiper.instance.getLiveMembers();
-        int blockFor = allEndpoints.size();
-        final TruncateResponseHandler responseHandler = new TruncateResponseHandler(blockFor);
-
-        // Send out the truncate calls and track the responses with the callbacks.
-        logger.debug("Starting to send truncate messages to hosts {}", allEndpoints);
-        Truncation truncation = new Truncation(keyspace, cfname);
-        Message message = truncation.makeTruncationMessage();
-        MessagingService.instance.sendRR(message, allEndpoints.toArray(new InetAddress[]{}), responseHandler);
-
-        // Wait for all
-        logger.debug("Sent all truncate messages, now waiting for {} responses", blockFor);
-        responseHandler.get();
-        logger.debug("truncate done");
+        
+        // ensure immtable and correct equals method.
+        XAXactId xid_im = new XAXactId(xid);
+        
+        boolean endingCurrentXid = false;
+        
+        // must match the Xid from start()
+        if (currentXid != null) {
+            if (!currentXid.equals(xid_im))
+                throw new XAException(XAException.XAER_PROTO);
+            endingCurrentXid = true;
+        }
+        
+        XATransactionState tranState = getTransactionState(xid_im);
+        if (tranState == null)
+            throw new XAException(XAException.XAER_NOTA);
+        
+        boolean rollbackOnly = tranState.end(this, flags, endingCurrentXid);
+        
+        // RESOLVE - what happens to the connection on a fail
+        // where we are not ending the current XID.
+        if (endingCurrentXid) {
+            currentXid = null;            
+            con.realConnection = null;
+        }
+        
+        if (rollbackOnly)
+            throw new XAException(tranState.rollbackOnlyCode);        
     }
 
     /**
-     * Asks the gossiper if there are any nodes that are currently down.
-     * @return true if the gossiper thinks all nodes are up.
+     * Ask the resource manager to prepare for a transaction commit of the
+     * transaction specified in xid.
+     *
+     * @param xid A global transaction identifier
+     *
+     * @return A value indicating the resource manager's vote on the outcome
+     * of the transaction. The possible values are: XA_RDONLY or XA_OK. If the
+     * resource manager wants to roll back the transaction, it should do so by
+     * raising an appropriate XAException in the prepare method.
+     *
+     * @exception XAException An error has occurred. Possible exception values
+     * are: XA_RB*, XAER_RMERR, XAER_RMFAIL, XAER_NOTA, XAER_INVAL, or
+     * XAER_PROTO.
+     *
      */
-    private static boolean isAnyHostDown()
-    {
-        return !Gossiper.instance.getUnreachableMembers().isEmpty();
+    public final synchronized int prepare(Xid xid) throws XAException {
+        checkXAActive();
+        
+        // ensure immtable and correct equals method.
+        XAXactId xid_im = new XAXactId(xid);
+        
+        XATransactionState tranState = getTransactionState(xid_im);
+        
+        if (tranState == null) {
+            XAResourceManager rm = ra.getXAResourceManager();
+            
+            ContextManager inDoubtCM = rm.find(xid);
+            
+            // RM also does not know about this xid.
+            if (inDoubtCM == null)
+                throw new XAException(XAException.XAER_NOTA);
+            
+            // cannot prepare in doubt transactions
+            throw new XAException(XAException.XAER_PROTO);
+            
+        }
+        
+        synchronized (tranState) {
+            
+            checkUserCredentials(tranState.creatingResource);
+            
+            // Check the transaction is no associated with
+            // any XAResource.
+            switch (tranState.associationState) {
+                case XATransactionState.T0_NOT_ASSOCIATED:
+                    break;
+                    
+                case XATransactionState.TRO_FAIL:
+                    throw new XAException(tranState.rollbackOnlyCode);
+                    
+                default:
+                    throw new XAException(XAException.XAER_PROTO);
+            }
+            
+            if (tranState.suspendedList != null 
+                    && tranState.suspendedList.size() != 0)
+                throw new XAException(XAException.XAER_PROTO);
+            
+            if (tranState.isPrepared)
+                throw new XAException(XAException.XAER_PROTO);
+            
+            try {
+                
+                int ret = tranState.xa_prepare();
+                
+                if (ret == XATransactionController.XA_OK) {
+                    tranState.isPrepared = true;
+                    
+                    return XAResource.XA_OK;
+                } else {
+                    
+                    returnConnectionToResource(tranState, xid_im);
+
+					if (SanityManager.DEBUG) {
+						if (con.realConnection != null) {
+							SanityManager.ASSERT(
+                                con.realConnection.transactionIsIdle(),
+                                "real connection should have been idle." +
+                                "tranState = " + tranState +
+                                "ret = " + ret +
+                                "con.realConnection = " + con.realConnection);
+                        }
+					}
+                    return XAResource.XA_RDONLY;
+                }
+            } catch (SQLException sqle) {
+                throw wrapInXAException(sqle);
+            }
+        }
+        
     }
+
+    /**
+     * Obtain the current transaction timeout value set for this XAResource
+     * instance. If XAResource.setTransactionTimeout was not use prior to
+     * invoking this method, the return value is 0; otherwise, the value
+     * used in the previous setTransactionTimeout call is returned.
+     *
+     * @return the transaction timeout value in seconds. If the returned value
+     * is equal to Integer.MAX_VALUE it means no timeout.
+     */
+    public synchronized int getTransactionTimeout() {
+        return timeoutSeconds;
+    }
+
+    /**
+     * This method is called to determine if the resource manager instance
+     * represented by the target object is the same as the resouce manager
+     * instance represented by the parameter xares.
+     *
+     * @param xares An XAResource object whose resource manager instance is to
+     * be compared with the resource manager instance of the target object.
+     *
+     * @return true if it's the same RM instance; otherwise false.
+     * @exception XAException An error has occurred. Possible exception values
+     * are XAER_RMERR, XAER_RMFAIL.
+     */
+    public final synchronized boolean isSameRM(XAResource xares) 
+                                                        throws XAException {
+        checkXAActive();        
+        if (xares instanceof EmbedXAResource) {            
+            return ra == ((EmbedXAResource) xares).ra;
+        }        
+        return false;
+    }
+    
+    /**
+     * Obtain a list of prepared transaction branches from a resource
+     * manager. The transaction manager calls this method during recovery to
+     * obtain the list of transaction branches that are currently in prepared
+     * or heuristically completed states.
+     *
+     * @param flag One of TMSTARTRSCAN, TMENDRSCAN, TMNOFLAGS. TMNOFLAGS must
+     * be used when no other flags are set in flags.
+     *
+     * @return The resource manager returns zero or more XIDs for the
+     * transaction branches that are currently in a prepared or heuristically
+     * completed state. If an error occurs during the operation, the resource
+     * manager should throw the appropriate XAException.
+     *
+     * @exception XAException An error has occurred. Possible values are
+     * XAER_RMERR, XAER_RMFAIL, XAER_INVAL, and XAER_PROTO.
+     *
+     */
+    public final synchronized Xid[] recover(int flag) throws XAException {
+        checkXAActive();
+        
+        try {
+            return ra.getXAResourceManager().recover(flag);
+        } catch (StandardException se) {
+            throw wrapInXAException(se);
+        }
+    }
+    
+    /**
+     * Tell the resource manager to forget about a heuristically completed
+     * transaction branch.
+     *
+     * @param xid A global transaction identifier
+     * @exception XAException An error has occurred. Possible exception values
+     * are XAER_RMERR, XAER_RMFAIL, XAER_NOTA, XAER_INVAL, or XAER_PROTO.
+     */
+    public final synchronized void forget(Xid xid) throws XAException {
+        
+        checkXAActive();
+        
+        // ensure immtable and correct equals method.
+        XAXactId xid_im = new XAXactId(xid);
+        
+        XATransactionState tranState = getTransactionState(xid_im);
+        if (tranState == null) {
+            XAResourceManager rm = ra.getXAResourceManager();
+            
+            ContextManager inDoubtCM = rm.find(xid);
+            
+            // RM also does not know about this xid.
+            if (inDoubtCM == null)
+                throw new XAException(XAException.XAER_NOTA);
+            
+            ContextService csf = ContextService.getFactory();
+            
+            csf.setCurrentContextManager(inDoubtCM);
+            try {
+                rm.forget(inDoubtCM, xid_im);
+                
+                // close the connection/transaction since it can never be used again.
+                inDoubtCM.cleanupOnError(StandardException.closeException(),
+                        false);
+                return;
+            } catch (StandardException se) {
+                // The rm threw an exception, clean it up in the approprate
+                // context.  There is no transactionResource to handle the
+                // exception for us.
+                inDoubtCM.cleanupOnError(se, con.isActive());
+                throw wrapInXAException(se);
+            } finally {
+                csf.resetCurrentContextManager(inDoubtCM);
+            }
+            
+        }
+        
+        throw new XAException(tranState.isPrepared
+            ? XAException.XAER_NOTA 
+            : XAException.XAER_PROTO);
+    }    
+
+    /**
+     * Inform the resource manager to roll back work done on behalf of a
+     * transaction branch
+     *
+     * @param xid A global transaction identifier
+     * @exception XAException - An error has occurred
+     */
+    public final synchronized void rollback(Xid xid) throws XAException {
+        checkXAActive();
+        
+        // ensure immtable and correct equals method.
+        XAXactId xid_im = new XAXactId(xid);
+        
+        XATransactionState tranState = getTransactionState(xid_im);
+        
+        if (tranState == null) {
+            XAResourceManager rm = ra.getXAResourceManager();
+            
+            ContextManager inDoubtCM = rm.find(xid);
+            
+            // RM also does not know about this xid.
+            if (inDoubtCM == null)
+                throw new XAException(XAException.XAER_NOTA);
+            
+            ContextService csf = ContextService.getFactory();
+            
+            csf.setCurrentContextManager(inDoubtCM);
+            try {
+                rm.rollback(inDoubtCM, xid_im);
+                
+                // close the connection/transaction since it can never be used again.
+                inDoubtCM.cleanupOnError(StandardException.closeException(),
+                        false);
+                return;
+            } catch (StandardException se) {
+                // The rm threw an exception, clean it up in the approprate
+                // context.  There is no transactionResource to handle the
+                // exception for us.
+                inDoubtCM.cleanupOnError(se, con.isActive());
+                throw wrapInXAException(se);
+            } finally {
+                csf.resetCurrentContextManager(inDoubtCM);
+            }
+            
+        }
+        
+        synchronized (tranState) {
+            
+            // Check the transaction is no associated with
+            // any XAResource.
+            switch (tranState.associationState) {
+                case XATransactionState.T0_NOT_ASSOCIATED:
+                case XATransactionState.TRO_FAIL:
+                    break;
+                    
+                default:
+                    throw new XAException(XAException.XAER_PROTO);
+            }
+            
+            if (tranState.suspendedList != null 
+                    && tranState.suspendedList.size() != 0)
+                throw new XAException(XAException.XAER_PROTO);
+            
+            checkUserCredentials(tranState.creatingResource);
+            
+            try {
+                
+                tranState.xa_rollback();
+            } catch (SQLException sqle) {
+                throw wrapInXAException(sqle);
+            } finally {
+                returnConnectionToResource(tranState, xid_im);
+            }
+        }
+    }
+
+
+    /**
+     * Set the current transaction timeout value for this XAResource
+     * instance. Once set, this timeout value is effective until
+     * setTransactionTimeout is invoked again with a different value. To reset
+     * the timeout value to the default value used by the resource manager,
+     * set the value to zero. If the timeout operation is performed
+     * successfully, the method returns true; otherwise false. If a resource
+     * manager does not support transaction timeout value to be set
+     * explicitly, this method returns false.
+     *
+     * @param seconds the transaction timeout value in seconds.
+     *                Value of 0 means the reasource manager's default value.
+     *                Value of Integer.MAX_VALUE means no timeout.
+     * @return true if transaction timeout value is set successfully;
+     * otherwise false.
+     *
+     * @exception XAException - An error has occurred. Possible exception
+     * values are XAER_RMERR, XAER_RMFAIL, or XAER_INVAL.
+     */
+    public synchronized boolean setTransactionTimeout(int seconds)
+    throws XAException {
+        if (seconds < 0) {
+            // throw an exception if invalid value was specified
+            throw new XAException(XAException.XAER_INVAL);
+        }
+        timeoutSeconds = seconds;
+        return true;
+    }
+
+    /** Returns the default value for the transaction timeout in milliseconds
+     *  setted up by the system properties.
+     */
+    private long getDefaultXATransactionTimeout() throws XAException {
+        try {
+            LanguageConnectionContext lcc = con.getLanguageConnection();
+            TransactionController tc = lcc.getTransactionExecute();
+
+            long timeoutMillis = 1000 * (long) PropertyUtil.getServiceInt(
+                tc,
+                Property.PROP_XA_TRANSACTION_TIMEOUT,
+                0,
+                Integer.MAX_VALUE,
+                Property.DEFAULT_XA_TRANSACTION_TIMEOUT
+                );
+
+            return timeoutMillis;
+        } catch (SQLException sqle) {
+            throw wrapInXAException(sqle);
+        } catch (StandardException se) {
+            throw wrapInXAException(se);
+        }
+    }
+
+    /**
+     * Start work on behalf of a transaction branch specified in xid If TMJOIN
+     * is specified, the start is for joining a transaction previously seen by
+     * the resource manager. If TMRESUME is specified, the start is to resume
+     * a suspended transaction specified in the parameter xid. If neither
+     * TMJOIN nor TMRESUME is specified and the transaction specified by xid
+     * has previously been seen by the resource manager, the resource manager
+     * throws the XAException exception with XAER_DUPID error code.
+     *
+     * @param xid A global transaction identifier to be associated with the
+     * resource
+     * @param flags One of TMNOFLAGS, TMJOIN, or TMRESUME
+     *
+     * @exception XAException An error has occurred. Possible exceptions are
+     * XA_RB*, XAER_RMERR, XAER_RMFAIL, XAER_DUPID, XAER_OUTSIDE, XAER_NOTA,
+     * XAER_INVAL, or XAER_PROTO.
+     */
+    public final synchronized void start(Xid xid, 
+                                        int flags) throws XAException {
+        checkXAActive();
+        
+        // JDBC 3.0 section 12.3 - One transaction associated with a XAConnection
+        if (currentXid != null)
+            throw new XAException(XAException.XAER_PROTO);
+        
+        // ensure immtable and correct equals method.
+        XAXactId xid_im = new XAXactId(xid);
+        
+        XATransactionState tranState = getTransactionState(xid_im);
+        
+        switch (flags) {
+            case XAResource.TMNOFLAGS:
+                if (tranState != null)
+                    throw new XAException(XAException.XAER_DUPID);
+                
+                try {
+                    
+                    if (con.realConnection == null) {
+                        con.openRealConnection();
+                        
+                        if (con.currentConnectionHandle != null) {
+                            
+                            // since this is a new connection, set its complete
+                            // state according to the application's Connection
+                            // handle view of the world.
+                            con.currentConnectionHandle.setState(true);
+                            con.realConnection.setApplicationConnection
+                                    (con.currentConnectionHandle);
+                        }
+                        
+                    } else {
+                        
+                        // XAResource.start() auto commits in DB2 when in 
+                        // auto commit mode.
+                        if (con.currentConnectionHandle != null) {
+                            if (con.currentConnectionHandle.getAutoCommit())
+                                con.currentConnectionHandle.rollback();
+                        }
+                        if (!con.realConnection.transactionIsIdle())
+                            throw new XAException(XAException.XAER_OUTSIDE);
+                        
+                        if (con.currentConnectionHandle != null) {
+                            // It is possible that the isolation level state 
+                            // in connection handle has gotten out of sync 
+                            // with the real isolation level. This can happen 
+                            // if SLQ instead of JDBC api has been used to set 
+                            // the isolation level. The code below will check 
+                            // if isolation was set using JDBC or SQL and if 
+                            // yes, then it will update the isolation state 
+                            // in BrokeredConnection with EmbedConnection's
+                            // isolation level.
+                            con.currentConnectionHandle.getIsolationUptoDate();
+                            // we have a current handle so we need to keep
+                            // the connection state of the current connection.
+                            con.currentConnectionHandle.setState(true);
+                            
+                            // At the local to global transition we need 
+                            // to discard and close any open held result 
+                            // sets, a rollback will do this.
+                            con.realConnection.rollback();
+                        } else {
+                            con.resetRealConnection();
+                        }
+                        
+                    }
+                    
+                    // Global connections are always in auto commit false mode.
+                    con.realConnection.setAutoCommit(false);
+                    
+                    // and holdability false (cannot hold cursors across 
+                    // XA transactions.
+                    con.realConnection.setHoldability(
+                            ResultSet.CLOSE_CURSORS_AT_COMMIT);
+                    
+                    con.realConnection.getLanguageConnection().
+                            getTransactionExecute().
+                            createXATransactionFromLocalTransaction(
+                                                xid_im.getFormatId(),
+                                                xid_im.getGlobalTransactionId(),
+                                                xid_im.getBranchQualifier());
+                    
+                    
+                } catch (StandardException se) {
+                    throw wrapInXAException(se);
+                } catch (SQLException sqle) {
+                    throw wrapInXAException(sqle);
+                }
+                
+                tranState = new XATransactionState(
+                    con.realConnection.getContextManager(),
+                    con.realConnection, this, xid_im);
+                if (!ra.addConnection(xid_im, tranState))
+                    throw new XAException(XAException.XAER_DUPID);
+                
+                currentXid = xid_im;
+
+                // If the the timeout specified is equal to Integer.MAX_VALUE
+                // it means that transaction timeout is disabled.
+                if (timeoutSeconds != Integer.MAX_VALUE) {
+                    // Find out the value of the transaction timeout
+                    long timeoutMillis;
+                    if (timeoutSeconds > 0) {
+                        timeoutMillis = 1000*timeoutSeconds;
+                    } else {
+                        timeoutMillis = getDefaultXATransactionTimeout();
+                    }
+                    // If we have non-zero transaction timeout schedule a timeout task.
+                    // The only way how timeoutMillis might be equeal to 0 is that
+                    // it was specified as a default transaction timeout
+                    if (timeoutMillis > 0) {
+                        tranState.scheduleTimeoutTask(timeoutMillis);
+                    }
+                }
+
+                break;
+                
+            case XAResource.TMRESUME:
+            case XAResource.TMJOIN:
+                if (tranState == null)
+                    throw new XAException(XAException.XAER_NOTA);
+                
+                tranState.start(this, flags);
+                
+                if (tranState.conn != con.realConnection) {
+                    
+                    if (con.realConnection != null) {
+                        
+                        if (!con.realConnection.transactionIsIdle())
+                            throw new XAException(XAException.XAER_OUTSIDE);
+                        
+                        // We need to get the isolation level up to date same 
+                        // way as it is done at start of a transaction. Before
+                        // joining the transaction, it is possible that the 
+                        // isolation level was updated using SQL. We need to 
+                        // get this state and store in the connection handle so 
+                        // that we can restore the isolation when we are in the 
+                        // local mode.
+                        try {
+	                    	if (con.currentConnectionHandle != null) {
+	                    		con.currentConnectionHandle.getIsolationUptoDate();
+	                    	}
+                    	} catch (SQLException sqle) {
+                            throw wrapInXAException(sqle);
+                        }
+                        
+                        closeUnusedConnection(con.realConnection);
+                    }
+                    con.realConnection = tranState.conn;
+                    
+                    if (con.currentConnectionHandle != null) {
+                        
+                        try {
+                            // only reset the non-transaction specific 
+                            // Connection state.
+                            con.currentConnectionHandle.setState(false);
+                            con.realConnection.setApplicationConnection(
+                                    con.currentConnectionHandle);
+                        } catch (SQLException sqle) {
+                            throw wrapInXAException(sqle);
+                        }
+                    }
+                    
+                }
+                
+                
+                break;
+                
+            default:
+                throw new XAException(XAException.XAER_INVAL);
+        }
+        
+        currentXid = xid_im;
+    }
+    
+    /**
+     * Resturns currently active xid
+     * @return Xid
+     */
+    Xid getCurrentXid () {
+        return currentXid;
+    }
+
+    /**
+     * Returns the XATransactionState of the the transaction
+     * @param xid_im 
+     * @return XATransactionState
+     */
+    private XATransactionState getTransactionState(XAXactId xid_im) {
+        return (XATransactionState) ra.findConnection(xid_im);
+    }
+
+    /**
+     * Compares the user name and password of the XAResource with
+     * user name and password of this and throws XAException if there is 
+     * a mismatch
+     * @param original EmbedXAResource
+     */
+    private void checkUserCredentials(EmbedXAResource original)
+                                                        throws XAException {        
+        if (original == this)
+            return;        
+        if (original.con.getPassword().equals(con.getPassword()) && 
+                (original.con.getUsername().equals(con.getUsername())))
+            return;                
+        throw new XAException(XAException.XA_RBINTEGRITY);
+    }
+    
+    /**
+     * Checks if currently associated connection is active
+     * throws exception if not
+     */
+    private void checkXAActive() throws XAException {    
+        try {
+            con.checkActive();
+        } catch (SQLException sqle) {
+            throw wrapInXAException(sqle);
+        }
+    }
+    
+    /**
+     * Map a SQL exception to appropriate XAException.
+     * Return the mapped XAException.
+     */
+    private static XAException wrapInXAException(SQLException se) {
+        // Map interesting exceptions to XAException
+        String sqlstate = se.getSQLState();
+        String message = se.getMessage();
+        int seErrorCode = se.getErrorCode();      
+        int xaErrorCode;
+        
+        XAException xae;
+        
+        // Determine the XAException.errorCode.  This is known for 
+        // some specific exceptions. For other exceptions, we will
+        // return XAER_RMFAIL for SESSION_SEVERITY or greater and
+        // XAER_RMERR for less severe errors. DERBY-4141.
+        if (sqlstate.equals(StandardException.getSQLStateFromIdentifier(
+                            SQLState.STORE_XA_XAER_DUPID)))
+            xaErrorCode = XAException.XAER_DUPID;
+        else if (sqlstate.equals(StandardException.getSQLStateFromIdentifier(
+                                SQLState.STORE_XA_PROTOCOL_VIOLATION)))
+            xaErrorCode = XAException.XA_RBPROTO;
+        else if (sqlstate.equals(SQLState.DEADLOCK))
+            xaErrorCode = XAException.XA_RBDEADLOCK;
+        else if (sqlstate.equals(SQLState.LOCK_TIMEOUT))
+            xaErrorCode = XAException.XA_RBTIMEOUT;
+        else if (seErrorCode >=  ExceptionSeverity.SESSION_SEVERITY)
+            xaErrorCode = XAException.XAER_RMFAIL;            
+        else
+            xaErrorCode = XAException.XAER_RMERR;
+        
+        xae = new XAException(message);
+        xae.errorCode = xaErrorCode;
+        if (JVMInfo.JDK_ID >= JVMInfo.J2SE_14)
+            xae.initCause(se);
+        return xae;
+    }
+	
+    /**
+     * Map a Standard exception to appropriate XAException.
+     * Return the mapped XAException.
+     */
+    private static XAException wrapInXAException(StandardException se) {
+        return wrapInXAException(
+                TransactionResourceImpl.wrapInSQLException(se));
+    }
+    
+    /**
+     * Return an underlying connection object back to its XAResource
+     * if possible. If not close the connection.
+     * @param tranState 
+     * @param xid_im 
+     */
+    void returnConnectionToResource(XATransactionState tranState,
+                                                            XAXactId xid_im) {
+        
+        removeXATransaction(xid_im);    
+        synchronized (tranState) {
+            // global transaction is over.
+            tranState.associationState = XATransactionState.TC_COMPLETED;
+            tranState.notifyAll();
+            
+            EmbedConnection conn = tranState.conn;
+            
+            // already set in its own resource
+            // or can it be returned to its original resource?
+            if ((tranState.creatingResource.con.realConnection == conn) ||
+                    (tranState.creatingResource.con.realConnection == null)) {
+                
+                tranState.creatingResource.con.realConnection = conn;
+                
+                BrokeredConnection handle = 
+                        tranState.creatingResource.con.currentConnectionHandle;
+                
+                conn.setApplicationConnection(handle);
+                
+                if (handle != null) {
+                    try {
+                        handle.setState(true);
+                    } catch (SQLException sqle) {
+                        
+                        // couldn't reset the connection
+                        closeUnusedConnection(tranState.conn);
+                        tranState.creatingResource.con.realConnection = null;
+                    }
+                }
+                return;
+            }
+        }
+        
+        // nowhere to place it, close it.
+        closeUnusedConnection(tranState.conn);
+    }
+
+
+    /**
+     * Close  an underlying connection object when there is
+     * no active XAResource to hand it to.
+     * @param conn 
+     */
+    private static void closeUnusedConnection(EmbedConnection conn) {
+        if (conn != null) {
+            try {
+                conn.close();
+            } catch (SQLException sqle) {
+                
+            }
+        }
+    }
+
+    /**
+     * Removes the xid from currently active transactions
+     * @param xid_im 
+     */
+    void removeXATransaction(XAXactId xid_im) {
+        XATransactionState tranState = 
+                (XATransactionState) ra.removeConnection(xid_im);
+        if (tranState != null)
+            tranState.popMe();
+    }
+    
+    void setCurrentXid(XAXactId aCurrentXid) {
+        currentXid = aCurrentXid;
+    }
+
 }

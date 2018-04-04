@@ -91,8 +91,8 @@ The datasets used in this competition are from:
 
 | Directory | Total source code files | Lines of code (LOC) |
 | --- | --- |--- |
-| Dataset1/ | 4421 | 2305784 |
-| Dataset2/ | 11141 | 5556153 |
+| Dataset1/ | 4394 | 2291014 |
+| Dataset2/ | 11069 | 5530782 |
 
 ## Command-line interface
 
@@ -158,7 +158,7 @@ This loss function is designed with the following properties in mind:
 
 We note that the `recall@k` does not comply with all those properties.
 
-## Base line systems f
+## Base line systems
 
 We provide 5 dumb systems for illustrating how to parse the data and having a baseline performance. These are:
 * `guessFirst.py`: Always predict the first line of the file

@@ -1,14 +1,13 @@
-int mid = (low + high) >>> 1;
-
-package org.apache.lucene.search;
+IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, replicas_.size());
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,248 +18,177 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.IndexReader;
+package org.apache.cassandra.service;
+
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
 
-/**
- * Expert: Maintains caches of term values.
- *
- * <p>Created: May 19, 2004 11:13:14 AM
- *
- * @since   lucene 1.4
- * @version $Id$
- */
-public interface FieldCache {
+import org.apache.commons.lang.StringUtils;
 
-  /** Indicator for StringIndex values in the cache. */
-  // NOTE: the value assigned to this constant must not be
-  // the same as any of those in SortField!!
-  public static final int STRING_INDEX = -1;
+import org.apache.cassandra.cache.ICacheExpungeHook;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadResponse;
+import org.apache.cassandra.db.Row;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.ExpiringMap;
+import org.apache.cassandra.utils.FBUtilities;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
-  /** Expert: Stores term text values and document ordering data. */
-  public static class StringIndex {
-	  
-    public int binarySearchLookup(String key) {
-      // this special case is the reason that Arrays.binarySearch() isn't useful.
-      if (key == null)
-        return 0;
-	  
-      int low = 1;
-      int high = lookup.length-1;
+class ConsistencyChecker implements Runnable
+{
+    private static Logger logger_ = LoggerFactory.getLogger(ConsistencyChecker.class);
+    private static ExpiringMap<String, String> readRepairTable_ = new ExpiringMap<String, String>(DatabaseDescriptor.getRpcTimeout());
 
-      while (low <= high) {
-        int mid = (low + high) >> 1;
-        int cmp = lookup[mid].compareTo(key);
+    private final String table_;
+    private final Row row_;
+    protected final List<InetAddress> replicas_;
+    private final ReadCommand readCommand_;
 
-        if (cmp < 0)
-          low = mid + 1;
-        else if (cmp > 0)
-          high = mid - 1;
-        else
-          return mid; // key found
-      }
-      return -(low + 1);  // key not found.
+    public ConsistencyChecker(String table, Row row, List<InetAddress> endpoints, ReadCommand readCommand)
+    {
+        table_ = table;
+        row_ = row;
+        replicas_ = endpoints;
+        readCommand_ = readCommand;
     }
-	
-    /** All the term values, in natural order. */
-    public final String[] lookup;
 
-    /** For each document, an index into the lookup array. */
-    public final int[] order;
+    public void run()
+	{
+        ReadCommand readCommandDigestOnly = constructReadMessage(true);
+		try
+		{
+			Message message = readCommandDigestOnly.makeReadMessage();
+            if (logger_.isDebugEnabled())
+              logger_.debug("Reading consistency digest for " + readCommand_.key + " from " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
 
-    /** Creates one of these objects */
-    public StringIndex (int[] values, String[] lookup) {
-      this.order = values;
-      this.lookup = lookup;
+            MessagingService.instance.addCallback(new DigestResponseHandler(), message.getMessageId());
+            for (InetAddress endpoint : replicas_)
+            {
+                if (!endpoint.equals(FBUtilities.getLocalAddress()))
+                    MessagingService.instance.sendOneWay(message, endpoint);
+            }
+		}
+		catch (IOException ex)
+		{
+			throw new RuntimeException(ex);
+		}
+	}
+
+    private ReadCommand constructReadMessage(boolean isDigestQuery)
+    {
+        ReadCommand readCommand = readCommand_.copy();
+        readCommand.setDigestQuery(isDigestQuery);
+        return readCommand;
     }
-  }
 
-  /** Interface to parse bytes from document fields.
-   * @see FieldCache#getBytes(IndexReader, String, FieldCache.ByteParser)
-   */
-  public interface ByteParser {
-    /** Return a single Byte representation of this field's value. */
-    public byte parseByte(String string);
-  }
+    class DigestResponseHandler implements IAsyncCallback
+	{
+        private boolean repairInvoked;
 
-  /** Interface to parse shorts from document fields.
-   * @see FieldCache#getShorts(IndexReader, String, FieldCache.ShortParser)
-   */
-  public interface ShortParser {
-    /** Return a short representation of this field's value. */
-    public short parseShort(String string);
-  }
+		public synchronized void response(Message response)
+		{
+            if (repairInvoked)
+                return;
 
-  /** Interface to parse ints from document fields.
-   * @see FieldCache#getInts(IndexReader, String, FieldCache.IntParser)
-   */
-  public interface IntParser {
-    /** Return an integer representation of this field's value. */
-    public int parseInt(String string);
-  }
+            try
+            {
+                byte[] body = response.getMessageBody();
+                ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+                ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
+                byte[] digest = result.digest();
 
-  /** Interface to parse floats from document fields.
-   * @see FieldCache#getFloats(IndexReader, String, FieldCache.FloatParser)
-   */
-  public interface FloatParser {
-    /** Return an float representation of this field's value. */
-    public float parseFloat(String string);
-  }
+                if (!Arrays.equals(ColumnFamily.digest(row_.cf), digest))
+                {
+                    IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_);
+                    IAsyncCallback responseHandler;
+                    if (replicas_.contains(FBUtilities.getLocalAddress()))
+                        responseHandler = new DataRepairHandler(row_, replicas_.size(), readResponseResolver);
+                    else
+                        responseHandler = new DataRepairHandler(replicas_.size(), readResponseResolver);
 
-  /** Expert: The cache used internally by sorting and range query classes. */
-  public static FieldCache DEFAULT = new FieldCacheImpl();
+                    ReadCommand readCommand = constructReadMessage(false);
+                    Message message = readCommand.makeReadMessage();
+                    if (logger_.isDebugEnabled())
+                      logger_.debug("Performing read repair for " + readCommand_.key + " to " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
+                    MessagingService.instance.addCallback(responseHandler, message.getMessageId());
+                    for (InetAddress endpoint : replicas_)
+                    {
+                        if (!endpoint.equals(FBUtilities.getLocalAddress()))
+                            MessagingService.instance.sendOneWay(message, endpoint);
+                    }
 
-  /** Checks the internal cache for an appropriate entry, and if none is
-   * found, reads the terms in <code>field</code> as a single byte and returns an array
-   * of size <code>reader.maxDoc()</code> of the value each document
-   * has in the given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the single byte values.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public byte[] getBytes (IndexReader reader, String field)
-  throws IOException;
+                    repairInvoked = true;
+                }
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException("Error handling responses for " + row_, e);
+            }
+        }
+    }
 
-  /** Checks the internal cache for an appropriate entry, and if none is found,
-   * reads the terms in <code>field</code> as bytes and returns an array of
-   * size <code>reader.maxDoc()</code> of the value each document has in the
-   * given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the bytes.
-   * @param parser  Computes byte for string values.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public byte[] getBytes (IndexReader reader, String field, ByteParser parser)
-  throws IOException;
+	static class DataRepairHandler implements IAsyncCallback, ICacheExpungeHook<String, String>
+	{
+		private final Collection<Message> responses_ = new LinkedBlockingQueue<Message>();
+		private final IResponseResolver<Row> readResponseResolver_;
+		private final int majority_;
+		
+		DataRepairHandler(int responseCount, IResponseResolver<Row> readResponseResolver)
+		{
+			readResponseResolver_ = readResponseResolver;
+			majority_ = (responseCount / 2) + 1;  
+		}
 
-  /** Checks the internal cache for an appropriate entry, and if none is
-   * found, reads the terms in <code>field</code> as shorts and returns an array
-   * of size <code>reader.maxDoc()</code> of the value each document
-   * has in the given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the shorts.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public short[] getShorts (IndexReader reader, String field)
-  throws IOException;
+        public DataRepairHandler(Row localRow, int responseCount, IResponseResolver<Row> readResponseResolver) throws IOException
+        {
+            this(responseCount, readResponseResolver);
+            // wrap localRow in a response Message so it doesn't need to be special-cased in the resolver
+            ReadResponse readResponse = new ReadResponse(localRow);
+            DataOutputBuffer out = new DataOutputBuffer();
+            ReadResponse.serializer().serialize(readResponse, out);
+            byte[] bytes = new byte[out.getLength()];
+            System.arraycopy(out.getData(), 0, bytes, 0, bytes.length);
+            responses_.add(new Message(FBUtilities.getLocalAddress(), StageManager.RESPONSE_STAGE, StorageService.Verb.READ_RESPONSE, bytes));
+        }
 
-  /** Checks the internal cache for an appropriate entry, and if none is found,
-   * reads the terms in <code>field</code> as shorts and returns an array of
-   * size <code>reader.maxDoc()</code> of the value each document has in the
-   * given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the shorts.
-   * @param parser  Computes short for string values.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public short[] getShorts (IndexReader reader, String field, ShortParser parser)
-  throws IOException;
+        // synchronized so the " == majority" is safe
+		public synchronized void response(Message message)
+		{
+			if (logger_.isDebugEnabled())
+			  logger_.debug("Received responses in DataRepairHandler : " + message.toString());
+			responses_.add(message);
+            if (responses_.size() == majority_)
+            {
+                String messageId = message.getMessageId();
+                readRepairTable_.put(messageId, messageId, this);
+            }
+        }
 
-  /** Checks the internal cache for an appropriate entry, and if none is
-   * found, reads the terms in <code>field</code> as integers and returns an array
-   * of size <code>reader.maxDoc()</code> of the value each document
-   * has in the given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the integers.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public int[] getInts (IndexReader reader, String field)
-  throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if none is found,
-   * reads the terms in <code>field</code> as integers and returns an array of
-   * size <code>reader.maxDoc()</code> of the value each document has in the
-   * given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the integers.
-   * @param parser  Computes integer for string values.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public int[] getInts (IndexReader reader, String field, IntParser parser)
-  throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if
-   * none is found, reads the terms in <code>field</code> as floats and returns an array
-   * of size <code>reader.maxDoc()</code> of the value each document
-   * has in the given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the floats.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public float[] getFloats (IndexReader reader, String field)
-  throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if
-   * none is found, reads the terms in <code>field</code> as floats and returns an array
-   * of size <code>reader.maxDoc()</code> of the value each document
-   * has in the given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the floats.
-   * @param parser  Computes float for string values.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public float[] getFloats (IndexReader reader, String field,
-                            FloatParser parser) throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if none
-   * is found, reads the term values in <code>field</code> and returns an array
-   * of size <code>reader.maxDoc()</code> containing the value each document
-   * has in the given field.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the strings.
-   * @return The values in the given field for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public String[] getStrings (IndexReader reader, String field)
-  throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if none
-   * is found reads the term values in <code>field</code> and returns
-   * an array of them in natural order, along with an array telling
-   * which element in the term array each document uses.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the strings.
-   * @return Array of terms and index into the array for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public StringIndex getStringIndex (IndexReader reader, String field)
-  throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if
-   * none is found reads <code>field</code> to see if it contains integers, floats
-   * or strings, and then calls one of the other methods in this class to get the
-   * values.  For string values, a StringIndex is returned.  After
-   * calling this method, there is an entry in the cache for both
-   * type <code>AUTO</code> and the actual found type.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the values.
-   * @return int[], float[] or StringIndex.
-   * @throws IOException  If any error occurs.
-   */
-  public Object getAuto (IndexReader reader, String field)
-  throws IOException;
-
-  /** Checks the internal cache for an appropriate entry, and if none
-   * is found reads the terms out of <code>field</code> and calls the given SortComparator
-   * to get the sort values.  A hit in the cache will happen if <code>reader</code>,
-   * <code>field</code>, and <code>comparator</code> are the same (using <code>equals()</code>)
-   * as a previous call to this method.
-   * @param reader  Used to get field values.
-   * @param field   Which field contains the values.
-   * @param comparator Used to convert terms into something to sort by.
-   * @return Array of sort objects, one for each document.
-   * @throws IOException  If any error occurs.
-   */
-  public Comparable[] getCustom (IndexReader reader, String field, SortComparator comparator)
-  throws IOException;
-  
+		public void callMe(String key, String value)
+		{
+            try
+			{
+				readResponseResolver_.resolve(responses_);
+            }
+            catch (Exception ex)
+            {
+                throw new RuntimeException(ex);
+            }
+        }
+    }
 }

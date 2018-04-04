@@ -1,13 +1,30 @@
-private Set<InetAddress> replicatingNodes = Collections.synchronizedSet(new HashSet<InetAddress>());
+int partitionSize = arrays.arrayLength; // all partitions, except, possibly, the last,
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.facet.search;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.lucene.facet.search.params.FacetRequest;
+import org.apache.lucene.facet.search.params.FacetRequest.SortOrder;
+import org.apache.lucene.facet.search.results.FacetResult;
+import org.apache.lucene.facet.search.results.FacetResultNode;
+import org.apache.lucene.facet.search.results.IntermediateFacetResult;
+import org.apache.lucene.facet.search.results.MutableFacetResultNode;
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
+import org.apache.lucene.facet.taxonomy.directory.ParallelTaxonomyArrays;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.collections.IntIterator;
+import org.apache.lucene.util.collections.IntToObjectMap;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,2074 +35,766 @@ private Set<InetAddress> replicatingNodes = Collections.synchronizedSet(new Hash
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
-
-import java.io.IOError;
-import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.concurrent.*;
-import javax.management.MBeanServer;
-import javax.management.MalformedObjectNameException;
-import javax.management.ObjectName;
-
-import com.google.common.base.Charsets;
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.Multimap;
-import org.apache.cassandra.locator.*;
-import org.apache.log4j.Level;
-import org.apache.commons.lang.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.concurrent.*;
-import org.apache.cassandra.config.*;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.migration.AddKeyspace;
-import org.apache.cassandra.db.migration.Migration;
-import org.apache.cassandra.dht.BootStrapper;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.gms.*;
-import org.apache.cassandra.io.DeletionService;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.net.IAsyncResult;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.net.ResponseVerbHandler;
-import org.apache.cassandra.service.AntiEntropyService.TreeRequestVerbHandler;
-import org.apache.cassandra.streaming.*;
-import org.apache.cassandra.thrift.Constants;
-import org.apache.cassandra.thrift.UnavailableException;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.SkipNullRepresenter;
-import org.apache.cassandra.utils.WrappedRunnable;
-import org.yaml.snakeyaml.Dumper;
-import org.yaml.snakeyaml.DumperOptions;
-import org.yaml.snakeyaml.Yaml;
-import org.yaml.snakeyaml.nodes.Tag;
-
-/*
- * This abstraction contains the token/identifier of this node
- * on the identifier space. This token gets gossiped around.
- * This class will also maintain histograms of the load information
- * of other nodes in the cluster.
+/**
+ * Generates {@link FacetResult} from the count arrays aggregated for a particular 
+ * {@link FacetRequest}.
+ * The generated {@link FacetResult} is a subtree of the taxonomy tree.
+ * Its root node, {@link FacetResult#getFacetResultNode()}, 
+ * is the facet specified by {@link FacetRequest#getCategoryPath()},
+ * and the enumerated children, {@link FacetResultNode#getSubResults()}, of each node in that 
+ * {@link FacetResult} are the top K ( = {@link FacetRequest#getNumResults()}) among its children
+ * in the taxonomy.
+ * Top in the sense {@link FacetRequest#getSortBy()},
+ * which can be by the values aggregated in the count arrays, or by ordinal numbers;
+ * also specified is the sort order, {@link FacetRequest#getSortOrder()}, 
+ * ascending or descending, of these values or ordinals before their top K are selected. 
+ * The depth (number of levels excluding the root) of the 
+ * {@link FacetResult} tree is specified by {@link FacetRequest#getDepth()}.  
+ * <p>
+ * Because the number of selected children of each node is restricted,
+ * and not the overall number of nodes in the {@link FacetResult}, facets not selected 
+ * into {@link FacetResult} might have better values, or ordinals, (typically,
+ * higher counts), than facets that are selected into the {@link FacetResult}.
+ * <p>
+ * The generated {@link FacetResult} also provides with 
+ * {@link FacetResult#getNumValidDescendants()}, which returns the total number of facets 
+ * that are descendants of the root node, no deeper than {@link FacetRequest#getDepth()}, and
+ * which have valid value. The rootnode itself is not counted here. 
+ * Valid value is determined by the {@link FacetResultsHandler}. 
+ * {@link TopKInEachNodeHandler} defines valid as != 0. 
+ * <p>
+ * <b>NOTE:</b> this code relies on the assumption that {@link TaxonomyReader#INVALID_ORDINAL} == -1, a smaller
+ * value than any valid ordinal.
+ * 
+ * @lucene.experimental
  */
-public class StorageService implements IEndpointStateChangeSubscriber, StorageServiceMBean
-{
-    private static Logger logger_ = LoggerFactory.getLogger(StorageService.class);     
+public class TopKInEachNodeHandler extends FacetResultsHandler {
 
-    public static final int RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
+  public TopKInEachNodeHandler(TaxonomyReader taxonomyReader,
+                                FacetRequest facetRequest) {
+    super(taxonomyReader, facetRequest);
+  }
 
-    /* All verb handler identifiers */
-    public enum Verb
-    {
-        MUTATION,
-        BINARY,
-        READ_REPAIR,
-        READ,
-        REQUEST_RESPONSE, // client-initiated reads and writes
-        STREAM_INITIATE, // Deprecated
-        STREAM_INITIATE_DONE, // Deprecated
-        STREAM_REPLY,
-        STREAM_REQUEST,
-        RANGE_SLICE,
-        BOOTSTRAP_TOKEN,
-        TREE_REQUEST,
-        TREE_RESPONSE,
-        JOIN, // Deprecated
-        GOSSIP_DIGEST_SYN,
-        GOSSIP_DIGEST_ACK,
-        GOSSIP_DIGEST_ACK2,
-        DEFINITIONS_ANNOUNCE,
-        DEFINITIONS_UPDATE_RESPONSE,
-        TRUNCATE,
-        SCHEMA_CHECK,
-        INDEX_SCAN,
-        REPLICATION_FINISHED,
-        INTERNAL_RESPONSE, // responses to internal calls
-        // use as padding for backwards compatability where a previous version needs to validate a verb from the future.
-        UNUSED_1,
-        UNUSED_2,
-        UNUSED_3,
-        ;
-        // remember to add new verbs at the end, since we serialize by ordinal
-    }
-    public static final Verb[] VERBS = Verb.values();
+  /**
+   * Recursively explore all facets that can be potentially included in the
+   * {@link FacetResult} to be generated, and that belong to the given
+   * partition, so that values can be examined and collected. For each such
+   * node, gather its top K ({@link FacetRequest#getNumResults()}) children
+   * among its children that are encountered in the given particular partition
+   * (aka current counting list).
+   * 
+   * @return {@link IntermediateFacetResult} consisting of
+   *         {@link IntToObjectMap} that maps potential
+   *         {@link FacetResult} nodes to their top K children encountered in
+   *         the current partition. Note that the mapped potential tree nodes
+   *         need not belong to the given partition, only the top K children
+   *         mapped to. The aim is to identify nodes that are certainly excluded
+   *         from the {@link FacetResult} to be eventually (after going through
+   *         all the partitions) returned by this handler, because they have K
+   *         better siblings, already identified in this partition. For the
+   *         identified excluded nodes, we only count number of their
+   *         descendants in the subtree (to be included in
+   *         {@link FacetResult#getNumValidDescendants()}), but not bother with
+   *         selecting top K in these generations, which, by definition, are,
+   *         too, excluded from the FacetResult tree.
+   * @param arrays the already filled in count array, potentially only covering
+   *        one partition: the ordinals ranging from
+   * @param offset to <code>offset</code> + the length of the count arrays
+   *        within <code>arrays</code> (exclusive)
+   * @throws IOException in case
+   *         {@link TaxonomyReader#getOrdinal(org.apache.lucene.facet.taxonomy.CategoryPath)}
+   *         does.
+   * @see FacetResultsHandler#fetchPartitionResult(FacetArrays, int)
+   */
+  @Override
+  public IntermediateFacetResult fetchPartitionResult(FacetArrays arrays, int offset) throws IOException {
 
-    public static final EnumMap<StorageService.Verb, Stage> verbStages = new EnumMap<StorageService.Verb, Stage>(StorageService.Verb.class)
-    {{
-        put(Verb.MUTATION, Stage.MUTATION);
-        put(Verb.BINARY, Stage.MUTATION);
-        put(Verb.READ_REPAIR, Stage.MUTATION);
-        put(Verb.READ, Stage.READ);
-        put(Verb.REQUEST_RESPONSE, Stage.REQUEST_RESPONSE);
-        put(Verb.STREAM_REPLY, Stage.MISC); // TODO does this really belong on misc? I've just copied old behavior here
-        put(Verb.STREAM_REQUEST, Stage.STREAM);
-        put(Verb.RANGE_SLICE, Stage.READ);
-        put(Verb.BOOTSTRAP_TOKEN, Stage.MISC);
-        put(Verb.TREE_REQUEST, Stage.ANTI_ENTROPY);
-        put(Verb.TREE_RESPONSE, Stage.ANTI_ENTROPY);
-        put(Verb.GOSSIP_DIGEST_ACK, Stage.GOSSIP);
-        put(Verb.GOSSIP_DIGEST_ACK2, Stage.GOSSIP);
-        put(Verb.GOSSIP_DIGEST_SYN, Stage.GOSSIP);
-        put(Verb.DEFINITIONS_ANNOUNCE, Stage.READ);
-        put(Verb.DEFINITIONS_UPDATE_RESPONSE, Stage.READ);
-        put(Verb.TRUNCATE, Stage.MUTATION);
-        put(Verb.SCHEMA_CHECK, Stage.MIGRATION);
-        put(Verb.INDEX_SCAN, Stage.READ);
-        put(Verb.REPLICATION_FINISHED, Stage.MISC);
-        put(Verb.INTERNAL_RESPONSE, Stage.INTERNAL_RESPONSE);
-        put(Verb.UNUSED_1, Stage.INTERNAL_RESPONSE);
-        put(Verb.UNUSED_2, Stage.INTERNAL_RESPONSE);
-        put(Verb.UNUSED_3, Stage.INTERNAL_RESPONSE);
-    }};
-
-
-    public static final RetryingScheduledThreadPoolExecutor scheduledTasks = new RetryingScheduledThreadPoolExecutor("ScheduledTasks");
-
-    private static IPartitioner partitioner_ = DatabaseDescriptor.getPartitioner();
-    public static VersionedValue.VersionedValueFactory valueFactory = new VersionedValue.VersionedValueFactory(partitioner_);
-    
-    public static final StorageService instance = new StorageService();
-
-    public static IPartitioner getPartitioner() {
-        return partitioner_;
+    // get the root of the result tree to be returned, and the depth of that result tree
+    // (depth means number of node levels excluding the root). 
+    int rootNode = this.taxonomyReader.getOrdinal(this.facetRequest.getCategoryPath());
+    if (rootNode == TaxonomyReader.INVALID_ORDINAL) {
+      return null;
     }
 
-    public Collection<Range> getLocalRanges(String table)
-    {
-        return getRangesForEndpoint(table, FBUtilities.getLocalAddress());
+    int K = Math.min(facetRequest.getNumResults(),taxonomyReader.getSize()); // number of best results in each node
+
+    // this will grow into the returned IntermediateFacetResult
+    IntToObjectMap<AACO> AACOsOfOnePartition = new IntToObjectMap<AACO>();
+
+    int partitionSize = arrays.getArraysLength(); // all partitions, except, possibly, the last,
+    // have the same length. Hence modulo is OK.
+
+    int depth = facetRequest.getDepth();
+
+    if (depth == 0) {
+      // Need to only have root node.
+      IntermediateFacetResultWithHash tempFRWH = new IntermediateFacetResultWithHash(
+          facetRequest, AACOsOfOnePartition);
+      if (isSelfPartition(rootNode, arrays, offset)) {
+        tempFRWH.isRootNodeIncluded = true;
+        tempFRWH.rootNodeValue = this.facetRequest.getValueOf(arrays, rootNode % partitionSize);
+      }
+      return tempFRWH;
     }
 
-    public Range getLocalPrimaryRange()
-    {
-        return getPrimaryRangeForEndpoint(FBUtilities.getLocalAddress());
+    if (depth > Short.MAX_VALUE - 3) {
+      depth = Short.MAX_VALUE -3;
     }
 
-    /* This abstraction maintains the token/endpoint metadata information */
-    private TokenMetadata tokenMetadata_ = new TokenMetadata();
+    int endOffset = offset + partitionSize; // one past the largest ordinal in the partition
+    ParallelTaxonomyArrays childrenArray = taxonomyReader.getParallelTaxonomyArrays();
+    int[] children = childrenArray.children();
+    int[] siblings = childrenArray.siblings();
+    int totalNumOfDescendantsConsidered = 0; // total number of facets with value != 0, 
+    // in the tree. These include those selected as top K in each node, and all the others that
+    // were not. Not including rootNode
 
-    private Set<InetAddress> replicatingNodes = new Collections.synchronizedSet(new HashSet<InetAddress>());
-    private InetAddress removingNode;
+    // the following priority queue will be used again and again for each node recursed into
+    // to select its best K children among its children encountered in the given partition
+    PriorityQueue<AggregatedCategory> pq = 
+      new AggregatedCategoryHeap(K, this.getSuitableACComparator());
 
-    /* Are we starting this node in bootstrap mode? */
-    private boolean isBootstrapMode;
-    /* when intialized as a client, we shouldn't write to the system table. */
-    private boolean isClientMode;
-    private boolean initialized;
-    private volatile boolean joined = false;
-    private String operationMode;
-    private MigrationManager migrationManager = new MigrationManager();
-
-    /* Used for tracking drain progress */
-    private volatile int totalCFs, remainingCFs;
-
-    public void finishBootstrapping()
-    {
-        isBootstrapMode = false;
-        setToken(getLocalToken());
-        logger_.info("Bootstrap/move completed! Now serving reads.");
+    // reusables will feed the priority queue in each use 
+    AggregatedCategory [] reusables = new AggregatedCategory[2+K];
+    for (int i = 0; i < reusables.length; i++) {
+      reusables[i] = new AggregatedCategory(1,0);
     }
 
-    /** This method updates the local token on disk  */
-    public void setToken(Token token)
-    {
-        if (logger_.isDebugEnabled())
-            logger_.debug("Setting token to {}", token);
-        SystemTable.updateToken(token);
-        tokenMetadata_.updateNormalToken(token, FBUtilities.getLocalAddress());
-        Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.normal(getLocalToken()));
-        setMode("Normal", false);
-    }
+    /*
+     * The returned map is built by a recursive visit of potential tree nodes. Nodes 
+     * determined to be excluded from the FacetResult are not recursively explored as others,
+     * they are only recursed in order to count the number of their descendants.
+     * Also, nodes that they and any of their descendants can not be mapped into facets encountered 
+     * in this partition, are, too, explored no further. These are facets whose ordinal 
+     * numbers are greater than the ordinals of the given partition. (recall that the Taxonomy
+     * maintains that a parent ordinal is smaller than any of its descendants' ordinals).  
+     * So, when scanning over all children of a potential tree node n: (1) all children with ordinal number
+     * greater than those in the given partition are skipped over, (2) among the children of n residing
+     * in this partition, the best K children are selected (using pq) for usual further recursion 
+     * and the rest (those rejected out from the pq) are only recursed for counting total number
+     * of descendants, and (3) all the children of ordinal numbers smaller than the given partition 
+     * are further explored in the usual way, since these may lead to descendants residing in this partition.
+     * 
+     * ordinalStack drives the recursive descent. 
+     * Top of stack holds the current node which we recurse from.
+     * ordinalStack[0] holds the root of the facetRequest, and
+     * it is always maintained that parent(ordianlStack[i]) = ordinalStack[i-1]. 
+     * localDepth points to the current top of ordinalStack.
+     * Only top of ordinalStack can be TaxonomyReader.INVALID_ORDINAL, and this if and only if
+     * the element below it explored all its relevant children.
+     */
+    int[] ordinalStack = new int[depth+2]; // for 0 and for invalid on top
+    ordinalStack[0] = rootNode;
+    int localDepth = 0;
 
-    public StorageService()
-    {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.db:type=StorageService"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+    /* 
+     * bestSignlingsStack[i] maintains the best K children of ordinalStack[i-1], namely,
+     * the best K siblings of ordinalStack[i], best K among those residing in the given partition.
+     * Note that the residents of ordinalStack need not belong
+     * to the current partition, only the residents of bestSignlingsStack.
+     * When exploring the children of ordianlStack[i-1] that reside in the current partition
+     * (after the top K of them have been determined and stored into bestSignlingsStack[i]),
+     * siblingExplored[i] points into bestSignlingsStack[i], to the child now explored, hence
+     * residing in ordinalStack[i], and firstToTheLeftOfPartition[i] holds the largest ordinal of
+     * a sibling smaller than the ordinals in the partition.  
+     * When siblingExplored[i] == max int, the top K siblings of ordinalStack[i] among those siblings
+     * that reside in this partition have not been determined yet. 
+     * if siblingExplored[i] < 0, the node in ordinalStack[i] is to the left of partition 
+     * (i.e. of a smaller ordinal than the current partition) 
+     * (step (3) above is executed for the children of ordianlStack[i-1])   
+     */
+    int[][] bestSignlingsStack = new int[depth+2][];
+    int[] siblingExplored = new int[depth+2];
+    int[] firstToTheLeftOfPartition = new int [depth+2];
 
-        /* register the verb handlers */
-        MessagingService.instance().registerVerbHandlers(Verb.BINARY, new BinaryVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.MUTATION, new RowMutationVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.READ_REPAIR, new ReadRepairVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.READ, new ReadVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.RANGE_SLICE, new RangeSliceVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.INDEX_SCAN, new IndexScanVerbHandler());
-        // see BootStrapper for a summary of how the bootstrap verbs interact
-        MessagingService.instance().registerVerbHandlers(Verb.BOOTSTRAP_TOKEN, new BootStrapper.BootstrapTokenVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.STREAM_REQUEST, new StreamRequestVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.STREAM_REPLY, new StreamReplyVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.REPLICATION_FINISHED, new ReplicationFinishedVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.REQUEST_RESPONSE, new ResponseVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.INTERNAL_RESPONSE, new ResponseVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.TREE_REQUEST, new TreeRequestVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.TREE_RESPONSE, new AntiEntropyService.TreeResponseVerbHandler());
+    int tosOrdinal; // top of stack element, the ordinal at the top of stack
 
-        MessagingService.instance().registerVerbHandlers(Verb.GOSSIP_DIGEST_SYN, new GossipDigestSynVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.GOSSIP_DIGEST_ACK, new GossipDigestAckVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.GOSSIP_DIGEST_ACK2, new GossipDigestAck2VerbHandler());
-        
-        MessagingService.instance().registerVerbHandlers(Verb.DEFINITIONS_ANNOUNCE, new DefinitionsAnnounceVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.DEFINITIONS_UPDATE_RESPONSE, new DefinitionsUpdateResponseVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.TRUNCATE, new TruncateVerbHandler());
-        MessagingService.instance().registerVerbHandlers(Verb.SCHEMA_CHECK, new SchemaCheckVerbHandler());
+    /*
+     * to start the loop, complete the datastructures for root node: 
+     * push its youngest child to ordinalStack; make a note in siblingExplored[] that the children
+     * of rootNode, which reside in the current partition have not been read yet to select the top
+     * K of them.  Also, make rootNode as if, related to its parent, rootNode belongs to the children
+     * of ordinal numbers smaller than those of the current partition (this will ease on end condition -- 
+     * we can continue to the older sibling of rootNode once the localDepth goes down, before we verify that 
+     * it went that down)
+     */
+    ordinalStack[++localDepth] = children[rootNode];
+    siblingExplored[localDepth] = Integer.MAX_VALUE;  // we have not verified position wrt current partition
+    siblingExplored[0] = -1; // as if rootNode resides to the left of current position
 
-        // spin up the streaming serivice so it is available for jmx tools.
-        if (StreamingService.instance == null)
-            throw new RuntimeException("Streaming service is unavailable.");
-    }
+    /*
+     * now the whole recursion: loop as long as stack is not empty of elements descendants of 
+     * facetRequest's root.
+     */
 
-    // should only be called via JMX
-    public void stopGossiping()
-    {
-        if (initialized)
-        {
-            logger_.warn("Stopping gossip by operator request");
-            Gossiper.instance.stop();
-            initialized = false;
-        }
-    }
-
-    // should only be called via JMX
-    public void startGossiping()
-    {
-        if (!initialized)
-        {
-            logger_.warn("Starting gossip by operator request");
-            Gossiper.instance.start(FBUtilities.getLocalAddress(), (int)(System.currentTimeMillis() / 1000));
-            initialized = true;
-        }
-    }
-
-    public void stopClient()
-    {
-        Gossiper.instance.unregister(migrationManager);
-        Gossiper.instance.unregister(this);
-        Gossiper.instance.stop();
-        MessagingService.instance().shutdown();
-        StageManager.shutdownNow();
-    }
-    
-    public boolean isInitialized() 
-    { 
-        return initialized; 
-    }
-
-    public synchronized void initClient() throws IOException, ConfigurationException
-    {
-        if (initialized)
-        {
-            if (!isClientMode)
-                throw new UnsupportedOperationException("StorageService does not support switching modes.");
-            return;
-        }
-        initialized = true;
-        isClientMode = true;
-        logger_.info("Starting up client gossip");
-        setMode("Client", false);
-        Gossiper.instance.register(this);
-        Gossiper.instance.start(FBUtilities.getLocalAddress(), (int)(System.currentTimeMillis() / 1000)); // needed for node-ring gathering.
-        MessagingService.instance().listen(FBUtilities.getLocalAddress());
-        
-        // sleep a while to allow gossip to warm up (the other nodes need to know about this one before they can reply).
-        try
-        {
-            Thread.sleep(5000L);
-        }
-        catch (Exception ex)
-        {
-            throw new IOError(ex);
-        }
-        MigrationManager.announce(DatabaseDescriptor.getDefsVersion(), DatabaseDescriptor.getSeeds());
-    }
-
-    public synchronized void initServer() throws IOException, org.apache.cassandra.config.ConfigurationException
-    {
-        logger_.info("Cassandra version: " + FBUtilities.getReleaseVersionString());
-        logger_.info("Thrift API version: " + Constants.VERSION);
-
-        if (initialized)
-        {
-            if (isClientMode)
-                throw new UnsupportedOperationException("StorageService does not support switching modes.");
-            return;
-        }
-        initialized = true;
-        isClientMode = false;
-
-        try
-        {
-            GCInspector.instance.start();
-        }
-        catch (Throwable t)
-        {
-            logger_.warn("Unable to start GCInspector (currently only supported on the Sun JVM)");
-        }
-
-        if (Boolean.parseBoolean(System.getProperty("cassandra.load_ring_state", "true")))
-        {
-            logger_.info("Loading persisted ring state");
-            for (Map.Entry<Token, InetAddress> entry : SystemTable.loadTokens().entrySet())
-            {
-                tokenMetadata_.updateNormalToken(entry.getKey(), entry.getValue());
-                Gossiper.instance.addSavedEndpoint(entry.getValue());
-            }
-        }
-
-        if (Boolean.parseBoolean(System.getProperty("cassandra.join_ring", "true")))
-        {
-            joinTokenRing();
-        }
-        else
-        {
-            logger_.info("Not joining ring as requested. Use JMX (StorageService->joinRing()) to initiate ring joining");
-        }
-    }
-
-    private void joinTokenRing() throws IOException, org.apache.cassandra.config.ConfigurationException
-    {
-        logger_.info("Starting up server gossip");
-        joined = true;
-
-        // have to start the gossip service before we can see any info on other nodes.  this is necessary
-        // for bootstrap to get the load info it needs.
-        // (we won't be part of the storage ring though until we add a nodeId to our state, below.)
-        Gossiper.instance.register(this);
-        Gossiper.instance.register(migrationManager);
-        Gossiper.instance.start(FBUtilities.getLocalAddress(), SystemTable.incrementAndGetGeneration()); // needed for node-ring gathering.
-
-        MessagingService.instance().listen(FBUtilities.getLocalAddress());
-        StorageLoadBalancer.instance.startBroadcasting();
-        MigrationManager.announce(DatabaseDescriptor.getDefsVersion(), DatabaseDescriptor.getSeeds());
-
-        if (DatabaseDescriptor.isAutoBootstrap()
-                && DatabaseDescriptor.getSeeds().contains(FBUtilities.getLocalAddress())
-                && !SystemTable.isBootstrapped())
-            logger_.info("This node will not auto bootstrap because it is configured to be a seed node.");
-
-        Token token;
-        if (DatabaseDescriptor.isAutoBootstrap()
-            && !(DatabaseDescriptor.getSeeds().contains(FBUtilities.getLocalAddress()) || SystemTable.isBootstrapped()))
-        {
-            setMode("Joining: getting load information", true);
-            StorageLoadBalancer.instance.waitForLoadInfo();
-            if (logger_.isDebugEnabled())
-                logger_.debug("... got load info");
-            if (tokenMetadata_.isMember(FBUtilities.getLocalAddress()))
-            {
-                String s = "This node is already a member of the token ring; bootstrap aborted. (If replacing a dead node, remove the old one from the ring first.)";
-                throw new UnsupportedOperationException(s);
-            }
-            setMode("Joining: getting bootstrap token", true);
-            token = BootStrapper.getBootstrapToken(tokenMetadata_, StorageLoadBalancer.instance.getLoadInfo());
-            // don't bootstrap if there are no tables defined.
-            if (DatabaseDescriptor.getNonSystemTables().size() > 0)
-            {
-                bootstrap(token);
-                assert !isBootstrapMode; // bootstrap will block until finished
-            }
-            // else nothing to do, go directly to participating in ring
-        }
-        else
-        {
-            token = SystemTable.getSavedToken();
-            if (token == null)
-            {
-                String initialToken = DatabaseDescriptor.getInitialToken();
-                if (initialToken == null)
-                {
-                    token = partitioner_.getRandomToken();
-                    logger_.warn("Generated random token " + token + ". Random tokens will result in an unbalanced ring; see http://wiki.apache.org/cassandra/Operations");
-                }
-                else
-                {
-                    token = partitioner_.getTokenFactory().fromString(initialToken);
-                    logger_.info("Saved token not found. Using " + token + " from configuration");
-                }
-            }
-            else
-            {
-                logger_.info("Using saved token " + token);
-            }
+    while (localDepth > 0) {
+      tosOrdinal = ordinalStack[localDepth];
+      if (tosOrdinal == TaxonomyReader.INVALID_ORDINAL) {
+        // the brotherhood that has been occupying the top of stack is all exhausted.  
+        // Hence, element below tos, namely, father of tos, has all its children, 
+        // and itself, all explored. 
+        localDepth--;
+        // replace this father, now on top of stack, by this father's sibling:
+        // this parent's ordinal can not be greater than current partition, as otherwise
+        // its child, now just removed, would not have been pushed on it.
+        // so the father is either inside the partition, or smaller ordinal
+        if (siblingExplored[localDepth] < 0 ) {
+          ordinalStack[localDepth] = siblings[ordinalStack[localDepth]];
+          continue;
         } 
-
-        SystemTable.setBootstrapped(true); // first startup is only chance to bootstrap
-        setToken(token);
-
-        assert tokenMetadata_.sortedTokens().size() > 0;
-    }
-
-    public synchronized void joinRing() throws IOException, org.apache.cassandra.config.ConfigurationException
-    {
-        if (!joined)
-        {
-            logger_.info("Joining ring by operator request");
-            joinTokenRing();
+        // in this point, siblingExplored[localDepth] between 0 and number of bestSiblings
+        // it can not be max int
+        siblingExplored[localDepth]--;
+        if (siblingExplored[localDepth] == -1 ) {
+          //siblings residing in the partition have been all processed, we now move
+          // to those of ordinal numbers smaller than the partition
+          ordinalStack[localDepth] = firstToTheLeftOfPartition[localDepth];
+        } else {
+          // still explore siblings residing in the partition
+          // just move to the next one
+          ordinalStack[localDepth] = bestSignlingsStack[localDepth][siblingExplored[localDepth]];
         }
-    }
+        continue;
+      } // endof tosOrdinal is invalid, and hence removed, and its parent was replaced by this 
+      // parent's sibling
 
-    public boolean isJoined()
-    {
-        return joined;
-    }
-
-    private void setMode(String m, boolean log)
-    {
-        operationMode = m;
-        if (log)
-            logger_.info(m);
-        else
-            logger_.debug(m);
-    }
-
-    private void bootstrap(Token token) throws IOException
-    {
-        isBootstrapMode = true;
-        SystemTable.updateToken(token); // DON'T use setToken, that makes us part of the ring locally which is incorrect until we are done bootstrapping
-        Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.bootstrapping(token));
-        setMode("Joining: sleeping " + RING_DELAY + " ms for pending range setup", true);
-        try
-        {
-            Thread.sleep(RING_DELAY);
+      // now try to push a kid, but first look at tos whether it 'deserves' its kids explored:
+      // it is not to the right of current partition, and we know whether to only count or to 
+      // select best K siblings.
+      if (siblingExplored[localDepth] == Integer.MAX_VALUE) {
+        //tosOrdinal was not examined yet for its position relative to current partition
+        // and the best K of current partition, among its siblings, have not been determined yet
+        while (tosOrdinal >= endOffset) {
+          tosOrdinal = siblings[tosOrdinal];
         }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
-        setMode("Bootstrapping", true);
-        new BootStrapper(FBUtilities.getLocalAddress(), token, tokenMetadata_).bootstrap(); // handles token update
-    }
+        // now it is inside. Run it and all its siblings inside the partition through a heap
+        // and in doing so, count them, find best K, and sum into residue
+        double residue = 0f;  // the sum of all the siblings from this partition that do not make 
+        // it to top K
+        pq.clear();
 
-    public boolean isBootstrapMode()
-    {
-        return isBootstrapMode;
-    }
+        //reusables are consumed as from a stack. The stack starts full and returns full.
+        int tosReuslables = reusables.length -1;  
 
-    public TokenMetadata getTokenMetadata()
-    {
-        return tokenMetadata_;
-    }
+        while (tosOrdinal >= offset) { // while tosOrdinal belongs to the given partition; here, too, we use the fact
+          // that TaxonomyReader.INVALID_ORDINAL == -1 < offset
+          double value = facetRequest.getValueOf(arrays, tosOrdinal % partitionSize);
+          if (value != 0) { // the value of yc is not 0, it is to be considered.  
+            totalNumOfDescendantsConsidered++;
 
-    /**
-     * for a keyspace, return the ranges and corresponding hosts for a given keyspace.
-     * @param keyspace
-     * @return
-     */
-    public Map<Range, List<String>> getRangeToEndpointMap(String keyspace)
-    {
-        // some people just want to get a visual representation of things. Allow null and set it to the first
-        // non-system table.
-        if (keyspace == null)
-            keyspace = DatabaseDescriptor.getNonSystemTables().get(0);
+            // consume one reusable, and push to the priority queue
+            AggregatedCategory ac = reusables[tosReuslables--];  
+            ac.ordinal = tosOrdinal;
+            ac.value = value; 
+            ac = pq.insertWithOverflow(ac);
+            if (null != ac) {
+              residue += ac.value;
+              // TODO (Facet): could it be that we need to do something
+              // else, not add, depending on the aggregator?
 
-        /* All the ranges for the tokens */
-        Map<Range, List<String>> map = new HashMap<Range, List<String>>();
-        for (Map.Entry<Range,List<InetAddress>> entry : getRangeToAddressMap(keyspace).entrySet())
-        {
-            map.put(entry.getKey(), stringify(entry.getValue()));
-        }
-        return map;
-    }
-
-    public Map<Range, List<String>> getPendingRangeToEndpointMap(String keyspace)
-    {
-        // some people just want to get a visual representation of things. Allow null and set it to the first
-        // non-system table.
-        if (keyspace == null)
-            keyspace = DatabaseDescriptor.getNonSystemTables().get(0);
-
-        Map<Range, List<String>> map = new HashMap<Range, List<String>>();
-        for (Map.Entry<Range, Collection<InetAddress>> entry : tokenMetadata_.getPendingRanges(keyspace).entrySet())
-        {
-            List<InetAddress> l = new ArrayList<InetAddress>(entry.getValue());
-            map.put(entry.getKey(), stringify(l));
-        }
-        return map;
-    }
-
-    public Map<Range, List<InetAddress>> getRangeToAddressMap(String keyspace)
-    {
-        List<Range> ranges = getAllRanges(tokenMetadata_.sortedTokens());
-        return constructRangeToEndpointMap(keyspace, ranges);
-    }
-
-    public Map<Token, String> getTokenToEndpointMap()
-    {
-        Map<Token, InetAddress> mapInetAddress = tokenMetadata_.getTokenToEndpointMap();
-        Map<Token, String> mapString = new HashMap<Token, String>(mapInetAddress.size());
-        for (Map.Entry<Token, InetAddress> entry : mapInetAddress.entrySet())
-        {
-            mapString.put(entry.getKey(), entry.getValue().getHostAddress());
-        }
-        return mapString;
-    }
-
-    /**
-     * Construct the range to endpoint mapping based on the true view
-     * of the world.
-     * @param ranges
-     * @return mapping of ranges to the replicas responsible for them.
-    */
-    private Map<Range, List<InetAddress>> constructRangeToEndpointMap(String keyspace, List<Range> ranges)
-    {
-        Map<Range, List<InetAddress>> rangeToEndpointMap = new HashMap<Range, List<InetAddress>>();
-        for (Range range : ranges)
-        {
-            rangeToEndpointMap.put(range, Table.open(keyspace).getReplicationStrategy().getNaturalEndpoints(range.right));
-        }
-        return rangeToEndpointMap;
-    }
-
-    /*
-     * onChange only ever sees one ApplicationState piece change at a time, so we perform a kind of state machine here.
-     * We are concerned with two events: knowing the token associated with an endpoint, and knowing its operation mode.
-     * Nodes can start in either bootstrap or normal mode, and from bootstrap mode can change mode to normal.
-     * A node in bootstrap mode needs to have pendingranges set in TokenMetadata; a node in normal mode
-     * should instead be part of the token ring.
-     * 
-     * Normal MOVE_STATE progression of a node should be like this:
-     * STATE_BOOTSTRAPPING,token
-     *   if bootstrapping. stays this way until all files are received.
-     * STATE_NORMAL,token 
-     *   ready to serve reads and writes.
-     * STATE_NORMAL,token,REMOVE_TOKEN,token
-     *   specialized normal state in which this node acts as a proxy to tell the cluster about a dead node whose
-     *   token is being removed. this value becomes the permanent state of this node (unless it coordinates another
-     *   removetoken in the future).
-     * STATE_LEAVING,token 
-     *   get ready to leave the cluster as part of a decommission or move
-     * STATE_LEFT,token 
-     *   set after decommission or move is completed.
-     * 
-     * Note: Any time a node state changes from STATE_NORMAL, it will not be visible to new nodes. So it follows that
-     * you should never bootstrap a new node during a removetoken, decommission or move.
-     */
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value)
-    {
-        if (state != ApplicationState.STATUS)
-            return;
-
-        String apStateValue = value.value;
-        String[] pieces = apStateValue.split(VersionedValue.DELIMITER_STR, -1);
-        assert (pieces.length > 0);
-
-        String moveName = pieces[0];
-
-        if (moveName.equals(VersionedValue.STATUS_BOOTSTRAPPING))
-            handleStateBootstrap(endpoint, pieces);
-        else if (moveName.equals(VersionedValue.STATUS_NORMAL))
-            handleStateNormal(endpoint, pieces);
-        else if (moveName.equals(VersionedValue.STATUS_LEAVING))
-            handleStateLeaving(endpoint, pieces);
-        else if (moveName.equals(VersionedValue.STATUS_LEFT))
-            handleStateLeft(endpoint, pieces);
-    }
-
-    /**
-     * Handle node bootstrap
-     *
-     * @param endpoint bootstrapping node
-     * @param pieces STATE_BOOTSTRAPPING,bootstrap token as string
-     */
-    private void handleStateBootstrap(InetAddress endpoint, String[] pieces)
-    {
-        assert pieces.length == 2;
-        Token token = getPartitioner().getTokenFactory().fromString(pieces[1]);
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Node " + endpoint + " state bootstrapping, token " + token);
-
-        // if this node is present in token metadata, either we have missed intermediate states
-        // or the node had crashed. Print warning if needed, clear obsolete stuff and
-        // continue.
-        if (tokenMetadata_.isMember(endpoint))
-        {
-            // If isLeaving is false, we have missed both LEAVING and LEFT. However, if
-            // isLeaving is true, we have only missed LEFT. Waiting time between completing
-            // leave operation and rebootstrapping is relatively short, so the latter is quite
-            // common (not enough time for gossip to spread). Therefore we report only the
-            // former in the log.
-            if (!tokenMetadata_.isLeaving(endpoint))
-                logger_.info("Node " + endpoint + " state jump to bootstrap");
-            tokenMetadata_.removeEndpoint(endpoint);
-        }
-
-        tokenMetadata_.addBootstrapToken(token, endpoint);
-        calculatePendingRanges();
-    }
-
-    /**
-     * Handle node move to normal state. That is, node is entering token ring and participating
-     * in reads.
-     *
-     * @param endpoint node
-     * @param pieces STATE_NORMAL,token[,other_state,token]
-     */
-    private void handleStateNormal(InetAddress endpoint, String[] pieces)
-    {
-        assert pieces.length >= 2;
-        Token token = getPartitioner().getTokenFactory().fromString(pieces[1]);
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Node " + endpoint + " state normal, token " + token);
-
-        if (tokenMetadata_.isMember(endpoint))
-            logger_.info("Node " + endpoint + " state jump to normal");
-
-        // we don't want to update if this node is responsible for the token and it has a later startup time than endpoint.
-        InetAddress currentOwner = tokenMetadata_.getEndpoint(token);
-        if (currentOwner == null)
-        {
-            logger_.debug("New node " + endpoint + " at token " + token);
-            tokenMetadata_.updateNormalToken(token, endpoint);
-            if (!isClientMode)
-                SystemTable.updateToken(endpoint, token);
-        }
-        else if (endpoint.equals(currentOwner))
-        {
-            // set state back to normal, since the node may have tried to leave, but failed and is now back up
-            // no need to persist, token/ip did not change
-            tokenMetadata_.updateNormalToken(token, endpoint);
-        }
-        else if (Gossiper.instance.compareEndpointStartup(endpoint, currentOwner) > 0)
-        {
-            logger_.info(String.format("Nodes %s and %s have the same token %s.  %s is the new owner",
-                                       endpoint, currentOwner, token, endpoint));
-            tokenMetadata_.updateNormalToken(token, endpoint);
-            if (!isClientMode)
-                SystemTable.updateToken(endpoint, token);
-        }
-        else
-        {
-            logger_.info(String.format("Nodes %s and %s have the same token %s.  Ignoring %s",
-                                       endpoint, currentOwner, token, endpoint));
-        }
-
-        if (pieces.length > 2)
-        {
-            assert pieces.length == 4;
-            handleStateRemoving(endpoint, getPartitioner().getTokenFactory().fromString(pieces[3]), pieces[2]);
-        }
-
-        calculatePendingRanges();
-    }
-
-    /**
-     * Handle node preparing to leave the ring
-     *
-     * @param endpoint node
-     * @param pieces STATE_LEAVING,token
-     */
-    private void handleStateLeaving(InetAddress endpoint, String[] pieces)
-    {
-        assert pieces.length == 2;
-        String moveValue = pieces[1];
-        Token token = getPartitioner().getTokenFactory().fromString(moveValue);
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Node " + endpoint + " state leaving, token " + token);
-
-        // If the node is previously unknown or tokens do not match, update tokenmetadata to
-        // have this node as 'normal' (it must have been using this token before the
-        // leave). This way we'll get pending ranges right.
-        if (!tokenMetadata_.isMember(endpoint))
-        {
-            logger_.info("Node " + endpoint + " state jump to leaving");
-            tokenMetadata_.updateNormalToken(token, endpoint);
-        }
-        else if (!tokenMetadata_.getToken(endpoint).equals(token))
-        {
-            logger_.warn("Node " + endpoint + " 'leaving' token mismatch. Long network partition?");
-            tokenMetadata_.updateNormalToken(token, endpoint);
-        }
-
-        // at this point the endpoint is certainly a member with this token, so let's proceed
-        // normally
-        tokenMetadata_.addLeavingEndpoint(endpoint);
-        calculatePendingRanges();
-    }
-
-    /**
-     * Handle node leaving the ring. This can be either because of decommission or loadbalance
-     *
-     * @param endpoint If reason for leaving is decommission or loadbalance
-     * endpoint is the leaving node.
-     * @param pieces STATE_LEFT,token
-     */
-    private void handleStateLeft(InetAddress endpoint, String[] pieces)
-    {
-        assert pieces.length == 2;
-        Token token = getPartitioner().getTokenFactory().fromString(pieces[1]);
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Node " + endpoint + " state left, token " + token);
-
-        excise(token, endpoint);
-    }
-
-    /**
-     * Handle notification that a node being actively removed from the ring via 'removetoken'
-     *
-     * @param endpoint node
-     * @param state either REMOVED_TOKEN (node is gone) or REMOVING_TOKEN (replicas need to be restored)
-     */
-    private void handleStateRemoving(InetAddress endpoint, Token removeToken, String state)
-    {
-        InetAddress removeEndpoint = tokenMetadata_.getEndpoint(removeToken);
-        
-        if (removeEndpoint == null)
-            return;
-        
-        if (removeEndpoint.equals(FBUtilities.getLocalAddress()))
-        {
-            logger_.info("Received removeToken gossip about myself. Is this node a replacement for a removed one?");
-            return;
-        }
-
-        if (VersionedValue.REMOVED_TOKEN.equals(state))
-        {
-            excise(removeToken, removeEndpoint);
-        }
-        else if (VersionedValue.REMOVING_TOKEN.equals(state))
-        {
-            if (logger_.isDebugEnabled())
-                logger_.debug("Token " + removeToken + " removed manually (endpoint was " + removeEndpoint + ")");
-
-            // Note that the endpoint is being removed
-            tokenMetadata_.addLeavingEndpoint(removeEndpoint);
-            calculatePendingRanges();
-
-            // grab any data we are now responsible for and notify responsible node
-            restoreReplicaCount(removeEndpoint, endpoint);
-        }
-    }
-
-    private void excise(Token token, InetAddress endpoint)
-    {
-        Gossiper.instance.removeEndpoint(endpoint);
-        tokenMetadata_.removeEndpoint(endpoint);
-        HintedHandOffManager.deleteHintsForEndPoint(endpoint);
-        tokenMetadata_.removeBootstrapToken(token);
-        calculatePendingRanges();
-        if (!isClientMode)
-        {
-            logger_.info("Removing token " + token + " for " + endpoint);
-            SystemTable.removeToken(token);
-        }
-    }
-
-    /**
-     * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
-     *
-     * (1) When in doubt, it is better to write too much to a node than too little. That is, if
-     * there are multiple nodes moving, calculate the biggest ranges a node could have. Cleaning
-     * up unneeded data afterwards is better than missing writes during movement.
-     * (2) When a node leaves, ranges for other nodes can only grow (a node might get additional
-     * ranges, but it will not lose any of its current ranges as a result of a leave). Therefore
-     * we will first remove _all_ leaving tokens for the sake of calculation and then check what
-     * ranges would go where if all nodes are to leave. This way we get the biggest possible
-     * ranges with regard current leave operations, covering all subsets of possible final range
-     * values.
-     * (3) When a node bootstraps, ranges of other nodes can only get smaller. Without doing
-     * complex calculations to see if multiple bootstraps overlap, we simply base calculations
-     * on the same token ring used before (reflecting situation after all leave operations have
-     * completed). Bootstrapping nodes will be added and removed one by one to that metadata and
-     * checked what their ranges would be. This will give us the biggest possible ranges the
-     * node could have. It might be that other bootstraps make our actual final ranges smaller,
-     * but it does not matter as we can clean up the data afterwards.
-     *
-     * NOTE: This is heavy and ineffective operation. This will be done only once when a node
-     * changes state in the cluster, so it should be manageable.
-     */
-    private void calculatePendingRanges()
-    {
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-            calculatePendingRanges(Table.open(table).getReplicationStrategy(), table);
-    }
-
-    // public & static for testing purposes
-    public static void calculatePendingRanges(AbstractReplicationStrategy strategy, String table)
-    {
-        TokenMetadata tm = StorageService.instance.getTokenMetadata();
-        Multimap<Range, InetAddress> pendingRanges = HashMultimap.create();
-        Map<Token, InetAddress> bootstrapTokens = tm.getBootstrapTokens();
-        Set<InetAddress> leavingEndpoints = tm.getLeavingEndpoints();
-
-        if (bootstrapTokens.isEmpty() && leavingEndpoints.isEmpty())
-        {
-            if (logger_.isDebugEnabled())
-                logger_.debug("No bootstrapping or leaving nodes -> empty pending ranges for {}", table);
-            tm.setPendingRanges(table, pendingRanges);
-            return;
-        }
-
-        Multimap<InetAddress, Range> addressRanges = strategy.getAddressRanges();
-
-        // Copy of metadata reflecting the situation after all leave operations are finished.
-        TokenMetadata allLeftMetadata = tm.cloneAfterAllLeft();
-
-        // get all ranges that will be affected by leaving nodes
-        Set<Range> affectedRanges = new HashSet<Range>();
-        for (InetAddress endpoint : leavingEndpoints)
-            affectedRanges.addAll(addressRanges.get(endpoint));
-
-        // for each of those ranges, find what new nodes will be responsible for the range when
-        // all leaving nodes are gone.
-        for (Range range : affectedRanges)
-        {
-            Collection<InetAddress> currentEndpoints = strategy.calculateNaturalEndpoints(range.right, tm);
-            Collection<InetAddress> newEndpoints = strategy.calculateNaturalEndpoints(range.right, allLeftMetadata);
-            newEndpoints.removeAll(currentEndpoints);
-            pendingRanges.putAll(range, newEndpoints);
-        }
-
-        // At this stage pendingRanges has been updated according to leave operations. We can
-        // now finish the calculation by checking bootstrapping nodes.
-
-        // For each of the bootstrapping nodes, simply add and remove them one by one to
-        // allLeftMetadata and check in between what their ranges would be.
-        for (Map.Entry<Token, InetAddress> entry : bootstrapTokens.entrySet())
-        {
-            InetAddress endpoint = entry.getValue();
-
-            allLeftMetadata.updateNormalToken(entry.getKey(), endpoint);
-            for (Range range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
-                pendingRanges.put(range, endpoint);
-            allLeftMetadata.removeEndpoint(endpoint);
-        }
-
-        tm.setPendingRanges(table, pendingRanges);
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Pending ranges:\n" + (pendingRanges.isEmpty() ? "<empty>" : tm.printPendingRanges()));
-    }
-
-    /**
-     * Finds living endpoints responsible for the given ranges
-     *
-     * @param table the table ranges belong to
-     * @param ranges the ranges to find sources for
-     * @return multimap of addresses to ranges the address is responsible for
-     */
-    private Multimap<InetAddress, Range> getNewSourceRanges(String table, Set<Range> ranges) 
-    {
-        InetAddress myAddress = FBUtilities.getLocalAddress();
-        Multimap<Range, InetAddress> rangeAddresses = Table.open(table).getReplicationStrategy().getRangeAddresses(tokenMetadata_);
-        Multimap<InetAddress, Range> sourceRanges = HashMultimap.create();
-        IFailureDetector failureDetector = FailureDetector.instance;
-
-        // find alive sources for our new ranges
-        for (Range range : ranges)
-        {
-            Collection<InetAddress> possibleRanges = rangeAddresses.get(range);
-            IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
-            List<InetAddress> sources = snitch.getSortedListByProximity(myAddress, possibleRanges);
-
-            assert (!sources.contains(myAddress));
-
-            for (InetAddress source : sources)
-            {
-                if (failureDetector.isAlive(source))
-                {
-                    sourceRanges.put(source, range);
-                    break;
-                }
-            } 
-        }
-        return sourceRanges;
-    }
-
-    /**
-     * Sends a notification to a node indicating we have finished replicating data.
-     * 
-     * @param local the local address
-     * @param remote node to send notification to
-     */
-    private void sendReplicationNotification(InetAddress local, InetAddress remote)
-    {
-        // notify the remote token
-        Message msg = new Message(local, StorageService.Verb.REPLICATION_FINISHED, new byte[0]);
-        IFailureDetector failureDetector = FailureDetector.instance;
-        while (failureDetector.isAlive(remote))
-        {
-            IAsyncResult iar = MessagingService.instance().sendRR(msg, remote);
-            try 
-            {
-                iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-                return; // done
+              /* when a facet is excluded from top K, because already in this partition it has
+               * K better siblings, it is only recursed for count only.
+               */ 
+              // update totalNumOfDescendants by the now excluded node and all its descendants
+              totalNumOfDescendantsConsidered--; // reduce the 1 earned when the excluded node entered the heap
+              // and now return it and all its descendants. These will never make it to FacetResult
+              totalNumOfDescendantsConsidered += countOnly (ac.ordinal, children, 
+                  siblings, arrays, partitionSize, offset, endOffset, localDepth, depth);
+              reusables[++tosReuslables] = ac;
             }
-            catch(TimeoutException e)
-            {
-                // try again
+          }
+          tosOrdinal = siblings[tosOrdinal];  
+        }
+        // now pq has best K children of ordinals that belong to the given partition.   
+        // Populate a new AACO with them.
+        // tosOrdinal is now first sibling smaller than partition, make a note of that
+        firstToTheLeftOfPartition[localDepth] = tosOrdinal;
+        int aaci = pq.size();
+        int[] ords = new int[aaci];
+        double [] vals = new double [aaci];
+        while (aaci > 0) {
+          AggregatedCategory ac = pq.pop();
+          ords[--aaci] = ac.ordinal;
+          vals[aaci] = ac.value;
+          reusables[++tosReuslables] = ac;
+        }
+        // if more than 0 ordinals, add this AACO to the map to be returned, 
+        // and add ords to sibling stack, and make a note in siblingExplored that these are to 
+        // be visited now
+        if (ords.length > 0) {
+          AACOsOfOnePartition.put(ordinalStack[localDepth-1], new AACO(ords,vals,residue));
+          bestSignlingsStack[localDepth] = ords;
+          siblingExplored[localDepth] = ords.length-1;
+          ordinalStack[localDepth] = ords[ords.length-1];
+        } else {
+          // no ordinals siblings of tosOrdinal in current partition, move to the left of it
+          // tosOrdinal is already there (to the left of partition).
+          // make a note of it in siblingExplored
+          ordinalStack[localDepth] = tosOrdinal;
+          siblingExplored[localDepth] = -1;
+        }
+        continue;
+      } // endof we did not check the position of a valid ordinal wrt partition
+
+      // now tosOrdinal is a valid ordinal, inside partition or to the left of it, we need 
+      // to push its kids on top of it, if not too deep. 
+      // Make a note that we did not check them yet
+      if (localDepth >= depth) { 
+        // localDepth == depth; current tos exhausted its possible children, mark this by pushing INVALID_ORDINAL
+        ordinalStack[++localDepth] = TaxonomyReader.INVALID_ORDINAL;
+        continue;
+      }
+      ordinalStack[++localDepth] = children[tosOrdinal];
+      siblingExplored[localDepth] = Integer.MAX_VALUE;
+    } // endof loop while stack is not empty
+
+    // now generate a TempFacetResult from AACOsOfOnePartition, and consider self.
+    IntermediateFacetResultWithHash tempFRWH = new IntermediateFacetResultWithHash(
+        facetRequest, AACOsOfOnePartition);
+    if (isSelfPartition(rootNode, arrays, offset)) {
+      tempFRWH.isRootNodeIncluded = true;
+      tempFRWH.rootNodeValue = this.facetRequest.getValueOf(arrays, rootNode % partitionSize);
+    }
+    tempFRWH.totalNumOfFacetsConsidered = totalNumOfDescendantsConsidered;
+    return tempFRWH;
+
+  }
+
+  /**
+   * Recursively count <code>ordinal</code>, whose depth is <code>currentDepth</code>, 
+   * and all its descendants down to <code>maxDepth</code> (including), 
+   * descendants whose value in the count arrays, <code>arrays</code>, is != 0. 
+   * The count arrays only includes the current partition, from <code>offset</code>, to (exclusive) 
+   * <code>endOffset</code>.
+   * It is assumed that <code>ordinal</code> < <code>endOffset</code>, 
+   * otherwise, not <code>ordinal</code>, and none of its descendants, reside in
+   * the current partition. <code>ordinal</code> < <code>offset</code> is allowed, 
+   * as ordinal's descendants might be >= <code>offeset</code>.
+   * 
+   * @param ordinal a facet ordinal. 
+   * @param youngestChild mapping a given ordinal to its youngest child in the taxonomy (of largest ordinal number),
+   * or to -1 if has no children.  
+   * @param olderSibling  mapping a given ordinal to its older sibling, or to -1
+   * @param arrays  values for the ordinals in the given partition
+   * @param offset  the first (smallest) ordinal in the given partition
+   * @param partitionSize  number of ordinals in the given partition
+   * @param endOffset one larger than the largest ordinal that belong to this partition
+   * @param currentDepth the depth or ordinal in the TaxonomyTree (relative to rootnode of the facetRequest)
+   * @param maxDepth maximal depth of descendants to be considered here (measured relative to rootnode of the 
+   * facetRequest).
+   * 
+   * @return the number of nodes, from ordinal down its descendants, of depth <= maxDepth,
+   * which reside in the current partition, and whose value != 0
+   */
+  private int countOnly(int ordinal, int[] youngestChild, int[] olderSibling,
+                        FacetArrays arrays, int partitionSize, int offset,
+                        int endOffset, int currentDepth, int maxDepth) {
+    int ret = 0;
+    if (offset <= ordinal) {
+      // ordinal belongs to the current partition
+      if (0 != facetRequest.getValueOf(arrays, ordinal % partitionSize)) {
+        ret++;
+      }
+    }
+    // now consider children of ordinal, if not too deep
+    if (currentDepth >= maxDepth) {
+      return ret;
+    }
+
+    int yc = youngestChild[ordinal];
+    while (yc >= endOffset) {
+      yc = olderSibling[yc];
+    }
+    while (yc > TaxonomyReader.INVALID_ORDINAL) { // assuming this is -1, smaller than any legal ordinal
+      ret += countOnly (yc, youngestChild, olderSibling, arrays, 
+          partitionSize, offset, endOffset, currentDepth+1, maxDepth);
+      yc = olderSibling[yc];
+    }
+    return ret;
+  }
+
+  /**
+   * Merge several partitions' {@link IntermediateFacetResult}-s into one of the
+   * same format
+   * 
+   * @see FacetResultsHandler#mergeResults(IntermediateFacetResult...)
+   */
+  @Override
+  public IntermediateFacetResult mergeResults(IntermediateFacetResult... tmpResults)
+  throws ClassCastException, IllegalArgumentException {
+
+    if (tmpResults.length == 0) {
+      return null;
+    }
+
+    int i=0;
+    // skip over null tmpResults
+    for (; (i < tmpResults.length)&&(tmpResults[i] == null); i++) {}
+    if (i == tmpResults.length) {
+      // all inputs are null
+      return null;
+    }
+
+    // i points to the first non-null input 
+    int K = this.facetRequest.getNumResults(); // number of best result in each node
+    IntermediateFacetResultWithHash tmpToReturn = (IntermediateFacetResultWithHash)tmpResults[i++];
+
+    // now loop over the rest of tmpResults and merge each into tmpToReturn
+    for ( ; i < tmpResults.length; i++) {
+      IntermediateFacetResultWithHash tfr = (IntermediateFacetResultWithHash)tmpResults[i];
+      tmpToReturn.totalNumOfFacetsConsidered += tfr.totalNumOfFacetsConsidered;
+      if (tfr.isRootNodeIncluded) {
+        tmpToReturn.isRootNodeIncluded = true;
+        tmpToReturn.rootNodeValue = tfr.rootNodeValue;
+      }
+      // now merge the HashMap of tfr into this of tmpToReturn
+      IntToObjectMap<AACO> tmpToReturnMapToACCOs = tmpToReturn.mapToAACOs;
+      IntToObjectMap<AACO> tfrMapToACCOs = tfr.mapToAACOs;
+      IntIterator tfrIntIterator = tfrMapToACCOs.keyIterator();
+      //iterate over all ordinals in tfr that are maps to their children (and the residue over 
+      // non included chilren)
+      while (tfrIntIterator.hasNext()) {
+        int tfrkey = tfrIntIterator.next();
+        AACO tmpToReturnAACO = null;
+        if (null == (tmpToReturnAACO = tmpToReturnMapToACCOs.get(tfrkey))) {
+          // if tmpToReturn does not have any kids of tfrkey, map all the kids
+          // from tfr to it as one package, along with their redisude
+          tmpToReturnMapToACCOs.put(tfrkey, tfrMapToACCOs.get(tfrkey));
+        } else {
+          // merge the best K children of tfrkey as appear in tmpToReturn and in tfr
+          AACO tfrAACO = tfrMapToACCOs.get(tfrkey);
+          int resLength = tfrAACO.ordinals.length + tmpToReturnAACO.ordinals.length;
+          if (K < resLength) {
+            resLength = K;
+          }
+          int[] resOrds = new int [resLength];
+          double[] resVals = new double [resLength];
+          double resResidue = tmpToReturnAACO.residue + tfrAACO.residue;
+          int indexIntoTmpToReturn = 0;
+          int indexIntoTFR = 0;
+          ACComparator merger = getSuitableACComparator(); // by facet Request
+          for (int indexIntoRes = 0; indexIntoRes < resLength; indexIntoRes++) {
+            if (indexIntoTmpToReturn >= tmpToReturnAACO.ordinals.length) {
+              //tmpToReturnAACO (former result to return) ran out of indices
+              // it is all merged into resOrds and resVal
+              resOrds[indexIntoRes] = tfrAACO.ordinals[indexIntoTFR];
+              resVals[indexIntoRes] = tfrAACO.values[indexIntoTFR];
+              indexIntoTFR++;
+              continue;
             }
-        }
-    }
-
-    /**
-     * Called when an endpoint is removed from the ring. This function checks
-     * whether this node becomes responsible for new ranges as a
-     * consequence and streams data if needed.
-     *
-     * This is rather ineffective, but it does not matter so much
-     * since this is called very seldom
-     *
-     * @param endpoint the node that left
-     */
-    private void restoreReplicaCount(InetAddress endpoint, final InetAddress notifyEndpoint)
-    {
-        final Multimap<InetAddress, String> fetchSources = HashMultimap.create();
-        Multimap<String, Map.Entry<InetAddress, Collection<Range>>> rangesToFetch = HashMultimap.create();
-
-        final InetAddress myAddress = FBUtilities.getLocalAddress();
-
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            Multimap<Range, InetAddress> changedRanges = getChangedRangesForLeaving(table, endpoint); 
-            Set<Range> myNewRanges = new HashSet<Range>();
-            for (Map.Entry<Range, InetAddress> entry : changedRanges.entries())
-            {
-                if (entry.getValue().equals(myAddress))
-                    myNewRanges.add(entry.getKey());
+            if (indexIntoTFR >= tfrAACO.ordinals.length) {
+              // tfr ran out of indices
+              resOrds[indexIntoRes] = tmpToReturnAACO.ordinals[indexIntoTmpToReturn];
+              resVals[indexIntoRes] = tmpToReturnAACO.values[indexIntoTmpToReturn];
+              indexIntoTmpToReturn++;
+              continue;
             }
-            Multimap<InetAddress, Range> sourceRanges = getNewSourceRanges(table, myNewRanges);
-            for (Map.Entry<InetAddress, Collection<Range>> entry : sourceRanges.asMap().entrySet())
-            {
-                fetchSources.put(entry.getKey(), table);
-                rangesToFetch.put(table, entry);
+            // select which goes now to res: next (ord, value) from tmpToReturn or from tfr:
+            if (merger.leftGoesNow(  tmpToReturnAACO.ordinals[indexIntoTmpToReturn], 
+                tmpToReturnAACO.values[indexIntoTmpToReturn], 
+                tfrAACO.ordinals[indexIntoTFR], 
+                tfrAACO.values[indexIntoTFR])) {
+              resOrds[indexIntoRes] = tmpToReturnAACO.ordinals[indexIntoTmpToReturn];
+              resVals[indexIntoRes] = tmpToReturnAACO.values[indexIntoTmpToReturn];
+              indexIntoTmpToReturn++;
+            } else {
+              resOrds[indexIntoRes] = tfrAACO.ordinals[indexIntoTFR];
+              resVals[indexIntoRes] = tfrAACO.values[indexIntoTFR];
+              indexIntoTFR++;
             }
-        }
-
-        for (final String table : rangesToFetch.keySet())
-        {
-            for (Map.Entry<InetAddress, Collection<Range>> entry : rangesToFetch.get(table))
-            {
-                final InetAddress source = entry.getKey();
-                Collection<Range> ranges = entry.getValue();
-                final Runnable callback = new Runnable()
-                {
-                    public void run()
-                    {
-                        synchronized (fetchSources)
-                        {
-                            fetchSources.remove(source, table);
-                            if (fetchSources.isEmpty())
-                                sendReplicationNotification(myAddress, notifyEndpoint);
-                        }
-                    }
-                };
-                if (logger_.isDebugEnabled())
-                    logger_.debug("Requesting from " + source + " ranges " + StringUtils.join(ranges, ", "));
-                StreamIn.requestRanges(source, table, ranges, callback);
-            }
-        }
-    }
-
-    // needs to be modified to accept either a table or ARS.
-    private Multimap<Range, InetAddress> getChangedRangesForLeaving(String table, InetAddress endpoint)
-    {
-        // First get all ranges the leaving endpoint is responsible for
-        Collection<Range> ranges = getRangesForEndpoint(table, endpoint);
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Node " + endpoint + " ranges [" + StringUtils.join(ranges, ", ") + "]");
-
-        Map<Range, List<InetAddress>> currentReplicaEndpoints = new HashMap<Range, List<InetAddress>>();
-
-        // Find (for each range) all nodes that store replicas for these ranges as well
-        for (Range range : ranges)
-            currentReplicaEndpoints.put(range, Table.open(table).getReplicationStrategy().calculateNaturalEndpoints(range.right, tokenMetadata_));
-
-        TokenMetadata temp = tokenMetadata_.cloneAfterAllLeft();
-
-        // endpoint might or might not be 'leaving'. If it was not leaving (that is, removetoken
-        // command was used), it is still present in temp and must be removed.
-        if (temp.isMember(endpoint))
-            temp.removeEndpoint(endpoint);
-
-        Multimap<Range, InetAddress> changedRanges = HashMultimap.create();
-
-        // Go through the ranges and for each range check who will be
-        // storing replicas for these ranges when the leaving endpoint
-        // is gone. Whoever is present in newReplicaEndpoins list, but
-        // not in the currentReplicaEndpoins list, will be needing the
-        // range.
-        for (Range range : ranges)
-        {
-            Collection<InetAddress> newReplicaEndpoints = Table.open(table).getReplicationStrategy().calculateNaturalEndpoints(range.right, temp);
-            newReplicaEndpoints.removeAll(currentReplicaEndpoints.get(range));
-            if (logger_.isDebugEnabled())
-                if (newReplicaEndpoints.isEmpty())
-                    logger_.debug("Range " + range + " already in all replicas");
-                else
-                    logger_.debug("Range " + range + " will be responsibility of " + StringUtils.join(newReplicaEndpoints, ", "));
-            changedRanges.putAll(range, newReplicaEndpoints);
-        }
-
-        return changedRanges;
-    }
-
-    public void onJoin(InetAddress endpoint, EndpointState epState)
-    {
-        for (Map.Entry<ApplicationState, VersionedValue> entry : epState.getApplicationStateMap().entrySet())
-        {
-            onChange(endpoint, entry.getKey(), entry.getValue());
-        }
-    }
-
-    public void onAlive(InetAddress endpoint, EndpointState state)
-    {
-        if (!isClientMode)
-            deliverHints(endpoint);
-    }
-
-    public void onRemove(InetAddress endpoint)
-    {
-        tokenMetadata_.removeEndpoint(endpoint);
-        calculatePendingRanges();
-    }
-
-    public void onDead(InetAddress endpoint, EndpointState state)
-    {
-        MessagingService.instance().convict(endpoint);
-    }
-
-    /** raw load value */
-    public double getLoad()
-    {
-        double bytes = 0;
-        for (String tableName : DatabaseDescriptor.getTables())
-        {
-            Table table = Table.open(tableName);
-            for (ColumnFamilyStore cfs : table.getColumnFamilyStores())
-                bytes += cfs.getLiveDiskSpaceUsed();
-        }
-        return bytes;
-    }
-
-    public String getLoadString()
-    {
-        return FileUtils.stringifyFileSize(getLoad());
-    }
-
-    public Map<String, String> getLoadMap()
-    {
-        Map<String, String> map = new HashMap<String, String>();
-        for (Map.Entry<InetAddress,Double> entry : StorageLoadBalancer.instance.getLoadInfo().entrySet())
-        {
-            map.put(entry.getKey().getHostAddress(), FileUtils.stringifyFileSize(entry.getValue()));
-        }
-        // gossiper doesn't see its own updates, so we need to special-case the local node
-        map.put(FBUtilities.getLocalAddress().getHostAddress(), getLoadString());
-        return map;
-    }
-
-    /**
-     * Deliver hints to the specified node when it has crashed
-     * and come back up/ marked as alive after a network partition
-    */
-    public final void deliverHints(InetAddress endpoint)
-    {
-        HintedHandOffManager.instance.deliverHints(endpoint);
-    }
-
-    public final void deliverHints(String host) throws UnknownHostException
-    {
-        HintedHandOffManager.instance.deliverHints(host);
-    }
-
-    public Token getLocalToken()
-    {
-        Token token = SystemTable.getSavedToken();
-        assert token != null; // should not be called before initServer sets this
-        return token;
-    }
-
-    /* These methods belong to the MBean interface */
-
-    public String getToken()
-    {
-        return getLocalToken().toString();
-    }
-
-    public String getReleaseVersion()
-    {
-        return FBUtilities.getReleaseVersionString();
-    }
-
-    public List<String> getLeavingNodes()
-    {
-        return stringify(tokenMetadata_.getLeavingEndpoints());
-    }
-
-    public List<String> getJoiningNodes()
-    {
-        return stringify(tokenMetadata_.getBootstrapTokens().values());
-    }
-
-    public List<String> getLiveNodes()
-    {
-        return stringify(Gossiper.instance.getLiveMembers());
-    }
-
-    public List<String> getUnreachableNodes()
-    {
-        return stringify(Gossiper.instance.getUnreachableMembers());
-    }
-
-    private List<String> stringify(Iterable<InetAddress> endpoints)
-    {
-        List<String> stringEndpoints = new ArrayList<String>();
-        for (InetAddress ep : endpoints)
-        {
-            stringEndpoints.add(ep.getHostAddress());
-        }
-        return stringEndpoints;
-    }
-
-    public int getCurrentGenerationNumber()
-    {
-        return Gossiper.instance.getCurrentGenerationNumber(FBUtilities.getLocalAddress());
-    }
-
-    public void forceTableCleanup(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException
-    {
-        if (tableName.equals("system"))
-            throw new RuntimeException("Cleanup of the system table is neither necessary nor wise");
-                    
-        for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName, columnFamilies))
-        {
-            cfStore.forceCleanup();
-        }
-    }
-
-    public void forceTableCompaction(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException
-    {
-        for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName, columnFamilies))
-        {
-            cfStore.forceMajorCompaction();
-        }
-    }
-
-    public void invalidateKeyCaches(String tableName, String... columnFamilies) throws IOException
-    {
-        for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName, columnFamilies))
-        {
-            cfStore.invalidateKeyCache();
-        }
-    }
-
-    public void invalidateRowCaches(String tableName, String... columnFamilies) throws IOException
-    {
-        for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName, columnFamilies))
-        {
-            cfStore.invalidateRowCache();
-        }
-    }
-
-    /**
-     * Takes the snapshot for a given table.
-     *
-     * @param tableName the name of the table.
-     * @param tag   the tag given to the snapshot (null is permissible)
-     */
-    public void takeSnapshot(String tableName, String tag) throws IOException
-    {
-        Table tableInstance = getValidTable(tableName);
-        tableInstance.snapshot(tag);
-    }
-
-    private Table getValidTable(String tableName) throws IOException
-    {
-        if (!DatabaseDescriptor.getTables().contains(tableName))
-        {
-            throw new IOException("Table " + tableName + "does not exist");
-        }
-        return Table.open(tableName);
-    }
-
-    /**
-     * Takes a snapshot for every table.
-     *
-     * @param tag the tag given to the snapshot (null is permissible)
-     */
-    public void takeAllSnapshot(String tag) throws IOException
-    {
-        for (Table table : Table.all())
-            table.snapshot(tag);
-    }
-
-    /**
-     * Remove all the existing snapshots.
-     */
-    public void clearSnapshot() throws IOException
-    {
-        for (Table table : Table.all())
-            table.clearSnapshot();
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Cleared out all snapshot directories");
-    }
-
-    public Iterable<ColumnFamilyStore> getValidColumnFamilies(String tableName, String... cfNames) throws IOException
-    {
-        Table table = getValidTable(tableName);
-
-        if (cfNames.length == 0)
-            // all stores are interesting
-            return table.getColumnFamilyStores();
-
-        // filter out interesting stores
-        Set<ColumnFamilyStore> valid = new HashSet<ColumnFamilyStore>();
-        for (String cfName : cfNames)
-        {
-            ColumnFamilyStore cfStore = table.getColumnFamilyStore(cfName);
-            if (cfStore == null)
-            {
-                // this means there was a cf passed in that is not recognized in the keyspace. report it and continue.
-                logger_.warn(String.format("Invalid column family specified: %s. Proceeding with others.", cfName));
-                continue;
-            }
-            valid.add(cfStore);
-        }
-        return valid;
-    }
-
-    /**
-     * Flush all memtables for a table and column families.
-     * @param tableName
-     * @param columnFamilies
-     * @throws IOException
-     */
-    public void forceTableFlush(final String tableName, final String... columnFamilies)
-                throws IOException, ExecutionException, InterruptedException
-    {
-        for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName, columnFamilies))
-        {
-            logger_.debug("Forcing binary flush on keyspace " + tableName + ", CF " + cfStore.getColumnFamilyName());
-            cfStore.forceFlushBinary();
-            logger_.debug("Forcing flush on keyspace " + tableName + ", CF " + cfStore.getColumnFamilyName());
-            cfStore.forceBlockingFlush();
-        }
-    }
-
-    /**
-     * Trigger proactive repair for a table and column families.
-     * @param tableName
-     * @param columnFamilies
-     * @throws IOException
-     */
-    public void forceTableRepair(final String tableName, final String... columnFamilies) throws IOException
-    {
-        String[] families;
-        if (columnFamilies.length == 0)
-        {
-            ArrayList<String> names = new ArrayList<String>();
-            for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName)) {
-                names.add(cfStore.getColumnFamilyName());
-            }
-            families = names.toArray(new String[] {});
-        }
-        else
-        {
-            families = columnFamilies;
-        }
-        AntiEntropyService.RepairSession sess = AntiEntropyService.instance.getRepairSession(tableName, families);
-        
-        try
-        {
-            sess.start();
-            // block until the repair has completed
-            sess.join();
-        }
-        catch (InterruptedException e)
-        {
-            throw new IOException("Repair session " + sess + " failed.", e);
-        }
-    }
-
-    /* End of MBean interface methods */
-
-    /**
-     * This method returns the predecessor of the endpoint ep on the identifier
-     * space.
-     */
-    InetAddress getPredecessor(InetAddress ep)
-    {
-        Token token = tokenMetadata_.getToken(ep);
-        return tokenMetadata_.getEndpoint(tokenMetadata_.getPredecessor(token));
-    }
-
-    /*
-     * This method returns the successor of the endpoint ep on the identifier
-     * space.
-     */
-    public InetAddress getSuccessor(InetAddress ep)
-    {
-        Token token = tokenMetadata_.getToken(ep);
-        return tokenMetadata_.getEndpoint(tokenMetadata_.getSuccessor(token));
-    }
-
-    /**
-     * Get the primary range for the specified endpoint.
-     * @param ep endpoint we are interested in.
-     * @return range for the specified endpoint.
-     */
-    public Range getPrimaryRangeForEndpoint(InetAddress ep)
-    {
-        return tokenMetadata_.getPrimaryRangeFor(tokenMetadata_.getToken(ep));
-    }
-
-    /**
-     * Get all ranges an endpoint is responsible for.
-     * @param ep endpoint we are interested in.
-     * @return ranges for the specified endpoint.
-     */
-    Collection<Range> getRangesForEndpoint(String table, InetAddress ep)
-    {
-        return Table.open(table).getReplicationStrategy().getAddressRanges().get(ep);
-    }
-
-    /**
-     * Get all ranges that span the ring given a set
-     * of tokens. All ranges are in sorted order of
-     * ranges.
-     * @return ranges in sorted order
-    */
-    public List<Range> getAllRanges(List<Token> sortedTokens)
-    {
-        if (logger_.isDebugEnabled())
-            logger_.debug("computing ranges for " + StringUtils.join(sortedTokens, ", "));
-
-        if (sortedTokens.isEmpty()) 
-            return Collections.emptyList();
-        List<Range> ranges = new ArrayList<Range>();
-        int size = sortedTokens.size();
-        for (int i = 1; i < size; ++i)
-        {
-            Range range = new Range(sortedTokens.get(i - 1), sortedTokens.get(i));
-            ranges.add(range);
-        }
-        Range range = new Range(sortedTokens.get(size - 1), sortedTokens.get(0));
-        ranges.add(range);
-
-        return ranges;
-    }
-
-    /**
-     * This method returns the N endpoints that are responsible for storing the
-     * specified key i.e for replication.
-     *
-     * @param key - key for which we need to find the endpoint return value -
-     * the endpoint responsible for this key
-     */
-    public List<InetAddress> getNaturalEndpoints(String table, ByteBuffer key)
-    {
-        return getNaturalEndpoints(table, partitioner_.getToken(key));
-    }
-
-    public List<InetAddress> getNaturalEndpoints(String table, byte[] key)
-    {
-        return getNaturalEndpoints(table, ByteBuffer.wrap(key));
-    }
-
-    /**
-     * This method returns the N endpoints that are responsible for storing the
-     * specified key i.e for replication.
-     *
-     * @param token - token for which we need to find the endpoint return value -
-     * the endpoint responsible for this token
-     */
-    public List<InetAddress> getNaturalEndpoints(String table, Token token)
-    {
-        return Table.open(table).getReplicationStrategy().getNaturalEndpoints(token);
-    }
-
-    /**
-     * This method attempts to return N endpoints that are responsible for storing the
-     * specified key i.e for replication.
-     *
-     * @param key - key for which we need to find the endpoint return value -
-     * the endpoint responsible for this key
-     */
-    public List<InetAddress> getLiveNaturalEndpoints(String table, ByteBuffer key)
-    {
-        return getLiveNaturalEndpoints(table, partitioner_.getToken(key));
-    }
-
-    public List<InetAddress> getLiveNaturalEndpoints(String table, Token token)
-    {
-        List<InetAddress> liveEps = new ArrayList<InetAddress>();
-        List<InetAddress> endpoints = Table.open(table).getReplicationStrategy().getNaturalEndpoints(token);
-
-        for (InetAddress endpoint : endpoints)
-        {
-            if (FailureDetector.instance.isAlive(endpoint))
-                liveEps.add(endpoint);
-        }
-
-        return liveEps;
-    }
-
-    public void setLog4jLevel(String classQualifier, String rawLevel)
-    {
-        Level level = Level.toLevel(rawLevel);
-        org.apache.log4j.Logger.getLogger(classQualifier).setLevel(level);
-        logger_.info("set log level to " + level + " for classes under '" + classQualifier + "' (if the level doesn't look like '" + rawLevel + "' then log4j couldn't parse '" + rawLevel + "')");
-    }
-
-    /**
-     * @return list of Tokens (_not_ keys!) breaking up the data this node is responsible for into pieces of roughly keysPerSplit
-     */ 
-    public List<Token> getSplits(String table, String cfName, Range range, int keysPerSplit)
-    {
-        List<Token> tokens = new ArrayList<Token>();
-        // we use the actual Range token for the first and last brackets of the splits to ensure correctness
-        tokens.add(range.left);
-
-        List<DecoratedKey> keys = new ArrayList<DecoratedKey>();
-        Table t = Table.open(table);
-        ColumnFamilyStore cfs = t.getColumnFamilyStore(cfName);
-        for (DecoratedKey sample : cfs.allKeySamples())
-        {
-            if (range.contains(sample.token))
-                keys.add(sample);
-        }
-        FBUtilities.sortSampledKeys(keys, range);
-        int splits = keys.size() * DatabaseDescriptor.getIndexInterval() / keysPerSplit;
-
-        if (keys.size() >= splits)
-        {
-            for (int i = 1; i < splits; i++)
-            {
-                int index = i * (keys.size() / splits);
-                tokens.add(keys.get(index).token);
-            }
-        }
-
-        tokens.add(range.right);
-        return tokens;
-    }
-
-    /** return a token to which if a node bootstraps it will get about 1/2 of this node's range */
-    public Token getBootstrapToken()
-    {
-        Range range = getLocalPrimaryRange();
-        List<DecoratedKey> keys = new ArrayList<DecoratedKey>();
-        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
-        {
-            for (DecoratedKey key : cfs.allKeySamples())
-            {
-                if (range.contains(key.token))
-                    keys.add(key);
-            }
-        }
-        FBUtilities.sortSampledKeys(keys, range);
-
-        if (keys.size() < 3)
-            return partitioner_.midpoint(range.left, range.right);
-        else
-            return keys.get(keys.size() / 2).token;
-    }
-
-    /**
-     * Broadcast leaving status and update local tokenMetadata_ accordingly
-     */
-    private void startLeaving()
-    {
-        Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.leaving(getLocalToken()));
-        tokenMetadata_.addLeavingEndpoint(FBUtilities.getLocalAddress());
-        calculatePendingRanges();
-    }
-
-    public void decommission() throws InterruptedException
-    {
-        if (!tokenMetadata_.isMember(FBUtilities.getLocalAddress()))
-            throw new UnsupportedOperationException("local node is not a member of the token ring yet");
-        if (tokenMetadata_.cloneAfterAllLeft().sortedTokens().size() < 2)
-            throw new UnsupportedOperationException("no other normal nodes in the ring; decommission would be pointless");
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            if (tokenMetadata_.getPendingRanges(table, FBUtilities.getLocalAddress()).size() > 0)
-                throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
-        }
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("DECOMMISSIONING");
-        startLeaving();
-        setMode("Leaving: sleeping " + RING_DELAY + " ms for pending range setup", true);
-        Thread.sleep(RING_DELAY);
-
-        Runnable finishLeaving = new Runnable()
-        {
-            public void run()
-            {
-                Gossiper.instance.stop();
-                MessagingService.instance().shutdown();
-                StageManager.shutdownNow();
-                setMode("Decommissioned", true);
-                // let op be responsible for killing the process
-            }
-        };
-        unbootstrap(finishLeaving);
-    }
-
-    private void leaveRing()
-    {
-        SystemTable.setBootstrapped(false);
-        tokenMetadata_.removeEndpoint(FBUtilities.getLocalAddress());
-        calculatePendingRanges();
-
-        Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.left(getLocalToken()));
-        try
-        {
-            Thread.sleep(2 * Gossiper.intervalInMillis_);
-        }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
-    }
-
-    private void unbootstrap(final Runnable onFinish)
-    {
-        final CountDownLatch latch = new CountDownLatch(DatabaseDescriptor.getNonSystemTables().size());
-        for (final String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            Multimap<Range, InetAddress> rangesMM = getChangedRangesForLeaving(table, FBUtilities.getLocalAddress());
-            if (logger_.isDebugEnabled())
-                logger_.debug("Ranges needing transfer are [" + StringUtils.join(rangesMM.keySet(), ",") + "]");
-            if (rangesMM.isEmpty())
-            {
-                latch.countDown();
-                continue;
-            }
-
-            setMode("Leaving: streaming data to other nodes", true);
-            final Set<Map.Entry<Range, InetAddress>> pending = new HashSet<Map.Entry<Range, InetAddress>>(rangesMM.entries());
-            for (final Map.Entry<Range, InetAddress> entry : rangesMM.entries())
-            {
-                final Range range = entry.getKey();
-                final InetAddress newEndpoint = entry.getValue();
-                final Runnable callback = new Runnable()
-                {
-                    public void run()
-                    {
-                        synchronized(pending)
-                        {
-                            pending.remove(entry);
-                            if (pending.isEmpty())
-                                latch.countDown();
-                        }
-                    }
-                };
-                StageManager.getStage(Stage.STREAM).execute(new Runnable()
-                {
-                    public void run()
-                    {
-                        // TODO each call to transferRanges re-flushes, this is potentially a lot of waste
-                        StreamOut.transferRanges(newEndpoint, table, Arrays.asList(range), callback);
-                    }
-                });
-            }
-        }
-
-        // wait for the transfer runnables to signal the latch.
-        logger_.debug("waiting for stream aks.");
-        try
-        {
-            latch.await();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        logger_.debug("stream acks all received.");
-        leaveRing();
-        onFinish.run();
-    }
-
-    public void move(String newToken) throws IOException, InterruptedException
-    {
-        move(partitioner_.getTokenFactory().fromString(newToken));
-    }
-
-    public void loadBalance() throws IOException, InterruptedException
-    {
-        move((Token)null);
-    }
-
-    /**
-     * move the node to new token or find a new token to boot to according to load
-     *
-     * @param token new token to boot to, or if null, find balanced token to boot to
-     */
-    private void move(final Token token) throws IOException, InterruptedException
-    {
-        for (String table : DatabaseDescriptor.getTables())
-        {
-            if (tokenMetadata_.getPendingRanges(table, FBUtilities.getLocalAddress()).size() > 0)
-                throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
-        }
-        if (token != null && tokenMetadata_.sortedTokens().contains(token))
-            throw new IOException("target token " + token + " is already owned by another node");
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("Leaving: old token was " + getLocalToken());
-        startLeaving();
-        setMode("Leaving: sleeping " + RING_DELAY + " ms for pending range setup", true);
-        Thread.sleep(RING_DELAY);
-
-        Runnable finishMoving = new WrappedRunnable()
-        {
-            public void runMayThrow() throws IOException
-            {
-                Token bootstrapToken = token;
-                if (bootstrapToken == null)
-                {
-                    StorageLoadBalancer.instance.waitForLoadInfo();
-                    bootstrapToken = BootStrapper.getBalancedToken(tokenMetadata_, StorageLoadBalancer.instance.getLoadInfo());
-                }
-                logger_.info("re-bootstrapping to new token {}", bootstrapToken);
-                bootstrap(bootstrapToken);
-            }
-        };
-        unbootstrap(finishMoving);
-    }
-
-    /**
-     * Get the status of a token removal.
-     */
-    public String getRemovalStatus()
-    {
-        if (removingNode == null) {
-            return "No token removals in process.";
-        }
-        return String.format("Removing token (%s). Waiting for replication confirmation from [%s].",
-                             tokenMetadata_.getToken(removingNode),
-                             StringUtils.join(replicatingNodes, ","));
-    }
-
-    /**
-     * Force a remove operation to complete. This may be necessary if a remove operation
-     * blocks forever due to node/stream failure. removeToken() must be called
-     * first, this is a last resort measure.  No further attempt will be made to restore replicas.
-     */
-    public void forceRemoveCompletion()
-    {
-        if (!replicatingNodes.isEmpty())
-        {
-            logger_.warn("Removal not confirmed for for " + StringUtils.join(this.replicatingNodes, ","));
-            replicatingNodes.clear();
-        }
-        else
-        {
-            throw new UnsupportedOperationException("No tokens to force removal on, call 'removetoken' first");
-        }
-    }
-
-    /**
-     * Remove a node that has died, attempting to restore the replica count.
-     * If the node is alive, decommission should be attempted.  If decommission
-     * fails, then removeToken should be called.  If we fail while trying to
-     * restore the replica count, finally forceRemoveCompleteion should be
-     * called to forcibly remove the node without regard to replica count.
-     *
-     * @param tokenString token for the node
-     */
-    public void removeToken(String tokenString)
-    {
-        InetAddress myAddress = FBUtilities.getLocalAddress();
-        Token localToken = tokenMetadata_.getToken(myAddress);
-        Token token = partitioner_.getTokenFactory().fromString(tokenString);
-        InetAddress endpoint = tokenMetadata_.getEndpoint(token);
-
-        if (endpoint == null)
-            throw new UnsupportedOperationException("Token not found.");
-
-        if (endpoint.equals(myAddress))
-             throw new UnsupportedOperationException("Cannot remove node's own token");
-
-        if (Gossiper.instance.getLiveMembers().contains(endpoint))
-            throw new UnsupportedOperationException("Node " + endpoint + " is alive and owns this token. Use decommission command to remove it from the ring");
-
-        // A leaving endpoint that is dead is already being removed.
-        if (tokenMetadata_.isLeaving(endpoint))
-            logger_.warn("Node " + endpoint + " is already being removed, continuing removal anyway");
-
-        if (replicatingNodes != null)
-            throw new UnsupportedOperationException("This node is already processing a removal. Wait for it to complete, or use 'removetoken force' if this has failed.");
-
-        // Find the endpoints that are going to become responsible for data
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            // if the replication factor is 1 the data is lost so we shouldn't wait for confirmation
-            if (Table.open(table).getReplicationStrategy().getReplicationFactor() == 1)
-                continue;
-
-            // get all ranges that change ownership (that is, a node needs
-            // to take responsibility for new range)
-            Multimap<Range, InetAddress> changedRanges = getChangedRangesForLeaving(table, endpoint);
-            IFailureDetector failureDetector = FailureDetector.instance;
-            for (InetAddress ep : changedRanges.values())
-            {
-                if (failureDetector.isAlive(ep))
-                    replicatingNodes.add(ep);
-                else
-                    logger_.warn("Endpoint " + ep + " is down and will not receive data for re-replication of " + endpoint);
-            }
-        }
-        removingNode = endpoint;
-
-        tokenMetadata_.addLeavingEndpoint(endpoint);
-        calculatePendingRanges();
-        // bundle two states together. include this nodes state to keep the status quo, 
-        // but indicate the leaving token so that it can be dealt with.
-        Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.removingNonlocal(localToken, token));
-
-        // kick off streaming commands
-        restoreReplicaCount(endpoint, myAddress);
-
-        // wait for ReplicationFinishedVerbHandler to signal we're done
-        while (!replicatingNodes.isEmpty())
-        {
-            try
-            {
-                Thread.sleep(100);
-            }
-            catch (InterruptedException e)
-            {
-                throw new AssertionError(e);
-            }
-        }
-
-        excise(token, endpoint);
-
-        // indicate the token has left
-        Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.removedNonlocal(localToken, token));
-
-        replicatingNodes = null;
-        removingNode = null;
-    }
-
-    public void confirmReplication(InetAddress node)
-    {
-        assert replicatingNodes != null;
-        replicatingNodes.remove(node);
-    }
-
-    public boolean isClientMode()
-    {
-        return isClientMode;
-    }
-
-    public synchronized void requestGC()
-    {
-        if (hasUnreclaimedSpace())
-        {
-            logger_.info("requesting GC to free disk space");
-            System.gc();
-            try
-            {
-                Thread.sleep(1000);
-            }
-            catch (InterruptedException e)
-            {
-                throw new AssertionError(e);
-            }
-        }
-    }
-
-    private boolean hasUnreclaimedSpace()
-    {
-        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
-        {
-            if (cfs.hasUnreclaimedSpace())
-                return true;
-        }
-        return false;
-    }
-
-    public String getOperationMode()
-    {
-        return operationMode;
-    }
-
-    public String getDrainProgress()
-    {
-        return String.format("Drained %s/%s ColumnFamilies", remainingCFs, totalCFs);
-    }
-
-    /** shuts node off to writes, empties memtables and the commit log. */
-    public synchronized void drain() throws IOException, InterruptedException, ExecutionException
-    {
-        ExecutorService mutationStage = StageManager.getStage(Stage.MUTATION);
-        if (mutationStage.isTerminated())
-        {
-            logger_.warn("Cannot drain node (did it already happen?)");
-            return;
-        }
-        setMode("Starting drain process", true);
-        Gossiper.instance.stop();
-        setMode("Draining: shutting down MessageService", false);
-        MessagingService.instance().shutdown();
-        setMode("Draining: emptying MessageService pools", false);
-        MessagingService.instance().waitFor();
-
-        setMode("Draining: clearing mutation stage", false);
-        mutationStage.shutdown();
-        mutationStage.awaitTermination(3600, TimeUnit.SECONDS);
-
-        // lets flush.
-        setMode("Draining: flushing column families", false);
-        List<ColumnFamilyStore> cfses = new ArrayList<ColumnFamilyStore>();
-        for (String tableName : DatabaseDescriptor.getNonSystemTables())
-        {
-            Table table = Table.open(tableName);
-            cfses.addAll(table.getColumnFamilyStores());
-        }
-        totalCFs = remainingCFs = cfses.size();
-        for (ColumnFamilyStore cfs : cfses)
-        {
-            cfs.forceBlockingFlush();
-            remainingCFs--;
-        }
-
-        ColumnFamilyStore.postFlushExecutor.shutdown();
-        ColumnFamilyStore.postFlushExecutor.awaitTermination(60, TimeUnit.SECONDS);
-
-        // want to make sure that any segments deleted as a result of flushing are gone.
-        DeletionService.waitFor();
-
-        setMode("Node is drained", true);
-    }
-
-    /**
-     * load schema from yaml. This can only be done on a fresh system.
-     * @throws ConfigurationException
-     * @throws IOException
-     */
-    public void loadSchemaFromYAML() throws ConfigurationException, IOException
-    { 
-        // validate
-        final Collection<KSMetaData> tables = DatabaseDescriptor.readTablesFromYaml();
-        for (KSMetaData table : tables)
-        {
-            if (!table.name.matches(Migration.NAME_VALIDATOR_REGEX))
-                throw new ConfigurationException("Invalid table name: " + table.name);
-            for (CFMetaData cfm : table.cfMetaData().values())
-                if (!Migration.isLegalName(cfm.cfName))
-                    throw new ConfigurationException("Invalid column family name: " + cfm.cfName);
-        }
-        
-        Callable<Migration> call = new Callable<Migration>()
-        {
-            public Migration call() throws Exception
-            {
-                // blow up if there is a schema saved.
-                if (DatabaseDescriptor.getDefsVersion().timestamp() > 0 || Migration.getLastMigrationId() != null)
-                    throw new ConfigurationException("Cannot import schema when one already exists");
-             
-                Migration migration = null;
-                for (KSMetaData table : tables)
-                {
-                    migration = new AddKeyspace(table); 
-                    migration.apply();
-                }
-                return migration;
-            }
-        };
-        Migration migration;
-        try
-        {
-            migration = StageManager.getStage(Stage.MIGRATION).submit(call).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            if (e.getCause() instanceof ConfigurationException)
-                throw (ConfigurationException)e.getCause();
-            else if (e.getCause() instanceof IOException)
-                throw (IOException)e.getCause();
-            else if (e.getCause() instanceof Exception)
-                throw new ConfigurationException(e.getCause().getMessage(), (Exception)e.getCause());
-            else
-                throw new RuntimeException(e);
-        }
-        
-        assert DatabaseDescriptor.getDefsVersion().timestamp() > 0;
-        DefsTable.dumpToStorage(DatabaseDescriptor.getDefsVersion());
-        // flush system and definition tables.
-        Collection<Future> flushers = new ArrayList<Future>();
-        flushers.addAll(Table.open(Table.SYSTEM_TABLE).flush());
-        for (Future f : flushers)
-        {
-            try
-            {
-                f.get();
-            }
-            catch (Exception e)
-            {
-                ConfigurationException ce = new ConfigurationException(e.getMessage());
-                ce.initCause(e);
-                throw ce;
-            }
-        }
-        
-        // we don't want to announce after every Migration.apply(). keep track of the last one and then announce the
-        // current version.
-        if (migration != null)
-            migration.announce();
-        
-    }
-
-    public String exportSchema() throws IOException
-    {
-        List<RawKeyspace> keyspaces = new ArrayList<RawKeyspace>();
-        for (String ksname : DatabaseDescriptor.getNonSystemTables())
-        {
-            KSMetaData ksm = DatabaseDescriptor.getTableDefinition(ksname);
-            RawKeyspace rks = new RawKeyspace();
-            rks.name = ksm.name;
-            rks.replica_placement_strategy = ksm.strategyClass.getName();
-            rks.replication_factor = ksm.replicationFactor;
-            rks.column_families = new RawColumnFamily[ksm.cfMetaData().size()];
-            int i = 0;
-            for (CFMetaData cfm : ksm.cfMetaData().values())
-            {
-                RawColumnFamily rcf = new RawColumnFamily();
-                rcf.name = cfm.cfName;
-                rcf.compare_with = cfm.comparator.getClass().getName();
-                rcf.default_validation_class = cfm.getDefaultValidator().getClass().getName();
-                rcf.compare_subcolumns_with = cfm.subcolumnComparator == null ? null : cfm.subcolumnComparator.getClass().getName();
-                rcf.column_type = cfm.cfType;
-                rcf.comment = cfm.getComment();
-                rcf.keys_cached = cfm.getKeyCacheSize();
-                rcf.read_repair_chance = cfm.getReadRepairChance();
-                rcf.gc_grace_seconds = cfm.getGcGraceSeconds();
-                rcf.rows_cached = cfm.getRowCacheSize();
-                rcf.column_metadata = new RawColumnDefinition[cfm.getColumn_metadata().size()];
-                int j = 0;
-                for (ColumnDefinition cd : cfm.getColumn_metadata().values())
-                {
-                    RawColumnDefinition rcd = new RawColumnDefinition();
-                    rcd.index_name = cd.getIndexName();
-                    rcd.index_type = cd.getIndexType();
-                    rcd.name = ByteBufferUtil.string(cd.name, Charsets.UTF_8);
-                    rcd.validator_class = cd.validator.getClass().getName();
-                    rcf.column_metadata[j++] = rcd;
-                }
-                if (j == 0)
-                    rcf.column_metadata = null;
-                rks.column_families[i++] = rcf;
-            }
-            // whew.
-            keyspaces.add(rks);
-        }
-        
-        DumperOptions options = new DumperOptions();
-        /* Use a block YAML arrangement */
-        options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
-        SkipNullRepresenter representer = new SkipNullRepresenter();
-        /* Use Tag.MAP to avoid the class name being included as global tag */
-        representer.addClassTag(RawColumnFamily.class, Tag.MAP);
-        representer.addClassTag(Keyspaces.class, Tag.MAP);
-        representer.addClassTag(ColumnDefinition.class, Tag.MAP);
-        Dumper dumper = new Dumper(representer, options);
-        Yaml yaml = new Yaml(dumper);
-        Keyspaces ks = new Keyspaces();
-        ks.keyspaces = keyspaces;
-        return yaml.dump(ks);
-    }
+          } // end of merge of best kids of tfrkey that appear in tmpToReturn and its kids that appear in tfr
+          // altogether yielding no more that best K kids for tfrkey, not to appear in the new shape of 
+          // tmpToReturn
+
+          while (indexIntoTmpToReturn < tmpToReturnAACO.ordinals.length) {
+            resResidue += tmpToReturnAACO.values[indexIntoTmpToReturn++];
+          }
+          while (indexIntoTFR < tfrAACO.ordinals.length) {
+            resResidue += tfrAACO.values[indexIntoTFR++];
+          }
+          //update the list of best kids of tfrkey as appear in tmpToReturn
+          tmpToReturnMapToACCOs.put(tfrkey, new AACO(resOrds, resVals, resResidue));
+        } // endof need to merge both AACO -- children and residue for same ordinal
+
+      } // endof loop over all ordinals in tfr 
+    } // endof loop over all temporary facet results to merge
+
+    return tmpToReturn;
+  }
+
+  private static class AggregatedCategoryHeap extends PriorityQueue<AggregatedCategory> {
     
-    public class Keyspaces
-    {
-        public List<RawKeyspace> keyspaces;
+    private ACComparator merger;
+    public AggregatedCategoryHeap(int size, ACComparator merger) {
+      super(size);
+      this.merger = merger;
     }
+
+    @Override
+    protected boolean lessThan(AggregatedCategory arg1, AggregatedCategory arg2) {
+      return merger.leftGoesNow(arg2.ordinal, arg2.value, arg1.ordinal, arg1.value);
+    }
+
+  }
+
+  private static class ResultNodeHeap extends PriorityQueue<FacetResultNode> {
+    private ACComparator merger;
+    public ResultNodeHeap(int size, ACComparator merger) {
+      super(size);
+      this.merger = merger;
+    }
+
+    @Override
+    protected boolean lessThan(FacetResultNode arg1, FacetResultNode arg2) {
+      return merger.leftGoesNow(arg2.getOrdinal(), arg2.getValue(), arg1.getOrdinal(), arg1.getValue());
+    }
+
+  }
+
+  /**
+   * @return the {@link ACComparator} that reflects the order,
+   * expressed in the {@link FacetRequest}, of 
+   * facets in the {@link FacetResult}. 
+   */
+
+  private ACComparator getSuitableACComparator() {
+    if (facetRequest.getSortOrder() == SortOrder.ASCENDING) {
+      switch (facetRequest.getSortBy()) {
+        case VALUE:
+          return new AscValueACComparator();
+        case ORDINAL:
+          return new AscOrdACComparator();
+      }
+    } else {
+      switch (facetRequest.getSortBy()) {
+        case VALUE:
+          return new DescValueACComparator();
+        case ORDINAL:
+          return new DescOrdACComparator();
+      }
+    }
+    return null;
+  }
+
+  /**
+   * A comparator of two Aggregated Categories according to the order
+   * (ascending / descending) and item (ordinal or value) specified in the 
+   * FacetRequest for the FacetResult to be generated
+   */
+
+  private static abstract class ACComparator {
+    ACComparator() { }
+    protected abstract boolean leftGoesNow (int ord1, double val1, int ord2, double val2); 
+  }
+
+  private static final class AscValueACComparator extends ACComparator {
     
-    // Never ever do this at home. Used by tests.
-    IPartitioner setPartitionerUnsafe(IPartitioner newPartitioner)
-    {
-        IPartitioner oldPartitioner = partitioner_;
-        partitioner_ = newPartitioner;
-        valueFactory = new VersionedValue.VersionedValueFactory(partitioner_);
-        return oldPartitioner;
+    AscValueACComparator() { }
+    
+    @Override
+    protected boolean leftGoesNow (int ord1, double val1, int ord2, double val2) {
+      return (val1 == val2) ? (ord1 < ord2) : (val1 < val2);
+    }
+  }
+
+  private static final class DescValueACComparator extends ACComparator {
+    
+    DescValueACComparator() { }
+    
+    @Override
+    protected boolean leftGoesNow (int ord1, double val1, int ord2, double val2) {
+      return (val1 == val2) ? (ord1 > ord2) : (val1 > val2);
+    }
+  }
+
+  private static final class AscOrdACComparator extends ACComparator {
+    
+    AscOrdACComparator() { }
+    
+    @Override
+    protected boolean leftGoesNow (int ord1, double val1, int ord2, double val2) {
+      return (ord1 < ord2);
+    }
+  }
+
+  private static final class DescOrdACComparator extends ACComparator {
+    
+    DescOrdACComparator() { }
+    
+    @Override
+    protected boolean leftGoesNow (int ord1, double val1, int ord2, double val2) {
+      return (ord1 > ord2);
+    }
+  }
+
+  /**
+   * Intermediate result to hold counts from one or more partitions processed
+   * thus far. Its main field, constructor parameter <i>mapToAACOs</i>, is a map
+   * from ordinals to AACOs. The AACOs mapped to contain ordinals and values
+   * encountered in the count arrays of the partitions processed thus far. The
+   * ordinals mapped from are their parents, and they may be not contained in
+   * the partitions processed thus far. All nodes belong to the taxonomy subtree
+   * defined at the facet request, constructor parameter <i>facetReq</i>, by its
+   * root and depth.
+   */
+  public static class IntermediateFacetResultWithHash implements IntermediateFacetResult {
+    protected IntToObjectMap<AACO> mapToAACOs;
+    FacetRequest facetRequest;
+    boolean isRootNodeIncluded; // among the ordinals in the partitions 
+    // processed thus far
+    double rootNodeValue; // the value of it, in case encountered.
+    int totalNumOfFacetsConsidered; // total number of facets 
+    // which belong to facetRequest subtree and have value != 0,
+    // and have been encountered thus far in the partitions processed. 
+    // root node of result tree is not included in this count.
+
+    public IntermediateFacetResultWithHash(FacetRequest facetReq,
+                                    IntToObjectMap<AACO> mapToAACOs) {
+      this.mapToAACOs = mapToAACOs;
+      this.facetRequest = facetReq;
+      this.isRootNodeIncluded = false;
+      this.rootNodeValue = 0.0;
+      this.totalNumOfFacetsConsidered = 0;
     }
 
-    TokenMetadata setTokenMetadataUnsafe(TokenMetadata tmd)
-    {
-        TokenMetadata old = tokenMetadata_;
-        tokenMetadata_ = tmd;
-        return old;
+    @Override
+    public FacetRequest getFacetRequest() {
+      return this.facetRequest;
+    }
+  } // endof FacetResultWithHash
+
+  /**
+   * Maintains info of one entry in the filled up count array:
+   * an ordinal number of a category and the value aggregated for it 
+   * (typically, that value is the count for that ordinal).
+   */
+  private static final class AggregatedCategory {
+    int ordinal;
+    double value;
+    AggregatedCategory(int ord, double val) {
+      this.ordinal = ord;
+      this.value = val;
+    }
+  }
+
+  /**
+   * Maintains an array of <code>AggregatedCategory</code>. For space consideration, this is implemented as 
+   * a pair of arrays, <i>ordinals</i> and <i>values</i>, rather than one array of pairs.
+   * Enumerated in <i>ordinals</i> are siblings,  
+   * potential nodes of the {@link FacetResult} tree  
+   * (i.e., the descendants of the root node, no deeper than the specified depth).
+   * No more than K ( = {@link FacetRequest#getNumResults()}) 
+   * siblings are enumerated, and  
+   * <i>residue</i> holds the sum of values of the siblings rejected from the 
+   * enumerated top K.
+   * @lucene.internal
+   */
+  protected static final class AACO {
+    int [] ordinals; // ordinals of the best K children, sorted from best to least
+    double [] values; // the respective values for these children
+    double residue; // sum of values of all other children, that did not get into top K
+    AACO (int[] ords, double[] vals, double r) {
+      this.ordinals = ords;
+      this.values = vals;
+      this.residue = r;
+    }
+  }
+
+  @Override
+  /**
+   * Recursively label the first facetRequest.getNumLabel() sub results 
+   * of the root of a given {@link FacetResult}, or of an already labeled node in it.
+   * I.e., a node is labeled only if it is the root or all its ancestors are labeled. 
+   */
+  public void labelResult(FacetResult facetResult) throws IOException {
+    if (facetResult == null) {
+      return; // any result to label?
+    }
+    FacetResultNode rootNode = facetResult.getFacetResultNode();
+    recursivelyLabel(rootNode, facetRequest.getNumLabel());
+  }
+
+  private void recursivelyLabel(FacetResultNode node, int numToLabel) throws IOException {
+    if (node == null) {
+      return;
+    }
+    node.getLabel(this.taxonomyReader); // attach a label -- category path -- to the node
+    if (null == node.getSubResults()) {
+      return;  // if node has no children -- done 
     }
 
-    public void truncate(String keyspace, String columnFamily) throws UnavailableException, TimeoutException, IOException
-    {
-        StorageProxy.truncateBlocking(keyspace, columnFamily);
+    // otherwise, label the first numToLabel of these children, and recursively -- their children.
+    int numLabeled = 0;
+    for (FacetResultNode frn : node.getSubResults()) { 
+      // go over the children of node from first to last, no more than numToLable of them
+      recursivelyLabel(frn, numToLabel);
+      if (++numLabeled >= numToLabel) {
+        return;
+      }
+    }
+  }
+
+  @Override
+  // verifies that the children of each node are sorted by the order
+  // specified by the facetRequest.
+  // the values in these nodes may have changed due to a re-count, for example
+  // following the accumulation by Sampling.
+  // so now we test and re-order if necessary.
+  public FacetResult rearrangeFacetResult(FacetResult facetResult) {
+    PriorityQueue<FacetResultNode> nodesHeap = 
+      new ResultNodeHeap(this.facetRequest.getNumResults(), this.getSuitableACComparator());
+    MutableFacetResultNode topFrn = (MutableFacetResultNode) facetResult.getFacetResultNode(); // safe cast
+    rearrangeChilrenOfNode(topFrn, nodesHeap);
+    return facetResult;
+  }
+
+  private void rearrangeChilrenOfNode(FacetResultNode node,
+                                      PriorityQueue<FacetResultNode> nodesHeap) {
+    nodesHeap.clear(); // just to be safe
+    for (FacetResultNode frn : node.getSubResults()) {
+      nodesHeap.add(frn);
+    }
+    int size = nodesHeap.size();
+    ArrayList<FacetResultNode> subResults = new ArrayList<FacetResultNode>(size);
+    while (nodesHeap.size()>0) {
+      subResults.add(0,nodesHeap.pop());
+    }
+    ((MutableFacetResultNode)node).setSubResults(subResults);
+    for (FacetResultNode frn : node.getSubResults()) {
+      rearrangeChilrenOfNode(frn, nodesHeap);
     }
 
-    public void saveCaches() throws ExecutionException, InterruptedException
-    {
-        List<Future<?>> futures = new ArrayList<Future<?>>();
-        logger_.debug("submitting cache saves");
-        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
-        {
-            futures.add(cfs.submitKeyCacheWrite());
-            futures.add(cfs.submitRowCacheWrite());
-        }
-        FBUtilities.waitOnFutures(futures);
-        logger_.debug("cache saves completed");
+  }
+
+  @Override
+  public FacetResult renderFacetResult(IntermediateFacetResult tmpResult) throws IOException {
+    IntermediateFacetResultWithHash tmp = (IntermediateFacetResultWithHash) tmpResult;
+    int ordinal = this.taxonomyReader.getOrdinal(this.facetRequest.getCategoryPath());
+    if ((tmp == null) || (ordinal == TaxonomyReader.INVALID_ORDINAL)) {
+      return null;
     }
-
-    public Map<Token, Float> getOwnership()
-    {
-        List<Token> sortedTokens = new ArrayList<Token>(getTokenToEndpointMap().keySet());
-        Collections.sort(sortedTokens);
-        return partitioner_.describeOwnership(sortedTokens);
+    double value = Double.NaN;
+    if (tmp.isRootNodeIncluded) {
+      value = tmp.rootNodeValue;
     }
+    MutableFacetResultNode root = generateNode (ordinal, value, tmp.mapToAACOs);
+    return new FacetResult (tmp.facetRequest, root, tmp.totalNumOfFacetsConsidered); 
 
-    public List<String> getKeyspaces()
-    {
-        List<String> tableslist = new ArrayList<String>(DatabaseDescriptor.getTables());
-        return Collections.unmodifiableList(tableslist);
+  }
+
+  private MutableFacetResultNode generateNode (int ordinal, double val,  IntToObjectMap<AACO> mapToAACOs) {
+    MutableFacetResultNode node = new MutableFacetResultNode(ordinal, val);
+    AACO aaco = mapToAACOs.get(ordinal);
+    if (null == aaco) {
+      return node;
     }
-
-    public void updateSnitch(String epSnitchClassName, Boolean dynamic, Integer dynamicUpdateInterval, Integer dynamicResetInterval, Double dynamicBadnessThreshold) throws ConfigurationException
-    {
-        IEndpointSnitch oldSnitch = DatabaseDescriptor.getEndpointSnitch();
-
-        // new snitch registers mbean during construction
-        IEndpointSnitch newSnitch = FBUtilities.construct(epSnitchClassName, "snitch");
-        if (dynamic)
-        {
-            DatabaseDescriptor.setDynamicUpdateInterval(dynamicUpdateInterval);
-            DatabaseDescriptor.setDynamicResetInterval(dynamicResetInterval);
-            DatabaseDescriptor.setDynamicBadnessThreshold(dynamicBadnessThreshold);
-            newSnitch = new DynamicEndpointSnitch(newSnitch);
-        }
-
-        // point snitch references to the new instance
-        DatabaseDescriptor.setEndpointSnitch(newSnitch);
-        for (String ks : DatabaseDescriptor.getTables())
-        {
-            Table.open(ks).getReplicationStrategy().snitch = newSnitch;
-        }
-
-        if (oldSnitch instanceof DynamicEndpointSnitch)
-            ((DynamicEndpointSnitch)oldSnitch).unregisterMBean();
+    List<FacetResultNode> list = new ArrayList<FacetResultNode>();
+    for (int i = 0; i < aaco.ordinals.length; i++) {
+      list.add(generateNode(aaco.ordinals[i], aaco.values[i], mapToAACOs));
     }
+    node.setSubResults(list);
+    node.setResidue(aaco.residue);
+    return node;  
+  }
+
 }

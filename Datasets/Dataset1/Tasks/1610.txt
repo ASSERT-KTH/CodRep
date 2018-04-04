@@ -1,14 +1,13 @@
-sizeInBytes.getAndAdd(-existing.sizeInBytes);
-
-package org.apache.lucene.store;
+SSTableReader sstable = new SSTableReader(dataFileName, partitioner);
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,325 +18,488 @@ package org.apache.lucene.store;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.util.Iterator;
-import java.util.Random;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.ArrayList;
-import java.util.Arrays;
+package org.apache.cassandra.io;
+
+import java.io.*;
+import java.util.*;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
+
+import org.apache.log4j.Logger;
+
+import org.apache.commons.lang.StringUtils;
+
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.utils.BloomFilter;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
 
 /**
- * This is a subclass of RAMDirectory that adds methods
- * intended to be used only by unit tests.
+ * SSTableReaders are open()ed by Table.onStart; after that they are created by SSTableWriter.renameAndOpen.
+ * Do not re-call open() on existing SSTable files; use the references kept by ColumnFamilyStore post-start instead.
  */
+public class SSTableReader extends SSTable implements Comparable<SSTableReader>
+{
+    private static final Logger logger = Logger.getLogger(SSTableReader.class);
 
-public class MockRAMDirectory extends RAMDirectory {
-  long maxSize;
+    private static final FileSSTableMap openedFiles = new FileSSTableMap();
+    
+    // `finalizers` is required to keep the PhantomReferences alive after the enclosing SSTR is itself
+    // unreferenced.  otherwise they will never get enqueued.
+    private static final Set<Reference<SSTableReader>> finalizers = new HashSet<Reference<SSTableReader>>();
+    private static final ReferenceQueue<SSTableReader> finalizerQueue = new ReferenceQueue<SSTableReader>()
+    {{
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                while (true)
+                {
+                    FileDeletingReference r = null;
+                    try
+                    {
+                        r = (FileDeletingReference) finalizerQueue.remove();
+                        finalizers.remove(r);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                    try
+                    {
+                        r.cleanup();
+                    }
+                    catch (IOException e)
+                    {
+                        logger.error("Error deleting " + r.path, e);
+                    }
+                }
+            }
+        };
+        new Thread(runnable, "SSTABLE-DELETER").start();
+    }};
 
-  // Max actual bytes used. This is set by MockRAMOutputStream:
-  long maxUsedSize;
-  double randomIOExceptionRate;
-  Random randomState;
-  boolean noDeleteOpenFile = true;
-  boolean preventDoubleWrite = true;
-  private Set<String> unSyncedFiles;
-  private Set<String> createdFiles;
-  volatile boolean crashed;
+    public static int indexInterval()
+    {
+        return INDEX_INTERVAL;
+    }
 
-  // NOTE: we cannot initialize the Map here due to the
-  // order in which our constructor actually does this
-  // member initialization vs when it calls super.  It seems
-  // like super is called, then our members are initialized:
-  Map<String,Integer> openFiles;
+    public static long getApproximateKeyCount()
+    {
+        return getApproximateKeyCount(openedFiles.values());
+    }
 
-  private synchronized void init() {
-    if (openFiles == null)
-      openFiles = new HashMap<String,Integer>();
-    if (createdFiles == null)
-      createdFiles = new HashSet();
-    if (unSyncedFiles == null)
-      unSyncedFiles = new HashSet();
-  }
+    public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
+    {
+        long count = 0;
 
-  public MockRAMDirectory() {
-    super();
-    init();
-  }
-  public MockRAMDirectory(Directory dir) throws IOException {
-    super(dir);
-    init();
-  }
-
-  /** If set to true, we throw an IOException if the same
-   *  file is opened by createOutput, ever. */
-  public void setPreventDoubleWrite(boolean value) {
-    preventDoubleWrite = value;
-  }
-
-  @Override
-  public synchronized void sync(String name) throws IOException {
-    maybeThrowDeterministicException();
-    if (crashed)
-      throw new IOException("cannot sync after crash");
-    if (unSyncedFiles.contains(name))
-      unSyncedFiles.remove(name);
-  }
-
-  /** Simulates a crash of OS or machine by overwriting
-   *  unsynced files. */
-  public synchronized void crash() throws IOException {
-    crashed = true;
-    openFiles = new HashMap();
-    Iterator<String> it = unSyncedFiles.iterator();
-    unSyncedFiles = new HashSet();
-    int count = 0;
-    while(it.hasNext()) {
-      String name = it.next();
-      RAMFile file = fileMap.get(name);
-      if (count % 3 == 0) {
-        deleteFile(name, true);
-      } else if (count % 3 == 1) {
-        // Zero out file entirely
-        final int numBuffers = file.numBuffers();
-        for(int i=0;i<numBuffers;i++) {
-          byte[] buffer = file.getBuffer(i);
-          Arrays.fill(buffer, (byte) 0);
+        for (SSTableReader sstable : sstables)
+        {
+            int indexKeyCount = sstable.getIndexPositions().size();
+            count = count + (indexKeyCount + 1) * INDEX_INTERVAL;
+            if (logger.isDebugEnabled())
+                logger.debug("index size for bloom filter calc for file  : " + sstable.getFilename() + "   : " + count);
         }
-      } else if (count % 3 == 2) {
-        // Truncate the file:
-        file.setLength(file.getLength()/2);
-      }
-      count++;
+
+        return count;
     }
-  }
-
-  public synchronized void clearCrash() throws IOException {
-    crashed = false;
-  }
-
-  public void setMaxSizeInBytes(long maxSize) {
-    this.maxSize = maxSize;
-  }
-  public long getMaxSizeInBytes() {
-    return this.maxSize;
-  }
-
-  /**
-   * Returns the peek actual storage used (bytes) in this
-   * directory.
-   */
-  public long getMaxUsedSizeInBytes() {
-    return this.maxUsedSize;
-  }
-  public void resetMaxUsedSizeInBytes() {
-    this.maxUsedSize = getRecomputedActualSizeInBytes();
-  }
-
-  /**
-   * Emulate windows whereby deleting an open file is not
-   * allowed (raise IOException).
-  */
-  public void setNoDeleteOpenFile(boolean value) {
-    this.noDeleteOpenFile = value;
-  }
-  public boolean getNoDeleteOpenFile() {
-    return noDeleteOpenFile;
-  }
-
-  /**
-   * If 0.0, no exceptions will be thrown.  Else this should
-   * be a double 0.0 - 1.0.  We will randomly throw an
-   * IOException on the first write to an OutputStream based
-   * on this probability.
-   */
-  public void setRandomIOExceptionRate(double rate, long seed) {
-    randomIOExceptionRate = rate;
-    // seed so we have deterministic behaviour:
-    randomState = new Random(seed);
-  }
-  public double getRandomIOExceptionRate() {
-    return randomIOExceptionRate;
-  }
-
-  void maybeThrowIOException() throws IOException {
-    if (randomIOExceptionRate > 0.0) {
-      int number = Math.abs(randomState.nextInt() % 1000);
-      if (number < randomIOExceptionRate*1000) {
-        throw new IOException("a random IOException");
-      }
-    }
-  }
-
-  @Override
-  public synchronized void deleteFile(String name) throws IOException {
-    deleteFile(name, false);
-  }
-
-  private synchronized void deleteFile(String name, boolean forced) throws IOException {
-
-    maybeThrowDeterministicException();
-
-    if (crashed && !forced)
-      throw new IOException("cannot delete after crash");
-
-    if (unSyncedFiles.contains(name))
-      unSyncedFiles.remove(name);
-    if (!forced) {
-      if (noDeleteOpenFile && openFiles.containsKey(name)) {
-        throw new IOException("MockRAMDirectory: file \"" + name + "\" is still open: cannot delete");
-      }
-    }
-    super.deleteFile(name);
-  }
-
-  @Override
-  public synchronized IndexOutput createOutput(String name) throws IOException {
-    if (crashed)
-      throw new IOException("cannot createOutput after crash");
-    init();
-    if (preventDoubleWrite && createdFiles.contains(name) && !name.equals("segments.gen"))
-      throw new IOException("file \"" + name + "\" was already written to");
-    if (noDeleteOpenFile && openFiles.containsKey(name))
-      throw new IOException("MockRAMDirectory: file \"" + name + "\" is still open: cannot overwrite");
-    RAMFile file = new RAMFile(this);
-    if (crashed)
-      throw new IOException("cannot createOutput after crash");
-    unSyncedFiles.add(name);
-    createdFiles.add(name);
-    RAMFile existing = fileMap.get(name);
-    // Enforce write once:
-    if (existing!=null && !name.equals("segments.gen") && preventDoubleWrite)
-      throw new IOException("file " + name + " already exists");
-    else {
-      if (existing!=null) {
-        sizeInBytes -= existing.sizeInBytes;
-        existing.directory = null;
-      }
-
-      fileMap.put(name, file);
-    }
-
-    return new MockRAMOutputStream(this, file, name);
-  }
-
-  @Override
-  public synchronized IndexInput openInput(String name) throws IOException {
-    RAMFile file = fileMap.get(name);
-    if (file == null)
-      throw new FileNotFoundException(name);
-    else {
-      if (openFiles.containsKey(name)) {
-        Integer v = (Integer) openFiles.get(name);
-        v = Integer.valueOf(v.intValue()+1);
-        openFiles.put(name, v);
-      } else {
-         openFiles.put(name, Integer.valueOf(1));
-      }
-    }
-    return new MockRAMInputStream(this, name, file);
-  }
-
-  /** Provided for testing purposes.  Use sizeInBytes() instead. */
-  public synchronized final long getRecomputedSizeInBytes() {
-    long size = 0;
-    for(final RAMFile file: fileMap.values()) {
-      size += file.getSizeInBytes();
-    }
-    return size;
-  }
-
-  /** Like getRecomputedSizeInBytes(), but, uses actual file
-   * lengths rather than buffer allocations (which are
-   * quantized up to nearest
-   * RAMOutputStream.BUFFER_SIZE (now 1024) bytes.
-   */
-
-  public final synchronized long getRecomputedActualSizeInBytes() {
-    long size = 0;
-    for (final RAMFile file : fileMap.values())
-      size += file.length;
-    return size;
-  }
-
-  @Override
-  public synchronized void close() {
-    if (openFiles == null) {
-      openFiles = new HashMap();
-    }
-    if (noDeleteOpenFile && openFiles.size() > 0) {
-      // RuntimeException instead of IOException because
-      // super() does not throw IOException currently:
-      throw new RuntimeException("MockRAMDirectory: cannot close: there are still open files: " + openFiles);
-    }
-  }
-
-  /**
-   * Objects that represent fail-able conditions. Objects of a derived
-   * class are created and registered with the mock directory. After
-   * register, each object will be invoked once for each first write
-   * of a file, giving the object a chance to throw an IOException.
-   */
-  public static class Failure {
-    /**
-     * eval is called on the first write of every new file.
-     */
-    public void eval(MockRAMDirectory dir) throws IOException { }
 
     /**
-     * reset should set the state of the failure to its default
-     * (freshly constructed) state. Reset is convenient for tests
-     * that want to create one failure object and then reuse it in
-     * multiple cases. This, combined with the fact that Failure
-     * subclasses are often anonymous classes makes reset difficult to
-     * do otherwise.
-     *
-     * A typical example of use is
-     * Failure failure = new Failure() { ... };
-     * ...
-     * mock.failOn(failure.reset())
+     * Get all indexed keys defined by the two predicates.
+     * @param cfpred A Predicate defining matching column families.
+     * @param dkpred A Predicate defining matching DecoratedKeys.
      */
-    public Failure reset() { return this; }
+    public static List<DecoratedKey> getIndexedDecoratedKeysFor(Predicate<SSTable> cfpred, Predicate<DecoratedKey> dkpred)
+    {
+        List<DecoratedKey> indexedKeys = new ArrayList<DecoratedKey>();
+        
+        for (SSTableReader sstable : openedFiles.values())
+        {
+            if (!cfpred.apply(sstable))
+                continue;
+            for (KeyPosition kp : sstable.getIndexPositions())
+            {
+                if (dkpred.apply(kp.key))
+                {
+                    indexedKeys.add(kp.key);
+                }
+            }
+        }
+        Collections.sort(indexedKeys);
 
-    protected boolean doFail;
-
-    public void setDoFail() {
-      doFail = true;
+        return indexedKeys;
     }
 
-    public void clearDoFail() {
-      doFail = false;
+    /**
+     * Get all indexed keys in any SSTable for our primary range.
+     */
+    public static List<DecoratedKey> getIndexedDecoratedKeys()
+    {
+        final Range range = StorageService.instance().getLocalPrimaryRange();
+
+        Predicate<SSTable> cfpred = Predicates.alwaysTrue();
+        return getIndexedDecoratedKeysFor(cfpred,
+                                          new Predicate<DecoratedKey>(){
+            public boolean apply(DecoratedKey dk)
+            {
+               return range.contains(dk.token);
+            }
+        });
     }
-  }
 
-  ArrayList failures;
-
-  /**
-   * add a Failure object to the list of objects to be evaluated
-   * at every potential failure point
-   */
-  synchronized public void failOn(Failure fail) {
-    if (failures == null) {
-      failures = new ArrayList();
+    public static SSTableReader open(String dataFileName) throws IOException
+    {
+        return open(dataFileName, StorageService.getPartitioner(), DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName)));
     }
-    failures.add(fail);
-  }
 
-  /**
-   * Iterate through the failures list, giving each object a
-   * chance to throw an IOE
-   */
-  synchronized void maybeThrowDeterministicException() throws IOException {
-    if (failures != null) {
-      for(int i = 0; i < failures.size(); i++) {
-        ((Failure)failures.get(i)).eval(this);
-      }
+    public static SSTableReader open(String dataFileName, IPartitioner partitioner, double cacheFraction) throws IOException
+    {
+        assert partitioner != null;
+        assert openedFiles.get(dataFileName) == null;
+
+        long start = System.currentTimeMillis();
+        SSTableReader sstable = new SSTableReader(dataFileName, partitioner)
+        sstable.loadIndexFile();
+        sstable.loadBloomFilter();
+        if (cacheFraction > 0)
+        {
+            sstable.keyCache = createKeyCache((int)((sstable.getIndexPositions().size() + 1) * INDEX_INTERVAL * cacheFraction));
+        }
+        if (logger.isDebugEnabled())
+            logger.debug("INDEX LOAD TIME for "  + dataFileName + ": " + (System.currentTimeMillis() - start) + " ms.");
+
+        return sstable;
     }
-  }
 
+    FileDeletingReference phantomReference;
 
+    public static ConcurrentLinkedHashMap<DecoratedKey, Long> createKeyCache(int size)
+    {
+        return ConcurrentLinkedHashMap.create(ConcurrentLinkedHashMap.EvictionPolicy.SECOND_CHANCE, size);
+    }
+
+    private ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache;
+
+    SSTableReader(String filename, IPartitioner partitioner, List<KeyPosition> indexPositions, BloomFilter bloomFilter, ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache)
+    {
+        super(filename, partitioner);
+        this.indexPositions = indexPositions;
+        this.bf = bloomFilter;
+        phantomReference = new FileDeletingReference(this, finalizerQueue);
+        finalizers.add(phantomReference);
+        openedFiles.put(filename, this);
+        this.keyCache = keyCache;
+    }
+
+    private SSTableReader(String filename, IPartitioner partitioner)
+    {
+        this(filename, partitioner, null, null, null);
+    }
+
+    public List<KeyPosition> getIndexPositions()
+    {
+        return indexPositions;
+    }
+
+    void loadBloomFilter() throws IOException
+    {
+        DataInputStream stream = new DataInputStream(new FileInputStream(filterFilename()));
+        try
+        {
+            bf = BloomFilter.serializer().deserialize(stream);
+        }
+        finally
+        {
+            stream.close();
+        }
+    }
+
+    void loadIndexFile() throws IOException
+    {
+        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(), "r");
+        try
+        {
+            indexPositions = new ArrayList<KeyPosition>();
+
+            int i = 0;
+            long indexSize = input.length();
+            while (true)
+            {
+                long indexPosition = input.getFilePointer();
+                if (indexPosition == indexSize)
+                {
+                    break;
+                }
+                DecoratedKey decoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
+                input.readLong();
+                if (i++ % INDEX_INTERVAL == 0)
+                {
+                    indexPositions.add(new KeyPosition(decoratedKey, indexPosition));
+                }
+            }
+        }
+        finally
+        {
+            input.close();
+        }
+    }
+
+    /** get the position in the index file to start scanning to find the given key (at most indexInterval keys away) */
+    private long getIndexScanPosition(DecoratedKey decoratedKey)
+    {
+        assert indexPositions != null && indexPositions.size() > 0;
+        int index = Collections.binarySearch(indexPositions, new KeyPosition(decoratedKey, -1));
+        if (index < 0)
+        {
+            // binary search gives us the first index _greater_ than the key searched for,
+            // i.e., its insertion position
+            int greaterThan = (index + 1) * -1;
+            if (greaterThan == 0)
+                return -1;
+            return indexPositions.get(greaterThan - 1).position;
+        }
+        else
+        {
+            return indexPositions.get(index).position;
+        }
+    }
+
+    /**
+     * returns the position in the data file to find the given key, or -1 if the key is not present
+     */
+    public long getPosition(DecoratedKey decoratedKey) throws IOException
+    {
+        if (!bf.isPresent(partitioner.convertToDiskFormat(decoratedKey)))
+            return -1;
+        if (keyCache != null)
+        {
+            Long cachedPosition = keyCache.get(decoratedKey);
+            if (cachedPosition != null)
+            {
+                return cachedPosition;
+            }
+        }
+        long start = getIndexScanPosition(decoratedKey);
+        if (start < 0)
+        {
+            return -1;
+        }
+
+        // TODO mmap the index file?
+        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(path), "r");
+        input.seek(start);
+        int i = 0;
+        try
+        {
+            do
+            {
+                DecoratedKey indexDecoratedKey;
+                try
+                {
+                    indexDecoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
+                }
+                catch (EOFException e)
+                {
+                    return -1;
+                }
+                long position = input.readLong();
+                int v = indexDecoratedKey.compareTo(decoratedKey);
+                if (v == 0)
+                {
+                    if (keyCache != null)
+                        keyCache.put(decoratedKey, position);
+                    return position;
+                }
+                if (v > 0)
+                    return -1;
+            } while  (++i < INDEX_INTERVAL);
+        }
+        finally
+        {
+            input.close();
+        }
+        return -1;
+    }
+
+    /** like getPosition, but if key is not found will return the location of the first key _greater_ than the desired one, or -1 if no such key exists. */
+    public long getNearestPosition(DecoratedKey decoratedKey) throws IOException
+    {
+        long start = getIndexScanPosition(decoratedKey);
+        if (start < 0)
+        {
+            return 0;
+        }
+        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(path), "r");
+        input.seek(start);
+        try
+        {
+            while (true)
+            {
+                DecoratedKey indexDecoratedKey;
+                try
+                {
+                    indexDecoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
+                }
+                catch (EOFException e)
+                {
+                    return -1;
+                }
+                long position = input.readLong();
+                int v = indexDecoratedKey.compareTo(decoratedKey);
+                if (v >= 0)
+                    return position;
+            }
+        }
+        finally
+        {
+            input.close();
+        }
+    }
+
+    public long length()
+    {
+        return new File(path).length();
+    }
+
+    public int compareTo(SSTableReader o)
+    {
+        return ColumnFamilyStore.getGenerationFromFileName(path) - ColumnFamilyStore.getGenerationFromFileName(o.path);
+    }
+
+    public void markCompacted() throws IOException
+    {
+        if (logger.isDebugEnabled())
+            logger.debug("Marking " + path + " compacted");
+        openedFiles.remove(path);
+        new File(compactedFilename()).createNewFile();
+        phantomReference.deleteOnCleanup();
+    }
+
+    /** obviously only for testing */
+    public void forceBloomFilterFailures()
+    {
+        bf = BloomFilter.alwaysMatchingBloomFilter();
+    }
+
+    static void reopenUnsafe() throws IOException // testing only
+    {
+        Collection<SSTableReader> sstables = new ArrayList<SSTableReader>(openedFiles.values());
+        openedFiles.clear();
+        for (SSTableReader sstable : sstables)
+        {
+            SSTableReader.open(sstable.path, sstable.partitioner, 0.01);
+        }
+    }
+
+    public IPartitioner getPartitioner()
+    {
+        return partitioner;
+    }
+
+    public SSTableScanner getScanner(int bufferSize) throws IOException
+    {
+        return new SSTableScanner(this, bufferSize);
+    }
+
+    public AbstractType getColumnComparator()
+    {
+        return DatabaseDescriptor.getComparator(getTableName(), getColumnFamilyName());
+    }
+
+    public ColumnFamily makeColumnFamily()
+    {
+        return ColumnFamily.create(getTableName(), getColumnFamilyName());
+    }
+
+    public ICompactSerializer2<IColumn> getColumnSerializer()
+    {
+        return DatabaseDescriptor.getColumnFamilyType(getTableName(), getColumnFamilyName()).equals("Standard")
+               ? Column.serializer()
+               : SuperColumn.serializer(getColumnComparator());
+    }
+}
+
+class FileSSTableMap
+{
+    private final Map<String, SSTableReader> map = new NonBlockingHashMap<String, SSTableReader>();
+
+    public SSTableReader get(String filename)
+    {
+        try
+        {
+            return map.get(new File(filename).getCanonicalPath());
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public SSTableReader put(String filename, SSTableReader value)
+    {
+        try
+        {
+            return map.put(new File(filename).getCanonicalPath(), value);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Collection<SSTableReader> values()
+    {
+        return map.values();
+    }
+
+    public void clear()
+    {
+        map.clear();
+    }
+
+    public void remove(String filename) throws IOException
+    {
+        map.remove(new File(filename).getCanonicalPath());
+    }
+
+    @Override
+    public String toString()
+    {
+        return "FileSSTableMap {" + StringUtils.join(map.keySet(), ", ") + "}";
+    }
+}
+
+class FileDeletingReference extends PhantomReference<SSTableReader>
+{
+    public final String path;
+    private boolean deleteOnCleanup;
+
+    FileDeletingReference(SSTableReader referent, ReferenceQueue<? super SSTableReader> q)
+    {
+        super(referent, q);
+        this.path = referent.path;
+    }
+
+    public void deleteOnCleanup()
+    {
+        deleteOnCleanup = true;
+    }
+
+    public void cleanup() throws IOException
+    {
+        if (deleteOnCleanup)
+        {
+            SSTable.delete(path);
+        }
+    }
 }

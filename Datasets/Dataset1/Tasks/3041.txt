@@ -1,4 +1,4 @@
-public class SuperColumn implements IColumn, IColumnContainer
+this(new HashMap<Integer, Integer>(), CFMetaData.getCfToIdMap().size());
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,325 +18,185 @@ public class SuperColumn implements IColumn, IColumnContainer
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.cassandra.db.commitlog;
 
 import java.io.*;
-import java.util.Collection;
-import java.util.concurrent.ConcurrentSkipListMap;
-import java.security.MessageDigest;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.zip.CRC32;
+import java.util.zip.Checksum;
 
-import org.apache.log4j.Logger;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.io.ICompactSerializer;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+import org.apache.cassandra.utils.Pair;
 
-import org.apache.cassandra.io.ICompactSerializer2;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.utils.FBUtilities;
+class CommitLogHeader
+{    
+    static CommitLogHeaderSerializer serializer = new CommitLogHeaderSerializer();
 
-
-public final class SuperColumn implements IColumn, IColumnContainer
-{
-	private static Logger logger_ = Logger.getLogger(SuperColumn.class);
-
-    public static SuperColumnSerializer serializer(AbstractType comparator)
+    static int getLowestPosition(CommitLogHeader clheader)
     {
-        return new SuperColumnSerializer(comparator);
-    }
-
-    private byte[] name_;
-    private ConcurrentSkipListMap<byte[], IColumn> columns_;
-    private AtomicInteger localDeletionTime = new AtomicInteger(Integer.MIN_VALUE);
-	private AtomicLong markedForDeleteAt = new AtomicLong(Long.MIN_VALUE);
-
-    SuperColumn(byte[] name, AbstractType comparator)
-    {
-        this(name, new ConcurrentSkipListMap<byte[], IColumn>(comparator));
-    }
-
-    private SuperColumn(byte[] name, ConcurrentSkipListMap<byte[], IColumn> columns)
-    {
-        assert name != null;
-        assert name.length <= IColumn.MAX_NAME_LENGTH;
-    	name_ = name;
-        columns_ = columns;
-    }
-
-    public AbstractType getComparator()
-    {
-        return (AbstractType)columns_.comparator();
-    }
-
-    public SuperColumn cloneMeShallow()
-    {
-        SuperColumn sc = new SuperColumn(name_, getComparator());
-        sc.markForDeleteAt(localDeletionTime.get(), markedForDeleteAt.get());
-        return sc;
-    }
-
-    public IColumn cloneMe()
-    {
-        SuperColumn sc = new SuperColumn(name_, new ConcurrentSkipListMap<byte[], IColumn>(columns_));
-        sc.markForDeleteAt(localDeletionTime.get(), markedForDeleteAt.get());
-        return sc;
-    }
-
-	public boolean isMarkedForDelete()
-	{
-		return markedForDeleteAt.get() > Long.MIN_VALUE;
-	}
-
-    public byte[] name()
-    {
-    	return name_;
-    }
-
-    public Collection<IColumn> getSubColumns()
-    {
-    	return columns_.values();
-    }
-
-    public IColumn getSubColumn(byte[] columnName)
-    {
-        IColumn column = columns_.get(columnName);
-        assert column == null || column instanceof Column;
-        return column;
-    }
-
-    /**
-     * This calculates the exact size of the sub columns on the fly
-     */
-    public int size()
-    {
-        int size = 0;
-        for (IColumn subColumn : getSubColumns())
-        {
-            size += subColumn.serializedSize();
-        }
-        return size;
-    }
-
-    /**
-     * This returns the size of the super-column when serialized.
-     * @see org.apache.cassandra.db.IColumn#serializedSize()
-    */
-    public int serializedSize()
-    {
-    	/*
-    	 * We need to keep the way we are calculating the column size in sync with the
-    	 * way we are calculating the size for the column family serializer.
-    	 */
-    	return IColumn.UtfPrefix_ + name_.length + DBConstants.intSize_ + DBConstants.longSize_ + DBConstants.intSize_ + size();
-    }
-
-    public void remove(byte[] columnName)
-    {
-    	columns_.remove(columnName);
-    }
-
-    public long timestamp()
-    {
-    	throw new UnsupportedOperationException("This operation is not supported for Super Columns.");
-    }
-
-    public long mostRecentLiveChangeAt()
-    {
-        long max = Long.MIN_VALUE;
-        for (IColumn column : columns_.values())
-        {
-            if (!column.isMarkedForDelete() && column.timestamp() > max)
+        return clheader.lastFlushedAt.size() == 0 ? 0 : Collections.min(clheader.lastFlushedAt.values(), new Comparator<Integer>(){
+            public int compare(Integer o1, Integer o2)
             {
-                max = column.timestamp();
+                if (o1 == 0)
+                    return 1;
+                else if (o2 == 0)
+                    return -1;
+                else
+                    return o1 - o2;
             }
-        }
-        return max;
+        });
     }
 
-    public byte[] value()
+    private Map<Integer, Integer> lastFlushedAt; // position at which each CF was last flushed
+    private final int cfCount; // we keep this in case cfcount changes in the interim (size of lastFlushedAt is not a good indication).
+    
+    CommitLogHeader()
     {
-    	throw new UnsupportedOperationException("This operation is not supported for Super Columns.");
+        this(new HashMap<Integer, Integer>(), CFMetaData.getCfIdMap().size());
     }
-
-    public void addColumn(IColumn column)
-    {
-    	assert column instanceof Column : "A super column can only contain simple columns";
-        byte[] name = column.name();
-        IColumn oldColumn = columns_.putIfAbsent(name, column);
-    	if (oldColumn != null)
-        {
-    		while (((Column)oldColumn).comparePriority((Column)column) <= 0)
-            {
-    			if (columns_.replace(name, oldColumn, column))
-                    break;
-                oldColumn = columns_.get(name);
-            }
-    	}
-    }
-
+    
     /*
-     * Go through each sub column if it exists then as it to resolve itself
-     * if the column does not exist then create it.
-     */
-    public void putColumn(IColumn column)
+     * This ctor is used while deserializing. This ctor
+     * also builds an index of position to column family
+     * Id.
+    */
+    private CommitLogHeader(Map<Integer, Integer> lastFlushedAt, int cfCount)
     {
-        assert column instanceof SuperColumn;
-
-        for (IColumn subColumn : column.getSubColumns())
-        {
-        	addColumn(subColumn);
-        }
-        FBUtilities.atomicSetMax(localDeletionTime, column.getLocalDeletionTime()); // do this first so we won't have a column that's "deleted" but has no local deletion time
-        FBUtilities.atomicSetMax(markedForDeleteAt, column.getMarkedForDeleteAt());
+        this.cfCount = cfCount;
+        this.lastFlushedAt = lastFlushedAt;
+        assert lastFlushedAt.size() <= cfCount;
+    }
+        
+    boolean isDirty(int cfId)
+    {
+        return lastFlushedAt.containsKey(cfId);
+    } 
+    
+    int getPosition(int index)
+    {
+        Integer x = lastFlushedAt.get(index);
+        return x == null ? 0 : x;
+    }
+    
+    void turnOn(int cfId, long position)
+    {
+        lastFlushedAt.put(cfId, (int)position);
     }
 
-    public int getObjectCount()
+    void turnOff(int cfId)
     {
-    	return 1 + columns_.size();
+        lastFlushedAt.remove(cfId);
     }
 
-    public long getMarkedForDeleteAt()
+    boolean isSafeToDelete() throws IOException
     {
-        return markedForDeleteAt.get();
+        return lastFlushedAt.isEmpty();
     }
 
-    public IColumn diff(IColumn columnNew)
+    byte[] toByteArray() throws IOException
     {
-    	IColumn columnDiff = new SuperColumn(columnNew.name(), ((SuperColumn)columnNew).getComparator());
-        if (columnNew.getMarkedForDeleteAt() > getMarkedForDeleteAt())
-        {
-            ((SuperColumn)columnDiff).markForDeleteAt(columnNew.getLocalDeletionTime(), columnNew.getMarkedForDeleteAt());
-        }
-
-        // (don't need to worry about columnNew containing subColumns that are shadowed by
-        // the delete tombstone, since columnNew was generated by CF.resolve, which
-        // takes care of those for us.)
-        for (IColumn subColumn : columnNew.getSubColumns())
-        {
-        	IColumn columnInternal = columns_.get(subColumn.name());
-        	if(columnInternal == null )
-        	{
-        		columnDiff.addColumn(subColumn);
-        	}
-        	else
-        	{
-            	IColumn subColumnDiff = columnInternal.diff(subColumn);
-        		if(subColumnDiff != null)
-        		{
-            		columnDiff.addColumn(subColumnDiff);
-        		}
-        	}
-        }
-
-        if (!columnDiff.getSubColumns().isEmpty() || columnNew.isMarkedForDelete())
-        	return columnDiff;
-        else
-        	return null;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        serializer.serialize(this, dos);
+        dos.flush();
+        return bos.toByteArray();
     }
-
-    public void updateDigest(MessageDigest digest)
+    
+    // we use cf ids. getting the cf names would be pretty pretty expensive.
+    public String toString()
     {
-        assert name_ != null;
-        digest.update(name_);
-        DataOutputBuffer buffer = new DataOutputBuffer();
-        try
-        {
-            buffer.writeLong(markedForDeleteAt.get());
+        StringBuilder sb = new StringBuilder("");
+        sb.append("CLH(dirty+flushed={");
+        for (Map.Entry<Integer, Integer> entry : lastFlushedAt.entrySet())
+        {       
+            sb.append(entry.getKey()).append(": ").append(entry.getValue()).append(", ");
         }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        digest.update(buffer.getData(), 0, buffer.getLength());
-        for (IColumn column : columns_.values())
-        {
-            column.updateDigest(digest);
-        }
-    }
-
-    public String getString(AbstractType comparator)
-    {
-    	StringBuilder sb = new StringBuilder();
-        sb.append("SuperColumn(");
-    	sb.append(comparator.getString(name_));
-
-        if (isMarkedForDelete()) {
-            sb.append(" -delete at ").append(getMarkedForDeleteAt()).append("-");
-        }
-
-        sb.append(" [");
-        sb.append(getComparator().getColumnsString(columns_.values()));
-        sb.append("])");
-
+        sb.append("})");
         return sb.toString();
     }
 
-    public int getLocalDeletionTime()
+    public String dirtyString()
     {
-        return localDeletionTime.get();
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<Integer, Integer> entry : lastFlushedAt.entrySet())
+            sb.append(entry.getKey()).append(", ");
+        return sb.toString();
     }
 
-    @Deprecated // TODO this is a hack to set initial value outside constructor
-    public void markForDeleteAt(int localDeleteTime, long timestamp)
+    static CommitLogHeader readCommitLogHeader(BufferedRandomAccessFile logReader) throws IOException
     {
-        this.localDeletionTime.set(localDeleteTime);
-        this.markedForDeleteAt.set(timestamp);
-    }
-}
-
-class SuperColumnSerializer implements ICompactSerializer2<IColumn>
-{
-    private AbstractType comparator;
-
-    public SuperColumnSerializer(AbstractType comparator)
-    {
-        this.comparator = comparator;
+        int statedSize = logReader.readInt();
+        byte[] bytes = new byte[statedSize];
+        logReader.readFully(bytes);
+        ByteArrayInputStream byteStream = new ByteArrayInputStream(bytes);
+        return serializer.deserialize(new DataInputStream(byteStream));
     }
 
-    public AbstractType getComparator()
+    static class CommitLogHeaderSerializer implements ICompactSerializer<CommitLogHeader>
     {
-        return comparator;
-    }
-
-    public void serialize(IColumn column, DataOutput dos)
-    {
-    	SuperColumn superColumn = (SuperColumn)column;
-        ColumnSerializer.writeName(column.name(), dos);
-        try
+        public void serialize(CommitLogHeader clHeader, DataOutputStream dos) throws IOException
         {
-            dos.writeInt(superColumn.getLocalDeletionTime());
-            dos.writeLong(superColumn.getMarkedForDeleteAt());
+            assert clHeader.lastFlushedAt.size() <= clHeader.cfCount;
+            Checksum checksum = new CRC32();
 
-            Collection<IColumn> columns = column.getSubColumns();
-            dos.writeInt(columns.size());
-            for (IColumn subColumn : columns)
+            // write the first checksum after the fixed-size part, so we won't read garbage lastFlushedAt data.
+            dos.writeInt(clHeader.cfCount); // 4
+            dos.writeInt(clHeader.lastFlushedAt.size()); // 4
+            checksum.update(clHeader.cfCount);
+            checksum.update(clHeader.lastFlushedAt.size());
+            dos.writeLong(checksum.getValue());
+
+            // write the 2nd checksum after the lastflushedat map
+            for (Map.Entry<Integer, Integer> entry : clHeader.lastFlushedAt.entrySet())
             {
-                Column.serializer().serialize(subColumn, dos);
+                dos.writeInt(entry.getKey()); // 4
+                checksum.update(entry.getKey());
+                dos.writeInt(entry.getValue()); // 4
+                checksum.update(entry.getValue());
+            }
+            dos.writeLong(checksum.getValue());
+
+            // keep the size constant by padding for missing flushed-at entries.  these do not affect checksum.
+            for (int i = clHeader.lastFlushedAt.entrySet().size(); i < clHeader.cfCount; i++)
+            {
+                dos.writeInt(0);
+                dos.writeInt(0);
             }
         }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
 
-    public IColumn deserialize(DataInput dis) throws IOException
-    {
-        byte[] name = ColumnSerializer.readName(dis);
-        SuperColumn superColumn = new SuperColumn(name, comparator);
-        int localDeleteTime = dis.readInt();
-        if (localDeleteTime != Integer.MIN_VALUE && localDeleteTime <= 0)
+        public CommitLogHeader deserialize(DataInputStream dis) throws IOException
         {
-            throw new IOException("Invalid localDeleteTime read: " + localDeleteTime);
-        }
-        superColumn.markForDeleteAt(localDeleteTime, dis.readLong());
+            Checksum checksum = new CRC32();
 
-        /* read the number of columns */
-        int size = dis.readInt();
-        for ( int i = 0; i < size; ++i )
-        {
-            IColumn subColumn = Column.serializer().deserialize(dis);
-            superColumn.addColumn(subColumn);
+            int cfCount = dis.readInt();
+            checksum.update(cfCount);
+            int lastFlushedAtSize = dis.readInt();
+            checksum.update(lastFlushedAtSize);
+            if (checksum.getValue() != dis.readLong())
+            {
+                throw new IOException("Invalid or corrupt commitlog header");
+            }
+            Map<Integer, Integer> lastFlushedAt = new HashMap<Integer, Integer>();
+            for (int i = 0; i < lastFlushedAtSize; i++)
+            {
+                int key = dis.readInt();
+                checksum.update(key);
+                int value = dis.readInt();
+                checksum.update(value);
+                lastFlushedAt.put(key, value);
+            }
+            if (checksum.getValue() != dis.readLong())
+            {
+                throw new IOException("Invalid or corrupt commitlog header");
+            }
+
+            return new CommitLogHeader(lastFlushedAt, cfCount);
         }
-        return superColumn;
     }
 }

@@ -1,6 +1,6 @@
-public final void visitDocument(int n, StoredFieldVisitor visitor) throws IOException {
+Counter bytesUsed, IOContext context, float acceptableOverheadRatio) {
 
-package org.apache.lucene.codecs.lucene40;
+package org.apache.lucene.codecs.lucene40.values;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,224 +20,241 @@ package org.apache.lucene.codecs.lucene40;
  */
 
 import java.io.IOException;
+import java.util.Comparator;
+import java.util.List;
 
-import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.StoredFieldsReader;
-import org.apache.lucene.index.CorruptIndexException;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfos;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.StoredFieldVisitor;
-import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
+import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSortedSourceBase;
+import org.apache.lucene.codecs.lucene40.values.Bytes.DerefBytesWriterBase;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.SortedBytesMergeUtils;
+import org.apache.lucene.index.DocValues.SortedSource;
+import org.apache.lucene.index.DocValues.Type;
+import org.apache.lucene.index.SortedBytesMergeUtils.IndexOutputBytesRefConsumer;
+import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
+import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
+import org.apache.lucene.index.MergeState;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.Counter;
 import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.packed.PackedInts;
 
-import java.io.Closeable;
-
-import static org.apache.lucene.codecs.lucene40.Lucene40StoredFieldsWriter.*;
+// Stores variable-length byte[] by deref, ie when two docs
+// have the same value, they store only 1 byte[] and both
+// docs reference that single source
 
 /**
- * Class responsible for access to stored document fields.
- * <p/>
- * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
- * 
- * @see Lucene40StoredFieldsFormat
- * @lucene.internal
+ * @lucene.experimental
  */
-public final class Lucene40StoredFieldsReader extends StoredFieldsReader implements Cloneable, Closeable {
-  private final FieldInfos fieldInfos;
-  private final IndexInput fieldsStream;
-  private final IndexInput indexStream;
-  private int numTotalDocs;
-  private int size;
-  private boolean closed;
+final class VarSortedBytesImpl {
 
-  /** Returns a cloned FieldsReader that shares open
-   *  IndexInputs with the original one.  It is the caller's
-   *  job not to close the original FieldsReader until all
-   *  clones are called (eg, currently SegmentReader manages
-   *  this logic). */
-  @Override
-  public Lucene40StoredFieldsReader clone() {
-    ensureOpen();
-    return new Lucene40StoredFieldsReader(fieldInfos, numTotalDocs, size, (IndexInput)fieldsStream.clone(), (IndexInput)indexStream.clone());
-  }
-  
-  // Used only by clone
-  private Lucene40StoredFieldsReader(FieldInfos fieldInfos, int numTotalDocs, int size, IndexInput fieldsStream, IndexInput indexStream) {
-    this.fieldInfos = fieldInfos;
-    this.numTotalDocs = numTotalDocs;
-    this.size = size;
-    this.fieldsStream = fieldsStream;
-    this.indexStream = indexStream;
-  }
+  static final String CODEC_NAME_IDX = "VarDerefBytesIdx";
+  static final String CODEC_NAME_DAT = "VarDerefBytesDat";
 
-  public Lucene40StoredFieldsReader(Directory d, SegmentInfo si, FieldInfos fn, IOContext context) throws IOException {
-    final String segment = si.name;
-    boolean success = false;
-    fieldInfos = fn;
-    try {
-      fieldsStream = d.openInput(IndexFileNames.segmentFileName(segment, "", FIELDS_EXTENSION), context);
-      final String indexStreamFN = IndexFileNames.segmentFileName(segment, "", FIELDS_INDEX_EXTENSION);
-      indexStream = d.openInput(indexStreamFN, context);
-      
-      CodecUtil.checkHeader(indexStream, CODEC_NAME_IDX, VERSION_START, VERSION_CURRENT);
-      CodecUtil.checkHeader(fieldsStream, CODEC_NAME_DAT, VERSION_START, VERSION_CURRENT);
-      assert HEADER_LENGTH_DAT == fieldsStream.getFilePointer();
-      assert HEADER_LENGTH_IDX == indexStream.getFilePointer();
-      final long indexSize = indexStream.length() - HEADER_LENGTH_IDX;
-      this.size = (int) (indexSize >> 3);
-      // Verify two sources of "maxDoc" agree:
-      if (this.size != si.getDocCount()) {
-        throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + this.size + " but segmentInfo shows " + si.getDocCount());
-      }
-      numTotalDocs = (int) (indexSize >> 3);
-      success = true;
-    } finally {
-      // With lock-less commits, it's entirely possible (and
-      // fine) to hit a FileNotFound exception above. In
-      // this case, we want to explicitly close any subset
-      // of things that were opened so that we don't have to
-      // wait for a GC to do so.
-      if (!success) {
-        close();
-      }
+  static final int VERSION_START = 0;
+  static final int VERSION_CURRENT = VERSION_START;
+
+  final static class Writer extends DerefBytesWriterBase {
+    private final Comparator<BytesRef> comp;
+
+    public Writer(Directory dir, String id, Comparator<BytesRef> comp,
+        Counter bytesUsed, IOContext context, float acceptableOverheadRatio) throws IOException {
+      super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_CURRENT, bytesUsed, context, acceptableOverheadRatio, Type.BYTES_VAR_SORTED);
+      this.comp = comp;
+      size = 0;
     }
-  }
 
-  /**
-   * @throws AlreadyClosedException if this FieldsReader is closed
-   */
-  private void ensureOpen() throws AlreadyClosedException {
-    if (closed) {
-      throw new AlreadyClosedException("this FieldsReader is closed");
-    }
-  }
+    @Override
+    public void merge(MergeState mergeState, DocValues[] docValues)
+        throws IOException {
+      boolean success = false;
+      try {
+        MergeContext ctx = SortedBytesMergeUtils.init(Type.BYTES_VAR_SORTED, docValues, comp, mergeState.segmentInfo.getDocCount());
+        final List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(mergeState.docBase, mergeState.docMaps, docValues, ctx);
+        IndexOutput datOut = getOrCreateDataOut();
+        
+        ctx.offsets = new long[1];
+        final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, new IndexOutputBytesRefConsumer(datOut), slices);
+        final long[] offsets = ctx.offsets;
+        maxBytes = offsets[maxOrd-1];
+        final IndexOutput idxOut = getOrCreateIndexOut();
+        
+        idxOut.writeLong(maxBytes);
+        final PackedInts.Writer offsetWriter = PackedInts.getWriter(idxOut, maxOrd+1,
+            PackedInts.bitsRequired(maxBytes), PackedInts.DEFAULT);
+        offsetWriter.add(0);
+        for (int i = 0; i < maxOrd; i++) {
+          offsetWriter.add(offsets[i]);
+        }
+        offsetWriter.finish();
+        
+        final PackedInts.Writer ordsWriter = PackedInts.getWriter(idxOut, ctx.docToEntry.length,
+            PackedInts.bitsRequired(maxOrd-1), PackedInts.DEFAULT);
+        for (SortedSourceSlice slice : slices) {
+          slice.writeOrds(ordsWriter);
+        }
+        ordsWriter.finish();
+        success = true;
+      } finally {
+        releaseResources();
+        if (success) {
+          IOUtils.close(getIndexOut(), getDataOut());
+        } else {
+          IOUtils.closeWhileHandlingException(getIndexOut(), getDataOut());
+        }
 
-  /**
-   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams.
-   * This means that the Fields values will not be accessible.
-   *
-   * @throws IOException
-   */
-  public final void close() throws IOException {
-    if (!closed) {
-      IOUtils.close(fieldsStream, indexStream);
-      closed = true;
-    }
-  }
-
-  public final int size() {
-    return size;
-  }
-
-  private void seekIndex(int docID) throws IOException {
-    indexStream.seek(HEADER_LENGTH_IDX + docID * 8L);
-  }
-
-  public final void visitDocument(int n, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
-    seekIndex(n);
-    fieldsStream.seek(indexStream.readLong());
-
-    final int numFields = fieldsStream.readVInt();
-    for (int fieldIDX = 0; fieldIDX < numFields; fieldIDX++) {
-      int fieldNumber = fieldsStream.readVInt();
-      FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
-      
-      int bits = fieldsStream.readByte() & 0xFF;
-      assert bits <= (FIELD_IS_NUMERIC_MASK | FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
-
-      switch(visitor.needsField(fieldInfo)) {
-        case YES:
-          readField(visitor, fieldInfo, bits);
-          break;
-        case NO: 
-          skipField(bits);
-          break;
-        case STOP: 
-          return;
       }
     }
-  }
 
-  private void readField(StoredFieldVisitor visitor, FieldInfo info, int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-          visitor.intField(info, fieldsStream.readInt());
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-          visitor.longField(info, fieldsStream.readLong());
-          return;
-        case FIELD_IS_NUMERIC_FLOAT:
-          visitor.floatField(info, Float.intBitsToFloat(fieldsStream.readInt()));
-          return;
-        case FIELD_IS_NUMERIC_DOUBLE:
-          visitor.doubleField(info, Double.longBitsToDouble(fieldsStream.readLong()));
-          return;
-        default:
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
-      }
-    } else { 
-      final int length = fieldsStream.readVInt();
-      byte bytes[] = new byte[length];
-      fieldsStream.readBytes(bytes, 0, length);
-      if ((bits & FIELD_IS_BINARY) != 0) {
-        visitor.binaryField(info, bytes, 0, bytes.length);
-      } else {
-        visitor.stringField(info, new String(bytes, 0, bytes.length, IOUtils.CHARSET_UTF_8));
-      }
+    @Override
+    protected void checkSize(BytesRef bytes) {
+      // allow var bytes sizes
     }
-  }
-  
-  private void skipField(int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-        case FIELD_IS_NUMERIC_FLOAT:
-          fieldsStream.readInt();
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-        case FIELD_IS_NUMERIC_DOUBLE:
-          fieldsStream.readLong();
-          return;
-        default: 
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
+
+    // Important that we get docCount, in case there were
+    // some last docs that we didn't see
+    @Override
+    public void finishInternal(int docCount) throws IOException {
+      fillDefault(docCount);
+      final int count = hash.size();
+      final IndexOutput datOut = getOrCreateDataOut();
+      final IndexOutput idxOut = getOrCreateIndexOut();
+      long offset = 0;
+      final int[] index = new int[count];
+      final int[] sortedEntries = hash.sort(comp);
+      // total bytes of data
+      idxOut.writeLong(maxBytes);
+      PackedInts.Writer offsetWriter = PackedInts.getWriter(idxOut, count+1,
+          PackedInts.bitsRequired(maxBytes), PackedInts.DEFAULT);
+      // first dump bytes data, recording index & write offset as
+      // we go
+      final BytesRef spare = new BytesRef();
+      for (int i = 0; i < count; i++) {
+        final int e = sortedEntries[i];
+        offsetWriter.add(offset);
+        index[e] = i;
+        final BytesRef bytes = hash.get(e, spare);
+        // TODO: we could prefix code...
+        datOut.writeBytes(bytes.bytes, bytes.offset, bytes.length);
+        offset += bytes.length;
       }
-    } else {
-      final int length = fieldsStream.readVInt();
-      fieldsStream.seek(fieldsStream.getFilePointer() + length);
+      // write sentinel
+      offsetWriter.add(offset);
+      offsetWriter.finish();
+      // write index
+      writeIndex(idxOut, docCount, count, index, docToEntry);
+
     }
   }
 
-  /** Returns the length in bytes of each raw document in a
-   *  contiguous range of length numDocs starting with
-   *  startDocID.  Returns the IndexInput (the fieldStream),
-   *  already seeked to the starting point for startDocID.*/
-  public final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
-    seekIndex(startDocID);
-    long startOffset = indexStream.readLong();
-    long lastOffset = startOffset;
-    int count = 0;
-    while (count < numDocs) {
-      final long offset;
-      final int docID = startDocID + count + 1;
-      assert docID <= numTotalDocs;
-      if (docID < numTotalDocs) 
-        offset = indexStream.readLong();
-      else
-        offset = fieldsStream.length();
-      lengths[count++] = (int) (offset-lastOffset);
-      lastOffset = offset;
+  public static class Reader extends BytesReaderBase {
+
+    private final Comparator<BytesRef> comparator;
+
+    Reader(Directory dir, String id, int maxDoc,
+        IOContext context, Type type, Comparator<BytesRef> comparator)
+        throws IOException {
+      super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_START, true, context, type);
+      this.comparator = comparator;
     }
 
-    fieldsStream.seek(startOffset);
+    @Override
+    public org.apache.lucene.index.DocValues.Source load()
+        throws IOException {
+      return new VarSortedSource(cloneData(), cloneIndex(), comparator);
+    }
 
-    return fieldsStream;
+    @Override
+    public Source getDirectSource() throws IOException {
+      return new DirectSortedSource(cloneData(), cloneIndex(), comparator, getType());
+    }
+    
+  }
+  private static final class VarSortedSource extends BytesSortedSourceBase {
+    private final int valueCount;
+
+    VarSortedSource(IndexInput datIn, IndexInput idxIn,
+        Comparator<BytesRef> comp) throws IOException {
+      super(datIn, idxIn, comp, idxIn.readLong(), Type.BYTES_VAR_SORTED, true);
+      valueCount = ordToOffsetIndex.size()-1; // the last value here is just a dummy value to get the length of the last value
+      closeIndexInput();
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      final long offset = ordToOffsetIndex.get(ord);
+      final long nextOffset = ordToOffsetIndex.get(1 + ord);
+      data.fillSlice(bytesRef, offset, (int) (nextOffset - offset));
+      return bytesRef;
+    }
+
+    @Override
+    public int getValueCount() {
+      return valueCount;
+    }
+  }
+
+  private static final class DirectSortedSource extends SortedSource {
+    private final PackedInts.Reader docToOrdIndex;
+    private final PackedInts.Reader ordToOffsetIndex;
+    private final IndexInput datIn;
+    private final long basePointer;
+    private final int valueCount;
+    
+    DirectSortedSource(IndexInput datIn, IndexInput idxIn,
+        Comparator<BytesRef> comparator, Type type) throws IOException {
+      super(type, comparator);
+      idxIn.readLong();
+      ordToOffsetIndex = PackedInts.getDirectReader(idxIn);
+      valueCount = ordToOffsetIndex.size()-1; // the last value here is just a dummy value to get the length of the last value
+      // advance this iterator to the end and clone the stream once it points to the docToOrdIndex header
+      ordToOffsetIndex.get(valueCount);
+      docToOrdIndex = PackedInts.getDirectReader((IndexInput) idxIn.clone()); // read the ords in to prevent too many random disk seeks
+      basePointer = datIn.getFilePointer();
+      this.datIn = datIn;
+    }
+
+    @Override
+    public int ord(int docID) {
+      return (int) docToOrdIndex.get(docID);
+    }
+
+    @Override
+    public boolean hasPackedDocToOrd() {
+      return true;
+    }
+
+    @Override
+    public PackedInts.Reader getDocToOrd() {
+      return docToOrdIndex;
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      try {
+        final long offset = ordToOffsetIndex.get(ord);
+        // 1+ord is safe because we write a sentinel at the end
+        final long nextOffset = ordToOffsetIndex.get(1+ord);
+        datIn.seek(basePointer + offset);
+        final int length = (int) (nextOffset - offset);
+        bytesRef.offset = 0;
+        bytesRef.grow(length);
+        datIn.readBytes(bytesRef.bytes, 0, length);
+        bytesRef.length = length;
+        return bytesRef;
+      } catch (IOException ex) {
+        throw new IllegalStateException("failed", ex);
+      }
+    }
+    
+    @Override
+    public int getValueCount() {
+      return valueCount;
+    }
+
   }
 }

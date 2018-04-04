@@ -1,4 +1,4 @@
-public void forceFlush()
+HeartBeatState hbState = new HeartBeatState(generationNbr);
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,1437 +18,1017 @@ public void forceFlush()
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.cassandra.gms;
 
-import java.io.File;
-import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.PriorityQueue;
-import java.util.Set;
-import java.util.StringTokenizer;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.io.*;
+import java.util.*;
+import java.net.InetAddress;
+
+import org.apache.cassandra.concurrent.SingleThreadedStage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
 
 import org.apache.log4j.Logger;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.io.DataInputBuffer;
-import org.apache.cassandra.io.DataOutputBuffer;
-import org.apache.cassandra.io.IndexHelper;
-import org.apache.cassandra.io.SSTable;
-import org.apache.cassandra.io.SequenceFile;
-import org.apache.cassandra.net.EndPoint;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.utils.FileUtils;
-import org.apache.cassandra.utils.LogUtil;
-
 /**
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ * This module is responsible for Gossiping information for the local endpoint. This abstraction
+ * maintains the list of live and dead endpoints. Periodically i.e. every 1 second this module
+ * chooses a random node and initiates a round of Gossip with it. A round of Gossip involves 3
+ * rounds of messaging. For instance if node A wants to initiate a round of Gossip with node B
+ * it starts off by sending node B a GossipDigestSynMessage. Node B on receipt of this message
+ * sends node A a GossipDigestAckMessage. On receipt of this message node A sends node B a
+ * GossipDigestAck2Message which completes a round of Gossip. This module as and when it hears one
+ * of the three above mentioned messages updates the Failure Detector with the liveness information.
  */
 
-public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+public class Gossiper implements IFailureDetectionEventListener, IEndPointStateChangePublisher
 {
-    private static int threshHold_ = 4;
-    private static final int bufSize_ = 128*1024*1024;
-    private static int compactionMemoryThreshold_ = 1 << 30;
-    private static Logger logger_ = Logger.getLogger(ColumnFamilyStore.class);
-
-    private final String table_;
-    public final String columnFamily_;
-    private final boolean isSuper_;
-    
-    private volatile Integer memtableSwitchCount = 0;
-
-    /* This is used to generate the next index for a SSTable */
-    private AtomicInteger fileIndexGenerator_ = new AtomicInteger(0);
-
-    /* memtable associated with this ColumnFamilyStore. */
-    private AtomicReference<Memtable> memtable_;
-    private AtomicReference<BinaryMemtable> binaryMemtable_;
-
-    /* SSTables on disk for this column family */
-    private Set<String> ssTables_ = new HashSet<String>();
-
-    /* Modification lock used for protecting reads from compactions. */
-    private ReentrantReadWriteLock lock_ = new ReentrantReadWriteLock(true);
-
-    /* Flag indicates if a compaction is in process */
-    private AtomicBoolean isCompacting_ = new AtomicBoolean(false);
-
-    ColumnFamilyStore(String table, String columnFamily, boolean isSuper, int indexValue) throws IOException
+    private class GossipTimerTask extends TimerTask
     {
-        table_ = table;
-        columnFamily_ = columnFamily;
-        isSuper_ = isSuper;
-        fileIndexGenerator_.set(indexValue);
-        memtable_ = new AtomicReference<Memtable>(new Memtable(table_, columnFamily_));
-        binaryMemtable_ = new AtomicReference<BinaryMemtable>(new BinaryMemtable(table_, columnFamily_));
+        public void run()
+        {
+            try
+            {
+                synchronized( Gossiper.instance() )
+                {
+                	/* Update the local heartbeat counter. */
+                    endPointStateMap_.get(localEndPoint_).getHeartBeatState().updateHeartBeat();
+                    List<GossipDigest> gDigests = new ArrayList<GossipDigest>();
+                    Gossiper.instance().makeRandomGossipDigest(gDigests);
+
+                    if ( gDigests.size() > 0 )
+                    {
+                        Message message = makeGossipDigestSynMessage(gDigests);
+                        /* Gossip to some random live member */
+                        boolean gossipedToSeed = doGossipToLiveMember(message);
+
+                        /* Gossip to some unreachable member with some probability to check if he is back up */
+                        doGossipToUnreachableMember(message);
+
+                        /* Gossip to a seed if we did not do so above, or we have seen less nodes
+                           than there are seeds.  This prevents partitions where each group of nodes
+                           is only gossiping to a subset of the seeds.
+
+                           The most straightforward check would be to check that all the seeds have been
+                           verified either as live or unreachable.  To avoid that computation each round,
+                           we reason that:
+
+                           either all the live nodes are seeds, in which case non-seeds that come online
+                           will introduce themselves to a member of the ring by definition,
+
+                           or there is at least one non-seed node in the list, in which case eventually
+                           someone will gossip to it, and then do a gossip to a random seed from the
+                           gossipedToSeed check.
+
+                           See CASSANDRA-150 for more exposition. */
+                        if (!gossipedToSeed || liveEndpoints_.size() < seeds_.size())
+                            doGossipToSeed(message);
+
+                        if (logger_.isTraceEnabled())
+                            logger_.trace("Performing status check ...");
+                        doStatusCheck();
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
-    public static ColumnFamilyStore getColumnFamilyStore(String table, String columnFamily) throws IOException
-    {
-        /*
-         * Get all data files associated with old Memtables for this table.
-         * These files are named as follows <Table>-1.db, ..., <Table>-n.db. Get
-         * the max which in this case is n and increment it to use it for next
-         * index.
-         */
-        List<Integer> indices = new ArrayList<Integer>();
-        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocations();
-        for ( String directory : dataFileDirectories )
-        {
-            File fileDir = new File(directory);
-            File[] files = fileDir.listFiles();
-            for (File file : files)
-            {
-                String filename = file.getName();
-                String[] tblCfName = getTableAndColumnFamilyName(filename);
+    final static int MAX_GOSSIP_PACKET_SIZE = 1428;
+    /* GS - abbreviation for GOSSIPER_STAGE */
+    final static String GOSSIP_STAGE = "GS";
+    /* GSV - abbreviation for GOSSIP-DIGEST-SYN-VERB */
+    final static String JOIN_VERB_HANDLER = "JVH";
+    /* GSV - abbreviation for GOSSIP-DIGEST-SYN-VERB */
+    final static String GOSSIP_DIGEST_SYN_VERB = "GSV";
+    /* GAV - abbreviation for GOSSIP-DIGEST-ACK-VERB */
+    final static String GOSSIP_DIGEST_ACK_VERB = "GAV";
+    /* GA2V - abbreviation for GOSSIP-DIGEST-ACK2-VERB */
+    final static String GOSSIP_DIGEST_ACK2_VERB = "GA2V";
+    public final static int intervalInMillis_ = 1000;
+    private static Logger logger_ = Logger.getLogger(Gossiper.class);
+    private static volatile Gossiper gossiper_;
 
-                if (tblCfName[0].equals(table)
-                        && tblCfName[1].equals(columnFamily))
+    public synchronized static Gossiper instance()
+    {
+        if ( gossiper_ == null )
+        {
+            gossiper_ = new Gossiper();
+        }
+        return gossiper_;
+    }
+
+    private Timer gossipTimer_;
+    private InetAddress localEndPoint_;
+    private long aVeryLongTime_;
+    private Random random_ = new Random();
+
+    /* subscribers for interest in EndPointState change */
+    private List<IEndPointStateChangeSubscriber> subscribers_ = new ArrayList<IEndPointStateChangeSubscriber>();
+
+    /* live member set */
+    private Set<InetAddress> liveEndpoints_ = new HashSet<InetAddress>();
+
+    /* unreachable member set */
+    private Set<InetAddress> unreachableEndpoints_ = new HashSet<InetAddress>();
+
+    /* initial seeds for joining the cluster */
+    private Set<InetAddress> seeds_ = new HashSet<InetAddress>();
+
+    /* map where key is the endpoint and value is the state associated with the endpoint */
+    Map<InetAddress, EndPointState> endPointStateMap_ = new Hashtable<InetAddress, EndPointState>();
+
+    private Gossiper()
+    {
+        gossipTimer_ = new Timer(false);
+        aVeryLongTime_ = 259200 * 1000;
+        /* register with the Failure Detector for receiving Failure detector events */
+        FailureDetector.instance().registerFailureDetectionEventListener(this);
+        /* register the verbs */
+        MessagingService.instance().registerVerbHandlers(JOIN_VERB_HANDLER, new JoinVerbHandler());
+        MessagingService.instance().registerVerbHandlers(GOSSIP_DIGEST_SYN_VERB, new GossipDigestSynVerbHandler());
+        MessagingService.instance().registerVerbHandlers(GOSSIP_DIGEST_ACK_VERB, new GossipDigestAckVerbHandler());
+        MessagingService.instance().registerVerbHandlers(GOSSIP_DIGEST_ACK2_VERB, new GossipDigestAck2VerbHandler());
+        /* register the Gossip stage */
+        StageManager.registerStage( Gossiper.GOSSIP_STAGE, new SingleThreadedStage("GMFD") );
+    }
+
+    /** Register with the Gossiper for EndPointState notifications */
+    public synchronized void register(IEndPointStateChangeSubscriber subscriber)
+    {
+        subscribers_.add(subscriber);
+    }
+
+    public synchronized void unregister(IEndPointStateChangeSubscriber subscriber)
+    {
+        subscribers_.remove(subscriber);
+    }
+
+    public Set<InetAddress> getLiveMembers()
+    {
+        Set<InetAddress> liveMbrs = new HashSet<InetAddress>(liveEndpoints_);
+        liveMbrs.add(localEndPoint_);
+        return liveMbrs;
+    }
+
+    public Set<InetAddress> getUnreachableMembers()
+    {
+        return new HashSet<InetAddress>(unreachableEndpoints_);
+    }
+
+    /**
+     * This method is part of IFailureDetectionEventListener interface. This is invoked
+     * by the Failure Detector when it convicts an end point.
+     *
+     * param @ endpoint end point that is convicted.
+    */
+
+    public void convict(InetAddress endpoint)
+    {
+        EndPointState epState = endPointStateMap_.get(endpoint);
+        if (epState != null)
+        {
+            if (!epState.isAlive() && epState.isAGossiper())
+            {
+                // just to be sure - should already have been done by suspect()
+                if (liveEndpoints_.contains(endpoint))
                 {
-                    int index = getIndexFromFileName(filename);
-                    indices.add(index);
+                    logger_.info("InetAddress " + endpoint + " is now dead.");
+                    isAlive(endpoint, epState, false);
+                }
+                epState.isAGossiper(false);
+            }
+        }
+    }
+
+    /**
+     * This method is part of IFailureDetectionEventListener interface. This is invoked
+     * by the Failure Detector when it suspects an end point.
+     *
+     * param @ endpoint end point that is suspected.
+    */
+    public void suspect(InetAddress endpoint)
+    {
+        EndPointState epState = endPointStateMap_.get(endpoint);
+        if (epState.isAlive())
+        {
+            logger_.info("InetAddress " + endpoint + " is now dead.");
+            isAlive(endpoint, epState, false);
+        }
+    }
+
+    int getMaxEndPointStateVersion(EndPointState epState)
+    {
+        List<Integer> versions = new ArrayList<Integer>();
+        versions.add( epState.getHeartBeatState().getHeartBeatVersion() );
+        Map<String, ApplicationState> appStateMap = epState.getApplicationStateMap();
+
+        Set<String> keys = appStateMap.keySet();
+        for ( String key : keys )
+        {
+            int stateVersion = appStateMap.get(key).getStateVersion();
+            versions.add( stateVersion );
+        }
+
+        /* sort to get the max version to build GossipDigest for this endpoint */
+        Collections.sort(versions);
+        int maxVersion = versions.get(versions.size() - 1);
+        versions.clear();
+        return maxVersion;
+    }
+
+    /**
+     * Removes the endpoint from unreachable endpoint set
+     *
+     * @param endpoint endpoint to be removed from the current membership.
+    */
+    void evictFromMembership(InetAddress endpoint)
+    {
+        unreachableEndpoints_.remove(endpoint);
+    }
+
+    /**
+     * No locking required since it is called from a method that already
+     * has acquired a lock. The gossip digest is built based on randomization
+     * rather than just looping through the collection of live endpoints.
+     *
+     * @param gDigests list of Gossip Digests.
+    */
+    void makeRandomGossipDigest(List<GossipDigest> gDigests)
+    {
+        /* Add the local endpoint state */
+        EndPointState epState = endPointStateMap_.get(localEndPoint_);
+        int generation = epState.getHeartBeatState().getGeneration();
+        int maxVersion = getMaxEndPointStateVersion(epState);
+        gDigests.add( new GossipDigest(localEndPoint_, generation, maxVersion) );
+
+        List<InetAddress> endpoints = new ArrayList<InetAddress>( liveEndpoints_ );
+        Collections.shuffle(endpoints, random_);
+        for ( InetAddress liveEndPoint : endpoints )
+        {
+            epState = endPointStateMap_.get(liveEndPoint);
+            if ( epState != null )
+            {
+                generation = epState.getHeartBeatState().getGeneration();
+                maxVersion = getMaxEndPointStateVersion(epState);
+                gDigests.add( new GossipDigest(liveEndPoint, generation, maxVersion) );
+            }
+            else
+            {
+            	gDigests.add( new GossipDigest(liveEndPoint, 0, 0) );
+            }
+        }
+
+        /* FOR DEBUG ONLY - remove later */
+        StringBuilder sb = new StringBuilder();
+        for ( GossipDigest gDigest : gDigests )
+        {
+            sb.append(gDigest);
+            sb.append(" ");
+        }
+        if (logger_.isTraceEnabled())
+            logger_.trace("Gossip Digests are : " + sb.toString());
+    }
+
+    public int getCurrentGenerationNumber(InetAddress endpoint)
+    {
+    	return endPointStateMap_.get(endpoint).getHeartBeatState().getGeneration();
+    }
+
+    Message makeGossipDigestSynMessage(List<GossipDigest> gDigests) throws IOException
+    {
+        GossipDigestSynMessage gDigestMessage = new GossipDigestSynMessage(DatabaseDescriptor.getClusterName(), gDigests);
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(Gossiper.MAX_GOSSIP_PACKET_SIZE);
+        DataOutputStream dos = new DataOutputStream( bos );
+        GossipDigestSynMessage.serializer().serialize(gDigestMessage, dos);
+        return new Message(localEndPoint_, Gossiper.GOSSIP_STAGE, GOSSIP_DIGEST_SYN_VERB, bos.toByteArray());
+    }
+
+    Message makeGossipDigestAckMessage(GossipDigestAckMessage gDigestAckMessage) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(Gossiper.MAX_GOSSIP_PACKET_SIZE);
+        DataOutputStream dos = new DataOutputStream(bos);
+        GossipDigestAckMessage.serializer().serialize(gDigestAckMessage, dos);
+        if (logger_.isTraceEnabled())
+            logger_.trace("@@@@ Size of GossipDigestAckMessage is " + bos.toByteArray().length);
+        return new Message(localEndPoint_, Gossiper.GOSSIP_STAGE, GOSSIP_DIGEST_ACK_VERB, bos.toByteArray());
+    }
+
+    Message makeGossipDigestAck2Message(GossipDigestAck2Message gDigestAck2Message) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(Gossiper.MAX_GOSSIP_PACKET_SIZE);
+        DataOutputStream dos = new DataOutputStream(bos);
+        GossipDigestAck2Message.serializer().serialize(gDigestAck2Message, dos);
+        return new Message(localEndPoint_, Gossiper.GOSSIP_STAGE, GOSSIP_DIGEST_ACK2_VERB, bos.toByteArray());
+    }
+
+    /**
+     * Returns true if the chosen target was also a seed. False otherwise
+     *
+     *  @param message message to sent
+     *  @param epSet a set of endpoint from which a random endpoint is chosen.
+     *  @return true if the chosen endpoint is also a seed.
+     */
+    boolean sendGossip(Message message, Set<InetAddress> epSet)
+    {
+        int size = epSet.size();
+        /* Generate a random number from 0 -> size */
+        List<InetAddress> liveEndPoints = new ArrayList<InetAddress>(epSet);
+        int index = (size == 1) ? 0 : random_.nextInt(size);
+        InetAddress to = liveEndPoints.get(index);
+        if (logger_.isTraceEnabled())
+            logger_.trace("Sending a GossipDigestSynMessage to " + to + " ...");
+        MessagingService.instance().sendUdpOneWay(message, to);
+        return seeds_.contains(to);
+    }
+
+    /* Sends a Gossip message to a live member and returns true if the recipient was a seed */
+    boolean doGossipToLiveMember(Message message)
+    {
+        int size = liveEndpoints_.size();
+        if ( size == 0 )
+            return false;
+        // return sendGossipToLiveNode(message);
+        /* Use this for a cluster size >= 30 */
+        return sendGossip(message, liveEndpoints_);
+    }
+
+    /* Sends a Gossip message to an unreachable member */
+    void doGossipToUnreachableMember(Message message)
+    {
+        double liveEndPoints = liveEndpoints_.size();
+        double unreachableEndPoints = unreachableEndpoints_.size();
+        if ( unreachableEndPoints > 0 )
+        {
+            /* based on some probability */
+            double prob = unreachableEndPoints / (liveEndPoints + 1);
+            double randDbl = random_.nextDouble();
+            if ( randDbl < prob )
+                sendGossip(message, unreachableEndpoints_);
+        }
+    }
+
+    /* Gossip to a seed for facilitating partition healing */
+    void doGossipToSeed(Message message)
+    {
+        int size = seeds_.size();
+        if ( size > 0 )
+        {
+            if ( size == 1 && seeds_.contains(localEndPoint_) )
+            {
+                return;
+            }
+
+            if ( liveEndpoints_.size() == 0 )
+            {
+                sendGossip(message, seeds_);
+            }
+            else
+            {
+                /* Gossip with the seed with some probability. */
+                double probability = seeds_.size() / (double)( liveEndpoints_.size() + unreachableEndpoints_.size() );
+                double randDbl = random_.nextDouble();
+                if ( randDbl <= probability )
+                    sendGossip(message, seeds_);
+            }
+        }
+    }
+
+    void doStatusCheck()
+    {
+        Set<InetAddress> eps = endPointStateMap_.keySet();
+
+        for ( InetAddress endpoint : eps )
+        {
+            if ( endpoint.equals(localEndPoint_) )
+                continue;
+
+            FailureDetector.instance().interpret(endpoint);
+            EndPointState epState = endPointStateMap_.get(endpoint);
+            if ( epState != null )
+            {
+                long duration = System.currentTimeMillis() - epState.getUpdateTimestamp();
+                if ( !epState.isAlive() && (duration > aVeryLongTime_) )
+                {
+                    evictFromMembership(endpoint);
                 }
             }
         }
-        Collections.sort(indices);
-        int value = (indices.size() > 0) ? (indices.get(indices.size() - 1)) : 0;
+    }
 
-        ColumnFamilyStore cfs = new ColumnFamilyStore(table, columnFamily, "Super".equals(DatabaseDescriptor.getColumnType(columnFamily)), value);
+    EndPointState getEndPointStateForEndPoint(InetAddress ep)
+    {
+        return endPointStateMap_.get(ep);
+    }
 
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+    synchronized EndPointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+    {
+        if (logger_.isTraceEnabled())
+            logger_.trace("Scanning for state greater than " + version + " for " + forEndpoint);
+        EndPointState epState = endPointStateMap_.get(forEndpoint);
+        EndPointState reqdEndPointState = null;
+
+        if ( epState != null )
+        {
+            /*
+             * Here we try to include the Heart Beat state only if it is
+             * greater than the version passed in. It might happen that
+             * the heart beat version maybe lesser than the version passed
+             * in and some application state has a version that is greater
+             * than the version passed in. In this case we also send the old
+             * heart beat and throw it away on the receiver if it is redundant.
+            */
+            int localHbVersion = epState.getHeartBeatState().getHeartBeatVersion();
+            if ( localHbVersion > version )
+            {
+                reqdEndPointState = new EndPointState(epState.getHeartBeatState());
+            }
+            Map<String, ApplicationState> appStateMap = epState.getApplicationStateMap();
+            /* Accumulate all application states whose versions are greater than "version" variable */
+            Set<String> keys = appStateMap.keySet();
+            for ( String key : keys )
+            {
+                ApplicationState appState = appStateMap.get(key);
+                if ( appState.getStateVersion() > version )
+                {
+                    if ( reqdEndPointState == null )
+                    {
+                        reqdEndPointState = new EndPointState(epState.getHeartBeatState());
+                    }
+                    if (logger_.isTraceEnabled())
+                        logger_.trace("Adding state " + key + ": " + appState.getValue());
+                    reqdEndPointState.addApplicationState(key, appState);
+                }
+            }
+        }
+        return reqdEndPointState;
+    }
+
+    /*
+     * This method is called only from the JoinVerbHandler. This happens
+     * when a new node coming up multicasts the JoinMessage. Here we need
+     * to add the endPoint to the list of live endpoints.
+    */
+    synchronized void join(InetAddress from)
+    {
+        if ( !from.equals( localEndPoint_ ) )
+        {
+            /* Mark this endpoint as "live" */
+        	liveEndpoints_.add(from);
+            unreachableEndpoints_.remove(from);
+        }
+    }
+
+    void notifyFailureDetector(List<GossipDigest> gDigests)
+    {
+        IFailureDetector fd = FailureDetector.instance();
+        for ( GossipDigest gDigest : gDigests )
+        {
+            EndPointState localEndPointState = endPointStateMap_.get(gDigest.endPoint_);
+            /*
+             * If the local endpoint state exists then report to the FD only
+             * if the versions workout.
+            */
+            if ( localEndPointState != null )
+            {
+                int localGeneration = endPointStateMap_.get(gDigest.endPoint_).getHeartBeatState().generation_;
+                int remoteGeneration = gDigest.generation_;
+                if ( remoteGeneration > localGeneration )
+                {
+                    fd.report(gDigest.endPoint_);
+                    continue;
+                }
+
+                if ( remoteGeneration == localGeneration )
+                {
+                    int localVersion = getMaxEndPointStateVersion(localEndPointState);
+                    //int localVersion = endPointStateMap_.get(gDigest.endPoint_).getHeartBeatState().getHeartBeatVersion();
+                    int remoteVersion = gDigest.maxVersion_;
+                    if ( remoteVersion > localVersion )
+                    {
+                        fd.report(gDigest.endPoint_);
+                    }
+                }
+            }
+        }
+    }
+
+    void notifyFailureDetector(Map<InetAddress, EndPointState> remoteEpStateMap)
+    {
+        IFailureDetector fd = FailureDetector.instance();
+        Set<InetAddress> endpoints = remoteEpStateMap.keySet();
+        for ( InetAddress endpoint : endpoints )
+        {
+            EndPointState remoteEndPointState = remoteEpStateMap.get(endpoint);
+            EndPointState localEndPointState = endPointStateMap_.get(endpoint);
+            /*
+             * If the local endpoint state exists then report to the FD only
+             * if the versions workout.
+            */
+            if ( localEndPointState != null )
+            {
+                int localGeneration = localEndPointState.getHeartBeatState().generation_;
+                int remoteGeneration = remoteEndPointState.getHeartBeatState().generation_;
+                if ( remoteGeneration > localGeneration )
+                {
+                    fd.report(endpoint);
+                    continue;
+                }
+
+                if ( remoteGeneration == localGeneration )
+                {
+                    int localVersion = getMaxEndPointStateVersion(localEndPointState);
+                    //int localVersion = localEndPointState.getHeartBeatState().getHeartBeatVersion();
+                    int remoteVersion = remoteEndPointState.getHeartBeatState().getHeartBeatVersion();
+                    if ( remoteVersion > localVersion )
+                    {
+                        fd.report(endpoint);
+                    }
+                }
+            }
+        }
+    }
+
+    void markAlive(InetAddress addr, EndPointState localState)
+    {
+        if (logger_.isTraceEnabled())
+            logger_.trace("marking as alive " + addr);
+        if ( !localState.isAlive() )
+        {
+            isAlive(addr, localState, true);
+            logger_.info("InetAddress " + addr + " is now UP");
+        }
+    }
+
+    private void handleNewJoin(InetAddress ep, EndPointState epState)
+    {
+    	logger_.info("Node " + ep + " has now joined.");
+        endPointStateMap_.put(ep, epState);
+        isAlive(ep, epState, true);
+        for (IEndPointStateChangeSubscriber subscriber : subscribers_)
+        {
+            subscriber.onJoin(ep, epState);
+        }
+    }
+
+    synchronized void applyStateLocally(Map<InetAddress, EndPointState> epStateMap)
+    {
+        Set<InetAddress> eps = epStateMap.keySet();
+        for( InetAddress ep : eps )
+        {
+            if ( ep.equals( localEndPoint_ ) )
+                continue;
+
+            EndPointState localEpStatePtr = endPointStateMap_.get(ep);
+            EndPointState remoteState = epStateMap.get(ep);
+            /*
+                If state does not exist just add it. If it does then add it only if the version
+                of the remote copy is greater than the local copy.
+            */
+            if ( localEpStatePtr != null )
+            {
+            	int localGeneration = localEpStatePtr.getHeartBeatState().getGeneration();
+            	int remoteGeneration = remoteState.getHeartBeatState().getGeneration();
+
+            	if (remoteGeneration > localGeneration)
+            	{
+            		handleNewJoin(ep, remoteState);
+            	}
+            	else if ( remoteGeneration == localGeneration )
+            	{
+	                /* manage the membership state */
+	                int localMaxVersion = getMaxEndPointStateVersion(localEpStatePtr);
+	                int remoteMaxVersion = getMaxEndPointStateVersion(remoteState);
+	                if ( remoteMaxVersion > localMaxVersion )
+	                {
+	                    markAlive(ep, localEpStatePtr);
+	                    applyHeartBeatStateLocally(ep, localEpStatePtr, remoteState);
+	                    /* apply ApplicationState */
+	                    applyApplicationStateLocally(ep, localEpStatePtr, remoteState);
+	                }
+            	}
+            }
+            else
+            {
+            	handleNewJoin(ep, remoteState);
+            }
+        }
+    }
+
+    void applyHeartBeatStateLocally(InetAddress addr, EndPointState localState, EndPointState remoteState)
+    {
+        HeartBeatState localHbState = localState.getHeartBeatState();
+        HeartBeatState remoteHbState = remoteState.getHeartBeatState();
+
+        if ( remoteHbState.getGeneration() > localHbState.getGeneration() )
+        {
+            markAlive(addr, localState);
+            localState.setHeartBeatState(remoteHbState);
+        }
+        if ( localHbState.getGeneration() == remoteHbState.getGeneration() )
+        {
+            if ( remoteHbState.getHeartBeatVersion() > localHbState.getHeartBeatVersion() )
+            {
+                int oldVersion = localHbState.getHeartBeatVersion();
+                localState.setHeartBeatState(remoteHbState);
+                if (logger_.isTraceEnabled())
+                    logger_.trace("Updating heartbeat state version to " + localState.getHeartBeatState().getHeartBeatVersion() + " from " + oldVersion + " for " + addr + " ...");
+            }
+        }
+    }
+
+    void applyApplicationStateLocally(InetAddress addr, EndPointState localStatePtr, EndPointState remoteStatePtr)
+    {
+        Map<String, ApplicationState> localAppStateMap = localStatePtr.getApplicationStateMap();
+
+        for (Map.Entry<String,ApplicationState> remoteEntry : remoteStatePtr.getSortedApplicationStates())
+        {
+            String remoteKey = remoteEntry.getKey();
+            ApplicationState remoteAppState = remoteEntry.getValue();
+            ApplicationState localAppState = localAppStateMap.get(remoteKey);
+
+            /* If state doesn't exist locally for this key then just apply it */
+            if ( localAppState == null )
+            {
+                localStatePtr.addApplicationState(remoteKey, remoteAppState);
+                doNotifications(addr, remoteKey, remoteAppState);
+                continue;
+            }
+
+            int remoteGeneration = remoteStatePtr.getHeartBeatState().getGeneration();
+            int localGeneration = localStatePtr.getHeartBeatState().getGeneration();
+            assert remoteGeneration >= localGeneration; // SystemTable makes sure we never generate a smaller generation on start
+
+            /* If the remoteGeneration is greater than localGeneration then apply state blindly */
+            if ( remoteGeneration > localGeneration )
+            {
+                localStatePtr.addApplicationState(remoteKey, remoteAppState);
+                doNotifications(addr, remoteKey, remoteAppState);
+                continue;
+            }
+
+            /* If the generations are the same then apply state if the remote version is greater than local version. */
+            if ( remoteGeneration == localGeneration )
+            {
+                int remoteVersion = remoteAppState.getStateVersion();
+                int localVersion = localAppState.getStateVersion();
+
+                if ( remoteVersion > localVersion )
+                {
+                    localStatePtr.addApplicationState(remoteKey, remoteAppState);
+                    doNotifications(addr, remoteKey, remoteAppState);
+                }
+            }
+        }
+    }
+
+    void doNotifications(InetAddress addr, String stateName, ApplicationState state)
+    {
+        for (IEndPointStateChangeSubscriber subscriber : subscribers_)
+        {
+            subscriber.onChange(addr, stateName, state);
+        }
+    }
+
+    synchronized void isAlive(InetAddress addr, EndPointState epState, boolean value)
+    {
+        epState.isAlive(value);
+        if (value)
+        {
+            liveEndpoints_.add(addr);
+            unreachableEndpoints_.remove(addr);
+            for (IEndPointStateChangeSubscriber subscriber : subscribers_)
+                subscriber.onAlive(addr, epState);
+        }
+        else
+        {
+            liveEndpoints_.remove(addr);
+            unreachableEndpoints_.add(addr);
+            for (IEndPointStateChangeSubscriber subscriber : subscribers_)
+                subscriber.onDead(addr, epState);
+        }
+        if (epState.isAGossiper())
+            return;
+        epState.isAGossiper(true);
+    }
+
+    /* Request all the state for the endpoint in the gDigest */
+    void requestAll(GossipDigest gDigest, List<GossipDigest> deltaGossipDigestList, int remoteGeneration)
+    {
+        /* We are here since we have no data for this endpoint locally so request everthing. */
+        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndPoint(), remoteGeneration, 0) );
+    }
+
+    /* Send all the data with version greater than maxRemoteVersion */
+    void sendAll(GossipDigest gDigest, Map<InetAddress, EndPointState> deltaEpStateMap, int maxRemoteVersion)
+    {
+        EndPointState localEpStatePtr = getStateForVersionBiggerThan(gDigest.getEndPoint(), maxRemoteVersion) ;
+        if ( localEpStatePtr != null )
+            deltaEpStateMap.put(gDigest.getEndPoint(), localEpStatePtr);
+    }
+
+    /*
+        This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
+        and the delta state are built up.
+    */
+    synchronized void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<InetAddress, EndPointState> deltaEpStateMap)
+    {
+        for ( GossipDigest gDigest : gDigestList )
+        {
+            int remoteGeneration = gDigest.getGeneration();
+            int maxRemoteVersion = gDigest.getMaxVersion();
+            /* Get state associated with the end point in digest */
+            EndPointState epStatePtr = endPointStateMap_.get(gDigest.getEndPoint());
+            /*
+                Here we need to fire a GossipDigestAckMessage. If we have some data associated with this endpoint locally
+                then we follow the "if" path of the logic. If we have absolutely nothing for this endpoint we need to
+                request all the data for this endpoint.
+            */
+            if ( epStatePtr != null )
+            {
+                int localGeneration = epStatePtr.getHeartBeatState().getGeneration();
+                /* get the max version of all keys in the state associated with this endpoint */
+                int maxLocalVersion = getMaxEndPointStateVersion(epStatePtr);
+                if ( remoteGeneration == localGeneration && maxRemoteVersion == maxLocalVersion )
+                    continue;
+
+                if ( remoteGeneration > localGeneration )
+                {
+                    /* we request everything from the gossiper */
+                    requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
+                }
+                if ( remoteGeneration < localGeneration )
+                {
+                    /* send all data with generation = localgeneration and version > 0 */
+                    sendAll(gDigest, deltaEpStateMap, 0);
+                }
+                if ( remoteGeneration == localGeneration )
+                {
+                    /*
+                        If the max remote version is greater then we request the remote endpoint send us all the data
+                        for this endpoint with version greater than the max version number we have locally for this
+                        endpoint.
+                        If the max remote version is lesser, then we send all the data we have locally for this endpoint
+                        with version greater than the max remote version.
+                    */
+                    if ( maxRemoteVersion > maxLocalVersion )
+                    {
+                        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndPoint(), remoteGeneration, maxLocalVersion) );
+                    }
+                    if ( maxRemoteVersion < maxLocalVersion )
+                    {
+                        /* send all data with generation = localgeneration and version > maxRemoteVersion */
+                        sendAll(gDigest, deltaEpStateMap, maxRemoteVersion);
+                    }
+                }
+            }
+            else
+            {
+                /* We are here since we have no data for this endpoint locally so request everything. */
+                requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
+            }
+        }
+    }
+
+    /**
+     * Start the gossiper with the generation # retrieved from the System
+     * table
+     */
+    public void start(InetAddress localEndPoint, int generationNbr)
+    {
+        localEndPoint_ = localEndPoint;
+        /* Get the seeds from the config and initialize them. */
+        Set<InetAddress> seedHosts = DatabaseDescriptor.getSeeds();
+        for (InetAddress seed : seedHosts)
+        {
+            if (seed.equals(localEndPoint))
+                continue;
+            seeds_.add(seed);
+        }
+
+        /* initialize the heartbeat state for this localEndPoint */
+        EndPointState localState = endPointStateMap_.get(localEndPoint_);
+        if ( localState == null )
+        {
+            HeartBeatState hbState = new HeartBeatState(generationNbr, 0);
+            localState = new EndPointState(hbState);
+            localState.isAlive(true);
+            localState.isAGossiper(true);
+            endPointStateMap_.put(localEndPoint_, localState);
+        }
+
+        /* starts a timer thread */
+        gossipTimer_.schedule( new GossipTimerTask(), Gossiper.intervalInMillis_, Gossiper.intervalInMillis_);
+    }
+
+    public synchronized void addApplicationState(String key, ApplicationState appState)
+    {
+        EndPointState epState = endPointStateMap_.get(localEndPoint_);
+        assert epState != null;
+        epState.addApplicationState(key, appState);
+    }
+
+    public void stop()
+    {
+        gossipTimer_.cancel();
+        gossipTimer_ = new Timer(false); // makes the Gossiper reentrant.
+    }
+}
+
+class JoinVerbHandler implements IVerbHandler
+{
+    private static Logger logger_ = Logger.getLogger( JoinVerbHandler.class);
+
+    public void doVerb(Message message)
+    {
+        InetAddress from = message.getFrom();
+        if (logger_.isDebugEnabled())
+          logger_.debug("Received a JoinMessage from " + from);
+
+        byte[] bytes = message.getMessageBody();
+        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
+
+        JoinMessage joinMessage;
         try
         {
-            mbs.registerMBean(cfs, new ObjectName(
-                    "org.apache.cassandra.db:type=ColumnFamilyStore-" + table + "." + columnFamily));
+            joinMessage = JoinMessage.serializer().deserialize(dis);
         }
-        catch (Exception e)
+        catch (IOException e)
         {
             throw new RuntimeException(e);
         }
-
-        return cfs;
+        if ( joinMessage.clusterId_.equals( DatabaseDescriptor.getClusterName() ) )
+        {
+            Gossiper.instance().join(from);
+        }
     }
+}
 
-    void onStart() throws IOException
+class GossipDigestSynVerbHandler implements IVerbHandler
+{
+    private static Logger logger_ = Logger.getLogger( GossipDigestSynVerbHandler.class);
+
+    public void doVerb(Message message)
     {
-        /* Do major compaction */
-        List<File> ssTables = new ArrayList<File>();
-        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocations();
-        for ( String directory : dataFileDirectories )
-        {
-            File fileDir = new File(directory);
-            File[] files = fileDir.listFiles();
-            for (File file : files)
-            {
-                String filename = file.getName();
-                if(((file.length() == 0) || (filename.contains("-" + SSTable.temporaryFile_)) ) && (filename.contains(columnFamily_)))
-                {
-                	file.delete();
-                	continue;
-                }
-                
-                String[] tblCfName = getTableAndColumnFamilyName(filename);
-                if (tblCfName[0].equals(table_)
-                        && tblCfName[1].equals(columnFamily_)
-                        && filename.contains("-Data.db"))
-                {
-                    ssTables.add(file.getAbsoluteFile());
-                }
-            }
-        }
-        Collections.sort(ssTables, new FileUtils.FileComparator());
-        List<String> filenames = new ArrayList<String>();
-        for (File ssTable : ssTables)
-        {
-            filenames.add(ssTable.getAbsolutePath());
-        }
+        InetAddress from = message.getFrom();
+        if (logger_.isTraceEnabled())
+            logger_.trace("Received a GossipDigestSynMessage from " + from);
 
-        /* There are no files to compact just add to the list of SSTables */
-        ssTables_.addAll(filenames);
-        /* Load the index files and the Bloom Filters associated with them. */
-        SSTable.onStart(filenames);
-        logger_.debug("Submitting a major compaction task ...");
-        MinorCompactionManager.instance().submit(ColumnFamilyStore.this);
-        if(columnFamily_.equals(Table.hints_))
-        {
-        	HintedHandOffManager.instance().submit(this);
-        }
-        // TODO this seems unnecessary -- each memtable flush checks to see if it needs to compact, too
-        MinorCompactionManager.instance().submitPeriodicCompaction(this);
-    }
+        byte[] bytes = message.getMessageBody();
+        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
 
-    List<String> getAllSSTablesOnDisk()
-    {
-        return new ArrayList<String>(ssTables_);
+        try
+        {
+            GossipDigestSynMessage gDigestMessage = GossipDigestSynMessage.serializer().deserialize(dis);
+            /* If the message is from a different cluster throw it away. */
+            if ( !gDigestMessage.clusterId_.equals(DatabaseDescriptor.getClusterName()) )
+                return;
+
+            List<GossipDigest> gDigestList = gDigestMessage.getGossipDigests();
+            /* Notify the Failure Detector */
+            Gossiper.instance().notifyFailureDetector(gDigestList);
+
+            doSort(gDigestList);
+
+            List<GossipDigest> deltaGossipDigestList = new ArrayList<GossipDigest>();
+            Map<InetAddress, EndPointState> deltaEpStateMap = new HashMap<InetAddress, EndPointState>();
+            Gossiper.instance().examineGossiper(gDigestList, deltaGossipDigestList, deltaEpStateMap);
+
+            GossipDigestAckMessage gDigestAck = new GossipDigestAckMessage(deltaGossipDigestList, deltaEpStateMap);
+            Message gDigestAckMessage = Gossiper.instance().makeGossipDigestAckMessage(gDigestAck);
+            if (logger_.isTraceEnabled())
+                logger_.trace("Sending a GossipDigestAckMessage to " + from);
+            MessagingService.instance().sendUdpOneWay(gDigestAckMessage, from);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
     /*
-     * This method is called to obtain statistics about
-     * the Column Family represented by this Column Family
-     * Store. It will report the total number of files on
-     * disk and the total space oocupied by the data files
-     * associated with this Column Family.
+     * First construct a map whose key is the endpoint in the GossipDigest and the value is the
+     * GossipDigest itself. Then build a list of version differences i.e difference between the
+     * version in the GossipDigest and the version in the local state for a given InetAddress.
+     * Sort this list. Now loop through the sorted list and retrieve the GossipDigest corresponding
+     * to the endpoint from the map that was initially constructed.
     */
-    public String cfStats(String newLineSeparator)
+    private void doSort(List<GossipDigest> gDigestList)
     {
-        StringBuilder sb = new StringBuilder();
+        /* Construct a map of endpoint to GossipDigest. */
+        Map<InetAddress, GossipDigest> epToDigestMap = new HashMap<InetAddress, GossipDigest>();
+        for ( GossipDigest gDigest : gDigestList )
+        {
+            epToDigestMap.put(gDigest.getEndPoint(), gDigest);
+        }
+
         /*
-         * We want to do this so that if there are
-         * no files on disk we do not want to display
-         * something ugly on the admin page.
+         * These digests have their maxVersion set to the difference of the version
+         * of the local EndPointState and the version found in the GossipDigest.
         */
-        if ( ssTables_.size() == 0 )
+        List<GossipDigest> diffDigests = new ArrayList<GossipDigest>();
+        for ( GossipDigest gDigest : gDigestList )
         {
-            return sb.toString();
+            InetAddress ep = gDigest.getEndPoint();
+            EndPointState epState = Gossiper.instance().getEndPointStateForEndPoint(ep);
+            int version = (epState != null) ? Gossiper.instance().getMaxEndPointStateVersion( epState ) : 0;
+            int diffVersion = Math.abs(version - gDigest.getMaxVersion() );
+            diffDigests.add( new GossipDigest(ep, gDigest.getGeneration(), diffVersion) );
         }
-        sb.append(columnFamily_ + " statistics :");
-        sb.append(newLineSeparator);
-        sb.append("Number of files on disk : " + ssTables_.size());
-        sb.append(newLineSeparator);
-        double totalSpace = 0d;
-        for ( String file : ssTables_ )
-        {
-            File f = new File(file);
-            totalSpace += f.length();
-        }
-        String diskSpace = FileUtils.stringifyFileSize(totalSpace);
-        sb.append("Total disk space : " + diskSpace);
-        sb.append(newLineSeparator);
-        sb.append("--------------------------------------");
-        sb.append(newLineSeparator);
-        return sb.toString();
-    }
 
-    /*
-     * This is called after bootstrap to add the files
-     * to the list of files maintained.
-    */
-    void addToList(String file)
-    {
-    	lock_.writeLock().lock();
-        try
-        {
-            ssTables_.add(file);
-        }
-        finally
-        {
-        	lock_.writeLock().unlock();
-        }
-    }
-
-    void touch(String key, boolean fData) throws IOException
-    {
-        /* Scan the SSTables on disk first */
-        lock_.readLock().lock();
-        try
-        {
-            List<String> files = new ArrayList<String>(ssTables_);
-            for (String file : files)
-            {
-                /*
-                 * Get the BloomFilter associated with this file. Check if the key
-                 * is present in the BloomFilter. If not continue to the next file.
-                */
-                boolean bVal = SSTable.isKeyInFile(key, file);
-                if ( !bVal )
-                    continue;
-                SSTable ssTable = new SSTable(file, StorageService.getPartitioner());
-                ssTable.touch(key, fData);
-            }
-        }
-        finally
-        {
-            lock_.readLock().unlock();
-        }
-    }
-
-    /*
-     * This method forces a compaction of the SSTables on disk. We wait
-     * for the process to complete by waiting on a future pointer.
-    */
-    boolean forceCompaction(List<Range> ranges, EndPoint target, long skip, List<String> fileList)
-    {        
-    	Future<Boolean> futurePtr = null;
-    	if( ranges != null)
-    		futurePtr = MinorCompactionManager.instance().submit(ColumnFamilyStore.this, ranges, target, fileList);
-    	else
-    		MinorCompactionManager.instance().submitMajor(ColumnFamilyStore.this, skip);
-    	
-        boolean result = true;
-        try
-        {
-            /* Waiting for the compaction to complete. */
-        	if(futurePtr != null)
-        		result = futurePtr.get();
-            logger_.debug("Done forcing compaction ...");
-        }
-        catch (ExecutionException ex)
-        {
-            logger_.debug(LogUtil.throwableToString(ex));
-        }
-        catch ( InterruptedException ex2 )
-        {
-            logger_.debug(LogUtil.throwableToString(ex2));
-        }
-        return result;
-    }
-
-    String getColumnFamilyName()
-    {
-        return columnFamily_;
-    }
-
-    private static String[] getTableAndColumnFamilyName(String filename)
-    {
-        StringTokenizer st = new StringTokenizer(filename, "-");
-        String[] values = new String[2];
-        int i = 0;
-        while (st.hasMoreElements())
-        {
-            if (i == 0)
-                values[i] = (String) st.nextElement();
-            else if (i == 1)
-            {
-                values[i] = (String) st.nextElement();
-                break;
-            }
-            ++i;
-        }
-        return values;
-    }
-
-    protected static int getIndexFromFileName(String filename)
-    {
+        gDigestList.clear();
+        Collections.sort(diffDigests);
+        int size = diffDigests.size();
         /*
-         * File name is of the form <table>-<column family>-<index>-Data.db.
-         * This tokenizer will strip the .db portion.
-         */
-        StringTokenizer st = new StringTokenizer(filename, "-");
-        /*
-         * Now I want to get the index portion of the filename. We accumulate
-         * the indices and then sort them to get the max index.
-         */
-        int count = st.countTokens();
-        int i = 0;
-        String index = null;
-        while (st.hasMoreElements())
+         * Report the digests in descending order. This takes care of the endpoints
+         * that are far behind w.r.t this local endpoint
+        */
+        for ( int i = size - 1; i >= 0; --i )
         {
-            index = (String) st.nextElement();
-            if (i == (count - 2))
-                break;
-            ++i;
+            gDigestList.add( epToDigestMap.get(diffDigests.get(i).getEndPoint()) );
         }
-        return Integer.parseInt(index);
     }
+}
 
-    String getNextFileName()
+class GossipDigestAckVerbHandler implements IVerbHandler
+{
+    private static Logger logger_ = Logger.getLogger(GossipDigestAckVerbHandler.class);
+
+    public void doVerb(Message message)
     {
-    	// Psuedo increment so that we do not generate consecutive numbers 
-    	fileIndexGenerator_.incrementAndGet();
-        return table_ + "-" + columnFamily_ + "-" + fileIndexGenerator_.incrementAndGet();
-    }
+        InetAddress from = message.getFrom();
+        if (logger_.isTraceEnabled())
+            logger_.trace("Received a GossipDigestAckMessage from " + from);
 
-    /*
-     * Return a temporary file name.
-     */
-    String getTempFileName()
-    {
-    	// Psuedo increment so that we do not generate consecutive numbers 
-    	fileIndexGenerator_.incrementAndGet();
-        return table_ + "-" + columnFamily_ + "-" + SSTable.temporaryFile_ + "-" + fileIndexGenerator_.incrementAndGet();
-    }
+        byte[] bytes = message.getMessageBody();
+        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
 
-    /*
-     * Return a temporary file name. Based on the list of files input 
-     * This fn sorts the list and generates a number between he 2 lowest filenames 
-     * ensuring uniqueness.
-     * Since we do not generate consecutive numbers hence the lowest file number
-     * can just be incremented to generate the next file. 
-     */
-    String getTempFileName( List<String> files)
-    {
-    	int lowestIndex;
-    	int index;
-    	Collections.sort(files, new FileNameComparator(FileNameComparator.Ascending));
-    	
-    	if( files.size() <= 1)
-    		return null;
-    	lowestIndex = getIndexFromFileName(files.get(0));
-   		
-   		index = lowestIndex + 1 ;
-
-        return table_ + "-" + columnFamily_ + "-" + SSTable.temporaryFile_ + "-" + index;
-    }
-
-    
-    /*
-     * This version is used only on start up when we are recovering from logs.
-     * In the future we may want to parellelize the log processing for a table
-     * by having a thread per log file present for recovery. Re-visit at that
-     * time.
-     */
-    void switchMemtable()
-    {
-        memtable_.set(new Memtable(table_, columnFamily_));
-        
-        if (memtableSwitchCount == Integer.MAX_VALUE)
-        {
-            memtableSwitchCount = 0;
-        }
-        memtableSwitchCount++;
-    }
-
-    /*
-     * This version is used only on start up when we are recovering from logs.
-     * In the future we may want to parellelize the log processing for a table
-     * by having a thread per log file present for recovery. Re-visit at that
-     * time.
-     */
-    void switchBinaryMemtable(String key, byte[] buffer) throws IOException
-    {
-        binaryMemtable_.set( new BinaryMemtable(table_, columnFamily_) );
-        binaryMemtable_.get().put(key, buffer);
-    }
-
-    void forceFlush() throws IOException
-    {
-        memtable_.get().forceflush();
-    }
-
-    void forceBlockingFlush() throws IOException, ExecutionException, InterruptedException
-    {
-        forceFlush();
-        // block for flush to finish by adding a no-op action to the flush executorservice
-        // and waiting for that to finish.  (this works since flush ES is single-threaded.)
-        Future f = MemtableManager.instance().flusher_.submit(new Runnable()
-        {
-            public void run()
-            {
-            }
-        });
-        f.get();
-    }
-
-    void forceFlushBinary()
-    {
-        BinaryMemtableManager.instance().submit(getColumnFamilyName(), binaryMemtable_.get());
-        //binaryMemtable_.get().flush(true);
-    }
-
-    /**
-     * Insert/Update the column family for this key. 
-     * param @ lock - lock that needs to be used. 
-     * param @ key - key for update/insert 
-     * param @ columnFamily - columnFamily changes
-    */
-    void apply(String key, ColumnFamily columnFamily, CommitLog.CommitLogContext cLogCtx)
-            throws IOException
-    {
-        memtable_.get().put(key, columnFamily, cLogCtx);
-    }
-
-    /*
-     * Insert/Update the column family for this key. param @ lock - lock that
-     * needs to be used. param @ key - key for update/insert param @
-     * columnFamily - columnFamily changes
-     */
-    void applyBinary(String key, byte[] buffer)
-            throws IOException
-    {
-        binaryMemtable_.get().put(key, buffer);
-    }
-
-    public ColumnFamily getColumnFamily(String key, String columnFamilyColumn, IFilter filter) throws IOException
-    {
-        List<ColumnFamily> columnFamilies = getColumnFamilies(key, columnFamilyColumn, filter);
-        return resolveAndRemoveDeleted(columnFamilies);
-    }
-
-    public ColumnFamily getColumnFamily(String key, String columnFamilyColumn, IFilter filter, int gcBefore) throws IOException
-    {
-        List<ColumnFamily> columnFamilies = getColumnFamilies(key, columnFamilyColumn, filter);
-        ColumnFamily cf = ColumnFamily.resolve(columnFamilies);
-        return removeDeleted(cf, gcBefore);
-    }
-
-    /**
-     *
-     * Get the column family in the most efficient order.
-     * 1. Memtable
-     * 2. Sorted list of files
-     */
-    List<ColumnFamily> getColumnFamilies(String key, String columnFamilyColumn, IFilter filter) throws IOException
-    {
-        List<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>();
-        /* Get the ColumnFamily from Memtable */
-        getColumnFamilyFromCurrentMemtable(key, columnFamilyColumn, filter, columnFamilies);
-        if (columnFamilies.size() == 0 || !filter.isDone())
-        {
-            /* Check if MemtableManager has any historical information */
-            MemtableManager.instance().getColumnFamily(key, columnFamily_, columnFamilyColumn, filter, columnFamilies);
-        }
-        if (columnFamilies.size() == 0 || !filter.isDone())
-        {
-            long start = System.currentTimeMillis();
-            getColumnFamilyFromDisk(key, columnFamilyColumn, columnFamilies, filter);
-            logger_.debug("DISK TIME: " + (System.currentTimeMillis() - start) + " ms.");
-        }
-        return columnFamilies;
-    }
-
-    /**
-     * Fetch from disk files and go in sorted order  to be efficient
-     * This fn exits as soon as the required data is found.
-     * @param key
-     * @param cf
-     * @param columnFamilies
-     * @param filter
-     * @throws IOException
-     */
-    private void getColumnFamilyFromDisk(String key, String cf, List<ColumnFamily> columnFamilies, IFilter filter) throws IOException
-    {
-        /* Scan the SSTables on disk first */
-        List<String> files = new ArrayList<String>();        
-    	lock_.readLock().lock();
         try
         {
-            files.addAll(ssTables_);
-            Collections.sort(files, new FileNameComparator(FileNameComparator.Descending));
-        }
-        finally
-        {
-            lock_.readLock().unlock();
-        }
-    		        	        
-        for (String file : files)
-        {
-            /*
-             * Get the BloomFilter associated with this file. Check if the key
-             * is present in the BloomFilter. If not continue to the next file.
-            */
-            boolean bVal = SSTable.isKeyInFile(key, file);
-            if ( !bVal )
-                continue;
-            ColumnFamily columnFamily = fetchColumnFamily(key, cf, filter, file);
-            long start = System.currentTimeMillis();
-            if (columnFamily != null)
+            GossipDigestAckMessage gDigestAckMessage = GossipDigestAckMessage.serializer().deserialize(dis);
+            List<GossipDigest> gDigestList = gDigestAckMessage.getGossipDigestList();
+            Map<InetAddress, EndPointState> epStateMap = gDigestAckMessage.getEndPointStateMap();
+
+            if ( epStateMap.size() > 0 )
             {
-                columnFamilies.add(columnFamily);
-                if(filter.isDone())
-                {
-                	break;
-                }
+                /* Notify the Failure Detector */
+                Gossiper.instance().notifyFailureDetector(epStateMap);
+                Gossiper.instance().applyStateLocally(epStateMap);
             }
-            logger_.debug("DISK Data structure population  TIME: " + (System.currentTimeMillis() - start) + " ms.");
-        }
-    }
 
-
-    private ColumnFamily fetchColumnFamily(String key, String cf, IFilter filter, String ssTableFile) throws IOException
-	{
-		SSTable ssTable = new SSTable(ssTableFile, StorageService.getPartitioner());
-		long start = System.currentTimeMillis();
-		DataInputBuffer bufIn;
-		bufIn = filter.next(key, cf, ssTable);
-		logger_.debug("DISK ssTable.next TIME: " + (System.currentTimeMillis() - start) + " ms.");
-		if (bufIn.getLength() == 0)
-			return null;
-        start = System.currentTimeMillis();
-        ColumnFamily columnFamily = ColumnFamily.serializer().deserialize(bufIn, cf, filter);
-		logger_.debug("DISK Deserialize TIME: " + (System.currentTimeMillis() - start) + " ms.");
-		if (columnFamily == null)
-			return null;
-		return columnFamily;
-	}
-
-    private void getColumnFamilyFromCurrentMemtable(String key, String cf, IFilter filter, List<ColumnFamily> columnFamilies)
-    {
-        /* Get the ColumnFamily from Memtable */
-        ColumnFamily columnFamily = memtable_.get().get(key, cf, filter);
-        if (columnFamily != null)
-        {
-            columnFamilies.add(columnFamily);
-        }
-    }
-
-    /** like resolve, but leaves the resolved CF as the only item in the list */
-    private static void merge(List<ColumnFamily> columnFamilies)
-    {
-        ColumnFamily cf = ColumnFamily.resolve(columnFamilies);
-        columnFamilies.clear();
-        columnFamilies.add(cf);
-    }
-
-    private static ColumnFamily resolveAndRemoveDeleted(List<ColumnFamily> columnFamilies) {
-        ColumnFamily cf = ColumnFamily.resolve(columnFamilies);
-        return removeDeleted(cf);
-    }
-
-    /*
-     This is complicated because we need to preserve deleted columns, supercolumns, and columnfamilies
-     until they have been deleted for at least GC_GRACE_IN_SECONDS.  But, we do not need to preserve
-     their contents; just the object itself as a "tombstone" that can be used to repair other
-     replicas that do not know about the deletion.
-     */
-    static ColumnFamily removeDeleted(ColumnFamily cf)
-    {
-        return removeDeleted(cf, (int)(System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds());
-    }
-
-    static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
-    {
-        if (cf == null)
-            return null;
-
-        for (String cname : new ArrayList<String>(cf.getColumns().keySet()))
-        {
-            IColumn c = cf.getColumns().get(cname);
-            if (c instanceof SuperColumn)
+            /* Get the state required to send to this gossipee - construct GossipDigestAck2Message */
+            Map<InetAddress, EndPointState> deltaEpStateMap = new HashMap<InetAddress, EndPointState>();
+            for( GossipDigest gDigest : gDigestList )
             {
-                long minTimestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
-                // don't operate directly on the supercolumn, it could be the one in the memtable
-                cf.remove(cname);
-                SuperColumn sc = new SuperColumn(cname);
-                sc.markForDeleteAt(c.getLocalDeletionTime(), c.getMarkedForDeleteAt());
-                for (IColumn subColumn : c.getSubColumns())
-                {
-                    if (subColumn.timestamp() >= minTimestamp)
-                    {
-                        if (!subColumn.isMarkedForDelete() || subColumn.getLocalDeletionTime() > gcBefore)
-                        {
-                            sc.addColumn(subColumn.name(), subColumn);
-                        }
-                    }
-                }
-                if (sc.getSubColumns().size() > 0 || sc.getLocalDeletionTime() > gcBefore)
-                {
-                    cf.addColumn(sc);
-                }
+                InetAddress addr = gDigest.getEndPoint();
+                EndPointState localEpStatePtr = Gossiper.instance().getStateForVersionBiggerThan(addr, gDigest.getMaxVersion());
+                if ( localEpStatePtr != null )
+                    deltaEpStateMap.put(addr, localEpStatePtr);
             }
-            else if ((c.isMarkedForDelete() && c.getLocalDeletionTime() <= gcBefore)
-                     || c.timestamp() < cf.getMarkedForDeleteAt())
-            {
-                cf.remove(cname);
-            }
-        }
 
-        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
+            GossipDigestAck2Message gDigestAck2 = new GossipDigestAck2Message(deltaEpStateMap);
+            Message gDigestAck2Message = Gossiper.instance().makeGossipDigestAck2Message(gDigestAck2);
+            if (logger_.isTraceEnabled())
+                logger_.trace("Sending a GossipDigestAck2Message to " + from);
+            MessagingService.instance().sendUdpOneWay(gDigestAck2Message, from);
+        }
+        catch ( IOException e )
         {
-            return null;
+            throw new RuntimeException(e);
         }
-        return cf;
     }
+}
 
-    /*
-     * This version is used only on start up when we are recovering from logs.
-     * Hence no locking is required since we process logs on the main thread. In
-     * the future we may want to parellelize the log processing for a table by
-     * having a thread per log file present for recovery. Re-visit at that time.
-     */
-    void applyNow(String key, ColumnFamily columnFamily) throws IOException
-    {
-         memtable_.get().putOnRecovery(key, columnFamily);
-    }
+class GossipDigestAck2VerbHandler implements IVerbHandler
+{
+    private static Logger logger_ = Logger.getLogger(GossipDigestAck2VerbHandler.class);
 
-    /*
-     * This method is called when the Memtable is frozen and ready to be flushed
-     * to disk. This method informs the CommitLog that a particular ColumnFamily
-     * is being flushed to disk.
-     */
-    void onMemtableFlush(CommitLog.CommitLogContext cLogCtx) throws IOException
+    public void doVerb(Message message)
     {
-        if ( cLogCtx.isValidContext() )
-            CommitLog.open(table_).onMemtableFlush(columnFamily_, cLogCtx);
-    }
+        InetAddress from = message.getFrom();
+        if (logger_.isTraceEnabled())
+            logger_.trace("Received a GossipDigestAck2Message from " + from);
 
-    /*
-     * Called after the Memtable flushes its in-memory data. This information is
-     * cached in the ColumnFamilyStore. This is useful for reads because the
-     * ColumnFamilyStore first looks in the in-memory store and the into the
-     * disk to find the key. If invoked during recoveryMode the
-     * onMemtableFlush() need not be invoked.
-     *
-     * param @ filename - filename just flushed to disk
-     * param @ bf - bloom filter which indicates the keys that are in this file.
-    */
-    void storeLocation(String filename, BloomFilter bf)
-    {
-        int ssTableSize = 0;
-    	lock_.writeLock().lock();
+        byte[] bytes = message.getMessageBody();
+        DataInputStream dis = new DataInputStream( new ByteArrayInputStream(bytes) );
+        GossipDigestAck2Message gDigestAck2Message;
         try
         {
-            ssTables_.add(filename);
-            SSTable.storeBloomFilter(filename, bf);
-            ssTableSize = ssTables_.size();
+            gDigestAck2Message = GossipDigestAck2Message.serializer().deserialize(dis);
         }
-        finally
+        catch (IOException e)
         {
-        	lock_.writeLock().unlock();
+            throw new RuntimeException(e);
         }
-
-        if ((ssTableSize >= threshHold_ && !isCompacting_.get())
-            || (isCompacting_.get() && ssTableSize % threshHold_ == 0))
-        {
-            logger_.debug("Submitting for  compaction ...");
-            MinorCompactionManager.instance().submit(ColumnFamilyStore.this);
-            logger_.debug("Submitted for compaction ...");
-        }
-    }
-
-    PriorityQueue<FileStruct> initializePriorityQueue(List<String> files, List<Range> ranges, int minBufferSize)
-    {
-        PriorityQueue<FileStruct> pq = new PriorityQueue<FileStruct>();
-        if (files.size() > 1 || (ranges != null &&  files.size() > 0))
-        {
-            int bufferSize = Math.min( (ColumnFamilyStore.compactionMemoryThreshold_ / files.size()), minBufferSize ) ;
-            FileStruct fs = null;
-            for (String file : files)
-            {
-            	try
-            	{
-            		fs = new FileStruct(SequenceFile.bufferedReader(file, bufferSize), StorageService.getPartitioner());
-	                fs.advance();
-	                if(fs.isExhausted())
-	                	continue;
-	                pq.add(fs);
-            	}
-            	catch ( Exception ex)
-            	{
-                    logger_.warn("corrupt file?  or are you just blowing away data files manually out from under me?", ex);
-            		try
-            		{
-            			if (fs != null)
-            			{
-            				fs.close();
-            			}
-            		}
-            		catch(Exception e)
-            		{
-            			logger_.warn("Unable to close file :" + file);
-            		}
-                }
-            }
-        }
-        return pq;
-    }
-
-    /*
-     * Group files of similar size into buckets.
-     */
-    static Set<List<String>> getCompactionBuckets(List<String> files, long min)
-    {
-    	Map<List<String>, Long> buckets = new ConcurrentHashMap<List<String>, Long>();
-    	for(String fname : files)
-    	{
-    		File f = new File(fname);
-    		long size = f.length();
-
-    		boolean bFound = false;
-            // look for a bucket containing similar-sized files:
-            // group in the same bucket if it's w/in 50% of the average for this bucket,
-            // or this file and the bucket are all considered "small" (less than `min`)
-            for (List<String> bucket : buckets.keySet())
-    		{
-                long averageSize = buckets.get(bucket);
-                if ((size > averageSize/2 && size < 3*averageSize/2)
-                    || ( size < min && averageSize < min))
-    			{
-                    // remove and re-add because adding changes the hash
-                    buckets.remove(bucket);
-    				averageSize = (averageSize + size) / 2 ;
-                    bucket.add(fname);
-                    buckets.put(bucket, averageSize);
-    				bFound = true;
-    				break;
-    			}
-    		}
-            // no similar bucket found; put it in a new one
-    		if(!bFound)
-    		{
-                ArrayList<String> bucket = new ArrayList<String>();
-                bucket.add(fname);
-                buckets.put(bucket, size);
-    		}
-    	}
-
-        return buckets.keySet();
-    }
-
-    /*
-     * Break the files into buckets and then compact.
-     */
-    void doCompaction() throws IOException
-    {
-        isCompacting_.set(true);
-        List<String> files = new ArrayList<String>(ssTables_);
-        try
-        {
-	        int count;
-	    	for(List<String> fileList : getCompactionBuckets(files, 50L*1024L*1024L))
-            {
-	    		Collections.sort( fileList , new FileNameComparator( FileNameComparator.Ascending));
-	    		if(fileList.size() >= threshHold_ )
-	    		{
-	    			files.clear();
-	    			count = 0;
-	    			for(String file : fileList)
-	    			{
-	    				files.add(file);
-	    				count++;
-	    				if( count == threshHold_ )
-	    					break;
-	    			}
-                    // For each bucket if it has crossed the threshhold do the compaction
-                    // In case of range  compaction merge the counting bloom filters also.
-                    if( count == threshHold_)
-                        doFileCompaction(files, bufSize_);
-	    		}
-	    	}
-        }
-        finally
-        {
-        	isCompacting_.set(false);
-        }
-    }
-
-    void doMajorCompaction(long skip)
-    {
-    	doMajorCompactionInternal( skip );
-    }
-
-    /*
-     * Compact all the files irrespective of the size.
-     * skip : is the ammount in Gb of the files to be skipped
-     * all files greater than skip GB are skipped for this compaction.
-     * Except if skip is 0 , in that case this is ignored and all files are taken.
-     */
-    void doMajorCompactionInternal(long skip)
-    {
-        isCompacting_.set(true);
-        List<String> filesInternal = new ArrayList<String>(ssTables_);
-        List<String> files;
-        try
-        {
-        	 if( skip > 0L )
-        	 {
-        		 files = new ArrayList<String>();
-	        	 for ( String file : filesInternal )
-	        	 {
-	        		 File f = new File(file);
-	        		 if( f.length() < skip*1024L*1024L*1024L )
-	        		 {
-	        			 files.add(file);
-	        		 }
-	        	 }
-        	 }
-        	 else
-        	 {
-        		 files = filesInternal;
-        	 }
-        	 doFileCompaction(files, bufSize_);
-        }
-        catch ( Exception ex)
-        {
-        	ex.printStackTrace();
-        }
-        finally
-        {
-        	isCompacting_.set(false);
-        }
-    }
-
-    /*
-     * Add up all the files sizes this is the worst case file
-     * size for compaction of all the list of files given.
-     */
-    long getExpectedCompactedFileSize(List<String> files)
-    {
-    	long expectedFileSize = 0;
-    	for(String file : files)
-    	{
-    		File f = new File(file);
-    		long size = f.length();
-    		expectedFileSize = expectedFileSize + size;
-    	}
-    	return expectedFileSize;
-    }
-
-    /*
-     *  Find the maximum size file in the list .
-     */
-    String getMaxSizeFile( List<String> files )
-    {
-    	long maxSize = 0L;
-    	String maxFile = null;
-    	for ( String file : files )
-    	{
-    		File f = new File(file);
-    		if(f.length() > maxSize )
-    		{
-    			maxSize = f.length();
-    			maxFile = file;
-    		}
-    	}
-    	return maxFile;
-    }
-
-    boolean doAntiCompaction(List<Range> ranges, EndPoint target, List<String> fileList)
-    {
-        isCompacting_.set(true);
-        List<String> files = new ArrayList<String>(ssTables_);
-        boolean result = true;
-        try
-        {
-        	 result = doFileAntiCompaction(files, ranges, target, fileList, null);
-        }
-        catch ( Exception ex)
-        {
-        	ex.printStackTrace();
-        }
-        finally
-        {
-        	isCompacting_.set(false);
-        }
-        return result;
-
-    }
-
-    void forceCleanup()
-    {
-    	MinorCompactionManager.instance().submitCleanup(ColumnFamilyStore.this);
-    }
-    
-    /**
-     * This function goes over each file and removes the keys that the node is not responsible for 
-     * and only keeps keys that this node is responsible for.
-     * @throws IOException
-     */
-    void doCleanupCompaction()
-    {
-        isCompacting_.set(true);
-        List<String> files = new ArrayList<String>(ssTables_);
-        for(String file: files)
-        {
-	        try
-	        {
-	        	doCleanup(file);
-	        }
-	        catch ( Exception ex)
-	        {
-	        	ex.printStackTrace();
-	        }
-        }
-    	isCompacting_.set(false);
-    }
-    /**
-     * cleans up one particular file by removing keys that this node is not responsible for.
-     * @param file
-     * @throws IOException
-     */
-    /* TODO: Take care of the comments later. */
-    void doCleanup(String file)
-    {
-    	if(file == null )
-    		return;
-        List<Range> myRanges;
-    	List<String> files = new ArrayList<String>();
-    	files.add(file);
-    	List<String> newFiles = new ArrayList<String>();
-    	Map<EndPoint, List<Range>> endPointtoRangeMap = StorageService.instance().constructEndPointToRangesMap();
-    	myRanges = endPointtoRangeMap.get(StorageService.getLocalStorageEndPoint());
-    	List<BloomFilter> compactedBloomFilters = new ArrayList<BloomFilter>();
-        doFileAntiCompaction(files, myRanges, null, newFiles, compactedBloomFilters);
-        logger_.debug("Original file : " + file + " of size " + new File(file).length());
-        lock_.writeLock().lock();
-        try
-        {
-            ssTables_.remove(file);
-            SSTable.removeAssociatedBloomFilter(file);
-            for (String newfile : newFiles)
-            {                            	
-                logger_.debug("New file : " + newfile + " of size " + new File(newfile).length());
-                if ( newfile != null )
-                {
-                    ssTables_.add(newfile);
-                    logger_.debug("Inserting bloom filter for file " + newfile);
-                    SSTable.storeBloomFilter(newfile, compactedBloomFilters.get(0));
-                }
-            }
-            SSTable.delete(file);
-        }
-        finally
-        {
-            lock_.writeLock().unlock();
-        }
-    }
-    
-    /**
-     * This function is used to do the anti compaction process , it spits out the file which has keys that belong to a given range
-     * If the target is not specified it spits out the file as a compacted file with the unecessary ranges wiped out.
-     * @param files
-     * @param ranges
-     * @param target
-     * @param fileList
-     * @return
-     * @throws IOException
-     */
-    boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint target, List<String> fileList, List<BloomFilter> compactedBloomFilters)
-    {
-    	boolean result = false;
-        long startTime = System.currentTimeMillis();
-        long totalBytesRead = 0;
-        long totalBytesWritten = 0;
-        long totalkeysRead = 0;
-        long totalkeysWritten = 0;
-        String rangeFileLocation;
-        String mergedFileName;
-        IPartitioner p = StorageService.getPartitioner();
-        try
-        {
-	        // Calculate the expected compacted filesize
-	    	long expectedRangeFileSize = getExpectedCompactedFileSize(files);
-	    	/* in the worst case a node will be giving out alf of its data so we take a chance */
-	    	expectedRangeFileSize = expectedRangeFileSize / 2;
-	        rangeFileLocation = DatabaseDescriptor.getCompactionFileLocation(expectedRangeFileSize);
-	        // If the compaction file path is null that means we have no space left for this compaction.
-	        if( rangeFileLocation == null )
-	        {
-	            logger_.warn("Total bytes to be written for range compaction  ..."
-	                    + expectedRangeFileSize + "   is greater than the safe limit of the disk space available.");
-	            return result;
-	        }
-	        PriorityQueue<FileStruct> pq = initializePriorityQueue(files, ranges, ColumnFamilyStore.bufSize_);
-	        if (pq.size() > 0)
-	        {
-	            mergedFileName = getTempFileName();
-	            SSTable ssTableRange = null ;
-	            String lastkey = null;
-	            List<FileStruct> lfs = new ArrayList<FileStruct>();
-	            DataOutputBuffer bufOut = new DataOutputBuffer();
-	            int expectedBloomFilterSize = SSTable.getApproximateKeyCount(files);
-	            expectedBloomFilterSize = (expectedBloomFilterSize > 0) ? expectedBloomFilterSize : SSTable.indexInterval();
-	            logger_.debug("Expected bloom filter size : " + expectedBloomFilterSize);
-	            /* Create the bloom filter for the compacted file. */
-	            BloomFilter compactedRangeBloomFilter = new BloomFilter(expectedBloomFilterSize, 15);
-	            List<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>();
-
-	            while (pq.size() > 0 || lfs.size() > 0)
-	            {
-	                FileStruct fs = null;
-	                if (pq.size() > 0)
-	                {
-	                    fs = pq.poll();
-	                }
-	                if (fs != null
-	                        && (lastkey == null || lastkey.equals(fs.getKey())))
-	                {
-	                    // The keys are the same so we need to add this to the
-	                    // ldfs list
-	                    lastkey = fs.getKey();
-	                    lfs.add(fs);
-	                }
-	                else
-	                {
-	                    Collections.sort(lfs, new FileStructComparator());
-	                    ColumnFamily columnFamily;
-	                    bufOut.reset();
-	                    if(lfs.size() > 1)
-	                    {
-		                    for (FileStruct filestruct : lfs)
-		                    {
-		                    	try
-		                    	{
-	                                /* read the length although we don't need it */
-	                                filestruct.getBufIn().readInt();
-	                                // Skip the Index
-                                    IndexHelper.skipBloomFilterAndIndex(filestruct.getBufIn());
-	                                // We want to add only 2 and resolve them right there in order to save on memory footprint
-	                                if(columnFamilies.size() > 1)
-	                                {
-	    		                        // Now merge the 2 column families
-                                        merge(columnFamilies);
-	                                }
-			                        // deserialize into column families
-			                        columnFamilies.add(ColumnFamily.serializer().deserialize(filestruct.getBufIn()));
-		                    	}
-		                    	catch ( Exception ex)
-		                    	{
-                                    logger_.warn(LogUtil.throwableToString(ex));
-                                }
-		                    }
-		                    // Now after merging all crap append to the sstable
-		                    columnFamily = resolveAndRemoveDeleted(columnFamilies);
-		                    columnFamilies.clear();
-		                    if( columnFamily != null )
-		                    {
-			                	/* serialize the cf with column indexes */
-			                    ColumnFamily.serializerWithIndexes().serialize(columnFamily, bufOut);
-		                    }
-	                    }
-	                    else
-	                    {
-		                    FileStruct filestruct = lfs.get(0);
-	                    	try
-	                    	{
-		                        /* read the length although we don't need it */
-		                        int size = filestruct.getBufIn().readInt();
-		                        bufOut.write(filestruct.getBufIn(), size);
-	                    	}
-	                    	catch ( Exception ex)
-	                    	{
-	                    		logger_.warn(LogUtil.throwableToString(ex));
-	                            filestruct.close();
-	                            continue;
-	                    	}
-	                    }
-                        if (Range.isTokenInRanges(StorageService.getPartitioner().getInitialToken(lastkey), ranges))
-	                    {
-	                        if(ssTableRange == null )
-	                        {
-	                        	if( target != null )
-	                        		rangeFileLocation = rangeFileLocation + System.getProperty("file.separator") + "bootstrap";
-	                	        FileUtils.createDirectory(rangeFileLocation);
-	                            ssTableRange = new SSTable(rangeFileLocation, mergedFileName, StorageService.getPartitioner());
-	                        }	                        
-	                        try
-	                        {
-		                        ssTableRange.append(lastkey, bufOut);
-		                        compactedRangeBloomFilter.add(lastkey);
-	                        }
-	                        catch(Exception ex)
-	                        {
-	                            logger_.warn( LogUtil.throwableToString(ex) );
-	                        }
-	                    }
-	                    totalkeysWritten++;
-	                    for (FileStruct filestruct : lfs)
-	                    {
-	                    	try
-	                    	{
-                                filestruct.advance();
-	                    		if (filestruct.isExhausted())
-	                    		{
-	                    			continue;
-	                    		}
-	                    		/* keep on looping until we find a key in the range */
-                                while (!Range.isTokenInRanges(StorageService.getPartitioner().getInitialToken(filestruct.getKey()), ranges))
-	                            {
-                                    filestruct.advance();
-                                    if (filestruct.isExhausted())
-		                    		{
-		                    			break;
-		                    		}
-	                            }
-	                            if (!filestruct.isExhausted())
-	                            {
-	                            	pq.add(filestruct);
-	                            }
-		                        totalkeysRead++;
-	                    	}
-	                    	catch ( Exception ex )
-	                    	{
-	                    		// Ignore the exception as it might be a corrupted file
-	                    		// in any case we have read as far as possible from it
-	                    		// and it will be deleted after compaction.
-                                logger_.warn(LogUtil.throwableToString(ex));
-	                            filestruct.close();
-                            }
-	                    }
-	                    lfs.clear();
-	                    lastkey = null;
-	                    if (fs != null)
-	                    {
-	                        // Add back the fs since we processed the rest of
-	                        // filestructs
-	                        pq.add(fs);
-	                    }
-	                }
-	            }
-
-	            if( ssTableRange != null )
-	            {
-                    ssTableRange.closeRename(compactedRangeBloomFilter);
-                    if (fileList != null)
-                        fileList.add(ssTableRange.getDataFileLocation());
-                    if (compactedBloomFilters != null)
-                    	compactedBloomFilters.add(compactedRangeBloomFilter);
-	            }
-	        }
-        }
-        catch ( Exception ex)
-        {
-            logger_.error( LogUtil.throwableToString(ex) );
-        }
-        logger_.debug("Total time taken for range split   ..."
-                + (System.currentTimeMillis() - startTime));
-        logger_.debug("Total bytes Read for range split  ..." + totalBytesRead);
-        logger_.debug("Total bytes written for range split  ..."
-                + totalBytesWritten + "   Total keys read ..." + totalkeysRead);
-        return result;
-    }
-
-    private void doFill(BloomFilter bf, String decoratedKey)
-    {
-        bf.add(StorageService.getPartitioner().undecorateKey(decoratedKey));
-    }
-    
-    /*
-     * This function does the actual compaction for files.
-     * It maintains a priority queue of with the first key from each file
-     * and then removes the top of the queue and adds it to the SStable and
-     * repeats this process while reading the next from each file until its
-     * done with all the files . The SStable to which the keys are written
-     * represents the new compacted file. Before writing if there are keys
-     * that occur in multiple files and are the same then a resolution is done
-     * to get the latest data.
-     *
-     */
-    void  doFileCompaction(List<String> files,  int minBufferSize) throws IOException
-    {
-    	String newfile = null;
-        long startTime = System.currentTimeMillis();
-        long totalBytesRead = 0;
-        long totalBytesWritten = 0;
-        long totalkeysRead = 0;
-        long totalkeysWritten = 0;
-        // Calculate the expected compacted filesize
-        long expectedCompactedFileSize = getExpectedCompactedFileSize(files);
-        String compactionFileLocation = DatabaseDescriptor.getCompactionFileLocation(expectedCompactedFileSize);
-        // If the compaction file path is null that means we have no space left for this compaction.
-        if( compactionFileLocation == null )
-        {
-            String maxFile = getMaxSizeFile( files );
-            files.remove( maxFile );
-            doFileCompaction(files , minBufferSize);
-            return;
-        }
-        PriorityQueue<FileStruct> pq = initializePriorityQueue(files, null, minBufferSize);
-        if (pq.size() > 0)
-        {
-            String mergedFileName = getTempFileName( files );
-            SSTable ssTable = null;
-            String lastkey = null;
-            List<FileStruct> lfs = new ArrayList<FileStruct>();
-            DataOutputBuffer bufOut = new DataOutputBuffer();
-            int expectedBloomFilterSize = SSTable.getApproximateKeyCount(files);
-            expectedBloomFilterSize = (expectedBloomFilterSize > 0) ? expectedBloomFilterSize : SSTable.indexInterval();
-            logger_.debug("Expected bloom filter size : " + expectedBloomFilterSize);
-            /* Create the bloom filter for the compacted file. */
-            BloomFilter compactedBloomFilter = new BloomFilter(expectedBloomFilterSize, 15);
-            List<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>();
-
-            while (pq.size() > 0 || lfs.size() > 0)
-            {
-                FileStruct fs = null;
-                if (pq.size() > 0)
-                {
-                    fs = pq.poll();
-                }
-                if (fs != null
-                        && (lastkey == null || lastkey.equals(fs.getKey())))
-                {
-                    // The keys are the same so we need to add this to the
-                    // ldfs list
-                    lastkey = fs.getKey();
-                    lfs.add(fs);
-                }
-                else
-                {
-                    Collections.sort(lfs, new FileStructComparator());
-                    ColumnFamily columnFamily;
-                    bufOut.reset();
-                    if(lfs.size() > 1)
-                    {
-                        for (FileStruct filestruct : lfs)
-                        {
-                            try
-                            {
-                                /* read the length although we don't need it */
-                                filestruct.getBufIn().readInt();
-                                // Skip the Index
-                                IndexHelper.skipBloomFilterAndIndex(filestruct.getBufIn());
-                                // We want to add only 2 and resolve them right there in order to save on memory footprint
-                                if(columnFamilies.size() > 1)
-                                {
-                                    merge(columnFamilies);
-                                }
-                                // deserialize into column families
-                                columnFamilies.add(ColumnFamily.serializer().deserialize(filestruct.getBufIn()));
-                            }
-                            catch ( Exception ex)
-                            {
-                                logger_.warn("error in filecompaction", ex);
-                            }
-                        }
-                        // Now after merging all crap append to the sstable
-                        columnFamily = resolveAndRemoveDeleted(columnFamilies);
-                        columnFamilies.clear();
-                        if( columnFamily != null )
-                        {
-                            /* serialize the cf with column indexes */
-                            ColumnFamily.serializerWithIndexes().serialize(columnFamily, bufOut);
-                        }
-                    }
-                    else
-                    {
-                        FileStruct filestruct = lfs.get(0);
-                        try
-                        {
-                            /* read the length although we don't need it */
-                            int size = filestruct.getBufIn().readInt();
-                            bufOut.write(filestruct.getBufIn(), size);
-                        }
-                        catch ( Exception ex)
-                        {
-                            ex.printStackTrace();
-                            filestruct.close();
-                            continue;
-                        }
-                    }
-
-                    if ( ssTable == null )
-                    {
-                        ssTable = new SSTable(compactionFileLocation, mergedFileName, StorageService.getPartitioner());
-                    }
-                    ssTable.append(lastkey, bufOut);
-
-                    /* Fill the bloom filter with the key */
-                    doFill(compactedBloomFilter, lastkey);
-                    totalkeysWritten++;
-                    for (FileStruct filestruct : lfs)
-                    {
-                        try
-                        {
-                            filestruct.advance();
-                            if (filestruct.isExhausted())
-                            {
-                                continue;
-                            }
-                            pq.add(filestruct);
-                            totalkeysRead++;
-                        }
-                        catch ( Throwable ex )
-                        {
-                            // Ignore the exception as it might be a corrupted file
-                            // in any case we have read as far as possible from it
-                            // and it will be deleted after compaction.
-                            filestruct.close();
-                        }
-                    }
-                    lfs.clear();
-                    lastkey = null;
-                    if (fs != null)
-                    {
-                        /* Add back the fs since we processed the rest of filestructs */
-                        pq.add(fs);
-                    }
-                }
-            }
-            if ( ssTable != null )
-            {
-                ssTable.closeRename(compactedBloomFilter);
-                newfile = ssTable.getDataFileLocation();
-            }
-            lock_.writeLock().lock();
-            try
-            {
-                for (String file : files)
-                {
-                    ssTables_.remove(file);
-                    SSTable.removeAssociatedBloomFilter(file);
-                }
-                if ( newfile != null )
-                {
-                    ssTables_.add(newfile);
-                    logger_.debug("Inserting bloom filter for file " + newfile);
-                    SSTable.storeBloomFilter(newfile, compactedBloomFilter);
-                    totalBytesWritten = (new File(newfile)).length();
-                }
-            }
-            finally
-            {
-                lock_.writeLock().unlock();
-            }
-            for (String file : files)
-            {
-                SSTable.delete(file);
-            }
-        }
-        logger_.debug("Total time taken for compaction  ..."
-                + (System.currentTimeMillis() - startTime));
-        logger_.debug("Total bytes Read for compaction  ..." + totalBytesRead);
-        logger_.debug("Total bytes written for compaction  ..."
-                + totalBytesWritten + "   Total keys read ..." + totalkeysRead);
-    }
-
-    public boolean isSuper()
-    {
-        return isSuper_;
-    }
-
-    public void flushMemtableOnRecovery() throws IOException
-    {
-        memtable_.get().flushOnRecovery();
-    }
-
-    public int getMemtableColumnsCount()
-    {
-        return memtable_.get().getCurrentObjectCount();
-    }
-
-    public int getMemtableDataSize()
-    {
-        return memtable_.get().getCurrentSize();
-    }
-
-    public int getMemtableSwitchCount()
-    {
-        return memtableSwitchCount;
-    }
-
-    public int getMemtableTasks()
-    {
-        return memtable_.get().getPendingTasks();
-    }
-
-    /**
-     * clears out all data associated with this ColumnFamily.
-     * For use in testing.
-     */
-    public void reset() throws IOException, ExecutionException, InterruptedException
-    {
-        forceBlockingFlush();
-        for (String fName : ssTables_)
-        {
-            new File(fName).delete();
-        }
-        ssTables_.clear();
-    }
-
-    public Object getMemtable()
-    {
-        return memtable_.get();
-    }
-
-    public Set<String> getSSTableFilenames()
-    {
-        return Collections.unmodifiableSet(ssTables_);
+        Map<InetAddress, EndPointState> remoteEpStateMap = gDigestAck2Message.getEndPointStateMap();
+        /* Notify the Failure Detector */
+        Gossiper.instance().notifyFailureDetector(remoteEpStateMap);
+        Gossiper.instance().applyStateLocally(remoteEpStateMap);
     }
 }

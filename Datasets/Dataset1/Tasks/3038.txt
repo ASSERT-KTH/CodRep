@@ -1,657 +1,372 @@
-public static class CommitLogContext
-
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-package org.apache.cassandra.db;
-
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.BufferedRandomAccessFile;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.DeletionService;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.WrappedRunnable;
-import org.apache.cassandra.concurrent.StageManager;
-
-import org.apache.commons.lang.StringUtils;
-import org.apache.log4j.Logger;
-
-import java.io.*;
-import java.util.*;
-import java.util.zip.Checksum;
-import java.util.zip.CRC32;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+String delimiter_ = ",";
 
 /*
- * Commit Log tracks every write operation into the system. The aim
- * of the commit log is to be able to successfully recover data that was
- * not stored to disk via the Memtable. Every Commit Log maintains a
- * header represented by the abstraction CommitLogHeader. The header
- * contains a bit array and an array of longs and both the arrays are
- * of size, #column families for the Table, the Commit Log represents.
- *
- * Whenever a ColumnFamily is written to, for the first time its bit flag
- * is set to one in the CommitLogHeader. When it is flushed to disk by the
- * Memtable its corresponding bit in the header is set to zero. This helps
- * track which CommitLogs can be thrown away as a result of Memtable flushes.
- * Additionally, when a ColumnFamily is flushed and written to disk, its
- * entry in the array of longs is updated with the offset in the Commit Log
- * file where it was written. This helps speed up recovery since we can seek
- * to these offsets and start processing the commit log.
- *
- * Every Commit Log is rolled over everytime it reaches its threshold in size;
- * the new log inherits the "dirty" bits from the old.
- *
- * Over time there could be a number of commit logs that would be generated.
- * To allow cleaning up non-active commit logs, whenever we flush a column family and update its bit flag in
- * the active CL, we take the dirty bit array and bitwise & it with the headers of the older logs.
- * If the result is 0, then it is safe to remove the older file.  (Since the new CL
- * inherited the old's dirty bitflags, getting a zero for any given bit in the anding
- * means that either the CF was clean in the old CL or it has been flushed since the
- * switch in the new.)
- *
- * The CommitLog class itself is "mostly a singleton."  open() always returns one
- * instance, but log replay will bypass that.
+* Licensed to the Apache Software Foundation (ASF) under one
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership.  The ASF licenses this file
+* to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*    http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
+/**
+ * 
  */
-public class CommitLog
+package org.apache.cassandra.loader;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringTokenizer;
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.Unmarshaller;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.io.SSTable;
+import org.apache.cassandra.locator.EndPointSnitch;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.Token;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.cassandra.utils.*;
+
+
+/**
+ * This class is used to load the storage endpoints with the relevant data
+ * The data should be both what they are responsible for and what should be replicated on the specific
+ * endpoints.
+ * Population is done based on a xml file which should adhere to a schema.
+ *
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ */
+public class Loader
 {
-    private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
-    private static volatile CommitLog instance_;
-    private static final Lock lock_ = new ReentrantLock();
-    private static final Logger logger_ = Logger.getLogger(CommitLog.class);
-    private static final Map<String, CommitLogHeader> clHeaders_ = new HashMap<String, CommitLogHeader>();
-
-    public static final class CommitLogContext
+	private static long siesta_ = 60*1000;
+    private static Logger logger_ = Logger.getLogger( Loader.class );
+	private Importer importer_;
+    private StorageService storageService_;
+    
+    public Loader(StorageService storageService)
     {
-        /* Commit Log associated with this operation */
-        public final String file;
-        /* Offset within the Commit Log where this row as added */
-        public final long position;
-
-        public CommitLogContext(String file, long position)
-        {
-            this.file = file;
-            this.position = position;
-        }
-
-        boolean isValidContext()
-        {
-            return (position != -1L);
-        }
-
-        @Override
-        public String toString()
-        {
-            return "CommitLogContext(" +
-                   "file='" + file + '\'' +
-                   ", position=" + position +
-                   ')';
-        }
+        storageService_ = storageService;
     }
-
-    public static class CommitLogFileComparator implements Comparator<String>
-    {
-        public int compare(String f, String f2)
-        {
-            return (int)(getCreationTime(f) - getCreationTime(f2));
-        }
-    }
-
-    public static void setSegmentSize(int size)
-    {
-        SEGMENT_SIZE = size;
-    }
-
-    static int getSegmentCount()
-    {
-        return clHeaders_.size();
-    }
-
-    static long getCreationTime(String file)
-    {
-        String[] entries = FBUtilities.strip(file, "-.");
-        return Long.parseLong(entries[entries.length - 2]);
-    }
-
-    private static BufferedRandomAccessFile createWriter(String file) throws IOException
+    
+    /*
+     * This method loads all the keys into a special column family 
+     * called "RecycleBin". This column family is used for temporary
+     * processing of data and then can be recycled. The idea is that 
+     * after the load is complete we have all the keys in the system.
+     * Now we force a compaction and examine the single Index file 
+     * that is generated to determine how the nodes need to relocate
+     * to be perfectly load balanced.
+     * 
+     *  param @ rootDirectory - rootDirectory at which the parsing begins.
+     *  param @ table - table that will be populated.
+     *  param @ cfName - name of the column that will be populated. This is 
+     *  passed in so that we do not unncessary allocate temporary String objects.
+    */
+    private void preParse(File rootDirectory, String table, String cfName) throws Throwable
     {        
-        return new BufferedRandomAccessFile(file, "rw");
-    }
-
-    static CommitLog open() throws IOException
-    {
-        if ( instance_ == null )
+        File[] files = rootDirectory.listFiles();
+        
+        for ( File file : files )
         {
-            CommitLog.lock_.lock();
-            try
+            if ( file.isDirectory() )
+                preParse(file, table, cfName);
+            else
             {
-
-                if ( instance_ == null )
-                {
-                    instance_ = new CommitLog();
-                }
-            }
-            finally
-            {
-                CommitLog.lock_.unlock();
-            }
-        }
-        return instance_;
-    }
-
-    /* Current commit log file */
-    private String logFile_;
-    /* header for current commit log */
-    private CommitLogHeader clHeader_;
-    private BufferedRandomAccessFile logWriter_;
-    private final ExecutorService executor = new CommitLogExecutorService();
-
-    /*
-     * Generates a file name of the format CommitLog-<table>-<timestamp>.log in the
-     * directory specified by the Database Descriptor.
-    */
-    private void setNextFileName()
-    {
-        logFile_ = DatabaseDescriptor.getLogFileLocation() + File.separator +
-                   "CommitLog-" + System.currentTimeMillis() + ".log";
-    }
-
-    /*
-     * param @ table - name of table for which we are maintaining
-     *                 this commit log.
-     * param @ recoverymode - is commit log being instantiated in
-     *                        in recovery mode.
-    */
-    private CommitLog() throws IOException
-    {
-        setNextFileName();
-        logWriter_ = CommitLog.createWriter(logFile_);
-        writeCommitLogHeader();
-
-        if (DatabaseDescriptor.getCommitLogSync() == DatabaseDescriptor.CommitLogSync.periodic)
-        {
-            final Runnable syncer = new WrappedRunnable()
-            {
-                public void runMayThrow() throws IOException
-                {
-                    sync();
-                }
-            };
-
-            new Thread(new Runnable()
-            {
-                public void run()
-                {
-                    while (true)
-                    {
-                        try
-                        {
-                            executor.submit(syncer).get();
-                            Thread.sleep(DatabaseDescriptor.getCommitLogSyncPeriod());
-                        }
-                        catch (InterruptedException e)
-                        {
-                            throw new AssertionError(e);
-                        }
-                        catch (ExecutionException e)
-                        {
-                            throw new RuntimeException(e);
-                        }
-                    }
-                }
-            }, "PERIODIC-COMMIT-LOG-SYNCER").start();
-        }
-    }
-
-    /*
-     * This ctor is currently used only for debugging. We
-     * are now using it to modify the header so that recovery
-     * can be tested in as many scenarios as we could imagine.
-     *
-     * param @ logFile - logfile which we wish to modify.
-    */
-    CommitLog(File logFile) throws IOException
-    {
-        logFile_ = logFile.getAbsolutePath();
-        logWriter_ = CommitLog.createWriter(logFile_);
-    }
-
-    String getLogFile()
-    {
-        return logFile_;
-    }
-    
-    private CommitLogHeader readCommitLogHeader(BufferedRandomAccessFile logReader) throws IOException
-    {
-        int size = (int)logReader.readLong();
-        byte[] bytes = new byte[size];
-        logReader.read(bytes);
-        ByteArrayInputStream byteStream = new ByteArrayInputStream(bytes);
-        return CommitLogHeader.serializer().deserialize(new DataInputStream(byteStream));
-    }
-
-    /*
-     * This is invoked on startup via the ctor. It basically
-     * writes a header with all bits set to zero.
-    */
-    private void writeCommitLogHeader() throws IOException
-    {
-        int cfSize = Table.TableMetadata.getColumnFamilyCount();
-        clHeader_ = new CommitLogHeader(cfSize);
-        writeCommitLogHeader(logWriter_, clHeader_.toByteArray());
-    }
-
-    /** writes header at the beginning of the file, then seeks back to current position */
-    private void seekAndWriteCommitLogHeader(byte[] bytes) throws IOException
-    {
-        long currentPos = logWriter_.getFilePointer();
-        logWriter_.seek(0);
-
-        writeCommitLogHeader(logWriter_, bytes);
-
-        logWriter_.seek(currentPos);
-    }
-
-    private static void writeCommitLogHeader(BufferedRandomAccessFile logWriter, byte[] bytes) throws IOException
-    {
-        logWriter.writeLong(bytes.length);
-        logWriter.write(bytes);
-        logWriter.sync();
-    }
-
-    void recover(File[] clogs) throws IOException
-    {
-        Set<Table> tablesRecovered = new HashSet<Table>();
-        assert StageManager.getStage(StageManager.MUTATION_STAGE).getCompletedTaskCount() == 0;
-        int rows = 0;
-        for (File file : clogs)
-        {
-            int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
-            BufferedRandomAccessFile reader = new BufferedRandomAccessFile(file.getAbsolutePath(), "r", bufferSize);
-            final CommitLogHeader clHeader = readCommitLogHeader(reader);
-            /* seek to the lowest position where any CF has non-flushed data */
-            int lowPos = CommitLogHeader.getLowestPosition(clHeader);
-            if (lowPos == 0)
-                break;
-
-            reader.seek(lowPos);
-            if (logger_.isDebugEnabled())
-                logger_.debug("Replaying " + file + " starting at " + lowPos);
-
-            /* read the logs populate RowMutation and apply */
-            while (!reader.isEOF())
-            {
-                if (logger_.isDebugEnabled())
-                    logger_.debug("Reading mutation at " + reader.getFilePointer());
-
-                long claimedCRC32;
-                byte[] bytes;
-                try
-                {
-                    bytes = new byte[(int) reader.readLong()]; // readlong can throw EOFException too
-                    reader.readFully(bytes);
-                    claimedCRC32 = reader.readLong();
-                }
-                catch (EOFException e)
-                {
-                    // last CL entry didn't get completely written.  that's ok.
-                    break;
-                }
-
-                ByteArrayInputStream bufIn = new ByteArrayInputStream(bytes);
-                Checksum checksum = new CRC32();
-                checksum.update(bytes, 0, bytes.length);
-                if (claimedCRC32 != checksum.getValue())
-                {
-                    // this part of the log must not have been fsynced.  probably the rest is bad too,
-                    // but just in case there is no harm in trying them.
-                    continue;
-                }
-
-                /* deserialize the commit log entry */
-                final RowMutation rm = RowMutation.serializer().deserialize(new DataInputStream(bufIn));
-                if (logger_.isDebugEnabled())
-                    logger_.debug(String.format("replaying mutation for %s.%s: %s",
-                                                rm.getTable(),
-                                                rm.key(),
-                                                "{" + StringUtils.join(rm.getColumnFamilies(), ", ") + "}"));
-                final Table table = Table.open(rm.getTable());
-                tablesRecovered.add(table);
-                final Collection<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>(rm.getColumnFamilies());
-                final long entryLocation = reader.getFilePointer();
-                Runnable runnable = new WrappedRunnable()
-                {
-                    public void runMayThrow() throws IOException
-                    {
-                        /* remove column families that have already been flushed before applying the rest */
-                        for (ColumnFamily columnFamily : columnFamilies)
-                        {
-                            int id = table.getColumnFamilyId(columnFamily.name());
-                            if (!clHeader.isDirty(id) || entryLocation < clHeader.getPosition(id))
-                            {
-                                rm.removeColumnFamily(columnFamily);
-                            }
-                        }
-                        if (!rm.isEmpty())
-                        {
-                            Table.open(rm.getTable()).apply(rm, null, false);
-                        }
-                    }
-                };
-                StageManager.getStage(StageManager.MUTATION_STAGE).execute(runnable);
-                rows++;
-            }
-            reader.close();
-        }
-
-        // wait for all the writes to finish on the mutation stage
-        while (StageManager.getStage(StageManager.MUTATION_STAGE).getCompletedTaskCount() < rows)
-        {
-            try
-            {
-                Thread.sleep(10);
-            }
-            catch (InterruptedException e)
-            {
-                throw new AssertionError(e);
-            }
-        }
-
-        // flush replayed tables, allowing commitlog segments to be removed
-        List<Future<?>> futures = new ArrayList<Future<?>>();
-        for (Table table : tablesRecovered)
-        {
-            futures.addAll(table.flush());
-        }
-        // wait for flushes to finish before continuing with startup
-        for (Future<?> future : futures)
-        {
-            try
-            {
-                future.get();
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException(e);
-            }
-        }
-    }
-
-    /*
-     * Update the header of the commit log if a new column family
-     * is encountered for the first time.
-    */
-    private void maybeUpdateHeader(RowMutation rm) throws IOException
-    {
-        Table table = Table.open(rm.getTable());
-        for (ColumnFamily columnFamily : rm.getColumnFamilies())
-        {
-            int id = table.getColumnFamilyId(columnFamily.name());
-            if (!clHeader_.isDirty(id))
-            {
-                clHeader_.turnOn(id, logWriter_.getFilePointer());
-                seekAndWriteCommitLogHeader(clHeader_.toByteArray());
+                String fileName = file.getName();
+                RowMutation rm = new RowMutation(table, fileName);
+                rm.add(cfName, fileName.getBytes(), 0);
+                rm.apply();
             }
         }
     }
     
-    CommitLogContext getContext() throws IOException
+    /*
+     * Merges a list of strings with a particular combiner.
+     */
+    String merge( List<String> listFields,  String combiner)
     {
-        Callable<CommitLogContext> task = new Callable<CommitLogContext>()
+    	if(listFields.size() == 0 )
+    		return null;
+    	if(listFields.size() == 1)
+    		return listFields.get(0);
+    	String mergedKey = null;
+    	for(String field: listFields)
+    	{
+    		if(mergedKey == null)
+    		{
+    			mergedKey = field;
+    		}
+    		else
+    		{
+    			mergedKey = mergedKey + combiner + field;
+    		}
+    	}
+    	return mergedKey;
+    	
+    }
+    
+    /*
+     * This function checks if the local storage endpoint 
+     * is reponsible for storing this key .
+     */
+    boolean checkIfProcessKey(String key)
+    {
+		EndPoint[] endPoints = storageService_.getNStorageEndPoint(key);
+    	EndPoint localEndPoint = StorageService.getLocalStorageEndPoint();
+    	for(EndPoint endPoint : endPoints)
+    	{
+    		if(endPoint.equals(localEndPoint))
+    			return true;
+    	}
+    	return false;
+    }
+    
+   /*
+    * This functions parses each file based on delimiters specified in the 
+    * xml file. It also looks at all the parameters specified in teh xml and based
+    * on that populates the internal Row structure.
+    */ 
+    void parse(String filepath) throws Throwable
+    {
+        BufferedReader bufReader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(filepath)), 16 * 1024 * 1024);
+        String line = null;
+        String delimiter_ = new String(",");
+        RowMutation rm = null;
+        Map<String, RowMutation> rms = new HashMap<String, RowMutation>();
+        if(importer_.columnFamily.delimiter != null)
         {
-            public CommitLogContext call() throws Exception
+        	delimiter_ = importer_.columnFamily.delimiter;
+        }
+        while ((line = bufReader.readLine()) != null)
+        {
+            StringTokenizer st = new StringTokenizer(line, delimiter_);
+            List<String> tokenList = new ArrayList<String>();
+            String key = null;
+            while (st.hasMoreElements())
             {
-                return new CommitLogContext(logFile_, logWriter_.getFilePointer());
+            	tokenList.add((String)st.nextElement());
             }
-        };
-        try
-        {
-            return executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /*
-     * Adds the specified row to the commit log. This method will reset the
-     * file offset to what it is before the start of the operation in case
-     * of any problems. This way we can assume that the subsequent commit log
-     * entry will override the garbage left over by the previous write.
-    */
-    void add(RowMutation rowMutation, Object serializedRow) throws IOException
-    {
-        Callable<CommitLogContext> task = new LogRecordAdder(rowMutation, serializedRow);
-
-        try
-        {
-            executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /*
-     * This is called on Memtable flush to add to the commit log
-     * a token indicating that this column family has been flushed.
-     * The bit flag associated with this column family is set in the
-     * header and this is used to decide if the log file can be deleted.
-    */
-    void onMemtableFlush(final String tableName, final String cf, final CommitLog.CommitLogContext cLogCtx) throws IOException
-    {
-        Callable task = new Callable()
-        {
-            public Object call() throws IOException
+            /* Construct the Key */
+            List<String> keyFields = new ArrayList<String> ();
+            for(int fieldId: importer_.key.fields.field)
             {
-                Table table = Table.open(tableName);
-                int id = table.getColumnFamilyId(cf);
-                discardCompletedSegments(cLogCtx, id);
-                return null;
+            	keyFields.add(tokenList.get(fieldId));
             }
-        };
-        try
-        {
-            executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /*
-     * Delete log segments whose contents have been turned into SSTables.
-     *
-     * param @ cLogCtx The commitLog context .
-     * param @ id id of the columnFamily being flushed to disk.
-     *
-    */
-    private void discardCompletedSegments(CommitLog.CommitLogContext cLogCtx, int id) throws IOException
-    {
-        if (logger_.isDebugEnabled())
-            logger_.debug("discard completed log segments for " + cLogCtx + ", column family " + id + ". CFIDs are " + Table.TableMetadata.getColumnFamilyIDString());
-        /* retrieve the commit log header associated with the file in the context */
-        if (clHeaders_.get(cLogCtx.file) == null)
-        {
-            if (logFile_.equals(cLogCtx.file))
+            key = merge(keyFields, importer_.key.combiner);
+            if(importer_.key.optimizeIt != null && !importer_.key.optimizeIt)
             {
-                /* this means we are dealing with the current commit log. */
-                clHeaders_.put(cLogCtx.file, clHeader_);
+	            if(!checkIfProcessKey(key))
+	            {
+	            	continue;
+	            }
+            }
+            rm = rms.get(key);
+            if( rm == null)
+            {
+            	rm = new RowMutation(importer_.table, key);
+            	rms.put(key, rm);
+            }
+            if(importer_.columnFamily.superColumn != null)
+            {
+            	List<String> superColumnList = new ArrayList<String>();
+            	for(int fieldId : importer_.columnFamily.superColumn.fields.field)
+            	{
+            		superColumnList.add(tokenList.get(fieldId));
+            	}
+            	String superColumnName = merge(superColumnList, " ");
+            	superColumnList.clear();
+            	if(importer_.columnFamily.superColumn.tokenize)
+            	{
+            	    Analyzer analyzer = new StandardAnalyzer();
+            	    TokenStream ts = analyzer.tokenStream("superColumn", new StringReader(superColumnName));
+            	    Token token = null;
+            	    token = ts.next();
+            	    while(token != null)
+            	    {
+            	    	superColumnList.add(token.termText());
+                	    token = ts.next();
+            	    }
+            	}
+            	else
+            	{
+            		superColumnList.add(superColumnName);
+            	}
+            	for(String sName : superColumnList)
+            	{
+            		String cfName = importer_.columnFamily.name + ":" + sName;
+    	            if(importer_.columnFamily.column != null)
+    	            {
+    	            	for(ColumnType column : importer_.columnFamily.column )
+    	            	{
+    	            		String cfColumn = cfName +":" + (column.name == null ? tokenList.get(column.field):column.name);
+    	            		rm.add(cfColumn, tokenList.get(column.value.field).getBytes(), Integer.parseInt(tokenList.get(column.timestamp.field)));
+    	            	}
+    	            }
+            		
+            	}
+            	
             }
             else
             {
-                logger_.error("Unknown commitlog file " + cLogCtx.file);
-                return;
+	            if(importer_.columnFamily.column != null)
+	            {
+	            	for(ColumnType column : importer_.columnFamily.column )
+	            	{
+	            		String cfColumn = importer_.columnFamily.name +":" + (column.name == null ? tokenList.get(column.field):column.name);
+	            		rm.add(cfColumn, tokenList.get(column.value.field).getBytes(), Integer.parseInt(tokenList.get(column.timestamp.field)));
+	            	}
+	            }
             }
         }
-
+        // Now apply the data for all keys  
+        // TODO : Add checks for large data
+        // size maybe we want to check the 
+        // data size and then apply.
+        Set<String> keys = rms.keySet();
+        for(String pKey : keys)
+        {
+        	rm = rms.get(pKey);
+        	if( rm != null)
+        	{
+        		rm.apply();
+        	}
+        }
+    }
+    
+    
+    void parseFileList(File dir) 
+    {
+		int fileCount = dir.list().length;
+		for ( int i = 0 ; i < fileCount ; i++ ) 
+		{
+			File file = new File(dir.list()[i]);
+			if ( file.isDirectory())
+			{
+				parseFileList(file);
+			}
+			else 
+			{
+				try
+				{
+					if(importer_.key.optimizeIt != null && importer_.key.optimizeIt)
+					{
+						if(checkIfProcessKey(dir.list()[i]))
+						{
+							parse(dir.listFiles()[i].getAbsolutePath());
+						}
+					}
+					else
+					{
+						parse(dir.listFiles()[i].getAbsolutePath());
+					}
+				}
+				catch ( Throwable ex ) 
+				{
+					logger_.error(ex.toString());
+				}
+			}
+		}
+    }
+	
+    void preLoad(File rootDirectory) throws Throwable
+    {
+        String table = DatabaseDescriptor.getTables().get(0);
+        String cfName = Table.recycleBin_ + ":" + "Keys";
+        /* populate just the keys. */
+        preParse(rootDirectory, table, cfName);
+        /* dump the memtables */
+        Table.open(table).flush(false);
+        /* force a compaction of the files. */
+        Table.open(table).forceCompaction(null,null,null);
+        
         /*
-         * log replay assumes that we only have to look at entries past the last
-         * flush position, so verify that this flush happens after the last.
+         * This is a hack to let everyone finish. Just sleep for
+         * a couple of minutes. 
         */
-        assert cLogCtx.position >= clHeaders_.get(cLogCtx.file).getPosition(id);
-
-        /* Sort the commit logs based on creation time */
-        List<String> oldFiles = new ArrayList<String>(clHeaders_.keySet());
-        Collections.sort(oldFiles, new CommitLogFileComparator());
-
+        logger_.info("Taking a nap after forcing a compaction ...");
+        Thread.sleep(Loader.siesta_);
+        
+        /* Figure out the keys in the index file to relocate the node */
+        List<String> ssTables = Table.open(table).getAllSSTablesOnDisk();
+        /* Load the indexes into memory */
+        for ( String df : ssTables )
+        {
+        	new SSTable(df, StorageService.getPartitioner());
+        }
+        /* We should have only one file since we just compacted. */        
+        List<String> indexedKeys = SSTable.getIndexedKeys();        
+        storageService_.relocate(indexedKeys.toArray( new String[0]) );
+        
         /*
-         * Loop through all the commit log files in the history. Now process
-         * all files that are older than the one in the context. For each of
-         * these files the header needs to modified by resetting the dirty
-         * bit corresponding to the flushed CF.
+         * This is a hack to let everyone relocate and learn about
+         * each other. Just sleep for a couple of minutes. 
         */
-        for (String oldFile : oldFiles)
-        {
-            CommitLogHeader header = clHeaders_.get(oldFile);
-            if (oldFile.equals(cLogCtx.file))
-            {
-                // we can't just mark the segment where the flush happened clean,
-                // since there may have been writes to it between when the flush
-                // started and when it finished. so mark the flush position as
-                // the replay point for this CF, instead.
-                if (logger_.isDebugEnabled())
-                    logger_.debug("Marking replay position " + cLogCtx.position + " on commit log " + oldFile);
-                header.turnOn(id, cLogCtx.position);
-                if (oldFile.equals(logFile_))
-                {
-                    seekAndWriteCommitLogHeader(header.toByteArray());
-                }
-                else
-                {
-                    writeOldCommitLogHeader(oldFile, header);
-                }
-                break;
-            }
-
-            header.turnOff(id);
-            if (header.isSafeToDelete())
-            {
-                logger_.info("Deleting obsolete commit log:" + oldFile);
-                DeletionService.submitDelete(oldFile);
-                clHeaders_.remove(oldFile);
-            }
-            else
-            {
-                if (logger_.isDebugEnabled())
-                    logger_.debug("Not safe to delete commit log " + oldFile + "; dirty is " + header.dirtyString());
-                writeOldCommitLogHeader(oldFile, header);
-            }
-        }
+        logger_.info("Taking a nap after relocating ...");
+        Thread.sleep(Loader.siesta_);  
+        
+        /* 
+         * Do the cleanup necessary. Delete all commit logs and
+         * the SSTables and reset the load state in the StorageService. 
+        */
+        SSTable.delete(ssTables.get(0));
+        logger_.info("Finished all the requisite clean up ...");
     }
+    
+	void load(String xmlFile) throws Throwable
+	{
+		try
+		{
+			JAXBContext jc = JAXBContext.newInstance(this.getClass().getPackage().getName());			
+			Unmarshaller u = jc.createUnmarshaller();			
+			importer_ = (Importer)u.unmarshal(new FileInputStream( xmlFile ) );
+			String directory = importer_.columnFamily.directory;
+            File rootDirectory = new File(directory);
+            preLoad(rootDirectory);
+			parseFileList(rootDirectory);
+		}
+		catch (Exception e)
+		{
+			logger_.info(LogUtil.throwableToString(e));
+		}
+		
+	}
 
-    private void writeOldCommitLogHeader(String oldFile, CommitLogHeader header) throws IOException
-    {
-        BufferedRandomAccessFile logWriter = CommitLog.createWriter(oldFile);
-        writeCommitLogHeader(logWriter, header.toByteArray());
-        logWriter.close();
-    }
+	/**
+	 * @param args
+	 */
+	public static void main(String[] args) throws Throwable
+	{
+		LogUtil.init();
+        StorageService s = StorageService.instance();
+        s.start();
+		Loader loader = new Loader(s);
+		loader.load("mbox_importer.xml");
+	}
 
-    private boolean maybeRollLog() throws IOException
-    {
-        if (logWriter_.length() >= SEGMENT_SIZE)
-        {
-            /* Rolls the current log file over to a new one. */
-            setNextFileName();
-            String oldLogFile = logWriter_.getPath();
-            logWriter_.close();
-
-            /* point reader/writer to a new commit log file. */
-            logWriter_ = CommitLog.createWriter(logFile_);
-            /* squirrel away the old commit log header */
-            clHeaders_.put(oldLogFile, new CommitLogHeader(clHeader_));
-            clHeader_.clear();
-            writeCommitLogHeader(logWriter_, clHeader_.toByteArray());
-            return true;
-        }
-        return false;
-    }
-
-    void sync() throws IOException
-    {
-        logWriter_.sync();
-    }
-
-    class LogRecordAdder implements Callable<CommitLog.CommitLogContext>
-    {
-        final RowMutation rowMutation;
-        final Object serializedRow;
-
-        LogRecordAdder(RowMutation rm, Object serializedRow)
-        {
-            this.rowMutation = rm;
-            this.serializedRow = serializedRow;
-        }
-
-        public CommitLog.CommitLogContext call() throws Exception
-        {
-            long currentPosition = -1L;
-            try
-            {
-                currentPosition = logWriter_.getFilePointer();
-                CommitLogContext cLogCtx = new CommitLogContext(logFile_, currentPosition);
-                maybeUpdateHeader(rowMutation);
-                Checksum checkum = new CRC32();
-                if (serializedRow instanceof DataOutputBuffer)
-                {
-                    DataOutputBuffer buffer = (DataOutputBuffer) serializedRow;
-                    logWriter_.writeLong(buffer.getLength());
-                    logWriter_.write(buffer.getData(), 0, buffer.getLength());
-                    checkum.update(buffer.getData(), 0, buffer.getLength());
-                }
-                else
-                {
-                    assert serializedRow instanceof byte[];
-                    byte[] bytes = (byte[]) serializedRow;
-                    logWriter_.writeLong(bytes.length);
-                    logWriter_.write(bytes);
-                    checkum.update(bytes, 0, bytes.length);
-                }
-                logWriter_.writeLong(checkum.getValue());
-                maybeRollLog();
-                return cLogCtx;
-            }
-            catch (IOException e)
-            {
-                if ( currentPosition != -1 )
-                    logWriter_.seek(currentPosition);
-                throw e;
-            }
-        }
-    }
 }

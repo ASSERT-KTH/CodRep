@@ -1,131 +1,310 @@
-import org.apache.cassandra.io.sstable.SSTableReader;
+NumericDocValues getNormValues(String field) throws IOException {
 
-package org.apache.cassandra.db.filter;
+package org.apache.lucene.index;
+
 /*
- * 
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- * 
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-
 import java.io.IOException;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.cassandra.io.SSTableReader;
-import org.apache.cassandra.utils.ReducingIterator;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.DocValuesProducer;
+import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.codecs.TermVectorsReader;
+import org.apache.lucene.index.FieldInfo.DocValuesType;
+import org.apache.lucene.index.SegmentReader.CoreClosedListener;
+import org.apache.lucene.store.CompoundFileDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.CloseableThreadLocal;
+import org.apache.lucene.util.IOUtils;
 
-public abstract class QueryFilter
-{
-    public final String key;
-    public final QueryPath path;
+/** Holds core readers that are shared (unchanged) when
+ * SegmentReader is cloned or reopened */
+final class SegmentCoreReaders {
+  
+  // Counts how many other reader share the core objects
+  // (freqStream, proxStream, tis, etc.) of this reader;
+  // when coreRef drops to 0, these core objects may be
+  // closed.  A given instance of SegmentReader may be
+  // closed, even those it shares core objects with other
+  // SegmentReaders:
+  private final AtomicInteger ref = new AtomicInteger(1);
+  
+  final FieldInfos fieldInfos;
+  
+  final FieldsProducer fields;
+  final DocValuesProducer dvProducer;
+  final DocValuesProducer normsProducer;
 
-    protected QueryFilter(String key, QueryPath path)
-    {
-        this.key = key;
-        this.path = path;
+  final int termsIndexDivisor;
+  
+  private final SegmentReader owner;
+  
+  final StoredFieldsReader fieldsReaderOrig;
+  final TermVectorsReader termVectorsReaderOrig;
+  final CompoundFileDirectory cfsReader;
+
+  // TODO: make a single thread local w/ a
+  // Thingy class holding fieldsReader, termVectorsReader,
+  // normsProducer, dvProducer
+
+  final CloseableThreadLocal<StoredFieldsReader> fieldsReaderLocal = new CloseableThreadLocal<StoredFieldsReader>() {
+    @Override
+    protected StoredFieldsReader initialValue() {
+      return fieldsReaderOrig.clone();
     }
-
-    /**
-     * returns an iterator that returns columns from the given memtable
-     * matching the Filter criteria in sorted order.
-     */
-    public abstract ColumnIterator getMemColumnIterator(Memtable memtable, ColumnFamily cf, AbstractType comparator);
-
-    public ColumnIterator getMemColumnIterator(Memtable memtable, AbstractType comparator)
-    {
-        return getMemColumnIterator(memtable, memtable.getColumnFamily(key), comparator);
+  };
+  
+  final CloseableThreadLocal<TermVectorsReader> termVectorsLocal = new CloseableThreadLocal<TermVectorsReader>() {
+    @Override
+    protected TermVectorsReader initialValue() {
+      return (termVectorsReaderOrig == null) ? null : termVectorsReaderOrig.clone();
     }
+  };
 
-    /**
-     * returns an iterator that returns columns from the given SSTable
-     * matching the Filter criteria in sorted order.
-     */
-    public abstract ColumnIterator getSSTableColumnIterator(SSTableReader sstable) throws IOException;
+  final CloseableThreadLocal<Map<String,Object>> docValuesLocal = new CloseableThreadLocal<Map<String,Object>>() {
+    @Override
+    protected Map<String,Object> initialValue() {
+      return new HashMap<String,Object>();
+    }
+  };
 
-    /**
-     * collects columns from reducedColumns into returnCF.  Termination is determined
-     * by the filter code, which should have some limit on the number of columns
-     * to avoid running out of memory on large rows.
-     */
-    public abstract void collectReducedColumns(IColumnContainer container, Iterator<IColumn> reducedColumns, int gcBefore);
+  final CloseableThreadLocal<Map<String,Object>> normsLocal = new CloseableThreadLocal<Map<String,Object>>() {
+    @Override
+    protected Map<String,Object> initialValue() {
+      return new HashMap<String,Object>();
+    }
+  };
 
-    /**
-     * subcolumns of a supercolumn are unindexed, so to pick out parts of those we operate in-memory.
-     * @param superColumn may be modified by filtering op.
-     */
-    public abstract SuperColumn filterSuperColumn(SuperColumn superColumn, int gcBefore);
-
-    public Comparator<IColumn> getColumnComparator(final AbstractType comparator)
-    {
-        return new Comparator<IColumn>()
-        {
-            public int compare(IColumn c1, IColumn c2)
-            {
-                return comparator.compare(c1.name(), c2.name());
-            }
-        };
+  private final Set<CoreClosedListener> coreClosedListeners = 
+      Collections.synchronizedSet(new LinkedHashSet<CoreClosedListener>());
+  
+  SegmentCoreReaders(SegmentReader owner, Directory dir, SegmentInfoPerCommit si, IOContext context, int termsIndexDivisor) throws IOException {
+    
+    if (termsIndexDivisor == 0) {
+      throw new IllegalArgumentException("indexDivisor must be < 0 (don't load terms index) or greater than 0 (got 0)");
     }
     
-    public void collectCollatedColumns(final ColumnFamily returnCF, Iterator<IColumn> collatedColumns, int gcBefore)
-    {
-        // define a 'reduced' iterator that merges columns w/ the same name, which
-        // greatly simplifies computing liveColumns in the presence of tombstones.
-        ReducingIterator<IColumn, IColumn> reduced = new ReducingIterator<IColumn, IColumn>(collatedColumns)
-        {
-            ColumnFamily curCF = returnCF.cloneMeShallow();
+    final Codec codec = si.info.getCodec();
+    final Directory cfsDir; // confusing name: if (cfs) its the cfsdir, otherwise its the segment's directory.
 
-            protected boolean isEqual(IColumn o1, IColumn o2)
-            {
-                return Arrays.equals(o1.name(), o2.name());
-            }
+    boolean success = false;
+    
+    try {
+      if (si.info.getUseCompoundFile()) {
+        cfsDir = cfsReader = new CompoundFileDirectory(dir, IndexFileNames.segmentFileName(si.info.name, "", IndexFileNames.COMPOUND_FILE_EXTENSION), context, false);
+      } else {
+        cfsReader = null;
+        cfsDir = dir;
+      }
+      fieldInfos = codec.fieldInfosFormat().getFieldInfosReader().read(cfsDir, si.info.name, IOContext.READONCE);
 
-            public void reduce(IColumn current)
-            {
-                curCF.addColumn(current);
-            }
+      this.termsIndexDivisor = termsIndexDivisor;
+      final PostingsFormat format = codec.postingsFormat();
+      final SegmentReadState segmentReadState = new SegmentReadState(cfsDir, si.info, fieldInfos, context, termsIndexDivisor);
+      // Ask codec for its Fields
+      fields = format.fieldsProducer(segmentReadState);
+      assert fields != null;
+      // ask codec for its Norms: 
+      // TODO: since we don't write any norms file if there are no norms,
+      // kinda jaky to assume the codec handles the case of no norms file at all gracefully?!
 
-            protected IColumn getReduced()
-            {
-                IColumn c = curCF.getSortedColumns().iterator().next();
-                curCF.clear();
-                return c;
-            }
-        };
+      if (fieldInfos.hasDocValues()) {
+        dvProducer = codec.docValuesFormat().fieldsProducer(segmentReadState);
+        assert dvProducer != null;
+      } else {
+        dvProducer = null;
+      }
 
-        collectReducedColumns(returnCF, reduced, gcBefore);
+      if (fieldInfos.hasNorms()) {
+        normsProducer = codec.normsFormat().normsProducer(segmentReadState);
+        assert normsProducer != null;
+      } else {
+        normsProducer = null;
+      }
+  
+      fieldsReaderOrig = si.info.getCodec().storedFieldsFormat().fieldsReader(cfsDir, si.info, fieldInfos, context);
+
+      if (fieldInfos.hasVectors()) { // open term vector files only as needed
+        termVectorsReaderOrig = si.info.getCodec().termVectorsFormat().vectorsReader(cfsDir, si.info, fieldInfos, context);
+      } else {
+        termVectorsReaderOrig = null;
+      }
+
+      success = true;
+    } finally {
+      if (!success) {
+        decRef();
+      }
+    }
+    
+    // Must assign this at the end -- if we hit an
+    // exception above core, we don't want to attempt to
+    // purge the FieldCache (will hit NPE because core is
+    // not assigned yet).
+    this.owner = owner;
+  }
+  
+  void incRef() {
+    ref.incrementAndGet();
+  }
+
+  NumericDocValues getNumericDocValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
+    }
+    if (fi.getDocValuesType() == null) {
+      // Field was not indexed with doc values
+      return null;
+    }
+    if (fi.getDocValuesType() != DocValuesType.NUMERIC) {
+      // DocValues were not numeric
+      return null;
     }
 
-    public String getColumnFamilyName()
-    {
-        return path.columnFamilyName;
+    assert dvProducer != null;
+
+    Map<String,Object> dvFields = docValuesLocal.get();
+
+    NumericDocValues dvs = (NumericDocValues) dvFields.get(field);
+    if (dvs == null) {
+      dvs = dvProducer.getNumeric(fi);
+      dvFields.put(field, dvs);
     }
 
-    public static boolean isRelevant(IColumn column, IColumnContainer container, int gcBefore)
-    {
-        // the column itself must be not gc-able (it is live, or a still relevant tombstone, or has live subcolumns), (1)
-        // and if its container is deleted, the column must be changed more recently than the container tombstone (2)
-        // (since otherwise, the only thing repair cares about is the container tombstone)
-        long maxChange = column.mostRecentLiveChangeAt();
-        return (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore || maxChange > column.getMarkedForDeleteAt()) // (1)
-               && (!container.isMarkedForDelete() || maxChange > container.getMarkedForDeleteAt()); // (2)
+    return dvs;
+  }
+
+  BinaryDocValues getBinaryDocValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
     }
+    if (fi.getDocValuesType() == null) {
+      // Field was not indexed with doc values
+      return null;
+    }
+    if (fi.getDocValuesType() != DocValuesType.BINARY) {
+      // DocValues were not binary
+      return null;
+    }
+
+    assert dvProducer != null;
+
+    Map<String,Object> dvFields = docValuesLocal.get();
+
+    BinaryDocValues dvs = (BinaryDocValues) dvFields.get(field);
+    if (dvs == null) {
+      dvs = dvProducer.getBinary(fi);
+      dvFields.put(field, dvs);
+    }
+
+    return dvs;
+  }
+
+  SortedDocValues getSortedDocValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
+    }
+    if (fi.getDocValuesType() == null) {
+      // Field was not indexed with doc values
+      return null;
+    }
+    if (fi.getDocValuesType() != DocValuesType.SORTED) {
+      // DocValues were not sorted
+      return null;
+    }
+
+    assert dvProducer != null;
+
+    Map<String,Object> dvFields = docValuesLocal.get();
+
+    SortedDocValues dvs = (SortedDocValues) dvFields.get(field);
+    if (dvs == null) {
+      dvs = dvProducer.getSorted(fi);
+      dvFields.put(field, dvs);
+    }
+
+    return dvs;
+  }
+
+  NumericDocValues getSimpleNormValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
+    }
+    if (!fi.hasNorms()) {
+      return null;
+    }
+   
+    assert normsProducer != null;
+
+    Map<String,Object> normFields = normsLocal.get();
+
+    NumericDocValues norms = (NumericDocValues) normFields.get(field);
+    if (norms == null) {
+      norms = normsProducer.getNumeric(fi);
+      normFields.put(field, norms);
+    }
+
+    return norms;
+  }
+
+  void decRef() throws IOException {
+    if (ref.decrementAndGet() == 0) {
+      IOUtils.close(termVectorsLocal, fieldsReaderLocal, docValuesLocal, normsLocal, fields, dvProducer,
+                    termVectorsReaderOrig, fieldsReaderOrig, cfsReader, normsProducer);
+      notifyCoreClosedListeners();
+    }
+  }
+  
+  private void notifyCoreClosedListeners() {
+    synchronized(coreClosedListeners) {
+      for (CoreClosedListener listener : coreClosedListeners) {
+        listener.onClose(owner);
+      }
+    }
+  }
+
+  void addCoreClosedListener(CoreClosedListener listener) {
+    coreClosedListeners.add(listener);
+  }
+  
+  void removeCoreClosedListener(CoreClosedListener listener) {
+    coreClosedListeners.remove(listener);
+  }
+
+  @Override
+  public String toString() {
+    return "SegmentCoreReader(owner=" + owner + ")";
+  }
 }

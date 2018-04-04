@@ -1,723 +1,549 @@
-private static volatile MessagingService messagingService_ = new MessagingService();
+if (!se.isLockTimeout()) {
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/*
+
+   Derby - Class org.apache.derby.impl.store.raw.data.ReclaimSpaceHelper
+
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to you under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
  */
 
-package org.apache.cassandra.net;
+package org.apache.derby.impl.store.raw.data;
 
-import org.apache.cassandra.concurrent.*;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.net.io.SerializerType;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.utils.*;
-import org.apache.log4j.Logger;
+import org.apache.derby.impl.store.raw.data.BasePage;
+import org.apache.derby.impl.store.raw.data.ReclaimSpace;
 
-import java.io.IOException;
-import java.net.ServerSocket;
-import java.net.SocketException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.ServerSocketChannel;
-import java.security.MessageDigest;
-import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
 
-public class MessagingService
+import org.apache.derby.iapi.services.daemon.DaemonService;
+import org.apache.derby.iapi.services.daemon.Serviceable;
+import org.apache.derby.iapi.services.sanity.SanityManager;
+import org.apache.derby.iapi.error.StandardException;
+
+import org.apache.derby.iapi.store.access.TransactionController;
+
+import org.apache.derby.iapi.store.raw.ContainerKey;
+import org.apache.derby.iapi.store.raw.ContainerHandle;
+import org.apache.derby.iapi.store.raw.LockingPolicy;
+import org.apache.derby.iapi.store.raw.Page;
+import org.apache.derby.iapi.store.raw.PageKey;
+import org.apache.derby.iapi.store.raw.RecordHandle;
+import org.apache.derby.iapi.store.raw.Transaction;
+
+import org.apache.derby.iapi.store.raw.xact.RawTransaction;
+import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
+import org.apache.derby.shared.common.reference.SQLState;
+
+
+/**
+	This class helps a BaseDataFactory reclaims unused space.
+
+Space needs to be reclaimed in the following cases:
+<BR><NL>
+<LI> Row with long columns or overflow row pieces is deleted
+<LI> Insertion of a row that has long columns or overflows to other row pieces is rolled back
+<LI> Row is updated and the head row or some row pieces shrunk
+<LI> Row is updated and some long columns are orphaned because they are updated
+<LI> Row is updated and some long columns are created but the update rolled back
+<LI> Row is updated and some new row pieces are created but the update rolled back
+</NL> <P>
+
+We can implement a lot of optimization if we know that btree does not overflow.
+However, since that is not the case and Raw Store cannot tell if it is dealing
+with a btree page or a heap page, they all have to be treated gingerly.  E.g.,
+in heap page, once a head row is deleted (via a delete operation or via a
+rollback of insert), all the long rows and long columns can be reclaimed - in
+fact, most of the head row can be removed and reclaimed, only a row stub needs
+to remain for locking purposes.  But in the btree, a deleted row still needs to
+contain the key values so it cannot be cleaned up until the row is purged.
+
+<P><B>
+Row with long columns or long row is deleted
+</B><BR>
+
+When Access purge a committed deleted row, the purge operation will see if the
+row has overflowed row pieces or if it has long columns.  If it has, then all
+the long columns and row pieces are purged before the head row piece can be
+purged.  When a row is purged from an overflow page and it is the only row on
+the page, then the page is deallocated in the same transaction. Note that
+non-overflow pages are removed by Access but overflow pages are removed by Raw
+Store.  Note that page removal is done in the same transaction and not post
+commit.  This is, in general, dangerous because if the transaction does not
+commit for a long time, uncommit deallocated page slows down page allocation
+for this container.  However, we know that access only purges committed delete
+row in access post commit processing so we know the transaction will tend to
+commit relatively fast.  The alternative is to queue up a post commit
+ReclaimSpace.PAGE to reclaim the page after the purge commits.  In order to do
+that, the time stamp of the page must also be remembered because post commit
+work may be queued more than once, but in this case, it can only be done once.
+Also, doing the page deallocation post commit adds to the overall cost and
+tends to fill up the post commit queue. <BR>
+
+This approach is simple but has the drawback that the entire long row and all
+the long columns are logged in the purge operation.  The alternative is more
+complicated, we can remember all the long columns on the head row piece and
+where the row chain starts and clean them up during post commit.  During post
+commit, because the head row piece is already purged, there is no need to log
+the long column or the long rows, just wipe the page or just reuse the page if
+that is the only thing on the page.  The problem with this approach is that we
+need to make sure the purging of the head row does indeed commit (the
+transaction may commit but the purging may be rolled back due to savepoint).
+So, we need to find the head row in the post commit and only when we cannot
+find it can we be sure that the purge is committed.  However, in cases where
+the page can reuse its record Id (namely in btree), a new row may reuse the
+same recordId.  In that case, the post commit can purge the long columns or the
+rest of the row piece only if the head piece no longer points to it.  Because
+of the complexity of this latter approach, the first simple approach is used.
+However, if the performance due to extra logging becomes unbearble, we can
+consider implementing the second approach.  
+
+<P><B>
+Insertion of a row with long column or long row is rolled back.
+</B><BR>
+
+Insertion can be rolled back with either delete or purge.  If the row is rolled
+back with purge, then all the overflow columns pieces and row pieces are also
+rolled back with purge.  When a row is purged from an overflow page and it is
+the only row on the page, then a post commit ReclaimSpace.PAGE work is queued
+by Raw Store to reclaim that page.<BR>
+
+If the row is rolled back with delete, then all the overflow columns pieces and
+row pieces are also rolled back with delete.  Access will purge the deleted row
+in due time, see above.
+
+<P><B>
+Row is updated and the head row or some row pieces shrunk
+</B><BR>
+
+Every page that an update operation touches will see if the record on that page
+has any reserve space.  It it does, and if the reserve space plus the record
+size exceed the mininum record size, then a post commit ROW_RESERVE work will
+be queued to reclaim all unnecessary row reserved space for the entire row.
+
+<P><B>
+Row is updated and old long columns are orphaned
+</B><BR>
+
+The ground rule is, whether a column is a long column or not before an update
+has nothing to do with whether a column will be a long column or not after the
+update.  In other words, update can turn a non-long column into a long column,
+or it can turn a long column into a non-long column, or a long column can be
+updated to another long column and a non-long column can be updated to a
+non-long column.  The last case - update of a non-long column to another
+non-long column - is only of concern if it shrinks the row piece it is on (see
+above).<BR>
+
+So update can be looked at as 2 separate problems: A) a column is a long column
+before the update and the update will "orphaned" it.  B) a column is a long
+column after the update and the rollback of the update will "orphaned" it if it
+is rolled back with a delete.  This section deals with problem A, next section
+deals with problem B.<BR>
+
+Update specifies a set of columns to be updated.  If a row piece contains one
+or more columns to be updated, those columns are examined to see if they are
+actually long column chains.  If they are, then after the update, those long
+column chains will be orphaned.  So before the update happens, a post commit
+ReclaimSpace.COLUMN_CHAIN work is queued which contains the head rows id, the
+column number, the location of the first piece of the column chain, and the
+time stamp of the first page of the column chain. <BR>
+
+If the update transaction commits, the post commit work will walk the row until
+it finds the column number (note that it may not be on the page where the
+update happened because of subsequent row splitting), and if it doesn't point
+to the head of the column chain, we know the update operation has indeed
+committed (versus rolled back by a savepoint).  If a piece of the the column
+chain takes up an entire page, then the entire page can be reclaimed without
+first purging the row because the column chain is already orphaned.<BR>
+
+We need to page time stamp of the first page of the column chain because if the
+post commit ReclaimSpace.COLUMN_CHAIN is queued more than once, as can happen
+in repeated rollback to savepoint, then after the first time the column is
+reclaimed, the pages in the column chain can be reused.  Therefore, we cannot
+reclaim the column chain again.  Since there is no back pointer from the column
+chain to the head row, we need the timestamp to tell us if that column chain
+has already been touched (reclaimed) or not.
+
+<P><B> 
+Row is updated with new long columns and update is rolled back.
+</B><BR>
+
+When the update is rolled back, the new long columns, which got there by
+insertion, got rolled back either by delete or by purge.  If they were rolled
+back with delete, then they will be orphaned and need to be cleaned up with
+post abort work.  Therefore, insertion of long columns due to update must be
+rolled back with purge.<BR>
+
+This is safe because the moment the rollback of the head row piece happens, the
+new long column is orphaned anyway and nobody will be able to get to it.  Since
+we don't attempt to share long column pages, we know that nobody else could be
+on the page and it is safe to deallocate the page.
+
+<P><B>
+Row is updated with new long row piece and update is rolled back.
+</B><BR>
+
+When the update is rolled back, the new long row piece, which got there by
+insertion, got rolled back either by delete or by purge.  Like update with new
+long row, they should be rolled back with purge.  However, there is a problem
+in that the insert log record does not contain the head row handle.  It is
+possible that another long row emanating from the same head page overflows to
+this page.  That row may since have been deleted and is now in the middle of a
+purge, but the purge has not commit.  To the code that is rolling back the
+insert (caused by the update that split off a new row piece) the overflow page
+looks empty.  If it went ahead and deallocate the page, then the transaction
+which purged the row piece on this page won't be able to roll back.  For this
+reason, the rollback to insert of a long row piece due to update must be rolled
+back with delete.  Furthermore, there is no easy way to lodge a post
+termination work to reclaim this deleted row piece so it will be lost forever.
+<BR>
+
+RESOLVE: need to log the head row's handle in the insert log record, i.e., any
+insert due to update of long row or column piece should have the head row's
+handle on it so that when the insert is rolled back with purge, and there is no
+more row on the page, it can file a post commit to reclaim the page safely.
+The post commit reclaim page needs to lock the head row and latch the head page
+to make sure the entire row chain is stable.
+
+<P><B>
+*/
+public class ReclaimSpaceHelper
 {
-    private static int version_ = 1;
-    //TODO: make this parameter dynamic somehow.  Not sure if config is appropriate.
-    private static SerializerType serializerType_ = SerializerType.BINARY;
-    
-    private static byte[] protocol_ = new byte[16];
-    /* Verb Handler for the Response */
-    public static final String responseVerbHandler_ = "RESPONSE";
-    /* Stage for responses. */
-    public static final String responseStage_ = "RESPONSE-STAGE";
+	/**
+		Reclaim space based on work.
+	 */
+	public static int reclaimSpace(BaseDataFileFactory dataFactory,
+							RawTransaction tran,
+							ReclaimSpace work) 
+		 throws StandardException
+	{
+	
+		if (work.reclaimWhat() == ReclaimSpace.CONTAINER)
+			return reclaimContainer(dataFactory, tran, work);
 
-    private enum ReservedVerbs_ {
-    };
-    
-    private static Map<String, String> reservedVerbs_ = new Hashtable<String, String>();
-    /* Indicate if we are currently streaming data to another node or receiving streaming data */
-    private static AtomicBoolean isStreaming_ = new AtomicBoolean(false);
-    
-    /* This records all the results mapped by message Id */
-    private static ICachetable<String, IAsyncCallback> callbackMap_;
-    private static ICachetable<String, IAsyncResult> taskCompletionMap_;
-    
-    /* Manages the table of endpoints it is listening on */
-    private static Set<InetAddress> endPoints_;
-    
-    /* List of sockets we are listening on */
-    private static Map<InetAddress, SelectionKey> listenSockets_ = new HashMap<InetAddress, SelectionKey>();
-    
-    /* Lookup table for registering message handlers based on the verb. */
-    private static Map<String, IVerbHandler> verbHandlers_;
+		// Else, not reclaiming container. Get a no-wait shared lock on the 
+		// container regardless of how the user transaction had the
+		// container opened. 
 
-    /* Thread pool to handle messaging read activities of Socket and default stage */
-    private static ExecutorService messageDeserializationExecutor_;
-    
-    /* Thread pool to handle deserialization of messages read from the socket. */
-    private static ExecutorService messageDeserializerExecutor_;
-    
-    /* Thread pool to handle messaging write activities */
-    private static ExecutorService streamExecutor_;
-    
-    private final static ReentrantLock lock_ = new ReentrantLock();
-    private static Map<String, TcpConnectionManager> poolTable_ = new Hashtable<String, TcpConnectionManager>();
-    
-    private static boolean bShutdown_ = false;
-    
-    private static Logger logger_ = Logger.getLogger(MessagingService.class);
-    
-    private static MessagingService messagingService_ = new MessagingService();
+		LockingPolicy container_rlock = 
+			tran.newLockingPolicy(LockingPolicy.MODE_RECORD,
+								  TransactionController.ISOLATION_SERIALIZABLE, 
+								  true /* stricter OK */ );
 
-    private static final int MESSAGE_DESERIALIZE_THREADS = 4;
+		if (SanityManager.DEBUG)
+			SanityManager.ASSERT(container_rlock != null);
 
-    public static int getVersion()
-    {
-        return version_;
-    }
+		ContainerHandle containerHdl = 
+			openContainerNW(tran, container_rlock, work.getContainerId());
 
-    public static MessagingService instance()
-    {   
-    	if ( bShutdown_ )
-    	{
-            lock_.lock();
-            try
+		if (containerHdl == null)
+		{
+			tran.abort();
+
+			if (SanityManager.DEBUG)
             {
-                if ( bShutdown_ )
+                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
                 {
-            		messagingService_ = new MessagingService();
-            		bShutdown_ = false;
+                    SanityManager.DEBUG(
+                        DaemonService.DaemonTrace, " aborted " + work + 
+                        " because container is locked or dropped");
                 }
             }
-            finally
+
+			if (work.incrAttempts() < 3) // retry this for serveral times
+				// it is however, unlikely that three tries will be 
+				// enough because there is no delay between retries.
+				// See DERBY-4059 and DERBY-4055 for details.
             {
-                lock_.unlock();
+				return Serviceable.REQUEUE;
             }
-    	}
-        return messagingService_;
-    }
-    
-    public Object clone() throws CloneNotSupportedException
-    {
-        //Prevents the singleton from being cloned
-        throw new CloneNotSupportedException();
-    }
-
-    protected MessagingService()
-    {        
-        for ( ReservedVerbs_ verbs : ReservedVerbs_.values() )
-        {
-            reservedVerbs_.put(verbs.toString(), verbs.toString());
-        }
-        verbHandlers_ = new HashMap<String, IVerbHandler>();        
-        endPoints_ = new HashSet<InetAddress>();
-        /*
-         * Leave callbacks in the cachetable long enough that any related messages will arrive
-         * before the callback is evicted from the table. The concurrency level is set at 128
-         * which is the sum of the threads in the pool that adds shit into the table and the 
-         * pool that retrives the callback from here.
-        */ 
-        int maxSize = MESSAGE_DESERIALIZE_THREADS;
-        callbackMap_ = new Cachetable<String, IAsyncCallback>( 2 * DatabaseDescriptor.getRpcTimeout() );
-        taskCompletionMap_ = new Cachetable<String, IAsyncResult>( 2 * DatabaseDescriptor.getRpcTimeout() );        
-        
-        messageDeserializationExecutor_ = new DebuggableThreadPoolExecutor( maxSize,
-                maxSize,
-                Integer.MAX_VALUE,
-                TimeUnit.SECONDS,
-                new LinkedBlockingQueue<Runnable>(),
-                new NamedThreadFactory("MESSAGING-SERVICE-POOL")
-                );
-
-        messageDeserializerExecutor_ = new DebuggableThreadPoolExecutor( maxSize,
-                maxSize,
-                Integer.MAX_VALUE,
-                TimeUnit.SECONDS,
-                new LinkedBlockingQueue<Runnable>(),
-                new NamedThreadFactory("MESSAGE-DESERIALIZER-POOL")
-                ); 
-        
-        streamExecutor_ = new DebuggableThreadPoolExecutor("MESSAGE-STREAMING-POOL");
-                
-        protocol_ = hash(HashingSchemes.MD5, "FB-MESSAGING".getBytes());        
-        /* register the response verb handler */
-        registerVerbHandlers(MessagingService.responseVerbHandler_, new ResponseVerbHandler());
-        /* register stage for response */
-        StageManager.registerStage(MessagingService.responseStage_, new MultiThreadedStage("RESPONSE-STAGE", maxSize) );
-    }
-    
-    public byte[] hash(String type, byte data[])
-    {
-        byte result[] = null;
-        try
-        {
-            MessageDigest messageDigest = MessageDigest.getInstance(type);
-            result = messageDigest.digest(data);
-        }
-        catch(Exception e)
-        {
-            if (logger_.isDebugEnabled())
-                logger_.debug(LogUtil.throwableToString(e));
-        }
-        return result;
-    }
-    
-    /**
-     * Listen on the specified port.
-     * @param localEp InetAddress whose port to listen on.
-     */
-    public void listen(InetAddress localEp) throws IOException
-    {        
-        ServerSocketChannel serverChannel = ServerSocketChannel.open();
-        ServerSocket ss = serverChannel.socket();
-        ss.bind(new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort()));
-        serverChannel.configureBlocking(false);
-        
-        SelectionKeyHandler handler = new TcpConnectionHandler(localEp);
-
-        SelectionKey key = SelectorManager.getSelectorManager().register(serverChannel, handler, SelectionKey.OP_ACCEPT);          
-        endPoints_.add(localEp);            
-        listenSockets_.put(localEp, key);             
-    }
-    
-    /**
-     * Listen on the specified port.
-     * @param localEp InetAddress whose port to listen on.
-     */
-    public void listenUDP(InetAddress localEp)
-    {
-        UdpConnection connection = new UdpConnection();
-        if (logger_.isDebugEnabled())
-          logger_.debug("Starting to listen on " + localEp);
-        try
-        {
-            connection.init(localEp);
-            endPoints_.add(localEp);     
-        }
-        catch ( IOException e )
-        {
-            logger_.warn(LogUtil.throwableToString(e));
-        }
-    }
-    
-    public static TcpConnectionManager getConnectionPool(InetAddress from, InetAddress to)
-    {
-        String key = from + ":" + to;
-        TcpConnectionManager cp = poolTable_.get(key);
-        if( cp == null )
-        {
-            lock_.lock();
-            try
+			else
             {
-                cp = poolTable_.get(key);
-                if (cp == null )
+                // If code gets here, the space will be lost forever, and
+                // can only be reclaimed by a full offline compress of the
+                // table/index.
+
+                if (SanityManager.DEBUG)
                 {
-                    cp = new TcpConnectionManager(from, to);
-                    poolTable_.put(key, cp);
+                    if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                    {
+                        SanityManager.DEBUG(
+                            DaemonService.DaemonTrace, 
+                            "  gave up after 3 tries to get container lock " + 
+                            work);
+                    }
+                }
+
+				return Serviceable.DONE;
+            }
+		}	
+
+		// At this point, container is opened with IX lock.
+
+		if (work.reclaimWhat() == ReclaimSpace.PAGE)
+		{
+			// Reclaiming a page - called by undo of insert which purged the
+			// last row off an overflow page. It is safe to reclaim the page
+			// without first locking the head row because unlike post commit
+			// work, this is post abort work.  Abort is guarenteed to happen
+			// and to happen only once, if at all.
+			Page p = containerHdl.getPageNoWait(work.getPageId().getPageNumber());
+			if (p != null)
+				containerHdl.removePage(p);
+
+			tran.commit();
+			return Serviceable.DONE;
+		}
+
+		// We are reclaiming row space or long column.  
+		// First get an xlock on the head row piece.
+		RecordHandle headRecord = work.getHeadRowHandle();
+
+		if (!container_rlock.lockRecordForWrite(
+                tran, headRecord, false /* not insert */, false /* nowait */))
+		{
+			// cannot get the row lock, retry
+			tran.abort();
+			if (work.incrAttempts() < 3)
+            {
+				return Serviceable.REQUEUE;
+            }
+			else
+            {
+                // If code gets here, the space will be lost forever, and
+                // can only be reclaimed by a full offline compress of the
+                // table/index.
+
+                if (SanityManager.DEBUG)
+                {
+                    if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                    {
+                        SanityManager.DEBUG(
+                            DaemonService.DaemonTrace, 
+                            "  gave up after 3 tries to get row lock " + 
+                            work);
+                    }
+                }
+				return Serviceable.DONE;
+            }
+		}
+
+		// The exclusive lock on the head row has been gotten.
+
+		if (work.reclaimWhat() == ReclaimSpace.ROW_RESERVE)
+		{
+			// This row may benefit from compaction.
+			containerHdl.compactRecord(headRecord);
+
+            // This work is being done - post commit, there is no user 
+            // transaction that depends on the commit being sync'd.  It is safe
+            // to commitNoSync() This do as one of 2 things will happen:
+            //
+            //     1) if any data page associated with this transaction is
+            //        moved from cache to disk, then the transaction log
+            //        must be sync'd to the log record for that change and
+            //        all log records including the commit of this xact must
+            //        be sync'd before returning.
+            //
+            //     2) if the data page is never written then the log record
+            //        for the commit may never be written, and the xact will
+            //        never make to disk.  This is ok as no subsequent action
+            //        depends on this operation being committed.
+            //
+			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+
+			return Serviceable.DONE;
+		}
+		else
+		{
+			if (SanityManager.DEBUG)
+				SanityManager.ASSERT(work.reclaimWhat() == ReclaimSpace.COLUMN_CHAIN);
+
+			// Reclaiming a long column chain due to update.  The long column
+			// chain being reclaimed is the before image of the update
+			// operation.  
+			// 
+			long headPageId = ((PageKey)headRecord.getPageId()).getPageNumber();
+			//DERBY-4050 - we wait for the page so we don't have to retry.
+			// prior to the 4050 fix, we called getPageNoWait and just 
+			// retried 3 times.  This left unreclaimed space if we were 
+			// not successful after three tries.
+			StoredPage headRowPage = 
+				(StoredPage)containerHdl.getPage(headPageId);
+			if (headRowPage == null)
+			{
+				// It is not clear why headRowPage would be null,
+				// but logging the failure in case it happens.
+				// If code gets here, the space will be lost forever, and
+				// can only be reclaimed by a full offline compress of the
+				// table/index.
+
+				if (SanityManager.DEBUG)
+				{
+					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+					{
+						SanityManager.DEBUG(
+								DaemonService.DaemonTrace, 
+								"gave up because hadRowPage was null" + 
+								work);
+					}
+				}
+				tran.abort();
+				return Serviceable.DONE;
+			}
+			try
+			{
+				headRowPage.removeOrphanedColumnChain(work, containerHdl);
+			}
+			finally
+			{
+				headRowPage.unlatch();
+			}
+
+            // This work is being done - post commit, there is no user 
+            // transaction that depends on the commit being sync'd.  It is safe
+            // to commitNoSync() This do as one of 2 things will happen:
+            //
+            //     1) if any data page associated with this transaction is
+            //        moved from cache to disk, then the transaction log
+            //        must be sync'd to the log record for that change and
+            //        all log records including the commit of this xact must
+            //        be sync'd before returning.
+            //
+            //     2) if the data page is never written then the log record
+            //        for the commit may never be written, and the xact will
+            //        never make to disk.  This is ok as no subsequent action
+            //        depends on this operation being committed.
+            //
+			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+
+			return Serviceable.DONE;
+		}
+	}
+
+	private static int reclaimContainer(BaseDataFileFactory dataFactory,
+										RawTransaction tran,
+										ReclaimSpace work) 
+		 throws StandardException
+	{
+		// when we want to reclaim the whole container, gets an exclusive
+		// XLock on the container, wait for the lock.
+
+		LockingPolicy container_xlock = 
+			tran.newLockingPolicy(LockingPolicy.MODE_CONTAINER,
+								  TransactionController.ISOLATION_SERIALIZABLE, 
+								  true /* stricter OK */ );
+
+		if (SanityManager.DEBUG)
+			SanityManager.ASSERT(container_xlock != null);
+
+		// Try to just get the container thru the transaction.
+		// Need to do this to transition the transaction to active state. 
+		RawContainerHandle containerHdl = tran.openDroppedContainer(
+								work.getContainerId(), 
+								container_xlock);
+
+		// if it can get lock but it is not deleted or has already been
+		// deleted, done work
+		if (containerHdl == null || 
+			containerHdl.getContainerStatus() == RawContainerHandle.NORMAL ||
+			containerHdl.getContainerStatus() == RawContainerHandle.COMMITTED_DROP)
+		{
+			if (containerHdl != null)
+				containerHdl.close();
+			tran.abort();	// release xlock, if any
+
+			if (SanityManager.DEBUG)
+            {
+                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                {
+                    SanityManager.DEBUG(
+                        DaemonService.DaemonTrace, "  aborted " + work);
                 }
             }
-            finally
+		}	
+		else
+		{
+			// we got an xlock on a dropped container.  Must be committed.
+			// Get rid of the container now.
+			ContainerOperation lop = new
+				ContainerOperation(containerHdl, ContainerOperation.REMOVE);
+
+			// mark the container as pre-dirtied so that if a checkpoint
+			// happens after the log record is sent to the log stream, the
+			// cache cleaning will wait for this change.
+			containerHdl.preDirty(true);
+			try
+			{
+				tran.logAndDo(lop);
+			}
+			finally
+			{
+				// in case logAndDo fail, make sure the container is not
+				// stuck in preDirty state.
+				containerHdl.preDirty(false);
+			}
+
+
+			containerHdl.close();
+			tran.commit();
+
+			if (SanityManager.DEBUG)
             {
-                lock_.unlock();
-            }
-        }
-        return cp;
-    }
-
-    public static TcpConnection getConnection(InetAddress from, InetAddress to, Message msg) throws IOException
-    {
-        return getConnectionPool(from, to).getConnection(msg);
-    }
-    
-    private void checkForReservedVerb(String type)
-    {
-    	if ( reservedVerbs_.get(type) != null && verbHandlers_.get(type) != null )
-    	{
-    		throw new IllegalArgumentException( type + " is a reserved verb handler. Scram!");
-    	}
-    }     
-    
-    /**
-     * Register a verb and the corresponding verb handler with the
-     * Messaging Service.
-     * @param type name of the verb.
-     * @param verbHandler handler for the specified verb
-     */
-    public void registerVerbHandlers(String type, IVerbHandler verbHandler)
-    {
-    	checkForReservedVerb(type);
-    	verbHandlers_.put(type, verbHandler);
-    }
-    
-    /**
-     * Deregister all verbhandlers corresponding to localEndPoint.
-     * @param localEndPoint
-     */
-    public void deregisterAllVerbHandlers(InetAddress localEndPoint)
-    {
-        Iterator keys = verbHandlers_.keySet().iterator();
-        String key = null;
-        
-        /*
-         * endpoint specific verbhandlers can be distinguished because
-         * their key's contain the name of the endpoint. 
-         */
-        while(keys.hasNext())
-        {
-            key = (String)keys.next();
-            if (key.contains(localEndPoint.toString()))
-                keys.remove();
-        }
-    }
-    
-    /**
-     * Deregister a verbhandler corresponding to the verb from the
-     * Messaging Service.
-     * @param type name of the verb.
-     */
-    public void deregisterVerbHandlers(String type)
-    {
-        verbHandlers_.remove(type);
-    }
-
-    /**
-     * This method returns the verb handler associated with the registered
-     * verb. If no handler has been registered then null is returned.
-     * @param type for which the verb handler is sought
-     * @return a reference to IVerbHandler which is the handler for the specified verb
-     */
-    public IVerbHandler getVerbHandler(String type)
-    {
-        return verbHandlers_.get(type);
-    }
-
-    /**
-     * Send a message to a given endpoint.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @return an reference to an IAsyncResult which can be queried for the
-     * response
-     */
-    public String sendRR(Message message, InetAddress[] to, IAsyncCallback cb)
-    {
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId);
-        for ( int i = 0; i < to.length; ++i )
-        {
-            sendOneWay(message, to[i]);
-        }
-        return messageId;
-    }
-
-    public void addCallback(IAsyncCallback cb, String messageId)
-    {
-        callbackMap_.put(messageId, cb);
-    }
-
-    /**
-     * Send a message to a given endpoint. This method specifies a callback
-     * which is invoked with the actual response.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occurred to the invoker of the send().
-     *           suggest that a timeout occurred to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message message, InetAddress to, IAsyncCallback cb)
-    {        
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId);
-        sendOneWay(message, to);
-        return messageId;
-    }
-
-    /**
-     * Send a message to a given endpoint. The ith element in the <code>messages</code>
-     * array is sent to the ith element in the <code>to</code> array.This method assumes
-     * there is a one-one mapping between the <code>messages</code> array and
-     * the <code>to</code> array. Otherwise an  IllegalArgumentException will be thrown.
-     * This method also informs the MessagingService to wait for at least
-     * <code>howManyResults</code> responses to determine success of failure.
-     * @param messages messages to be sent.
-     * @param to endpoints to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occured to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message[] messages, InetAddress[] to, IAsyncCallback cb)
-    {
-        if ( messages.length != to.length )
-        {
-            throw new IllegalArgumentException("Number of messages and the number of endpoints need to be same.");
-        }
-        String groupId = GuidGenerator.guid();
-        addCallback(cb, groupId);
-        for ( int i = 0; i < messages.length; ++i )
-        {
-            messages[i].setMessageId(groupId);
-            sendOneWay(messages[i], to[i]);
-        }
-        return groupId;
-    } 
-    
-    /**
-     * Send a message to a given endpoint. This method adheres to the fire and forget
-     * style messaging.
-     * @param message messages to be sent.
-     * @param to endpoint to which the message needs to be sent
-     */
-    public void sendOneWay(Message message, InetAddress to)
-    {
-        // do local deliveries
-        if ( message.getFrom().equals(to) )
-        {
-            MessagingService.receive(message);
-            return;
-        }
-
-        TcpConnection connection = null;
-        try
-        {
-            Message processedMessage = SinkManager.processClientMessageSink(message);
-            if (processedMessage == null)
-            {
-                return;
-            }
-            connection = MessagingService.getConnection(processedMessage.getFrom(), to, message);
-            connection.write(message);
-        }
-        catch (SocketException se)
-        {
-            // Shutting down the entire pool. May be too conservative an approach.
-            MessagingService.getConnectionPool(message.getFrom(), to).shutdown();
-            logger_.error("socket error writing to " + to, se);
-        }
-        catch (IOException e)
-        {
-            if (connection != null)
-            {
-                connection.errorClose();
-            }
-            logger_.error("unexpected error writing " + message, e);
-        }
-        finally
-        {
-            if (connection != null)
-            {
-                connection.close();
-            }
-        }
-    }
-    
-    public IAsyncResult sendRR(Message message, InetAddress to)
-    {
-        IAsyncResult iar = new AsyncResult();
-        taskCompletionMap_.put(message.getMessageId(), iar);
-        sendOneWay(message, to);
-        return iar;
-    }
-    
-    /**
-     * Send a message to a given endpoint. This method adheres to the fire and forget
-     * style messaging.
-     * @param message messages to be sent.
-     * @param to endpoint to which the message needs to be sent
-     */
-    public void sendUdpOneWay(Message message, InetAddress to)
-    {
-        if (message.getFrom().equals(to)) {
-            MessagingService.receive(message);
-            return;
-        }
-        
-        UdpConnection connection = null;
-        try
-        {
-            connection = new UdpConnection(); 
-            connection.init();            
-            connection.write(message, to);            
-        }            
-        catch ( IOException e )
-        {               
-            logger_.warn(LogUtil.throwableToString(e));
-        } 
-        finally
-        {
-            if ( connection != null )
-                connection.close();
-        }
-    }
-    /**
-     * Stream a file from source to destination. This is highly optimized
-     * to not hold any of the contents of the file in memory.
-     * @param file name of file to stream.
-     * @param startPosition position inside the file
-     * @param total number of bytes to stream
-     * @param to endpoint to which we need to stream the file.
-    */
-
-    public void stream(String file, long startPosition, long total, InetAddress from, InetAddress to)
-    {
-        isStreaming_.set(true);
-        /* Streaming asynchronously on streamExector_ threads. */
-        Runnable streamingTask = new FileStreamTask(file, startPosition, total, from, to);
-        streamExecutor_.execute(streamingTask);
-    }
-
-    public static void setStreamingMode(boolean bVal)
-    {
-        isStreaming_.set(bVal);
-    }
-
-    public static void shutdown()
-    {
-        logger_.info("Shutting down ...");
-        synchronized (MessagingService.class)
-        {
-            /* Stop listening on any socket */
-            for (SelectionKey skey : listenSockets_.values())
-            {
-                skey.cancel();
-                try
+                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
                 {
-                    skey.channel().close();
+                    SanityManager.DEBUG(
+                        DaemonService.DaemonTrace, "  committed " + work);
                 }
-                catch (IOException e) {}
             }
-            listenSockets_.clear();
+		}
 
-            /* Shutdown the threads in the EventQueue's */
-            messageDeserializationExecutor_.shutdownNow();
-            messageDeserializerExecutor_.shutdownNow();
-            streamExecutor_.shutdownNow();
+		return Serviceable.DONE;
 
-            StageManager.shutdown();
-            
-            /* shut down the cachetables */
-            taskCompletionMap_.shutdown();
-            callbackMap_.shutdown();
+	}
 
-            /* Interrupt the selector manager thread */
-            SelectorManager.getSelectorManager().interrupt();
 
-            poolTable_.clear();
-            verbHandlers_.clear();
-            bShutdown_ = true;
-        }
-        logger_.info("Shutdown invocation complete.");
-    }
+	/**
+	 *	Open container shared no wait
+	 *
+	 * @param tran   Transaction
+	 * @param rlock  LockingPolicy
+	 * @param containerId container id.
+	 * 
+	 * @return ContainerHandle or null if it could not obtain lock.
+	 * 
+	 * @throws StandardException
+	 */
+	private static ContainerHandle openContainerNW(Transaction tran,
+		LockingPolicy rlock, ContainerKey containerId)
+		throws StandardException
+	{
+		ContainerHandle containerHdl = null;
+		try {
+				containerHdl = tran.openContainer
+				(containerId, rlock,
+						ContainerHandle.MODE_FORUPDATE |
+						ContainerHandle.MODE_LOCK_NOWAIT); 
+		} catch (StandardException se) {
+			// DERBY-4059
+			// if this is a lock timeout just return null.
+			// otherwise throw the exception
+			if (!se.getSQLState().equals(SQLState.LOCK_TIMEOUT)) {
+				throw se;
+			}
+		}
+		return containerHdl;
+	}
 
-    public static void receive(Message message)
-    {        
-        enqueueRunnable(message.getMessageType(), new MessageDeliveryTask(message));
-    }
-
-    private static void enqueueRunnable(String stageName, Runnable runnable){
-        
-        IStage stage = StageManager.getStage(stageName);   
-        
-        if ( stage != null )
-        {
-            stage.execute(runnable);
-        } 
-        else
-        {
-            logger_.warn("Running on default stage - beware");
-            messageDeserializerExecutor_.execute(runnable);
-        }
-    }    
-    
-    public static IAsyncCallback getRegisteredCallback(String key)
-    {
-        return callbackMap_.get(key);
-    }
-    
-    public static void removeRegisteredCallback(String key)
-    {
-        callbackMap_.remove(key);
-    }
-    
-    public static IAsyncResult getAsyncResult(String key)
-    {
-        return taskCompletionMap_.remove(key);
-    }
-
-    public static ExecutorService getReadExecutor()
-    {
-        return messageDeserializationExecutor_;
-    }
-
-    public static ExecutorService getDeserializationExecutor()
-    {
-        return messageDeserializerExecutor_;
-    }
-
-    public static boolean isProtocolValid(byte[] protocol)
-    {
-        return isEqual(protocol_, protocol);
-    }
-    
-    public static boolean isEqual(byte digestA[], byte digestB[])
-    {
-        return MessageDigest.isEqual(digestA, digestB);
-    }
-
-    public static byte[] toByteArray(int i)
-    {
-        byte bytes[] = new byte[4];
-        bytes[0] = (byte)(i >>> 24 & 0xff);
-        bytes[1] = (byte)(i >>> 16 & 0xff);
-        bytes[2] = (byte)(i >>> 8 & 0xff);
-        bytes[3] = (byte)(i & 0xff);
-        return bytes;
-    }
-    
-    public static byte[] toByteArray(short s)
-    {
-        byte bytes[] = new byte[2];
-        bytes[0] = (byte)(s >>> 8 & 0xff);
-        bytes[1] = (byte)(s & 0xff);
-        return bytes;
-    }
-    
-    public static short byteArrayToShort(byte bytes[])
-    {
-        return byteArrayToShort(bytes, 0);
-    }
-    
-    public static short byteArrayToShort(byte bytes[], int offset)
-    {
-        if(bytes.length - offset < 2)
-            throw new IllegalArgumentException("A short must be 2 bytes in size.");
-        short n = 0;
-        for(int i = 0; i < 2; i++)
-        {
-            n <<= 8;
-            n |= bytes[offset + i] & 0xff;
-        }
-
-        return n;
-    }
-
-    public static int getBits(int x, int p, int n)
-    {
-        return x >>> (p + 1) - n & ~(-1 << n);
-    }
-    
-    public static int byteArrayToInt(byte bytes[])
-    {
-        return byteArrayToInt(bytes, 0);
-    }
-
-    public static int byteArrayToInt(byte bytes[], int offset)
-    {
-        if(bytes.length - offset < 4)
-            throw new IllegalArgumentException("An integer must be 4 bytes in size.");
-        int n = 0;
-        for(int i = 0; i < 4; i++)
-        {
-            n <<= 8;
-            n |= bytes[offset + i] & 0xff;
-        }
-
-        return n;
-    }
-    
-    public static ByteBuffer packIt(byte[] bytes, boolean compress, boolean stream)
-    {
-        byte[] size = toByteArray(bytes.length);
-        /* 
-             Setting up the protocol header. This is 4 bytes long
-             represented as an integer. The first 2 bits indicate
-             the serializer type. The 3rd bit indicates if compression
-             is turned on or off. It is turned off by default. The 4th
-             bit indicates if we are in streaming mode. It is turned off
-             by default. The 5th-8th bits are reserved for future use.
-             The next 8 bits indicate a version number. Remaining 15 bits 
-             are not used currently.            
-        */
-        int n = 0;
-        // Setting up the serializer bit
-        n |= serializerType_.ordinal();
-        // set compression bit.
-        if ( compress )
-            n |= 4;
-        
-        // set streaming bit
-        if ( stream )
-            n |= 8;
-        
-        // Setting up the version bit
-        n |= (version_ << 8);               
-        /* Finished the protocol header setup */
-               
-        byte[] header = toByteArray(n);
-        ByteBuffer buffer = ByteBuffer.allocate(16 + header.length + size.length + bytes.length);
-        buffer.put(protocol_);
-        buffer.put(header);
-        buffer.put(size);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-        
-    public static ByteBuffer constructStreamHeader(boolean compress, boolean stream)
-    {
-        /* 
-        Setting up the protocol header. This is 4 bytes long
-        represented as an integer. The first 2 bits indicate
-        the serializer type. The 3rd bit indicates if compression
-        is turned on or off. It is turned off by default. The 4th
-        bit indicates if we are in streaming mode. It is turned off
-        by default. The following 4 bits are reserved for future use. 
-        The next 8 bits indicate a version number. Remaining 15 bits 
-        are not used currently.            
-        */
-        int n = 0;
-        // Setting up the serializer bit
-        n |= serializerType_.ordinal();
-        // set compression bit.
-        if ( compress )
-            n |= 4;
-       
-        // set streaming bit
-        if ( stream )
-            n |= 8;
-       
-        // Setting up the version bit 
-        n |= (version_ << 8);              
-        /* Finished the protocol header setup */
-              
-        byte[] header = toByteArray(n);
-        ByteBuffer buffer = ByteBuffer.allocate(16 + header.length);
-        buffer.put(protocol_);
-        buffer.put(header);
-        buffer.flip();
-        return buffer;
-    }
 }
