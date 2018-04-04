@@ -135,8 +135,8 @@ def printStatistics(verbose):
     global total_files, score, correct_files, all_predictions, k
     print("Total files: " + str(total_files))
     print("Average line error: " + str(sum(score.values())/(total_files*1.0)) + " (the lower, the better)")
-    print("Top 1 accuracy: " + str(correct_files_top1/(total_files*1.0)) + " (the higher, the better)")
-    print("Top " + str(k) + " accuracy: " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
+    print("Recall@1: " + str(correct_files_top1/(total_files*1.0)) + " (the higher, the better)")
+    print("Recall@" + str(k) + ": " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
 
 def main():
     global total_files, score, correct_files, all_predictions, k

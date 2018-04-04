@@ -127,10 +127,10 @@ your-program Files | python evaluate.py
 
 The output of `evaluate.py` will be:
 ```
-Total files: 2760
-Average error: 0.960075351257 (the lower, the better)
-Top 1 accuracy: 0.0187232372644 (the higher, the better)
-Top 5 accuracy: 0.0246376811594 (the higher, the better)
+Total files: 15562
+Average line error: 0.944349890554 (the lower, the better)
+Recall@1: 0.00777535021206 (the higher, the better)
+Recall@5: 0.0377200873924 (the higher, the better)
 ```
 
 For evaluating specific datasets, use [-d] or [-datasets=] options and specify paths to datasets. The default behaviour is evaluating on all datasets. The path must be absolute path and multiple paths should be separated by `:`, for example:
@@ -141,7 +141,7 @@ your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Dat
 Explanation of the output of `evaluate.py`:
 * `Total files`: Number of prediction tasks in datasets
 * `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition.
-* `Top k accuracy`: The percentage of correct answers in your top k predictions. As such, `Top 1 accuracy` is the percentage of perfect predictions in your top-1 prediction. We give the accuracy because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
+* `Recall@k`: The percentage of predictions where the correct answer is in your top k predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
 
 ## Loss function
 
@@ -156,9 +156,9 @@ This loss function is designed with the following properties in mind:
 * A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
 * The loss is symmetric, continuous and differentiable (except at 0)
 
-We note that the `Top k accuracy` does not comply with all those properties.
+We note that the `recall@k` does not comply with all those properties.
 
-## Base line systems
+## Base line systems f
 
 We provide 5 dumb systems for illustrating how to parse the data and having a baseline performance. These are:
 * `guessFirst.py`: Always predict the first line of the file
