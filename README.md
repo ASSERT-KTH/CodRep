@@ -147,7 +147,7 @@ Explanation of the output of `evaluate.py`:
 
 The average error is a loss function, output by `evaluate.py`, it measures how well your program performs on predicting the lines to be replaced. The lower the average line  is, the better are your predictions.
 
-The loss function for one prediction task is `tanh(abs({predicted line}-{correct line}))`. The average error is the loss function over all tasks, as calculated as the average of all individual loss.
+The loss function for one prediction task is `tanh(abs({predicted line}-{correct line}))`. When your algorithm outputs several predictions, the one with the minimal loss will be considered. The average line error is the loss function over all tasks, as calculated as the average of all individual loss.
 
 This loss function is designed with the following properties in mind:
 * There is 0 loss when the prediction is perfect
