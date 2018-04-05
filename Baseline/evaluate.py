@@ -158,19 +158,23 @@ def main():
             print("-d or --datasets= to evaluate on chosen datasets, must be absolute path, multiple paths should be seperated with ':'. Default is evaluating on all datasets")
             sys.exit()
 
+    # Count total number of tasks, default is all tasks in Datasets/
     total_files = countTasks(chosen_datasets)
+    # Deafault score of 1 for each tasks, which is maximal loss
     score = initScore(chosen_datasets)
 
     for args in sys.stdin:
         inputs = args.split()
         path_to_task = inputs[0]
         answers = inputs[1:]
+        # Stored for later use, maybe in verbose mode?
         all_predictions[path_to_task] = answers
         try:
             answers = answers = [int(answer) for answer in answers]
         except ValueError:
             print(answers + " should be integers!")
             raise
+        # Use the maximal number of predictions to calculate Recall@k
         if(len(answers) > k):
             k = len(answers)
         checkAnswers(answers, path_to_task, chosen_datasets)
