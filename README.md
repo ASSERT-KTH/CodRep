@@ -26,11 +26,13 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 
 Hall of fame:
 
-| Data | Name | Score Visible | Score Hidden | Link |
+| Data | Name | Score Dataset1 | Score Dataset2 | Link |
 | --- | --- |--- | --- |--- |
 | ... | ... | ... | ... |--- |
 
-The scores are computed on the dataset present in this repository, as well as on an hidden dataset. The score on the hidden dataset is used for the final ranking.
+The scores are computed on the dataset present in this repository. 
+We also have a hidden dataset, which is not present in this repository. 
+It will be taken into account for the final ranking in order to control overfitting.
 
 What the participants get?
 
