@@ -39,9 +39,9 @@ What the participants get?
 
 What the winner gets?
 
-1. She gets the ultimate CodRep fame
-2. She receives nice KTH goodies by post
-4. Her solution is invited to be part of the futuristic program repair bot designed and implemented at KTH
+1. The ultimate CodRep fame
+1. Nice KTH goodies by post
+1. The solution is invited to be a part of the futuristic program repair bot designed and implemented at KTH
 
 
 ## Data Structure and Format
