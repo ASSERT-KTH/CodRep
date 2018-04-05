@@ -35,7 +35,7 @@ The scores are computed on the dataset present in this repository, as well as on
 What the participants get?
 
 1. All participants get their name in the CodRep hall of fame
-1. All participants will be invited to present their solutions at a physical workshop with proceedings.
+1. All participants will be invited to present their solutions at a physical workshop with proceedings
 
 What the winner gets?
 
@@ -140,8 +140,8 @@ your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Dat
 
 Explanation of the output of `evaluate.py`:
 * `Total files`: Number of prediction tasks in datasets
-* `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition.
-* `Recall@k`: The percentage of predictions where the correct answer is in your top k predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below).
+* `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition
+* `Recall@k`: The percentage of predictions where the correct answer is in your top k predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below)
 
 ## Loss function
 
@@ -153,7 +153,7 @@ This loss function is designed with the following properties in mind:
 * There is 0 loss when the prediction is perfect
 * There is a bounded and constant loss even when the prediction is far away
 * Before the bound, the loss is logarithmic
-* A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations).
+* A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations)
 * The loss is symmetric, continuous and differentiable (except at 0)
 
 We note that the `recall@k` does not comply with all those properties.
