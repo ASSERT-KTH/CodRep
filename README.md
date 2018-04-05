@@ -12,9 +12,9 @@ In particular, we consider replacement insertions, where the new line replaces a
 
 ```diff
 public class test{
-  int a = 1
--  int b = 0.1
-+  double b = 0.1
+  int a = 1;
+-  int b = 0.1;
++  double b = 0.1;
 }
 ```
 
@@ -58,8 +58,8 @@ For instance, let's consider this example input file, called `foo.txt`.
 double b = 0.1
 
 public class test{
-  int a = 1
-  int b = 0.1
+  int a = 1;
+  int b = 0.1;
 }
 ```
 In this example, `double b = 0.1` is the code line to be added somewhere in the file in place of another line.
