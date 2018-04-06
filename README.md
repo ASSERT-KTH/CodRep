@@ -22,6 +22,12 @@ More specifically, the program  takes as input a set of pairs (source code line,
 
 The competition is organized by KTH Royal Institute of Technology, Stockholm, Sweden. The current organization team is Zimin Chen and Martin Monperrus.
 
+## How to participate?
+
+To participate to the competition, open an issue on this repository. The issue should contain: 1) the team name 2) a URL to the tool and 3) the score on Dataset1 and Dataset2.
+
+The deadline for participating is July 14th, 11:59pm AoE.
+
 ## The winners
 
 Hall of fame:
