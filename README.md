@@ -24,9 +24,14 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 
 ## How to participate?
 
-To participate to the competition, open an issue on this repository. The issue should contain: 1) the team name 2) a URL to the tool and 3) the score on Dataset1 and Dataset2.
+To be informed about news, intermediate rankings and final results, register to the CodRep mailing list: 
+[codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
-The deadline for participating is July 14th, 11:59pm AoE.
+To tell the world that you want to win CodRep, open an issue on this repository.
+
+To officialy participate to the competition, update your issue so that it contains: 1) the team name for the leaderboard 2) a URL to the tool and 3) the claimed score on Dataset1 and Dataset2.
+
+The deadline for participating is July 14th 2018, 11:59pm AoE.
 
 ## The winners
 
