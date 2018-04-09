@@ -16,7 +16,7 @@ def main():
                     with open(path_to_task, 'r') as file:
                         length = len(file.readlines())-2
                         #Alwasy guess the line in the middle
-                        print(path_to_task + " " + str(length/2))
+                        print(path_to_task + " " + str(length // 2))
 
 if __name__=="__main__":
     main()
