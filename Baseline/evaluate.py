@@ -10,12 +10,8 @@ total_files = 0
 score = {}
 # Number of correct predictions
 correct_files = 0
-# Number of correct predictions in your top-1 predictions
-correct_files_top1 = 0
 # All prediction outputs by your algorithm
 all_predictions = {}
-# Maximum number of preditions received
-k = 0
 
 # When prediction is out of range
 class LineOutOfRangeException(Exception):
@@ -25,9 +21,13 @@ class LineOutOfRangeException(Exception):
 class DatasetsNotChosenException(Exception):
     pass
 
-def lossFunction(guess, solution):
+# When predicting the same file twice
+class MultiplePredictionsFoundException(Exception):
+    pass
+
+def lossFunction(prediction, solution):
     # Loss function, more information in README
-    return math.tanh(abs(solution-guess))
+    return math.tanh(abs(solution-prediction))
 
 # Count files
 def countTasks(chosen_datasets):
@@ -78,14 +78,15 @@ def initScore(chosen_datasets):
     return score
 
 # Check the answers against the solution
-def checkAnswers(answers, path_to_task, chosen_datasets):
-    global score, correct_files, correct_files_top1
+def checkAnswers(prediction, path_to_task, chosen_datasets):
+    global score, correct_files
 
     try:
         task = open(path_to_task, "r")
     except IOError:
         print(path_to_task + " does not exist!")
         raise
+
     # If task exists, then solution should also exists
     solution = open(path_to_task.replace("Tasks", "Solutions"), "r")
 
@@ -101,46 +102,43 @@ def checkAnswers(answers, path_to_task, chosen_datasets):
         if(not isInChosenDatasets):
             raise DatasetsNotChosenException(path_to_task + " is outside of chosen datasets.")
 
-    # Check if answers are in range
-    for answer in answers:
-        if(answer < 1 or answer > source_program_length):
-            raise LineOutOfRangeException("Line number out of range for file " + path_to_task + "." +
-            " Expected: 1<={line}<=" + str(source_program_length) + ", found: " + answer)
+    # Check if the predition is in range
+    if(prediction < 1 or prediction > source_program_length):
+        raise LineOutOfRangeException("Line number out of range for file " + path_to_task + "." +
+        " Expected: 1<={line number}<=" + str(source_program_length) + ", found: " + str(prediction))
+
+    # Check if the file is already predicted
+    if(path_to_task in all_predictions):
+        raise MultiplePredictionsFoundException("Multiple predictions to " + path_to_task + "")
+
+    # Stored for later use, maybe in verbose mode?
+    all_predictions[path_to_task] = prediction
 
     # Read the solution
     sol = int(solution.readline())
 
-    # Use minimum loss among all answers to calculate loss
-    min_loss = float('Inf')
-    for answer in answers:
-        # Correct answer should have minimum loss, therefore we can break
-        if(lossFunction(answer, sol) < min_loss):
-            min_loss = lossFunction(answer, sol)
-        if(sol == answer):
-            correct_files+=1
-            break
+    # Check the prediction
+    if(sol == prediction):
+        correct_files += 1
 
-    # Number of prefect prediction in your top-1 prediction
-    if(sol == answers[0]):
-        correct_files_top1+=1
-
-    # Update the new score
-    score[path_to_task]=min_loss
+    # Calculate the loss and update the score
+    loss = lossFunction(prediction, sol)
+    score[path_to_task] = loss
 
     task.close()
     solution.close()
 
 # Print neccesary statistics
 def printStatistics(verbose):
-    global total_files, score, correct_files, all_predictions, k
+    global total_files, score, correct_files
     print("Total files: " + str(total_files))
     print("Average line error: " + str(sum(score.values())/(total_files*1.0)) + " (the lower, the better)")
-    print("Recall@1: " + str(correct_files_top1/(total_files*1.0)) + " (the higher, the better)")
-    print("Recall@" + str(k) + ": " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
+    print("Recall@1: " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
 
 def main():
-    global total_files, score, correct_files, all_predictions, k
+    global total_files, score
 
+    # Parse the options
     verbose = False #TODO, verbose mode?
     chosen_datasets = None
     try:
@@ -163,22 +161,22 @@ def main():
     # Deafault score of 1 for each tasks, which is maximal loss
     score = initScore(chosen_datasets)
 
+    # Reading each predition
     for args in sys.stdin:
         inputs = args.split()
         path_to_task = inputs[0]
-        answers = inputs[1:]
-        # Stored for later use, maybe in verbose mode?
-        all_predictions[path_to_task] = answers
-        try:
-            answers = answers = [int(answer) for answer in answers]
-        except ValueError:
-            print(answers + " should be integers!")
-            raise
-        # Use the maximal number of predictions to calculate Recall@k
-        if(len(answers) > k):
-            k = len(answers)
-        checkAnswers(answers, path_to_task, chosen_datasets)
+        prediction = inputs[1]
 
+        try:
+            prediction = int(prediction)
+        except ValueError:
+            print(prediction + " should be integers!")
+            raise
+
+        # Check the prediction
+        checkAnswers(prediction, path_to_task, chosen_datasets)
+
+    # Print statistics about your algorithm
     printStatistics(verbose)
 
 if __name__=="__main__":
