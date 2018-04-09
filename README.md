@@ -24,7 +24,7 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 
 ## How to participate?
 
-To be informed about news, intermediate rankings and final results, register to the CodRep mailing list: 
+To be informed about news, intermediate rankings and final results, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
 To tell the world that you want to win CodRep, open an issue on this repository.
@@ -41,8 +41,8 @@ Hall of fame:
 | --- | --- |--- | --- |--- |
 | ... | ... | ... | ... |--- |
 
-The scores are computed on the dataset present in this repository. 
-We also have a hidden dataset, which is not present in this repository. 
+The scores are computed on the dataset present in this repository.
+We also have a hidden dataset, which is not present in this repository.
 It will be taken into account for the final ranking in order to control overfitting.
 
 What the participants get?
@@ -68,16 +68,16 @@ The provided data are in `Datasets/.../Tasks/*.txt`. The txt files are meant to 
 
 For instance, let's consider this example input file, called `foo.txt`.
 ```java
-double b = 0.1
+double b = 0.1;
 
 public class test{
   int a = 1;
   int b = 0.1;
 }
 ```
-In this example, `double b = 0.1` is the code line to be added somewhere in the file in place of another line.
+In this example, `double b = 0.1;` is the code line to be added somewhere in the file in place of another line.
 
-For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1`) with the new code line `double b = 0.1`.
+For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1;`) with the new code line `double b = 0.1;`.
 
 To train the system, the correct answer for all input files is given in folder `Datasets/.../Solutions/*.txt`,  e.g. the correct answer to `Datasets/Datasets1/Tasks/1.txt` is in `Datasets/Datasets1/Solutions/1.txt`
 
@@ -115,19 +115,21 @@ To play in the competition, your program takes as input input a folder name, tha
 $ your-predictor Files
 ```
 
-Your programs outputs on the console, for each input data file, the predicted line numbers. Several line numbers can be predicted if the tool is not 100% sure of a single prediction. Warning: by convention, line numbers start from 1 (and not 0).
+Your programs outputs on the console, for each input data file, the predicted line number. Warning: by convention, line numbers start from 1 (and not 0).
 Your program does not have to predict something for all input files, if there is no clear answer, simply don't output anything, the error computation takes that into account, more information about this in **Loss function** below.
 
 ```
 <Path1> <line numer>
-<Path2> <line numer> <line numer>
+<Path2> <line numer>
 <Path3> <line numer>
+...
 ```
 
 E.g.;
 ```
 /Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/1.txt 42
-/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/2.txt 78 526
+/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/2.txt 78
+/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/2.txt 30
 ...
 ```
 
@@ -140,10 +142,9 @@ your-program Files | python evaluate.py
 
 The output of `evaluate.py` will be:
 ```
-Total files: 15562
-Average line error: 0.944349890554 (the lower, the better)
-Recall@1: 0.00777535021206 (the higher, the better)
-Recall@5: 0.0377200873924 (the higher, the better)
+Total files: 15463
+Average line error: 0.988357635773 (the lower, the better)
+Recall@1: 0.00750177843885 (the higher, the better)
 ```
 
 For evaluating specific datasets, use [-d] or [-datasets=] options and specify paths to datasets. The default behaviour is evaluating on all datasets. The path must be absolute path and multiple paths should be separated by `:`, for example:
@@ -154,13 +155,13 @@ your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Dat
 Explanation of the output of `evaluate.py`:
 * `Total files`: Number of prediction tasks in datasets
 * `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition
-* `Recall@k`: The percentage of predictions where the correct answer is in your top k predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below)
+* `Recall@1`: The percentage of predictions where the correct answer is in your top 1 predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below)
 
 ## Loss function
 
 The average error is a loss function, output by `evaluate.py`, it measures how well your program performs on predicting the lines to be replaced. The lower the average line  is, the better are your predictions.
 
-The loss function for one prediction task is `tanh(abs({correct line}-{predicted line}))`. When your algorithm outputs several predictions, the one with the minimal loss will be considered. The average line error is the loss function over all tasks, as calculated as the average of all individual loss.
+The loss function for one prediction task is `tanh(abs({correct line}-{predicted line}))`. The average line error is the loss function over all tasks, as calculated as the average of all individual loss.
 
 This loss function is designed with the following properties in mind:
 * There is 0 loss when the prediction is perfect
@@ -169,7 +170,7 @@ This loss function is designed with the following properties in mind:
 * A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations)
 * The loss is symmetric, continuous and differentiable (except at 0)
 
-We note that the `recall@k` does not comply with all those properties.
+We note that the `recall@1` does not comply with all those properties.
 
 ## Base line systems
 
