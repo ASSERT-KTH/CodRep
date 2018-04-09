@@ -20,17 +20,30 @@ public class test{
 
 More specifically, the program  takes as input a set of pairs (source code line, source code file), and outputs, for each pair,  the predicted line number of the line to be replaced by in the initial source code file.
 
-The competition is organized by KTH Royal Institute of Technology, Stockholm, Sweden. The current organization team is Zimin Chen and Martin Monperrus.
+The competition is organized by KTH Royal Institute of Technology, Stockholm, Sweden. The organization team is [Zimin Chen](https://www.kth.se/profile/zimin) and [Martin Monperrus](http://www.monperrus.net/martin/).
+
+## How to participate?
+
+To be informed about news, intermediate rankings and final results, register to the CodRep mailing list: 
+[codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
+
+To tell the world that you want to win CodRep, open an issue on this repository.
+
+To officialy participate to the competition, update your issue so that it contains: 1) the team name for the leaderboard 2) a URL to the tool and 3) the claimed score on Dataset1 and Dataset2.
+
+The deadline for participating is July 14th 2018, 11:59pm AoE.
 
 ## The winners
 
 Hall of fame:
 
-| Data | Name | Score Visible | Score Hidden | Link |
+| Data | Name | Score Dataset1 | Score Dataset2 | Link |
 | --- | --- |--- | --- |--- |
 | ... | ... | ... | ... |--- |
 
-The scores are computed on the dataset present in this repository, as well as on an hidden dataset. The score on the hidden dataset is used for the final ranking.
+The scores are computed on the dataset present in this repository. 
+We also have a hidden dataset, which is not present in this repository. 
+It will be taken into account for the final ranking in order to control overfitting.
 
 What the participants get?
 
