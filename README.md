@@ -182,3 +182,7 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 * `maximumError.py`: Predict the worst case, the farthest line from the correct solution
 
 Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, the value of `average error` are comparable.
+
+## Acknowledgment
+
+[comment]: # (TODO, add contributors)
