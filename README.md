@@ -27,7 +27,7 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 To be informed about news, intermediate rankings and final results, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
-To officially participate to the competition, send us an e-mail so that it contains: 1) the team name for the leaderboard 2) a copy of the tool (the program and instruction on how we should run it) 3) the claimed score on Dataset1 and Dataset2.
+To officially participate to the competition, send us an e-mail [codrep.competition@gmail.com](mailto:codrep.competition@gmail.com) so that it contains: 1) the team name for the leaderboard 2) a copy of the tool (the program and instruction on how we should run it) 3) the claimed score on Dataset1 and Dataset2.
 
 The deadline for participating is July 14th 2018, 11:59pm AoE.
 
