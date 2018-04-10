@@ -27,7 +27,7 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 To be informed about news, intermediate rankings and final results, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
-To officially participate to the competition, send us an e-mail so that it contains: 1) the team name for the leaderboard 2) a copy of the tool (the tool and instruction on how we should run it) 3) the claimed score on Dataset1 and Dataset2.
+To officially participate to the competition, send us an e-mail so that it contains: 1) the team name for the leaderboard 2) a copy of the tool (the program and instruction on how we should run it) 3) the claimed score on Dataset1 and Dataset2.
 
 The deadline for participating is July 14th 2018, 11:59pm AoE.
 
@@ -39,9 +39,9 @@ Hall of fame:
 | --- | --- |--- | --- |--- |
 | ... | ... | ... | ... |--- |
 
-The scores are computed on the dataset present in this repository.
-We also have a hidden dataset, which is not present in this repository.
-It will be taken into account for the final ranking in order to control overfitting.
+Intermediate ranking are computed on the datasets present in this repository. However, we also have hidden datasets, which is not present in this repository. The final ranking will be based on evaluation of the hidden datasets. The hidden datasets will be published after the deadline of the competition. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand.
+
+The winner's tool will be published after the deadline.
 
 What the participants get?
 
