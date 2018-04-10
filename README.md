@@ -129,7 +129,7 @@ E.g.;
 ```
 /Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/1.txt 42
 /Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/2.txt 78
-/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/2.txt 30
+/Users/foo/bar/CodRep-competition/Datasets/Dataset1/Tasks/3.txt 30
 ...
 ```
 
