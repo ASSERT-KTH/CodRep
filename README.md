@@ -83,11 +83,12 @@ To train the system, the correct answer for all input files is given in folder `
 
 The data used in the competition is taken from real commits in open-source projects.
 For a number of different projects, we have analyzed all commits and extracted all the one line replacement changes.
-We have further filtered the data  based on the following criteria:
+We have further filtered the data  based on the following criteria (best effort):
 
 * Only source code files are kept (Java files in dataset00)
 * Comment-only changes are discarded (e.g. replacing `// TODO` with `// Fixed`)
 * Inserted or removed lines are not empty lines, and are not space-only changes
+* Only one replaced code line in the whole file
 
 The datasets used in this competition are from:
 
