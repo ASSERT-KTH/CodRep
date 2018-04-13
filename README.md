@@ -38,15 +38,15 @@ Important dates:
 * Final submission deadline: Oct. 4th 2018.
 * Announcement of the final ranking & end of the competition Oct 14th 2018.
 
-## The winners
+## The winners and rankings
 
 Hall of fame:
 
-| Data | Name | Score Dataset1 | Score Dataset2 | Link |
-| --- | --- |--- | --- |--- |
-| ... | ... | ... | ... |--- |
+| Team name | Institution/Company | Team members | Score |
+| --- | --- | --- | --- |
+| ... | ... | ... | ... |
 
-Intermediate ranking are computed on the datasets present in this repository. However, we also have hidden datasets, which is not present in this repository. The final ranking will be based on evaluation of the hidden datasets. The hidden datasets will be published after the deadline of the competition. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand.
+The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of datasets in this competition. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. To give participants an intuition about of their performance compared with others, there will be a weekly updated ranking based on the score from datasets in this competition. The intermediate and final ranking could be very different from the weekly ranking, since the weekly ranking is more likely to overfit the datasets.
 
 The winner's tool will be published after the deadline.
 
@@ -188,7 +188,7 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 * `randomGuess.py`: Predict a random line in the file
 * `maximumError.py`: Predict the worst case, the farthest line from the correct solution
 
-Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, the value of `average error` are comparable.
+Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, therefore the value of `average error` are comparable.
 
 ## Acknowledgment
 
