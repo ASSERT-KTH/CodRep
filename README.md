@@ -59,7 +59,8 @@ What the winner gets?
 
 1. The ultimate CodRep fame
 1. Nice KTH goodies by post
-1. The solution is invited to be a part of the futuristic program repair bot designed and implemented at KTH
+1. To be invited to take part to the design of a futuristic program repair bot in a research group
+1. An official KTH certificate
 
 
 ## Data Structure and Format
