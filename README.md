@@ -5,7 +5,7 @@ The goal of the competition is provide different communities (machine learning, 
 The competition is designed with the following principles:
 
 1. There is no specific background or skill requirements on program analysis to understand the data.
-2. The systems that use the competition data can be used beyond the competition itself. In particular, there potential usages in the field of automated program repair.   
+2. The systems that use the competition data can be used beyond the competition itself. In particular, there are potential usages in the field of automated program repair.   
 
 To take part to the competition, you have to write a program which predicts where to insert a specific line into a source code file.
 In particular, we consider replacement insertions, where the new line replaces an old line, such as
