@@ -63,6 +63,15 @@ What the winner gets?
 1. An official KTH certificate
 
 
+## Weekly rankings
+Weekly rankings are computed based on datasets in this repo.
+
+Week 1 of CodRep-competition (2018-04-14 to 2018-04-21)
+
+| Team name | Institution/Company | Team members | Score |
+| --- | --- | --- | --- |
+| ... | ... | ... | ... |
+
 ## Data Structure and Format
 
 The provided data are in `Datasets/.../Tasks/*.txt`. The txt files are meant to be parsed by competing programs. Their format is as follows, each file contains:
