@@ -38,13 +38,22 @@ Important dates:
 * Final submission deadline: Oct. 4th 2018.
 * Announcement of the final ranking & end of the competition Oct 14th 2018.
 
+## Weekly rankings
+Weekly rankings are computed based on datasets in this repo.
+
+Week 2 of CodRep-competition (2018-04-21 to 2018-04-28)
+
+| # | Team name | Institution/Company | Team members | Score |
+| --- | --- | --- | --- | --- |
+| ... | ... | ... | ... | ... |
+
 ## The winners and rankings
 
 Hall of fame:
 
-| Team name | Institution/Company | Team members | Score |
-| --- | --- | --- | --- |
-| ... | ... | ... | ... |
+| # | Team name | Institution/Company | Team members | Score |
+| --- | --- | --- | --- | --- |
+| ... | ... | ... | ... | ... |
 
 The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of datasets in this competition. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. To give participants an intuition about of their performance compared with others, there will be a weekly updated ranking based on the score from datasets in this competition. The intermediate and final ranking could be very different from the weekly ranking, since the weekly ranking is more likely to overfit the datasets.
 
@@ -61,16 +70,6 @@ What the winner gets?
 1. Nice KTH goodies by post
 1. To be invited to take part to the design of a futuristic program repair bot in a research group
 1. An official KTH certificate
-
-
-## Weekly rankings
-Weekly rankings are computed based on datasets in this repo.
-
-Week 1 of CodRep-competition (2018-04-14 to 2018-04-21)
-
-| Team name | Institution/Company | Team members | Score |
-| --- | --- | --- | --- |
-| ... | ... | ... | ... |
 
 ## Data Structure and Format
 
