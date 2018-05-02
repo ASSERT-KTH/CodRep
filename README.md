@@ -41,7 +41,7 @@ Important dates:
 ## Weekly rankings
 Weekly rankings are computed based on datasets in this repo.
 
-Week 2 of CodRep-competition (2018-04-21 to 2018-04-28)
+Week 3 of CodRep-competition (2018-04-28 to 2018-05-05)
 
 | # | Team name | Institution/Company | Team members | Score |
 | --- | --- | --- | --- | --- |
