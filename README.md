@@ -43,9 +43,9 @@ Weekly rankings are computed based on datasets in this repo.
 
 Week 3 of CodRep-competition (2018-04-28 to 2018-05-05)
 
-| # | Team name | Institution/Company | Team members | Score |
-| --- | --- | --- | --- | --- |
-| ... | ... | ... | ... | ... |
+| # | Team name | Institution/Company | Team members | Score on dataset1 | Score on dataset2 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Thomas Durieux | INRIA | Thomas Durieux | 0.1143165305556653 | 0.08536293667171425 |
 
 ## The winners and rankings
 
@@ -184,6 +184,7 @@ This loss function is designed with the following properties in mind:
 * Before the bound, the loss is logarithmic
 * A perfect prediction is better, but only a small penalty is given to  almost-perfect ones. (in our context, some code line replacement are indeed insensitive to the exact insertion locations)
 * The loss is symmetric, continuous and differentiable (except at 0)
+* Easy to understand and to compute
 
 We note that the `recall@1` does not comply with all those properties.
 
