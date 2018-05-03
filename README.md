@@ -119,7 +119,7 @@ The datasets used in this competition are from:
 
 | Directory | Total source code files | Lines of code (LOC) |
 | --- | --- |--- |
-| Dataset1/ | 4394 | 2291014 |
+| Dataset1/ | 4394 | 2291002 |
 | Dataset2/ | 11069 | 5530782 |
 
 ## Command-line interface
