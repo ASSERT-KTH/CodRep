@@ -170,7 +170,7 @@ your-program Files | python evaluate.py -d /Users/foo/bar/CodRep-competition/Dat
 Explanation of the output of `evaluate.py`:
 * `Total files`: Number of prediction tasks in datasets
 * `Average error`: A measurement of the errors of your prediction, as defined in **Loss function** below. This is the only measure used to win the competition
-* `Recall@1`: The percentage of predictions where the correct answer is in your top 1 predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in `Loss function` below)
+* `Recall@1`: The percentage of predictions where the correct answer is in your top 1 predictions. As such, `Recall@1` is the percentage of perfect predictions. We give the recall because it is easily understandable, however, it is not suitable for the competition itself, because it does not has the right properties (explained in **Loss function** below)
 
 ## Loss function
 
@@ -186,7 +186,7 @@ This loss function is designed with the following properties in mind:
 * The loss is symmetric, continuous and differentiable (except at 0)
 * Easy to understand and to compute
 
-We note that the `recall@1` does not comply with all those properties.
+We note that the `Recall@1` does not comply with all those properties.
 
 ## Base line systems
 
@@ -197,7 +197,7 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 * `randomGuess.py`: Predict a random line in the file
 * `maximumError.py`: Predict the worst case, the farthest line from the correct solution
 
-Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, therefore the value of `average error` are comparable.
+Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, therefore the value of `Average line error` are comparable.
 
 ## Acknowledgment
 
