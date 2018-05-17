@@ -38,15 +38,15 @@ Important dates:
 * Final submission deadline: Oct. 4th 2018.
 * Announcement of the final ranking & end of the competition Oct 14th 2018.
 
-## Weekly rankings
-Weekly rankings are computed based on datasets in this repo.
+## Informal rankings
 
-Week 4 of CodRep-competition (2018-05-05 to 2018-05-12)
+(based on dataset1)
 
-| # | Team name | Institution/Company | Team members | Score on dataset1 | Score on dataset2 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | Thomas Durieux | INRIA | Thomas Durieux | 0.1143165305556653 | 0.08536293667171425 |
-| 2 | Egor Bogomolov | Saint Petersburg Academic University | Egor Bogomolov | 0.164 | 0.1235 
+| # | Team name | Page | Score on dataset1 | Score on dataset2 |
+| --- | --- | --- | --- | --- |
+| 1 | Thomas Durieux | [#16](https://github.com/KTH/CodRep-competition/issues/16) | 0.136 | 0.103 |
+| 2 | Egor Bogomolov | [#11](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 |
+| 2 |source{d} | [#16](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 |
 
 ## The winners and rankings
 
