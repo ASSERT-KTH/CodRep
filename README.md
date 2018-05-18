@@ -30,6 +30,16 @@ To participate to the competition, simply send an email to [codrep@googlegroups.
 To be informed about news, intermediate rankings and final results, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
+Registered participants:
+
+1. [Saint Petersburg Academic University](https://github.com/KTH/CodRep-competition/issues/11)
+1. [Microsoft Research](https://github.com/KTH/CodRep-competition/issues/14)
+1. [The University of Edinburgh](https://github.com/KTH/CodRep-competition/issues/15)
+1. [Inria](https://github.com/KTH/CodRep-competition/issues/16)
+1. [Siemens Technology and Services Private Limited](https://github.com/KTH/CodRep-competition/issues/17)
+1. [source{d}](https://github.com/KTH/CodRep-competition/issues/18)
+1. [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20)
+
 Important dates:
 
 * Official competition start: April 14th 2018.
