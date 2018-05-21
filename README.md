@@ -35,6 +35,7 @@ Registered participants:
 1. [Saint Petersburg Academic University](https://github.com/KTH/CodRep-competition/issues/11)
 1. [Microsoft Research](https://github.com/KTH/CodRep-competition/issues/14)
 1. [The University of Edinburgh](https://github.com/KTH/CodRep-competition/issues/15)
+1. [Inria](https://github.com/KTH/CodRep-competition/issues/16)
 1. [Siemens Technology and Services Private Limited](https://github.com/KTH/CodRep-competition/issues/17)
 1. [source{d}](https://github.com/KTH/CodRep-competition/issues/18)
 1. [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20)
@@ -51,10 +52,11 @@ Important dates:
 
 (based on dataset1)
 
-| # | Team name | Score on dataset1 | Score on dataset2 |
-| --- | --- | --- | --- |
-| 2 | [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 |
-| 2 | [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 |
+| Team name | Score on dataset1 | Score on dataset2 |
+| --- | --- | --- |
+| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 |
+| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 |
+| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 |
 
 ## The winners and rankings
 
