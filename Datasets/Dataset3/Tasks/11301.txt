@@ -1,0 +1,74 @@
+Collection<Cache> getCaches();
+
+/*
+ * Copyright 2010-2011 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.cache.interceptor;
+
+import java.lang.reflect.Method;
+import java.util.Collection;
+
+import org.springframework.cache.Cache;
+
+/**
+ * Interface describing the root object used during the expression evaluation.
+ * 
+ * @author Costin Leau
+ */
+interface CacheExpressionRootObject {
+
+	/**
+	 * Returns the name of the method being cached.
+	 * 
+	 * @return name of the cached method.
+	 */
+	String getMethodName();
+
+	/**
+	 * Returns the method being cached.
+	 * 
+	 * @return method being cached
+	 */
+	Method getMethod();
+
+	/**
+	 * Returns the parameters for this invocation.
+	 * 
+	 * @return params for this invocation.
+	 */
+	Object[] getParams();
+
+	/**
+	 * Returns the target instance being cached.
+	 * 
+	 * @return target instance
+	 */
+	Object getTarget();
+
+	/**
+	 * Returns the target class.
+	 * 
+	 * @return target class
+	 */
+	Class<?> getTargetClass();
+
+	/**
+	 * Returns the caches against which the method is executed.
+	 * 
+	 * @return current cache
+	 */
+	Collection<Cache<?,?>> getCaches();
+}

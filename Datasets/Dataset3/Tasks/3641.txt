@@ -1,0 +1,80 @@
+throw new UnsupportedOperationException("@Value is never required: " + parameter.getMethod());
+
+/*
+ * Copyright 2002-2011 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.web.method.annotation.support;
+
+import javax.servlet.ServletException;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.config.ConfigurableBeanFactory;
+import org.springframework.core.MethodParameter;
+import org.springframework.web.bind.WebDataBinder;
+import org.springframework.web.context.request.NativeWebRequest;
+
+/**
+ * Resolves method arguments annotated with @{@link Value}.
+ * 
+ * <p>An @{@link Value} is a named value that does not have a name but gets resolved from a default value string 
+ * that may contain ${...} placeholder or Spring Expression Language #{...} expressions. See the base class 
+ * {@link AbstractNamedValueMethodArgumentResolver} for more information on how named values are processed.
+ * 
+ * <p>A {@link WebDataBinder} is invoked to apply type conversion to resolved argument values that don't yet match 
+ * the method parameter type.
+ * 
+ * @author Rossen Stoyanchev
+ * @since 3.1
+ */
+public class ExpressionValueMethodArgumentResolver extends AbstractNamedValueMethodArgumentResolver {
+
+	/**
+	 * @param beanFactory a bean factory to use for resolving  ${...} placeholder and #{...} SpEL expressions 
+	 * in default values, or {@code null} if default values are not expected to contain expressions
+	 */
+	public ExpressionValueMethodArgumentResolver(ConfigurableBeanFactory beanFactory) {
+		super(beanFactory);
+	}
+
+	public boolean supportsParameter(MethodParameter parameter) {
+		return parameter.hasParameterAnnotation(Value.class);
+	}
+
+	@Override
+	protected NamedValueInfo createNamedValueInfo(MethodParameter parameter) {
+		Value annotation = parameter.getParameterAnnotation(Value.class);
+		return new ExpressionValueNamedValueInfo(annotation);
+	}
+
+	@Override
+	protected Object resolveName(String name, MethodParameter parameter, NativeWebRequest webRequest)
+			throws Exception {
+		// No name to resolve
+		return null;
+	}
+
+	@Override
+	protected void handleMissingValue(String name, MethodParameter parameter) throws ServletException {
+		throw new UnsupportedOperationException("Did not expect to handle a missing value: an @Value is never required");
+	}
+
+	private static class ExpressionValueNamedValueInfo extends NamedValueInfo {
+
+		private ExpressionValueNamedValueInfo(Value annotation) {
+			super("@Value", false, annotation.value());
+		}
+	}	
+}

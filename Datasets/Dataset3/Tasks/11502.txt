@@ -1,0 +1,179 @@
+import org.jboss.as.ee.weld.WeldDeploymentMarker;
+
+/*
+ * JBoss, Home of Professional Open Source.
+ * Copyright 2008, Red Hat Middleware LLC, and individual contributors
+ * as indicated by the @author tags. See the copyright.txt file in the
+ * distribution for a full listing of individual contributors.
+ *
+ * This is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as
+ * published by the Free Software Foundation; either version 2.1 of
+ * the License, or (at your option) any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this software; if not, write to the Free
+ * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
+ */
+package org.jboss.as.weld.deployment.processors;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.ListIterator;
+
+import org.jboss.as.ee.component.Attachments;
+import org.jboss.as.ee.component.EEApplicationClasses;
+import org.jboss.as.ee.component.EEModuleDescription;
+import org.jboss.as.ee.structure.DeploymentType;
+import org.jboss.as.ee.structure.DeploymentTypeMarker;
+import org.jboss.as.server.deployment.DeploymentPhaseContext;
+import org.jboss.as.server.deployment.DeploymentUnit;
+import org.jboss.as.server.deployment.DeploymentUnitProcessingException;
+import org.jboss.as.server.deployment.DeploymentUnitProcessor;
+import org.jboss.as.web.common.ExpressionFactoryWrapper;
+import org.jboss.as.web.common.WarMetaData;
+import org.jboss.as.web.common.WebComponentDescription;
+import org.jboss.as.weld.WeldDeploymentMarker;
+import org.jboss.as.weld.WeldLogger;
+import org.jboss.as.weld.webtier.jsp.JspInitializationListener;
+import org.jboss.metadata.javaee.spec.ParamValueMetaData;
+import org.jboss.metadata.web.jboss.JBossWebMetaData;
+import org.jboss.metadata.web.spec.FilterMappingMetaData;
+import org.jboss.metadata.web.spec.FilterMetaData;
+import org.jboss.metadata.web.spec.FiltersMetaData;
+import org.jboss.metadata.web.spec.ListenerMetaData;
+import org.jboss.weld.servlet.ConversationFilter;
+import org.jboss.weld.servlet.WeldListener;
+
+/**
+ * Deployment processor that integrates weld into the web tier
+ *
+ * @author Stuart Douglas
+ */
+public class WebIntegrationProcessor implements DeploymentUnitProcessor {
+    private final ListenerMetaData WBL;
+    private final FilterMetaData conversationFilterMetadata;
+
+    private static final String WELD_LISTENER = WeldListener.class.getName();
+
+    private static final String WELD_SERVLET_LISTENER = "org.jboss.weld.environment.servlet.Listener";
+
+    private static final String CONVERSATION_FILTER_CLASS = ConversationFilter.class.getName();
+    private static final String CONVERSATION_FILTER_NAME = "CDI Conversation Filter";
+
+    private static final ParamValueMetaData CONVERSATION_FILTER_INITIALIZED = new ParamValueMetaData();
+
+    public WebIntegrationProcessor() {
+
+        // create wbl listener
+        WBL = new ListenerMetaData();
+        WBL.setListenerClass(WELD_LISTENER);
+        conversationFilterMetadata = new FilterMetaData();
+        conversationFilterMetadata.setFilterClass(CONVERSATION_FILTER_CLASS);
+        conversationFilterMetadata.setFilterName(CONVERSATION_FILTER_NAME);
+        conversationFilterMetadata.setAsyncSupported(true);
+        CONVERSATION_FILTER_INITIALIZED.setParamName(ConversationFilter.CONVERSATION_FILTER_REGISTERED);
+        CONVERSATION_FILTER_INITIALIZED.setParamValue(Boolean.TRUE.toString());
+    }
+
+    @Override
+    public void deploy(DeploymentPhaseContext phaseContext) throws DeploymentUnitProcessingException {
+        final DeploymentUnit deploymentUnit = phaseContext.getDeploymentUnit();
+        final EEModuleDescription module = deploymentUnit.getAttachment(Attachments.EE_MODULE_DESCRIPTION);
+        final EEApplicationClasses applicationClasses = deploymentUnit.getAttachment(Attachments.EE_APPLICATION_CLASSES_DESCRIPTION);
+
+        if (!DeploymentTypeMarker.isType(DeploymentType.WAR, deploymentUnit)) {
+            return; // Skip non web deployments
+        }
+
+        if (!WeldDeploymentMarker.isWeldDeployment(deploymentUnit)) {
+            return; // skip non weld deployments
+        }
+
+        WarMetaData warMetaData = deploymentUnit.getAttachment(WarMetaData.ATTACHMENT_KEY);
+        if (warMetaData == null) {
+            WeldLogger.DEPLOYMENT_LOGGER.debug("Not installing Weld web tier integration as no war metadata found");
+            return;
+        }
+        JBossWebMetaData webMetaData = warMetaData.getMergedJBossWebMetaData();
+        if (webMetaData == null) {
+            WeldLogger.DEPLOYMENT_LOGGER.debug("Not installing Weld web tier integration as no merged web metadata found");
+            return;
+        }
+
+        List<ListenerMetaData> listeners = webMetaData.getListeners();
+        if (listeners == null) {
+            listeners = new ArrayList<ListenerMetaData>();
+            webMetaData.setListeners(listeners);
+        } else {
+            //if the weld servlet listener is present remove it
+            //this should allow wars to be portable between AS7 and servlet containers
+            final ListIterator<ListenerMetaData> iterator = listeners.listIterator();
+            while (iterator.hasNext()) {
+                final ListenerMetaData listener = iterator.next();
+                if (listener.getListenerClass().trim().equals(WELD_SERVLET_LISTENER)) {
+                    WeldLogger.DEPLOYMENT_LOGGER.debugf("Removing weld servlet listener %s from web config, as it is not needed in EE6 environments", WELD_SERVLET_LISTENER);
+                    iterator.remove();
+                    break;
+                }
+            }
+        }
+        listeners.add(0, WBL);
+
+        //These listeners use resource injection, so they need to be components
+        registerAsComponent(WELD_LISTENER, module, deploymentUnit, applicationClasses);
+
+        deploymentUnit.addToAttachmentList(ExpressionFactoryWrapper.ATTACHMENT_KEY, JspInitializationListener.INSTANCE);
+
+        if (webMetaData.getFilterMappings() != null) {
+            // register ConversationFilter
+            boolean filterMappingFound = false;
+            for (FilterMappingMetaData mapping : webMetaData.getFilterMappings()) {
+                if (CONVERSATION_FILTER_NAME.equals(mapping.getFilterName())) {
+                    filterMappingFound = true;
+                    break;
+                }
+            }
+
+            if (filterMappingFound) { // otherwise WeldListener will take care of conversation context activation
+                boolean filterFound = false;
+                for (FilterMetaData filter : webMetaData.getFilters()) {
+                    if (CONVERSATION_FILTER_CLASS.equals(filter.getFilterClass())) {
+                        filterFound = true;
+                        break;
+                    }
+                }
+                if (!filterFound) {
+                    // register ConversationFilter
+                    if (webMetaData.getFilters() == null) {
+                        webMetaData.setFilters(new FiltersMetaData());
+                    }
+                    webMetaData.getFilters().add(conversationFilterMetadata);
+                    registerAsComponent(CONVERSATION_FILTER_CLASS, module, deploymentUnit, applicationClasses);
+                    List<ParamValueMetaData> contextParams = webMetaData.getContextParams();
+                    if (contextParams == null) {
+                        webMetaData.setContextParams(new ArrayList<ParamValueMetaData>());
+                    }
+                    webMetaData.getContextParams().add(CONVERSATION_FILTER_INITIALIZED);
+                }
+            }
+
+        }
+    }
+
+    @Override
+    public void undeploy(DeploymentUnit context) {
+    }
+
+    private void registerAsComponent(String listener, EEModuleDescription module, DeploymentUnit deploymentUnit, EEApplicationClasses applicationClasses) {
+        final WebComponentDescription componentDescription = new WebComponentDescription(listener, listener, module, deploymentUnit.getServiceName(), applicationClasses);
+        module.addComponent(componentDescription);
+        deploymentUnit.addToAttachmentList(WebComponentDescription.WEB_COMPONENTS, componentDescription.getStartServiceName());
+    }
+}

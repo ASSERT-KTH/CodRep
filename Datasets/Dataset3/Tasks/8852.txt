@@ -1,0 +1,74 @@
+import org.xnio.OptionMap;
+
+/*
+ * JBoss, Home of Professional Open Source.
+ * Copyright 2011, Red Hat, Inc., and individual contributors
+ * as indicated by the @author tags. See the copyright.txt file in the
+ * distribution for a full listing of individual contributors.
+ *
+ * This is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as
+ * published by the Free Software Foundation; either version 2.1 of
+ * the License, or (at your option) any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this software; if not, write to the Free
+ * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
+ */
+
+package org.jboss.as.remoting;
+
+import java.util.List;
+import java.util.concurrent.Executor;
+import org.jboss.as.controller.AbstractAddStepHandler;
+import org.jboss.as.controller.NewOperationContext;
+import org.jboss.as.controller.NewStepHandler;
+import org.jboss.as.controller.ServiceVerificationHandler;
+import static org.jboss.as.remoting.CommonAttributes.CONNECTOR;
+import static org.jboss.as.remoting.CommonAttributes.THREAD_POOL;
+import org.jboss.as.threads.ThreadsServices;
+import org.jboss.dmr.ModelNode;
+import org.jboss.msc.inject.CastingInjector;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.ServiceController;
+import org.jboss.xnio.OptionMap;
+
+/**
+ * Add operation handler for the remoting subsystem.
+ *
+ * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
+ * @author Emanuel Muckenhuber
+ */
+class RemotingSubsystemAdd extends AbstractAddStepHandler {
+
+    static final NewStepHandler INSTANCE = new RemotingSubsystemAdd();
+
+    protected void populateModel(ModelNode operation, ModelNode model) {
+        final String threadPoolName = operation.require(THREAD_POOL).asString();
+        model.get(THREAD_POOL).set(threadPoolName);
+        // initialize the connectors
+        model.get(CONNECTOR);
+    }
+
+    protected void performRuntime(NewOperationContext context, ModelNode operation, ModelNode model, ServiceVerificationHandler verificationHandler, List<ServiceController<?>> newControllers) {
+        final String threadPoolName = operation.require(THREAD_POOL).asString();
+        // create endpoint
+        final EndpointService endpointService = new EndpointService();
+        // todo configure option map
+        endpointService.setOptionMap(OptionMap.EMPTY);
+        final Injector<Executor> executorInjector = endpointService.getExecutorInjector();
+
+        newControllers.add(context
+                .getServiceTarget()
+                .addService(RemotingServices.ENDPOINT, endpointService)
+                .addDependency(ThreadsServices.executorName(threadPoolName), new CastingInjector<Executor>(executorInjector, Executor.class))
+                .addListener(verificationHandler)
+                .install());
+    }
+}

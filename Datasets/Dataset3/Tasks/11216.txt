@@ -1,0 +1,164 @@
+final ThreadFactory threadFactory = new JBossThreadFactory(new ThreadGroup("DeploymentScanner-threads"), Boolean.FALSE, null, "%G - %t", null, null, AccessController.getContext());
+
+/*
+ * JBoss, Home of Professional Open Source.
+ * Copyright 2010, Red Hat, Inc., and individual contributors
+ * as indicated by the @author tags. See the copyright.txt file in the
+ * distribution for a full listing of individual contributors.
+ *
+ * This is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as
+ * published by the Free Software Foundation; either version 2.1 of
+ * the License, or (at your option) any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this software; if not, write to the Free
+ * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
+ */
+
+package org.jboss.as.server.deployment.scanner;
+
+import java.io.File;
+import java.security.AccessController;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+
+import org.jboss.as.server.ServerController;
+import org.jboss.as.server.Services;
+import org.jboss.as.server.deployment.api.ServerDeploymentRepository;
+import org.jboss.as.server.deployment.scanner.api.DeploymentScanner;
+import org.jboss.as.server.services.path.AbsolutePathService;
+import org.jboss.as.server.services.path.RelativePathService;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceController.Mode;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.ServiceTarget;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
+import org.jboss.threads.JBossThreadFactory;
+
+/**
+ * Service responsible creating a {@code DeploymentScanner}
+ *
+ * @author Emanuel Muckenhuber
+ */
+public class DeploymentScannerService implements Service<DeploymentScanner> {
+
+    private static final int DEFAULT_INTERVAL = 5000;
+    private long interval;
+    private TimeUnit unit = TimeUnit.MILLISECONDS;
+    private boolean enabled;
+    private boolean autoDeployZipped;
+    private boolean autoDeployExploded;
+    private Long deploymentTimeout;
+
+    /** The created scanner. */
+    private DeploymentScanner scanner;
+
+    private final InjectedValue<String> pathValue = new InjectedValue<String>();
+    private final InjectedValue<ServerController> serverControllerValue = new InjectedValue<ServerController>();
+    private final InjectedValue<ServerDeploymentRepository> deploymentRepositoryValue = new InjectedValue<ServerDeploymentRepository>();
+    private final InjectedValue<ScheduledExecutorService> scheduledExecutorValue = new InjectedValue<ScheduledExecutorService>();
+
+    public static ServiceName getServiceName(String repositoryName) {
+        return DeploymentScanner.BASE_SERVICE_NAME.append(repositoryName);
+    }
+
+    /**
+     * Add the deployment scanner service to a batch.
+     *
+     * @param serviceTarget the service target
+     * @param name the repository name
+     * @param relativeTo the relative to
+     * @param path the path
+     * @param scanInterval the scan interval
+     * @param scanEnabled scan enabled
+     * @param deploymentTimeout the deployment timeout
+     * @return
+     */
+    public static void addService(final ServiceTarget serviceTarget, final String name, final String relativeTo, final String path,
+            final Integer scanInterval, TimeUnit unit, final Boolean autoDeployZip, final Boolean autoDeployExploded, final Boolean scanEnabled, final Long deploymentTimeout) {
+        final DeploymentScannerService service = new DeploymentScannerService(scanInterval, unit, autoDeployZip, autoDeployExploded, scanEnabled, deploymentTimeout);
+        final ServiceName serviceName = getServiceName(name);
+        final ServiceName pathService = serviceName.append("path");
+
+        if(relativeTo != null) {
+            RelativePathService.addService(pathService, path, relativeTo, serviceTarget);
+        } else {
+            AbsolutePathService.addService(pathService, path, serviceTarget);
+        }
+        final ThreadFactory threadFactory = new JBossThreadFactory(new ThreadGroup("DeplooymentScanner-threads"), Boolean.FALSE, null, "%G - %t", null, null, AccessController.getContext());
+        final ScheduledExecutorService scheduledExecutorService = Executors.newScheduledThreadPool(2, threadFactory);
+
+        serviceTarget.addService(serviceName, service)
+            .addDependency(pathService, String.class, service.pathValue)
+            .addDependency(Services.JBOSS_SERVER_CONTROLLER, ServerController.class, service.serverControllerValue)
+            .addDependency(ServerDeploymentRepository.SERVICE_NAME, ServerDeploymentRepository.class, service.deploymentRepositoryValue)
+            .addInjection(service.scheduledExecutorValue, scheduledExecutorService)
+            .setInitialMode(Mode.ACTIVE)
+            .install();
+    }
+
+    DeploymentScannerService(final Integer interval, final TimeUnit unit, final Boolean autoDeployZipped,
+            final Boolean autoDeployExploded, final Boolean enabled, final Long deploymentTimeout) {
+        this.interval = interval == null ? DEFAULT_INTERVAL : interval.longValue();
+        this.unit = unit;
+        this.autoDeployZipped = autoDeployZipped == null ? true : autoDeployZipped.booleanValue();
+        this.autoDeployExploded = autoDeployExploded == null ? false : autoDeployExploded.booleanValue();
+        this.enabled = enabled == null ? true : enabled.booleanValue();
+        this.deploymentTimeout = deploymentTimeout;
+    }
+
+
+    /** {@inheritDoc} */
+    @Override
+    public synchronized void start(StartContext context) throws StartException {
+        try {
+            final String pathName = pathValue.getValue();
+
+            final FileSystemDeploymentService scanner = new FileSystemDeploymentService(new File(pathName), serverControllerValue.getValue(), scheduledExecutorValue.getValue(), deploymentRepositoryValue.getValue());
+            scanner.setScanInterval(unit.toMillis(interval));
+            scanner.setAutoDeployExplodedContent(autoDeployExploded);
+            scanner.setAutoDeployZippedContent(autoDeployZipped);
+            if(deploymentTimeout != null) {
+                scanner.setDeploymentTimeout(deploymentTimeout);
+            }
+
+            if(enabled) {
+                scanner.startScanner();
+            }
+            this.scanner = scanner;
+        } catch (Exception e) {
+            throw new StartException(e);
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public synchronized void stop(StopContext context) {
+        final DeploymentScanner scanner = this.scanner;
+        this.scanner = null;
+        scanner.stopScanner();
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public synchronized DeploymentScanner getValue() throws IllegalStateException {
+        final DeploymentScanner scanner = this.scanner;
+        if(scanner == null) {
+            throw new IllegalStateException();
+        }
+        return scanner;
+    }
+
+}

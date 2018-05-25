@@ -1,0 +1,97 @@
+context.removeService(ConnectorServices.RESOURCEADAPTERS_SERVICE);
+
+/*
+ * JBoss, Home of Professional Open Source.
+ * Copyright 2011, Red Hat, Inc., and individual contributors
+ * as indicated by the @author tags. See the copyright.txt file in the
+ * distribution for a full listing of individual contributors.
+ *
+ * This is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as
+ * published by the Free Software Foundation; either version 2.1 of
+ * the License, or (at your option) any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this software; if not, write to the Free
+ * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
+ */
+
+package org.jboss.as.connector.subsystems.resourceadapters;
+
+import org.jboss.as.controller.NewOperationContext;
+import org.jboss.as.controller.NewStepHandler;
+import org.jboss.as.controller.OperationFailedException;
+import org.jboss.as.controller.ServiceVerificationHandler;
+
+import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
+import static org.jboss.as.connector.subsystems.resourceadapters.Constants.ARCHIVE;
+import org.jboss.as.connector.ConnectorServices;
+import org.jboss.as.connector.subsystems.resourceadapters.ResourceAdaptersService.ModifiableResourceAdaptors;
+import org.jboss.as.controller.PathAddress;
+import org.jboss.dmr.ModelNode;
+import org.jboss.msc.service.ServiceController;
+import org.jboss.msc.service.ServiceController.Mode;
+import org.jboss.msc.service.ServiceTarget;
+
+/**
+ * Operation handler responsible for adding a Ra.
+ *
+ * @author maeste
+ */
+public class RaAdd extends AbstractRaOperation implements NewStepHandler {
+    static final RaAdd INSTANCE = new RaAdd();
+
+    protected void populateModel(ModelNode operation, ModelNode model) {
+        for (final String attribute : ResourceAdaptersSubsystemProviders.RESOURCEADAPTER_ATTRIBUTE) {
+            if (operation.get(attribute).isDefined()) {
+                model.get(attribute).set(operation.get(attribute));
+            }
+        }
+    }
+
+    public void execute(NewOperationContext context, ModelNode operation) {
+        final ModelNode subModel = context.readModelForUpdate(PathAddress.EMPTY_ADDRESS);
+        populateModel(operation, subModel);
+
+        // Compensating is remove
+        final ModelNode address = operation.require(OP_ADDR);
+        final String archive = PathAddress.pathAddress(address).getLastElement().getValue();
+        operation.get(ARCHIVE).set(archive);
+
+        if (context.getType() == NewOperationContext.Type.SERVER) {
+            context.addStep(new NewStepHandler() {
+                public void execute(NewOperationContext context, ModelNode operation) throws OperationFailedException {
+                    final ServiceTarget serviceTarget = context.getServiceTarget();
+                    final ServiceVerificationHandler verificationHandler = new ServiceVerificationHandler();
+
+                    ModifiableResourceAdaptors resourceAdapters = buildResourceAdaptersObject(operation);
+
+                    final ServiceController<?> raService = context.getServiceRegistry(false).getService(
+                            ConnectorServices.RESOURCEADAPTERS_SERVICE);
+                    ServiceController<?> controller = null;
+                    if (raService == null) {
+                         controller = serviceTarget.addService(ConnectorServices.RESOURCEADAPTERS_SERVICE,
+                                        new ResourceAdaptersService(resourceAdapters)).setInitialMode(Mode.ACTIVE).addListener(verificationHandler).install();
+                    } else {
+                        ((ModifiableResourceAdaptors) raService.getValue()).addAllResourceAdapters(resourceAdapters.getResourceAdapters());
+                    }
+
+                    context.addStep(verificationHandler, NewOperationContext.Stage.VERIFY);
+
+                    if (context.completeStep() == NewOperationContext.ResultAction.ROLLBACK) {
+                        if(controller != null) {
+                            context.removeService(controller);
+                        }
+                    }
+                }
+            }, NewOperationContext.Stage.RUNTIME);
+        }
+        context.completeStep();
+    }
+}
