@@ -79,9 +79,10 @@ What the participants get?
 What the winner gets?
 
 1. The ultimate CodRep fame
-1. Nice KTH goodies by post
-1. To be invited to take part to the design of a futuristic program repair bot in a research group
+1. An travel invitation to KTH in Stockholm, all expenses paid, to meet and discuss the design of a futuristic program repair bot.
 1. An official KTH certificate
+
+In addition, the top-three participants will get nice KTH goodies by post.
 
 ## Data Structure and Format
 
