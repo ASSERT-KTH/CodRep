@@ -52,12 +52,12 @@ Important dates:
 
 (based on dataset1)
 
-| Team name | Score on dataset1 | Score on dataset2 |
-| --- | --- | --- |
-| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 |
-| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.124 | 0.109 |
-| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 |
-| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 |
+| Team name | Score on Dataset1/ | Score on Dataset2/ | Score on Dataset3/
+| --- | --- | --- | --- |
+| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
+| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.124 | 0.109 | ... |
+| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
+| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
 
 ## The winners and rankings
 
