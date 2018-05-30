@@ -56,7 +56,7 @@ Important dates:
 | Team name | Score on Dataset1/ | Score on Dataset2/ | Score on Dataset3/
 | --- | --- | --- | --- |
 | [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
-| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.124 | 0.109 | ... |
+| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.118 | 0.109 | 0.075 |
 | [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
 | [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
 
