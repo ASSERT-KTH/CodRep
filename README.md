@@ -147,13 +147,12 @@ To play in the competition, your program takes as input input a folder name, tha
 $ your-predictor Files
 ```
 
-Your programs outputs on the console, for each input data file, the predicted line number. Warning: by convention, line numbers start from 1 (and not 0).
-Your program does not have to predict something for all input files, if there is no clear answer, simply don't output anything, the error computation takes that into account, more information about this in **Loss function** below.
+Your programs outputs on the console, for each task, the predicted line number. Warning: by convention, line numbers start from 1 (and not 0). If there is no prediction made for certain task (by not outputting *\<path\> \<line number\>*), you will receive maximum loss (which is 1) for the task, more information about this in **Loss function** below.
 
 ```
-<Path1> <line numer>
-<Path2> <line numer>
-<Path3> <line numer>
+<Path1> <line number>
+<Path2> <line number>
+<Path3> <line number>
 ...
 ```
 
