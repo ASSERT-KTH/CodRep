@@ -127,7 +127,8 @@ The datasets used in this competition are from:
 | --- | --- |--- |
 | Dataset1/ | [github](https://github.com/monperrus/real-bug-fixes-icse-2015/) | [*An Empirical Study on Real Bug Fixes (ICSE 2015)*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf) |
 | Dataset2/ | [HAL](https://hal.archives-ouvertes.fr/hal-00769121) | [*CVS-Vintage: A Dataset of 14 CVS Repositories of Java Software*](https://hal.archives-ouvertes.fr/hal-00769121/document) |
-| Dataset3/ | ... | [*Watch out for This Commit! A Study of Influential Software Changes*](https://arxiv.org/pdf/1606.03266.pdf)
+| Dataset3/ | ... | [*Watch out for This Commit! A Study of Influential Software Changes*](https://arxiv.org/pdf/1606.03266.pdf) |
+| Dataset4/ | Announced on July 14th 2018 | Announced on July 14th 2018 |
 
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
 
@@ -138,6 +139,7 @@ The datasets used in this competition are from:
 | Dataset1/ | 4394 | 2291002 |
 | Dataset2/ | 11069 | 5530782 |
 | Dataset3/ | 18633 | 4242795 |
+| Dataset4/ | Announced on July 14th 2018 | Announced on July 14th 2018 |
 
 ## Command-line interface
 
