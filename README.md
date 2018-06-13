@@ -41,6 +41,7 @@ Registered participants:
 1. [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20)
 1. [IPT Sao Paulo](https://github.com/KTH/CodRep-competition/issues/22)
 1. [Singapore Management University](https://github.com/KTH/CodRep-competition/issues/23)
+1. [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25)
 
 Important dates:
 
