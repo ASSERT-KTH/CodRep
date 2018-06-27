@@ -43,6 +43,7 @@ Registered participants:
 1. [Singapore Management University](https://github.com/KTH/CodRep-competition/issues/23)
 1. [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25)
 1. [Otto-von-Guericke University Magdeburg](https://github.com/KTH/CodRep-competition/issues/26)
+1. [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28)
 
 Important dates:
 
