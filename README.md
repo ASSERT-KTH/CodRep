@@ -53,29 +53,15 @@ Important dates:
 * Final submission deadline: Oct. 4th 2018.
 * Announcement of the final ranking & end of the competition Oct 14th 2018.
 
-## Informal rankings
-
-(based on dataset1)
-
-| Team name | Score on Dataset1/ | Score on Dataset2/ | Score on Dataset3/
-| --- | --- | --- | --- |
-| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
-| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.118 | 0.109 | 0.075 |
-| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
-| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
 
 ## The winners and rankings
 
-Hall of fame:
-
-| # | Team name | Institution/Company | Team members | Score |
-| --- | --- | --- | --- | --- |
-| ... | ... | ... | ... | ... |
-
-The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of datasets in this competition. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. To give participants an intuition about of their performance compared with others, there will be a weekly updated ranking based on the score from datasets in this competition. The intermediate and final ranking could be very different from the weekly ranking, since the weekly ranking is more likely to overfit the datasets.
+There are two rankings, an intermediate one, aiming at fostering competition, and a final one, to designate the winners.
+The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of already published datasets. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. 
 
 The winner's tool will be published after the deadline.
 
+### Prizes
 What the participants get?
 
 1. All participants get their name in the CodRep hall of fame
@@ -88,6 +74,37 @@ What the winner gets?
 1. An official KTH certificate
 
 In addition, the top-three participants will get nice KTH goodies by post.
+
+## Official Final Ranking
+
+To be announced on Oct 14th 2018, based on Dataset5:
+
+| # | Team (Institution/Company) | Score |
+| --- | --- | --- |
+| ... | ... | ... |
+
+
+### Offical Intermediate ranking
+
+Based on Dataset4
+
+| Position | Team name | Score on Dataset4 | 
+| --- | --- | --- | 
+| #1 | [Thomas Durieux (INRIA)](https://github.com/KTH/CodRep-competition/issues/16) |  0.0834200326357 |
+| #2 | [Gabin An & Shin Yoo (KAIST)](https://github.com/KTH/CodRep-competition/issues/28) | 0.0884776175201 |
+| #3 | [Jesper Derehag & Olof Mogren (Ericsson & RISE)](https://github.com/KTH/CodRep-competition/issues/25) | 0.09253418191163333 |
+| #4 | [Sebastian Nielebock, Robert Heumüller, Kevin Michael Schott, Frank Ortmeier (Otto-von-Guericke University Magdeburg, Germany)](https://github.com/KTH/CodRep-competition/issues/26) | 0.11869677510133332​ |
+
+### Informal ranking
+
+Based on Dataset1
+
+| Team name | Score on Dataset1 | Score on Dataset2 | Score on Dataset3 |
+| --- | --- | --- | --- |
+| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
+| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.118 | 0.109 | 0.075 |
+| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
+| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
 
 ## Data Structure and Format
 
