@@ -108,6 +108,7 @@ Based on Dataset1
 
 ## Data Structure and Format
 
+### Format
 The provided data are in `Datasets/.../Tasks/*.txt`. The txt files are meant to be parsed by competing programs. Their format is as follows, each file contains:
 ```
 {Code line to insert}
@@ -125,10 +126,12 @@ public class test{
 }
 ```
 In this example, `double b = 0.1;` is the code line to be added somewhere in the file in place of another line.
-
 For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1;`) with the new code line `double b = 0.1;`.
-
 To train the system, the correct answer for all input files is given in folder `Datasets/.../Solutions/*.txt`,  e.g. the correct answer to `Datasets/Datasets1/Tasks/1.txt` is in `Datasets/Datasets1/Solutions/1.txt`
+
+### Usage and citation
+
+This data can be used in many ways, completely outside of the scope of CodRep. If you use this data, please acknolwedge it by citing the following technical report: [The CodRep Machine Learning on Source Code Competition](https://arxiv.org/pdf/1807.03200) (Zimin Chen, Martin Monperrus), arXiv 1807.03200, 2018.   
 
 ## Data provenance
 
