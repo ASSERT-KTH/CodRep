@@ -41,6 +41,9 @@ Registered participants:
 1. [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20)
 1. [IPT Sao Paulo](https://github.com/KTH/CodRep-competition/issues/22)
 1. [Singapore Management University](https://github.com/KTH/CodRep-competition/issues/23)
+1. [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25)
+1. [Otto-von-Guericke University Magdeburg](https://github.com/KTH/CodRep-competition/issues/26)
+1. [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28)
 
 Important dates:
 
@@ -50,29 +53,15 @@ Important dates:
 * Final submission deadline: Oct. 4th 2018.
 * Announcement of the final ranking & end of the competition Oct 14th 2018.
 
-## Informal rankings
-
-(based on dataset1)
-
-| Team name | Score on Dataset1/ | Score on Dataset2/ | Score on Dataset3/
-| --- | --- | --- | --- |
-| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
-| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.118 | 0.109 | 0.075 |
-| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
-| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
 
 ## The winners and rankings
 
-Hall of fame:
-
-| # | Team name | Institution/Company | Team members | Score |
-| --- | --- | --- | --- | --- |
-| ... | ... | ... | ... | ... |
-
-The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of datasets in this competition. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. To give participants an intuition about of their performance compared with others, there will be a weekly updated ranking based on the score from datasets in this competition. The intermediate and final ranking could be very different from the weekly ranking, since the weekly ranking is more likely to overfit the datasets.
+There are two rankings, an intermediate one, aiming at fostering competition, and a final one, to designate the winners.
+The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of already published datasets. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. 
 
 The winner's tool will be published after the deadline.
 
+### Prizes
 What the participants get?
 
 1. All participants get their name in the CodRep hall of fame
@@ -86,8 +75,40 @@ What the winner gets?
 
 In addition, the top-three participants will get nice KTH goodies by post.
 
+## Official Final Ranking
+
+To be announced on Oct 14th 2018, based on Dataset5:
+
+| # | Team (Institution/Company) | Score |
+| --- | --- | --- |
+| ... | ... | ... |
+
+
+### Offical Intermediate ranking
+
+Based on Dataset4
+
+| Position | Team name | Score on Dataset4 | 
+| --- | --- | --- | 
+| #1 | [Thomas Durieux (INRIA)](https://github.com/KTH/CodRep-competition/issues/16) |  0.0834200326357 |
+| #2 | [Gabin An & Shin Yoo (KAIST)](https://github.com/KTH/CodRep-competition/issues/28) | 0.0884776175201 |
+| #3 | [Jesper Derehag & Olof Mogren (Ericsson & RISE)](https://github.com/KTH/CodRep-competition/issues/25) | 0.09253418191163333 |
+| #4 | [Sebastian Nielebock, Robert Heumüller, Kevin Michael Schott, Frank Ortmeier (Otto-von-Guericke University Magdeburg, Germany)](https://github.com/KTH/CodRep-competition/issues/26) | 0.11869677510133332​ |
+
+### Informal ranking
+
+Based on Dataset1
+
+| Team name | Score on Dataset1 | Score on Dataset2 | Score on Dataset3 |
+| --- | --- | --- | --- |
+| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
+| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.118 | 0.109 | 0.075 |
+| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
+| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
+
 ## Data Structure and Format
 
+### Format
 The provided data are in `Datasets/.../Tasks/*.txt`. The txt files are meant to be parsed by competing programs. Their format is as follows, each file contains:
 ```
 {Code line to insert}
@@ -105,10 +126,12 @@ public class test{
 }
 ```
 In this example, `double b = 0.1;` is the code line to be added somewhere in the file in place of another line.
-
 For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1;`) with the new code line `double b = 0.1;`.
-
 To train the system, the correct answer for all input files is given in folder `Datasets/.../Solutions/*.txt`,  e.g. the correct answer to `Datasets/Datasets1/Tasks/1.txt` is in `Datasets/Datasets1/Solutions/1.txt`
+
+### Usage and citation
+
+This data can be used in many ways, completely outside of the scope of CodRep. If you use this data, please acknolwedge it by citing the following technical report: [The CodRep Machine Learning on Source Code Competition](https://arxiv.org/pdf/1807.03200) (Zimin Chen, Martin Monperrus), arXiv 1807.03200, 2018.   
 
 ## Data provenance
 
@@ -127,7 +150,8 @@ The datasets used in this competition are from:
 | --- | --- |--- |
 | Dataset1/ | [github](https://github.com/monperrus/real-bug-fixes-icse-2015/) | [*An Empirical Study on Real Bug Fixes (ICSE 2015)*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf) |
 | Dataset2/ | [HAL](https://hal.archives-ouvertes.fr/hal-00769121) | [*CVS-Vintage: A Dataset of 14 CVS Repositories of Java Software*](https://hal.archives-ouvertes.fr/hal-00769121/document) |
-| Dataset3/ | ... | [*Watch out for This Commit! A Study of Influential Software Changes*](https://arxiv.org/pdf/1606.03266.pdf)
+| Dataset3/ | ... | [*Watch out for This Commit! A Study of Influential Software Changes*](https://arxiv.org/pdf/1606.03266.pdf) |
+| Dataset4/ | Announced on July 14th 2018 | Announced on July 14th 2018 |
 
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
 
@@ -138,6 +162,7 @@ The datasets used in this competition are from:
 | Dataset1/ | 4394 | 2291002 |
 | Dataset2/ | 11069 | 5530782 |
 | Dataset3/ | 18633 | 4242795 |
+| Dataset4/ | Announced on July 14th 2018 | Announced on July 14th 2018 |
 
 ## Command-line interface
 
