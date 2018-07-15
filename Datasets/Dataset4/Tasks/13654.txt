@@ -1,0 +1,85 @@
+Runtime.getRuntime().halt(0); // Because fuck you, deadlock causing Swing shutdown hooks.
+
+/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.backends.lwjgl;
+
+import com.badlogic.gdx.ApplicationListener;
+
+import java.awt.Dimension;
+import java.awt.Point;
+
+import javax.swing.JFrame;
+
+/** Wraps an {@link LwjglCanvas} in a resizable {@link JFrame}. */
+public class LwjglFrame extends JFrame {
+	final LwjglCanvas lwjglCanvas;
+
+	public LwjglFrame (ApplicationListener listener, String title, int width, int height, boolean useGL2) {
+		super(title);
+
+		lwjglCanvas = new LwjglCanvas(listener, useGL2) {
+			protected void stopped () {
+				LwjglFrame.this.dispose();
+			}
+
+			protected void setTitle (String title) {
+				LwjglFrame.this.setTitle(title);
+			}
+
+			protected void setDisplayMode (int width, int height) {
+				LwjglFrame.this.getContentPane().setPreferredSize(new Dimension(width, height));
+				LwjglFrame.this.getContentPane().invalidate();
+				LwjglFrame.this.pack();
+				LwjglFrame.this.setLocationRelativeTo(null);
+				updateSize(width, height);
+			}
+
+			protected void resize (int width, int height) {
+				updateSize(width, height);
+			}
+		};
+		getContentPane().add(lwjglCanvas.getCanvas());
+
+		Runtime.getRuntime().addShutdownHook(new Thread() {
+			public void run () {
+				Runtime.getRuntime().halt(0); // Because fuck you, Swing shutdown hooks.
+			}
+		});
+
+		setDefaultCloseOperation(EXIT_ON_CLOSE);
+		getContentPane().setPreferredSize(new Dimension(width, height));
+		initialize();
+		Dimension size = getSize();
+		if (size.width == 0 && size.height == 0) pack();
+		Point location = getLocation();
+		if (location.x == 0 && location.y == 0) setLocationRelativeTo(null);
+		setVisible(true);
+		lwjglCanvas.getCanvas().requestFocus();
+	}
+
+	/** Allows a subclass to initialize the JFrame before it is shown. */
+	protected void initialize () {
+	}
+
+	public void updateSize (int width, int height) {
+	}
+
+	public LwjglCanvas getLwjglCanvas () {
+		return lwjglCanvas;
+	}
+}

@@ -1,0 +1,182 @@
+} catch (Throwable e) {
+
+/*
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.rest.action.admin.indices.alias;
+
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest;
+import org.elasticsearch.action.admin.indices.alias.IndicesAliasesResponse;
+import org.elasticsearch.client.Client;
+import org.elasticsearch.cluster.metadata.AliasAction;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.rest.*;
+
+import java.io.IOException;
+import java.util.Map;
+
+import static org.elasticsearch.cluster.metadata.AliasAction.newAddAliasAction;
+import static org.elasticsearch.common.unit.TimeValue.timeValueSeconds;
+import static org.elasticsearch.rest.RestRequest.Method.POST;
+import static org.elasticsearch.rest.RestStatus.OK;
+import static org.elasticsearch.rest.action.support.RestXContentBuilder.restContentBuilder;
+
+/**
+ *
+ */
+public class RestIndicesAliasesAction extends BaseRestHandler {
+
+    @Inject
+    public RestIndicesAliasesAction(Settings settings, Client client, RestController controller) {
+        super(settings, client);
+        controller.registerHandler(POST, "/_aliases", this);
+    }
+
+    @Override
+    public void handleRequest(final RestRequest request, final RestChannel channel) {
+        IndicesAliasesRequest indicesAliasesRequest = new IndicesAliasesRequest();
+        indicesAliasesRequest.listenerThreaded(false);
+        XContentParser parser = null;
+        try {
+            // {
+            //     actions : [
+            //         { add : { index : "test1", alias : "alias1", filter : {"user" : "kimchy"} } }
+            //         { remove : { index : "test1", alias : "alias1" } }
+            //     ]
+            // }
+            indicesAliasesRequest.timeout(request.paramAsTime("timeout", timeValueSeconds(10)));
+            parser = XContentFactory.xContent(request.content()).createParser(request.content());
+            XContentParser.Token token = parser.nextToken();
+            if (token == null) {
+                throw new ElasticSearchIllegalArgumentException("No action is specified");
+            }
+            while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                if (token == XContentParser.Token.START_ARRAY) {
+                    while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                        if (token == XContentParser.Token.FIELD_NAME) {
+                            String action = parser.currentName();
+                            AliasAction.Type type;
+                            if ("add".equals(action)) {
+                                type = AliasAction.Type.ADD;
+                            } else if ("remove".equals(action)) {
+                                type = AliasAction.Type.REMOVE;
+                            } else {
+                                throw new ElasticSearchIllegalArgumentException("Alias action [" + action + "] not supported");
+                            }
+                            String index = null;
+                            String alias = null;
+                            Map<String, Object> filter = null;
+                            String routing = null;
+                            boolean routingSet = false;
+                            String indexRouting = null;
+                            boolean indexRoutingSet = false;
+                            String searchRouting = null;
+                            boolean searchRoutingSet = false;
+                            String currentFieldName = null;
+                            while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                                if (token == XContentParser.Token.FIELD_NAME) {
+                                    currentFieldName = parser.currentName();
+                                } else if (token == XContentParser.Token.VALUE_STRING) {
+                                    if ("index".equals(currentFieldName)) {
+                                        index = parser.text();
+                                    } else if ("alias".equals(currentFieldName)) {
+                                        alias = parser.text();
+                                    } else if ("routing".equals(currentFieldName)) {
+                                        routing = parser.textOrNull();
+                                        routingSet = true;
+                                    } else if ("indexRouting".equals(currentFieldName) || "index-routing".equals(currentFieldName) || "index_routing".equals(currentFieldName)) {
+                                        indexRouting = parser.textOrNull();
+                                        indexRoutingSet = true;
+                                    } else if ("searchRouting".equals(currentFieldName) || "search-routing".equals(currentFieldName) || "search_routing".equals(currentFieldName)) {
+                                        searchRouting = parser.textOrNull();
+                                        searchRoutingSet = true;
+                                    }
+                                } else if (token == XContentParser.Token.START_OBJECT) {
+                                    if ("filter".equals(currentFieldName)) {
+                                        filter = parser.mapOrdered();
+                                    }
+                                }
+                            }
+                            if (index == null) {
+                                throw new ElasticSearchIllegalArgumentException("Alias action [" + action + "] requires an [index] to be set");
+                            }
+                            if (alias == null) {
+                                throw new ElasticSearchIllegalArgumentException("Alias action [" + action + "] requires an [alias] to be set");
+                            }
+                            if (type == AliasAction.Type.ADD) {
+                                AliasAction aliasAction = newAddAliasAction(index, alias).filter(filter);
+                                if (routingSet) {
+                                    aliasAction.routing(routing);
+                                }
+                                if (indexRoutingSet) {
+                                    aliasAction.indexRouting(indexRouting);
+                                }
+                                if (searchRoutingSet) {
+                                    aliasAction.searchRouting(searchRouting);
+                                }
+                                indicesAliasesRequest.addAliasAction(aliasAction);
+                            } else if (type == AliasAction.Type.REMOVE) {
+                                indicesAliasesRequest.removeAlias(index, alias);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            try {
+                channel.sendResponse(new XContentThrowableRestResponse(request, e));
+            } catch (IOException e1) {
+                logger.warn("Failed to send response", e1);
+            }
+            return;
+        } finally {
+            parser.close();
+        }
+        client.admin().indices().aliases(indicesAliasesRequest, new ActionListener<IndicesAliasesResponse>() {
+            @Override
+            public void onResponse(IndicesAliasesResponse response) {
+                try {
+                    XContentBuilder builder = restContentBuilder(request);
+                    builder.startObject()
+                            .field("ok", true)
+                            .field("acknowledged", response.isAcknowledged())
+                            .endObject();
+                    channel.sendResponse(new XContentRestResponse(request, OK, builder));
+                } catch (Exception e) {
+                    onFailure(e);
+                }
+            }
+
+            @Override
+            public void onFailure(Throwable e) {
+                try {
+                    channel.sendResponse(new XContentThrowableRestResponse(request, e));
+                } catch (IOException e1) {
+                    logger.error("Failed to send failure response", e1);
+                }
+            }
+        });
+    }
+}

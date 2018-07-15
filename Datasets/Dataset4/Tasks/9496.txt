@@ -1,0 +1,300 @@
+import static org.elasticsearch.action.ValidateActions.addValidationError;
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.action.admin.indices.template.put;
+
+import org.elasticsearch.ElasticSearchGenerationException;
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
+import org.elasticsearch.action.ActionRequestValidationException;
+import org.elasticsearch.action.support.master.MasterNodeOperationRequest;
+import org.elasticsearch.common.collect.MapBuilder;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.settings.ImmutableSettings;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentType;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+import static com.google.common.collect.Maps.newHashMap;
+import static org.elasticsearch.action.Actions.addValidationError;
+import static org.elasticsearch.common.settings.ImmutableSettings.Builder.EMPTY_SETTINGS;
+import static org.elasticsearch.common.settings.ImmutableSettings.readSettingsFromStream;
+import static org.elasticsearch.common.settings.ImmutableSettings.writeSettingsToStream;
+import static org.elasticsearch.common.unit.TimeValue.readTimeValue;
+
+/**
+ * A request to create an index template.
+ */
+public class PutIndexTemplateRequest extends MasterNodeOperationRequest {
+
+    private String name;
+
+    private String cause = "";
+
+    private String template;
+
+    private int order;
+
+    private boolean create;
+
+    private Settings settings = EMPTY_SETTINGS;
+
+    private Map<String, String> mappings = newHashMap();
+
+    private TimeValue timeout = new TimeValue(10, TimeUnit.SECONDS);
+
+    PutIndexTemplateRequest() {
+    }
+
+    /**
+     * Constructs a new put index template request with the provided name.
+     */
+    public PutIndexTemplateRequest(String name) {
+        this.name = name;
+    }
+
+    @Override
+    public ActionRequestValidationException validate() {
+        ActionRequestValidationException validationException = null;
+        if (name == null) {
+            validationException = addValidationError("name is missing", validationException);
+        }
+        if (template == null) {
+            validationException = addValidationError("template is missing", validationException);
+        }
+        return validationException;
+    }
+
+    /**
+     * Sets the name of the index template.
+     */
+    public PutIndexTemplateRequest name(String name) {
+        this.name = name;
+        return this;
+    }
+
+    /**
+     * The name of the index template.
+     */
+    public String name() {
+        return this.name;
+    }
+
+    public PutIndexTemplateRequest template(String template) {
+        this.template = template;
+        return this;
+    }
+
+    public String template() {
+        return this.template;
+    }
+
+    public PutIndexTemplateRequest order(int order) {
+        this.order = order;
+        return this;
+    }
+
+    public int order() {
+        return this.order;
+    }
+
+    /**
+     * Set to <tt>true</tt> to force only creation, not an update of an index template. If it already
+     * exists, it will fail with an {@link org.elasticsearch.indices.IndexTemplateAlreadyExistsException}.
+     */
+    public PutIndexTemplateRequest create(boolean create) {
+        this.create = create;
+        return this;
+    }
+
+    public boolean create() {
+        return create;
+    }
+
+    /**
+     * The settings to create the index template with.
+     */
+    public PutIndexTemplateRequest settings(Settings settings) {
+        this.settings = settings;
+        return this;
+    }
+
+    /**
+     * The settings to create the index template with.
+     */
+    public PutIndexTemplateRequest settings(Settings.Builder settings) {
+        this.settings = settings.build();
+        return this;
+    }
+
+    /**
+     * The settings to crete the index template with (either json/yaml/properties format).
+     */
+    public PutIndexTemplateRequest settings(String source) {
+        this.settings = ImmutableSettings.settingsBuilder().loadFromSource(source).build();
+        return this;
+    }
+
+    /**
+     * The settings to crete the index template with (either json/yaml/properties format).
+     */
+    public PutIndexTemplateRequest settings(Map<String, Object> source) {
+        try {
+            XContentBuilder builder = XContentFactory.contentBuilder(XContentType.JSON);
+            builder.map(source);
+            settings(builder.string());
+        } catch (IOException e) {
+            throw new ElasticSearchGenerationException("Failed to generate [" + source + "]", e);
+        }
+        return this;
+    }
+
+    Settings settings() {
+        return this.settings;
+    }
+
+    /**
+     * Adds mapping that will be added when the index gets created.
+     *
+     * @param type   The mapping type
+     * @param source The mapping source
+     */
+    public PutIndexTemplateRequest mapping(String type, String source) {
+        mappings.put(type, source);
+        return this;
+    }
+
+    /**
+     * The cause for this index template creation.
+     */
+    public PutIndexTemplateRequest cause(String cause) {
+        this.cause = cause;
+        return this;
+    }
+
+    public String cause() {
+        return this.cause;
+    }
+
+    /**
+     * Adds mapping that will be added when the index gets created.
+     *
+     * @param type   The mapping type
+     * @param source The mapping source
+     */
+    public PutIndexTemplateRequest mapping(String type, XContentBuilder source) {
+        try {
+            mappings.put(type, source.string());
+        } catch (IOException e) {
+            throw new ElasticSearchIllegalArgumentException("Failed to build json for mapping request", e);
+        }
+        return this;
+    }
+
+    /**
+     * Adds mapping that will be added when the index gets created.
+     *
+     * @param type   The mapping type
+     * @param source The mapping source
+     */
+    public PutIndexTemplateRequest mapping(String type, Map<String, Object> source) {
+        // wrap it in a type map if its not
+        if (source.size() != 1 || !source.containsKey(type)) {
+            source = MapBuilder.<String, Object>newMapBuilder().put(type, source).map();
+        }
+        try {
+            XContentBuilder builder = XContentFactory.contentBuilder(XContentType.JSON);
+            builder.map(source);
+            return mapping(type, builder.string());
+        } catch (IOException e) {
+            throw new ElasticSearchGenerationException("Failed to generate [" + source + "]", e);
+        }
+    }
+
+    Map<String, String> mappings() {
+        return this.mappings;
+    }
+
+
+    /**
+     * Timeout to wait till the put mapping gets acknowledged of all current cluster nodes. Defaults to
+     * <tt>10s</tt>.
+     */
+    TimeValue timeout() {
+        return timeout;
+    }
+
+    /**
+     * Timeout to wait till the put mapping gets acknowledged of all current cluster nodes. Defaults to
+     * <tt>10s</tt>.
+     */
+    public PutIndexTemplateRequest timeout(TimeValue timeout) {
+        this.timeout = timeout;
+        return this;
+    }
+
+    /**
+     * Timeout to wait till the put mapping gets acknowledged of all current cluster nodes. Defaults to
+     * <tt>10s</tt>.
+     */
+    public PutIndexTemplateRequest timeout(String timeout) {
+        return timeout(TimeValue.parseTimeValue(timeout, null));
+    }
+
+    @Override
+    public void readFrom(StreamInput in) throws IOException {
+        super.readFrom(in);
+        cause = in.readUTF();
+        name = in.readUTF();
+        template = in.readUTF();
+        order = in.readInt();
+        create = in.readBoolean();
+        settings = readSettingsFromStream(in);
+        timeout = readTimeValue(in);
+        int size = in.readVInt();
+        for (int i = 0; i < size; i++) {
+            mappings.put(in.readUTF(), in.readUTF());
+        }
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        super.writeTo(out);
+        out.writeUTF(cause);
+        out.writeUTF(name);
+        out.writeUTF(template);
+        out.writeInt(order);
+        out.writeBoolean(create);
+        writeSettingsToStream(settings, out);
+        timeout.writeTo(out);
+        out.writeVInt(mappings.size());
+        for (Map.Entry<String, String> entry : mappings.entrySet()) {
+            out.writeUTF(entry.getKey());
+            out.writeUTF(entry.getValue());
+        }
+    }
+}

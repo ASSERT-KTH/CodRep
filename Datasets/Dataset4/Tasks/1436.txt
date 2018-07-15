@@ -1,0 +1,58 @@
+super(index, indexSettings, name, settings);
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.index.analysis.compound;
+
+import org.apache.lucene.analysis.compound.CompoundWordTokenFilterBase;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.inject.assistedinject.Assisted;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.analysis.AbstractTokenFilterFactory;
+import org.elasticsearch.index.analysis.Analysis;
+import org.elasticsearch.index.settings.IndexSettings;
+
+import java.util.Set;
+
+/**
+ * Contains the common configuration settings between subclasses of this class.
+ *
+ * @author Edward Dale (scompt@scompt.com)
+ * @author kimchy (shay.banon)
+ */
+public abstract class AbstractCompoundWordTokenFilterFactory extends AbstractTokenFilterFactory {
+
+    protected final int minWordSize;
+    protected final int minSubwordSize;
+    protected final int maxSubwordSize;
+    protected final boolean onlyLongestMatch;
+    protected final Set<String> wordList;
+
+    @Inject public AbstractCompoundWordTokenFilterFactory(Index index, @IndexSettings Settings indexSettings, @Assisted String name, @Assisted Settings settings) {
+        super(index, indexSettings, name);
+
+        minWordSize = settings.getAsInt("min_word_size", CompoundWordTokenFilterBase.DEFAULT_MIN_WORD_SIZE);
+        minSubwordSize = settings.getAsInt("min_subword_size", CompoundWordTokenFilterBase.DEFAULT_MIN_SUBWORD_SIZE);
+        maxSubwordSize = settings.getAsInt("max_subword_size", CompoundWordTokenFilterBase.DEFAULT_MAX_SUBWORD_SIZE);
+        onlyLongestMatch = settings.getAsBoolean("only_longest_max", false);
+        wordList = Analysis.getWordList(settings, "word_list");
+    }
+}

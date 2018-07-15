@@ -1,0 +1,69 @@
+import org.elasticsearch.util.io.stream.Streamable;
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.search.facets;
+
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
+import org.elasticsearch.util.io.Streamable;
+import org.elasticsearch.util.json.ToJson;
+
+/**
+ * A search facet.
+ *
+ * @author kimchy (shay.banon)
+ */
+public interface Facet extends Streamable, ToJson {
+
+    enum Type {
+        /**
+         * Count type facet.
+         */
+        COUNT((byte) 0);
+
+        byte id;
+
+        Type(byte id) {
+            this.id = id;
+        }
+
+        public byte id() {
+            return id;
+        }
+
+        public static Type fromId(byte id) {
+            if (id == 0) {
+                return COUNT;
+            } else {
+                throw new ElasticSearchIllegalArgumentException("No match for id [" + id + "]");
+            }
+        }
+    }
+
+    /**
+     * The "logical" name of the search facet.
+     */
+    String name();
+
+    /**
+     * The type of the facet.
+     */
+    Type type();
+}

@@ -1,0 +1,218 @@
+} catch (Throwable e) {
+
+/*
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.cluster.metadata;
+
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateUpdateTask;
+import org.elasticsearch.cluster.action.index.NodeIndexDeletedAction;
+import org.elasticsearch.cluster.block.ClusterBlocks;
+import org.elasticsearch.cluster.routing.RoutingTable;
+import org.elasticsearch.cluster.routing.allocation.AllocationService;
+import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;
+import org.elasticsearch.common.Priority;
+import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.indices.IndexMissingException;
+import org.elasticsearch.threadpool.ThreadPool;
+
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.elasticsearch.cluster.ClusterState.newClusterStateBuilder;
+import static org.elasticsearch.cluster.metadata.MetaData.newMetaDataBuilder;
+
+/**
+ *
+ */
+public class MetaDataDeleteIndexService extends AbstractComponent {
+
+    private final ThreadPool threadPool;
+
+    private final ClusterService clusterService;
+
+    private final AllocationService allocationService;
+
+    private final NodeIndexDeletedAction nodeIndexDeletedAction;
+
+    private final MetaDataService metaDataService;
+
+    @Inject
+    public MetaDataDeleteIndexService(Settings settings, ThreadPool threadPool, ClusterService clusterService, AllocationService allocationService,
+                                      NodeIndexDeletedAction nodeIndexDeletedAction, MetaDataService metaDataService) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.clusterService = clusterService;
+        this.allocationService = allocationService;
+        this.nodeIndexDeletedAction = nodeIndexDeletedAction;
+        this.metaDataService = metaDataService;
+    }
+
+    public void deleteIndex(final Request request, final Listener userListener) {
+        // we lock here, and not within the cluster service callback since we don't want to
+        // block the whole cluster state handling
+        MetaDataService.MdLock mdLock = metaDataService.indexMetaDataLock(request.index);
+        try {
+            mdLock.lock();
+        } catch (InterruptedException e) {
+            userListener.onFailure(e);
+            return;
+        }
+
+        final DeleteIndexListener listener = new DeleteIndexListener(mdLock, request, userListener);
+        clusterService.submitStateUpdateTask("delete-index [" + request.index + "]", new ClusterStateUpdateTask() {
+            @Override
+            public ClusterState execute(ClusterState currentState) {
+                try {
+                    if (!currentState.metaData().hasConcreteIndex(request.index)) {
+                        listener.onFailure(new IndexMissingException(new Index(request.index)));
+                        return currentState;
+                    }
+
+                    logger.info("[{}] deleting index", request.index);
+
+                    RoutingTable.Builder routingTableBuilder = RoutingTable.builder().routingTable(currentState.routingTable());
+                    routingTableBuilder.remove(request.index);
+
+                    MetaData newMetaData = newMetaDataBuilder()
+                            .metaData(currentState.metaData())
+                            .remove(request.index)
+                            .build();
+
+                    RoutingAllocation.Result routingResult = allocationService.reroute(
+                            newClusterStateBuilder().state(currentState).routingTable(routingTableBuilder).metaData(newMetaData).build());
+
+                    ClusterBlocks blocks = ClusterBlocks.builder().blocks(currentState.blocks()).removeIndexBlocks(request.index).build();
+
+                    final AtomicInteger counter = new AtomicInteger(currentState.nodes().size());
+
+                    final NodeIndexDeletedAction.Listener nodeIndexDeleteListener = new NodeIndexDeletedAction.Listener() {
+                        @Override
+                        public void onNodeIndexDeleted(String index, String nodeId) {
+                            if (index.equals(request.index)) {
+                                if (counter.decrementAndGet() == 0) {
+                                    listener.onResponse(new Response(true));
+                                    nodeIndexDeletedAction.remove(this);
+                                }
+                            }
+                        }
+                    };
+                    nodeIndexDeletedAction.add(nodeIndexDeleteListener);
+
+                    listener.future = threadPool.schedule(request.timeout, ThreadPool.Names.SAME, new Runnable() {
+                        @Override
+                        public void run() {
+                            listener.onResponse(new Response(false));
+                            nodeIndexDeletedAction.remove(nodeIndexDeleteListener);
+                        }
+                    });
+
+                    return newClusterStateBuilder().state(currentState).routingResult(routingResult).metaData(newMetaData).blocks(blocks).build();
+                } catch (Exception e) {
+                    listener.onFailure(e);
+                    return currentState;
+                }
+            }
+        });
+    }
+
+    class DeleteIndexListener implements Listener {
+
+        private final AtomicBoolean notified = new AtomicBoolean();
+
+        private final MetaDataService.MdLock mdLock;
+
+        private final Request request;
+
+        private final Listener listener;
+
+        volatile ScheduledFuture future;
+
+        private DeleteIndexListener(MetaDataService.MdLock mdLock, Request request, Listener listener) {
+            this.mdLock = mdLock;
+            this.request = request;
+            this.listener = listener;
+        }
+
+        @Override
+        public void onResponse(final Response response) {
+            if (notified.compareAndSet(false, true)) {
+                mdLock.unlock();
+                if (future != null) {
+                    future.cancel(false);
+                }
+                listener.onResponse(response);
+            }
+        }
+
+        @Override
+        public void onFailure(Throwable t) {
+            if (notified.compareAndSet(false, true)) {
+                mdLock.unlock();
+                if (future != null) {
+                    future.cancel(false);
+                }
+                listener.onFailure(t);
+            }
+        }
+    }
+
+
+    public static interface Listener {
+
+        void onResponse(Response response);
+
+        void onFailure(Throwable t);
+    }
+
+    public static class Request {
+
+        final String index;
+
+        TimeValue timeout = TimeValue.timeValueSeconds(10);
+
+        public Request(String index) {
+            this.index = index;
+        }
+
+        public Request timeout(TimeValue timeout) {
+            this.timeout = timeout;
+            return this;
+        }
+    }
+
+    public static class Response {
+        private final boolean acknowledged;
+
+        public Response(boolean acknowledged) {
+            this.acknowledged = acknowledged;
+        }
+
+        public boolean acknowledged() {
+            return acknowledged;
+        }
+    }
+}

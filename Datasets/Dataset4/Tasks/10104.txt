@@ -1,0 +1,92 @@
+public double factor(int docId) {
+
+/*
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.common.lucene.search.function;
+
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.search.Explanation;
+
+/**
+ *
+ */
+public class BoostScoreFunction implements ScoreFunction {
+
+    private final float boost;
+
+    public BoostScoreFunction(float boost) {
+        this.boost = boost;
+    }
+
+
+    public float getBoost() {
+        return boost;
+    }
+
+    @Override
+    public void setNextReader(AtomicReaderContext context) {
+        // nothing to do here...
+    }
+
+    @Override
+    public float score(int docId, float subQueryScore) {
+        return subQueryScore * boost;
+    }
+
+    @Override
+    public float factor(int docId) {
+        return boost;
+    }
+
+    @Override
+    public Explanation explainScore(int docId, Explanation subQueryExpl) {
+        Explanation exp = new Explanation(boost * subQueryExpl.getValue(), "static boost function: product of:");
+        exp.addDetail(subQueryExpl);
+        exp.addDetail(new Explanation(boost, "boostFactor"));
+        return exp;
+    }
+
+    @Override
+    public Explanation explainFactor(int docId) {
+        return new Explanation(boost, "boostFactor");
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        BoostScoreFunction that = (BoostScoreFunction) o;
+
+        if (Float.compare(that.boost, boost) != 0) return false;
+
+        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        return (boost != +0.0f ? Float.floatToIntBits(boost) : 0);
+    }
+
+    @Override
+    public String toString() {
+        return "boost[" + boost + "]";
+    }
+}

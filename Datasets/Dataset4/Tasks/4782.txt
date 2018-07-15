@@ -1,0 +1,268 @@
+if (indexShard.replicaShards().isEmpty()) {
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this 
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.cluster.routing;
+
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.metadata.MetaData;
+import org.elasticsearch.common.collect.IdentityHashSet;
+import org.elasticsearch.common.collect.ImmutableMap;
+import org.elasticsearch.common.collect.Sets;
+import org.elasticsearch.common.collect.UnmodifiableIterator;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.util.concurrent.Immutable;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * @author kimchy (Shay Banon)
+ */
+@Immutable
+public class IndexRoutingTable implements Iterable<IndexShardRoutingTable> {
+
+    private final String index;
+
+    // note, we assume that when the index routing is created, ShardRoutings are created for all possible number of
+    // shards with state set to UNASSIGNED
+    private final ImmutableMap<Integer, IndexShardRoutingTable> shards;
+
+    IndexRoutingTable(String index, Map<Integer, IndexShardRoutingTable> shards) {
+        this.index = index;
+        this.shards = ImmutableMap.copyOf(shards);
+    }
+
+    public String index() {
+        return this.index;
+    }
+
+    public String getIndex() {
+        return index();
+    }
+
+    public void validate(RoutingTableValidation validation, MetaData metaData) {
+        if (!metaData.hasIndex(index())) {
+            validation.addIndexFailure(index(), "Exists in routing does not exists in metadata");
+            return;
+        }
+        IndexMetaData indexMetaData = metaData.index(index());
+        // check the number of shards
+        if (indexMetaData.numberOfShards() != shards().size()) {
+            Set<Integer> expected = Sets.newHashSet();
+            for (int i = 0; i < indexMetaData.numberOfShards(); i++) {
+                expected.add(i);
+            }
+            for (IndexShardRoutingTable indexShardRoutingTable : this) {
+                expected.remove(indexShardRoutingTable.shardId().id());
+            }
+            validation.addIndexFailure(index(), "Wrong number of shards in routing table, missing: " + expected);
+        }
+        // check the replicas
+        for (IndexShardRoutingTable indexShardRoutingTable : this) {
+            int routingNumberOfReplicas = indexShardRoutingTable.size() - 1;
+            if (routingNumberOfReplicas != indexMetaData.numberOfReplicas()) {
+                validation.addIndexFailure(index(), "Shard [" + indexShardRoutingTable.shardId().id()
+                        + "] routing table has wrong number of replicas, expected [" + indexMetaData.numberOfReplicas() + "], got [" + routingNumberOfReplicas + "]");
+            }
+        }
+    }
+
+    @Override public UnmodifiableIterator<IndexShardRoutingTable> iterator() {
+        return shards.values().iterator();
+    }
+
+    public ImmutableMap<Integer, IndexShardRoutingTable> shards() {
+        return shards;
+    }
+
+    public ImmutableMap<Integer, IndexShardRoutingTable> getShards() {
+        return shards();
+    }
+
+    public IndexShardRoutingTable shard(int shardId) {
+        return shards.get(shardId);
+    }
+
+    /**
+     * A group shards iterator where each group ({@link ShardsIterator}
+     * is an iterator across shard replication group.
+     */
+    public GroupShardsIterator groupByShardsIt() {
+        IdentityHashSet<ShardsIterator> set = new IdentityHashSet<ShardsIterator>();
+        for (IndexShardRoutingTable indexShard : this) {
+            set.add(indexShard.shardsIt());
+        }
+        return new GroupShardsIterator(set);
+    }
+
+    /**
+     * A groups shards iterator where each groups is a single {@link ShardRouting} and a group
+     * is created for each shard routing.
+     *
+     * <p>This basically means that components that use the {@link GroupShardsIterator} will iterate
+     * over *all* the shards (all the replicas) within the index.
+     */
+    public GroupShardsIterator groupByAllIt() {
+        IdentityHashSet<ShardsIterator> set = new IdentityHashSet<ShardsIterator>();
+        for (IndexShardRoutingTable indexShard : this) {
+            for (ShardRouting shardRouting : indexShard) {
+                set.add(shardRouting.shardsIt());
+            }
+        }
+        return new GroupShardsIterator(set);
+    }
+
+    public void validate() throws RoutingValidationException {
+    }
+
+    public static class Builder {
+
+        private final String index;
+
+        private final Map<Integer, IndexShardRoutingTable> shards = new HashMap<Integer, IndexShardRoutingTable>();
+
+        public Builder(String index) {
+            this.index = index;
+        }
+
+        public static IndexRoutingTable readFrom(StreamInput in) throws IOException {
+            String index = in.readUTF();
+            Builder builder = new Builder(index);
+
+            int size = in.readVInt();
+            for (int i = 0; i < size; i++) {
+                builder.addIndexShard(IndexShardRoutingTable.Builder.readFromThin(in, index));
+            }
+
+            return builder.build();
+        }
+
+        public static void writeTo(IndexRoutingTable index, StreamOutput out) throws IOException {
+            out.writeUTF(index.index());
+            out.writeVInt(index.shards.size());
+            for (IndexShardRoutingTable indexShard : index) {
+                IndexShardRoutingTable.Builder.writeToThin(indexShard, out);
+            }
+        }
+
+        /**
+         * Initializes a new empty index
+         */
+        public Builder initializeEmpty(IndexMetaData indexMetaData) {
+            for (int shardId = 0; shardId < indexMetaData.numberOfShards(); shardId++) {
+                for (int i = 0; i <= indexMetaData.numberOfReplicas(); i++) {
+                    addShard(shardId, null, i == 0, ShardRoutingState.UNASSIGNED);
+                }
+            }
+            return this;
+        }
+
+        public Builder addReplica() {
+            for (int shardId : shards.keySet()) {
+                addShard(shardId, null, false, ShardRoutingState.UNASSIGNED);
+            }
+            return this;
+        }
+
+        public Builder removeReplica() {
+            for (int shardId : shards.keySet()) {
+                IndexShardRoutingTable indexShard = shards.get(shardId);
+                if (indexShard.backupsShards().isEmpty()) {
+                    // nothing to do here!
+                    return this;
+                }
+                // re-add all the current ones
+                IndexShardRoutingTable.Builder builder = new IndexShardRoutingTable.Builder(indexShard.shardId());
+                for (ShardRouting shardRouting : indexShard) {
+                    builder.addShard(new ImmutableShardRouting(shardRouting));
+                }
+                // first check if there is one that is not assigned to a node, and remove it
+                boolean removed = false;
+                for (ShardRouting shardRouting : indexShard) {
+                    if (!shardRouting.primary() && !shardRouting.assignedToNode()) {
+                        builder.removeShard(shardRouting);
+                        removed = true;
+                        break;
+                    }
+                }
+                if (!removed) {
+                    for (ShardRouting shardRouting : indexShard) {
+                        if (!shardRouting.primary()) {
+                            builder.removeShard(shardRouting);
+                            removed = true;
+                            break;
+                        }
+                    }
+                }
+                shards.put(shardId, builder.build());
+            }
+            return this;
+        }
+
+        public Builder addIndexShard(IndexShardRoutingTable indexShard) {
+            shards.put(indexShard.shardId().id(), indexShard);
+            return this;
+        }
+
+        public Builder addShard(ShardRouting shard) {
+            return internalAddShard(new ImmutableShardRouting(shard));
+        }
+
+        public Builder addShard(int shardId, String nodeId, boolean primary, ShardRoutingState state) {
+            ImmutableShardRouting shard = new ImmutableShardRouting(index, shardId, nodeId, primary, state);
+            return internalAddShard(shard);
+        }
+
+        private Builder internalAddShard(ImmutableShardRouting shard) {
+            IndexShardRoutingTable indexShard = shards.get(shard.id());
+            if (indexShard == null) {
+                indexShard = new IndexShardRoutingTable.Builder(shard.shardId()).addShard(shard).build();
+            } else {
+                indexShard = new IndexShardRoutingTable.Builder(indexShard).addShard(shard).build();
+            }
+            shards.put(indexShard.shardId().id(), indexShard);
+            return this;
+        }
+
+        public IndexRoutingTable build() throws RoutingValidationException {
+            IndexRoutingTable indexRoutingTable = new IndexRoutingTable(index, ImmutableMap.copyOf(shards));
+            indexRoutingTable.validate();
+            return indexRoutingTable;
+        }
+    }
+
+
+    public String prettyPrint() {
+        StringBuilder sb = new StringBuilder("-- index [" + index + "]\n");
+        for (IndexShardRoutingTable indexShard : this) {
+            sb.append("----shard_id [").append(indexShard.shardId().index().name()).append("][").append(indexShard.shardId().id()).append("]\n");
+            for (ShardRouting shard : indexShard) {
+                sb.append("--------").append(shard.shortSummary()).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+
+
+}

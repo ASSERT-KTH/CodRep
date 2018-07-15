@@ -1,0 +1,126 @@
+indexTemplateService.putTemplate(new MetaDataIndexTemplateService.PutRequest(request.cause(), request.getName())
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.action.admin.indices.template.put;
+
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.support.master.TransportMasterNodeOperationAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.metadata.MetaDataIndexTemplateService;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Put index template action.
+ */
+public class TransportPutIndexTemplateAction extends TransportMasterNodeOperationAction<PutIndexTemplateRequest, PutIndexTemplateResponse> {
+
+    private final MetaDataIndexTemplateService indexTemplateService;
+
+    @Inject
+    public TransportPutIndexTemplateAction(Settings settings, TransportService transportService, ClusterService clusterService,
+                                           ThreadPool threadPool, MetaDataIndexTemplateService indexTemplateService) {
+        super(settings, transportService, clusterService, threadPool);
+        this.indexTemplateService = indexTemplateService;
+    }
+
+    @Override
+    protected String executor() {
+        return ThreadPool.Names.MANAGEMENT;
+    }
+
+    @Override
+    protected String transportAction() {
+        return PutIndexTemplateAction.NAME;
+    }
+
+    @Override
+    protected PutIndexTemplateRequest newRequest() {
+        return new PutIndexTemplateRequest();
+    }
+
+    @Override
+    protected PutIndexTemplateResponse newResponse() {
+        return new PutIndexTemplateResponse();
+    }
+
+    @Override
+    protected ClusterBlockException checkBlock(PutIndexTemplateRequest request, ClusterState state) {
+        return state.blocks().indexBlockedException(ClusterBlockLevel.METADATA, "");
+    }
+
+    @Override
+    protected PutIndexTemplateResponse masterOperation(PutIndexTemplateRequest request, ClusterState state) throws ElasticSearchException {
+        String cause = request.cause();
+        if (cause.length() == 0) {
+            cause = "api";
+        }
+
+        final AtomicReference<PutIndexTemplateResponse> responseRef = new AtomicReference<PutIndexTemplateResponse>();
+        final AtomicReference<Throwable> failureRef = new AtomicReference<Throwable>();
+        final CountDownLatch latch = new CountDownLatch(1);
+        indexTemplateService.putTemplate(new MetaDataIndexTemplateService.PutRequest(request.cause(), request.name())
+                .template(request.template())
+                .order(request.order())
+                .settings(request.settings())
+                .mappings(request.mappings())
+                .customs(request.customs())
+                .create(request.create()),
+
+                new MetaDataIndexTemplateService.PutListener() {
+                    @Override
+                    public void onResponse(MetaDataIndexTemplateService.PutResponse response) {
+                        responseRef.set(new PutIndexTemplateResponse(response.acknowledged()));
+                        latch.countDown();
+                    }
+
+                    @Override
+                    public void onFailure(Throwable t) {
+                        failureRef.set(t);
+                        latch.countDown();
+                    }
+                });
+
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            failureRef.set(e);
+        }
+
+        if (failureRef.get() != null) {
+            if (failureRef.get() instanceof ElasticSearchException) {
+                throw (ElasticSearchException) failureRef.get();
+            } else {
+                throw new ElasticSearchException(failureRef.get().getMessage(), failureRef.get());
+            }
+        }
+
+        return responseRef.get();
+    }
+}

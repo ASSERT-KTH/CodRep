@@ -1,0 +1,197 @@
+THROTTLE,
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.index.gateway;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * @author kimchy (shay.banon)
+ */
+public class RecoveryStatus {
+
+    public static enum Stage {
+        INIT,
+        RETRY,
+        INDEX,
+        TRANSLOG,
+        DONE
+    }
+
+    private Stage stage = Stage.INIT;
+
+    private long startTime = System.currentTimeMillis();
+
+    private long retryTime = 0;
+
+    private long time;
+
+    private Index index = new Index();
+
+    private Translog translog = new Translog();
+
+    public Stage stage() {
+        return this.stage;
+    }
+
+    public RecoveryStatus updateStage(Stage stage) {
+        this.stage = stage;
+        return this;
+    }
+
+    public long startTime() {
+        return this.startTime;
+    }
+
+    public void startTime(long startTime) {
+        this.startTime = startTime;
+    }
+
+    public long retryTime() {
+        return this.retryTime;
+    }
+
+    public void retryTime(long retryTime) {
+        this.retryTime = retryTime;
+    }
+
+    public long time() {
+        return this.time;
+    }
+
+    public void time(long time) {
+        this.time = time;
+    }
+
+    public Index index() {
+        return index;
+    }
+
+    public Translog translog() {
+        return translog;
+    }
+
+    public static class Translog {
+        private long startTime = 0;
+        private long time;
+        private volatile long currentTranslogOperations = 0;
+
+        public long startTime() {
+            return this.startTime;
+        }
+
+        public void startTime(long startTime) {
+            this.startTime = startTime;
+        }
+
+        public long time() {
+            return this.time;
+        }
+
+        public void time(long time) {
+            this.time = time;
+        }
+
+        public void addTranslogOperations(long count) {
+            this.currentTranslogOperations += count;
+        }
+
+        public long currentTranslogOperations() {
+            return this.currentTranslogOperations;
+        }
+    }
+
+    public static class Index {
+        private long startTime = 0;
+        private long time = 0;
+
+        private long version = -1;
+        private int numberOfFiles = 0;
+        private long totalSize = 0;
+        private int numberOfExistingFiles = 0;
+        private long existingTotalSize = 0;
+        private AtomicLong retryTime = new AtomicLong();
+        private AtomicLong currentFilesSize = new AtomicLong();
+
+        public long startTime() {
+            return this.startTime;
+        }
+
+        public void startTime(long startTime) {
+            this.startTime = startTime;
+        }
+
+        public long time() {
+            return this.time;
+        }
+
+        public void time(long time) {
+            this.time = time;
+        }
+
+        public long version() {
+            return this.version;
+        }
+
+        public void files(int numberOfFiles, long totalSize, int numberOfExistingFiles, long existingTotalSize) {
+            this.numberOfFiles = numberOfFiles;
+            this.totalSize = totalSize;
+            this.numberOfExistingFiles = numberOfExistingFiles;
+            this.existingTotalSize = existingTotalSize;
+        }
+
+        public int numberOfFiles() {
+            return numberOfFiles;
+        }
+
+        public long totalSize() {
+            return this.totalSize;
+        }
+
+        public int numberOfExistingFiles() {
+            return numberOfExistingFiles;
+        }
+
+        public long existingTotalSize() {
+            return this.existingTotalSize;
+        }
+
+        public void addRetryTime(long delta) {
+            retryTime.addAndGet(delta);
+        }
+
+        public long retryTime() {
+            return this.retryTime.get();
+        }
+
+        public void updateVersion(long version) {
+            this.version = version;
+        }
+
+        public long currentFilesSize() {
+            return this.currentFilesSize.get();
+        }
+
+        public void addCurrentFilesSize(long updatedSize) {
+            this.currentFilesSize.addAndGet(updatedSize);
+        }
+    }
+}

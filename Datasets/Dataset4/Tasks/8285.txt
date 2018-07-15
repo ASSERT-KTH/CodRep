@@ -1,0 +1,125 @@
+package org.elasticsearch.indices.recovery;
+
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.index.shard.recovery;
+
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Streamable;
+import org.elasticsearch.index.shard.ShardId;
+
+import java.io.IOException;
+
+/**
+ * @author kimchy (shay.banon)
+ */
+class RecoveryFileChunkRequest implements Streamable {
+
+    private ShardId shardId;
+    private String name;
+    private long position;
+    private long length;
+    private String checksum;
+    private byte[] content;
+    private int contentLength;
+
+    RecoveryFileChunkRequest() {
+    }
+
+    RecoveryFileChunkRequest(ShardId shardId, String name, long position, long length, String checksum, byte[] content, int contentLength) {
+        this.shardId = shardId;
+        this.name = name;
+        this.position = position;
+        this.length = length;
+        this.checksum = checksum;
+        this.content = content;
+        this.contentLength = contentLength;
+    }
+
+    public ShardId shardId() {
+        return shardId;
+    }
+
+    public String name() {
+        return name;
+    }
+
+    public long position() {
+        return position;
+    }
+
+    @Nullable public String checksum() {
+        return this.checksum;
+    }
+
+    public long length() {
+        return length;
+    }
+
+    public byte[] content() {
+        return content;
+    }
+
+    public int contentLength() {
+        return contentLength;
+    }
+
+    public RecoveryFileChunkRequest readFileChunk(StreamInput in) throws IOException {
+        RecoveryFileChunkRequest request = new RecoveryFileChunkRequest();
+        request.readFrom(in);
+        return request;
+    }
+
+    @Override public void readFrom(StreamInput in) throws IOException {
+        shardId = ShardId.readShardId(in);
+        name = in.readUTF();
+        position = in.readVLong();
+        length = in.readVLong();
+        if (in.readBoolean()) {
+            checksum = in.readUTF();
+        }
+        contentLength = in.readVInt();
+        content = new byte[contentLength];
+        in.readFully(content);
+    }
+
+    @Override public void writeTo(StreamOutput out) throws IOException {
+        shardId.writeTo(out);
+        out.writeUTF(name);
+        out.writeVLong(position);
+        out.writeVLong(length);
+        if (checksum == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeUTF(checksum);
+        }
+        out.writeVInt(contentLength);
+        out.writeBytes(content, 0, contentLength);
+    }
+
+    @Override public String toString() {
+        return shardId + ": name='" + name + '\'' +
+                ", position=" + position +
+                ", length=" + length;
+    }
+}

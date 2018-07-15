@@ -1,0 +1,237 @@
+PostingsFormatProvider postingsFormatProvider();
+
+/*
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.index.mapper;
+
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.index.codec.postingsformat.PostingsFormatProvider;
+import org.elasticsearch.index.field.data.FieldDataType;
+import org.elasticsearch.index.query.QueryParseContext;
+import org.elasticsearch.index.similarity.SimilarityProvider;
+
+/**
+ *
+ */
+public interface FieldMapper<T> {
+
+    public static class Names {
+
+        private final String name;
+
+        private final String indexName;
+
+        private final String indexNameClean;
+
+        private final String fullName;
+
+        private final String sourcePath;
+
+        public Names(String name) {
+            this(name, name, name, name);
+        }
+
+        public Names(String name, String indexName, String indexNameClean, String fullName) {
+            this(name, indexName, indexNameClean, fullName, fullName);
+        }
+
+        public Names(String name, String indexName, String indexNameClean, String fullName, @Nullable String sourcePath) {
+            this.name = name.intern();
+            this.indexName = indexName.intern();
+            this.indexNameClean = indexNameClean.intern();
+            this.fullName = fullName.intern();
+            this.sourcePath = sourcePath == null ? this.fullName : sourcePath.intern();
+        }
+
+        /**
+         * The logical name of the field.
+         */
+        public String name() {
+            return name;
+        }
+
+        /**
+         * The indexed name of the field. This is the name under which we will
+         * store it in the index.
+         */
+        public String indexName() {
+            return indexName;
+        }
+
+        /**
+         * The cleaned index name, before any "path" modifications performed on it.
+         */
+        public String indexNameClean() {
+            return indexNameClean;
+        }
+
+        /**
+         * The full name, including dot path.
+         */
+        public String fullName() {
+            return fullName;
+        }
+
+        /**
+         * The dot path notation to extract the value from source.
+         */
+        public String sourcePath() {
+            return sourcePath;
+        }
+
+        /**
+         * Creates a new index term based on the provided value.
+         */
+        public Term createIndexNameTerm(String value) {
+            return new Term(indexName, value);
+        }
+
+        /**
+         * Creates a new index term based on the provided value.
+         */
+        public Term createIndexNameTerm(BytesRef value) {
+            return new Term(indexName, value);
+        }
+    }
+
+    Names names();
+
+    // LUCENE 4 UPGRADE Consider replacing these all with fieldType() and letting consumer pick and choose
+
+    boolean indexed();
+
+    boolean tokenized();
+
+    boolean stored();
+
+    boolean storeTermVectors();
+
+    boolean storeTermVectorOffsets();
+
+    boolean storeTermVectorPositions();
+
+    boolean storeTermVectorPayloads();
+
+    float boost();
+
+    boolean omitNorms();
+
+    IndexOptions indexOptions();
+
+    /**
+     * The analyzer that will be used to index the field.
+     */
+    Analyzer indexAnalyzer();
+
+    /**
+     * The analyzer that will be used to search the field.
+     */
+    Analyzer searchAnalyzer();
+
+    /**
+     * The analyzer that will be used for quoted search on the field.
+     */
+    Analyzer searchQuoteAnalyzer();
+
+    /**
+     * Similarity used for scoring queries on the field
+     */
+    SimilarityProvider similarity();
+
+    /**
+     * Returns the value that will be used as a result for search. Can be only of specific types... .
+     */
+    Object valueForSearch(Object value);
+
+    /**
+     * Returns the actual value of the field.
+     */
+    T value(Object value);
+
+    T valueFromString(String value);
+
+    /**
+     * Returns the actual value of the field as string.
+     */
+    String valueAsString(Object value);
+
+    /**
+     * Returns the indexed value.
+     */
+    BytesRef indexedValue(String value);
+
+    /**
+     * Should the field query {@link #fieldQuery(String, org.elasticsearch.index.query.QueryParseContext)}  be used when detecting this
+     * field in query string.
+     */
+    boolean useFieldQueryWithQueryString();
+
+    /**
+     * A field query for the specified value.
+     */
+    Query fieldQuery(String value, @Nullable QueryParseContext context);
+
+    Filter fieldFilter(String value, @Nullable QueryParseContext context);
+
+    Query fuzzyQuery(String value, String minSim, int prefixLength, int maxExpansions, boolean transpositions);
+
+    Query fuzzyQuery(String value, double minSim, int prefixLength, int maxExpansions, boolean transpositions);
+
+    Query prefixQuery(String value, @Nullable MultiTermQuery.RewriteMethod method, @Nullable QueryParseContext context);
+
+    Filter prefixFilter(String value, @Nullable QueryParseContext context);
+
+    Query regexpQuery(String value, int flags, @Nullable MultiTermQuery.RewriteMethod method, @Nullable QueryParseContext context);
+
+    Filter regexpFilter(String value, int flags, @Nullable QueryParseContext parseContext);
+
+    /**
+     * A term query to use when parsing a query string. Can return <tt>null</tt>.
+     */
+    Query queryStringTermQuery(Term term);
+
+    /**
+     * Constructs a range query based on the mapper.
+     */
+    Query rangeQuery(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper, @Nullable QueryParseContext context);
+
+    /**
+     * Constructs a range query filter based on the mapper.
+     */
+    Filter rangeFilter(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper, @Nullable QueryParseContext context);
+
+    /**
+     * Null value filter, returns <tt>null</tt> if there is no null value associated with the field.
+     */
+    @Nullable
+    Filter nullValueFilter();
+
+    FieldDataType fieldDataType();
+
+    PostingsFormatProvider postingFormatProvider();
+
+}

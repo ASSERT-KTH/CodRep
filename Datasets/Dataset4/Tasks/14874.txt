@@ -1,0 +1,79 @@
+sound.play(0.5f);
+
+/*******************************************************************************
+ * Copyright 2010 Mario Zechner (contact@badlogicgames.com)
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+ * License. You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS"
+ * BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.tests;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.InputProcessor;
+import com.badlogic.gdx.Files.FileType;
+import com.badlogic.gdx.audio.Music;
+import com.badlogic.gdx.audio.Sound;
+import com.badlogic.gdx.tests.utils.GdxTest;
+
+public class SoundTest extends GdxTest implements InputProcessor {
+	Sound sound;
+	Music music;
+	float volume = 1.0f;
+
+	@Override public void render () {		
+		Gdx.input.processEvents(this);
+	}
+
+
+	@Override public void create () {		
+			sound = Gdx.audio.newSound(Gdx.files.getFileHandle("data/shotgun.wav", FileType.Internal));
+
+//			music = Gdx.audio.newMusic(Gdx.files.getFileHandle("data/threeofaperfectpair.mp3", FileType.Internal));
+			music = Gdx.audio.newMusic(Gdx.files.getFileHandle("data/cloudconnected.ogg", FileType.Internal));
+			music.play();
+			music.setLooping(true);
+	}
+
+	@Override public boolean keyDown (int keycode) {
+		return false;
+	}
+
+	@Override public boolean keyTyped (char character) {
+		if (character == '+') volume += 0.1f;
+		if (character == '-') volume -= 0.1f;
+		music.setVolume(volume);
+
+		return false;
+	}
+
+	@Override public boolean keyUp (int keycode) {
+
+		return false;
+	}
+
+	@Override public boolean touchDown (int x, int y, int pointer) {
+		sound.play();
+		return false;
+	}
+
+	@Override public boolean touchDragged (int x, int y, int pointer) {
+		// TODO Auto-generated method stub
+		return false;
+	}
+
+	@Override public boolean touchUp (int x, int y, int pointer) {
+		return false;
+	}
+
+	@Override public boolean needsGL20 () {
+		// TODO Auto-generated method stub
+		return false;
+	}
+}
