@@ -70,7 +70,7 @@ What the participants get?
 What the winner gets?
 
 1. The ultimate CodRep fame
-1. An travel invitation to KTH in Stockholm, all expenses paid, to meet and discuss the design of a futuristic program repair bot.
+1. A travel invitation to KTH in Stockholm, all expenses paid, to meet and discuss the design of a futuristic program repair bot.
 1. An official KTH certificate
 
 In addition, the top-three participants will get nice KTH goodies by post.
