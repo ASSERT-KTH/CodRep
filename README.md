@@ -44,6 +44,7 @@ Registered participants:
 1. [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25)
 1. [Otto-von-Guericke University Magdeburg](https://github.com/KTH/CodRep-competition/issues/26)
 1. [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28)
+1. [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29)
 
 Important dates:
 
