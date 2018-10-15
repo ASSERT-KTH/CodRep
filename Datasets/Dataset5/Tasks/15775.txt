@@ -1,0 +1,326 @@
+this.classpath = new Path();
+
+/*
+ * Copyright (C) The Apache Software Foundation. All rights reserved.
+ *
+ * This software is published under the terms of the Apache Software License
+ * version 1.1, a copy of which has been included with this distribution in
+ * the LICENSE.txt file.
+ */
+package org.apache.tools.ant.taskdefs;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Enumeration;
+import java.util.Iterator;
+import java.util.Properties;
+import org.apache.myrmidon.api.TaskException;
+import org.apache.myrmidon.framework.exec.Environment;
+import org.apache.myrmidon.framework.exec.ExecException;
+import org.apache.tools.ant.AntClassLoader;
+import org.apache.tools.ant.Task;
+import org.apache.tools.ant.types.Path;
+import org.apache.tools.ant.types.Reference;
+
+/**
+ * Will set a Project property. Used to be a hack in ProjectHelper Will not
+ * override values set by the command line or parent projects.
+ *
+ * @author costin@dnt.ro
+ * @author <a href="mailto:rubys@us.ibm.com">Sam Ruby</a>
+ * @author <a href="mailto:glennm@ca.ibm.com">Glenn McAllister</a>
+ */
+public class Property extends Task
+{
+    protected Path classpath;
+    protected String env;
+    protected File file;
+
+    protected String name;
+    protected Reference ref;
+    protected String resource;
+
+    protected String value;// set read-only properties
+
+    public Property()
+    {
+        super();
+    }
+
+    public void setClasspath( Path classpath )
+        throws TaskException
+    {
+        if( this.classpath == null )
+        {
+            this.classpath = classpath;
+        }
+        else
+        {
+            this.classpath.append( classpath );
+        }
+    }
+
+    public void setClasspathRef( Reference r )
+        throws TaskException
+    {
+        createClasspath().setRefid( r );
+    }
+
+    public void setEnvironment( String env )
+    {
+        this.env = env;
+    }
+
+    public void setFile( File file )
+    {
+        this.file = file;
+    }
+
+    public void setLocation( File location )
+    {
+        setValue( location.getAbsolutePath() );
+    }
+
+    public void setName( String name )
+    {
+        this.name = name;
+    }
+
+    public void setRefid( Reference ref )
+    {
+        this.ref = ref;
+    }
+
+    public void setResource( String resource )
+    {
+        this.resource = resource;
+    }
+
+    public void setValue( String value )
+    {
+        this.value = value;
+    }
+
+    public String getEnvironment()
+    {
+        return env;
+    }
+
+    public File getFile()
+    {
+        return file;
+    }
+
+    public Reference getRefid()
+    {
+        return ref;
+    }
+
+    public String getResource()
+    {
+        return resource;
+    }
+
+    public String getValue()
+    {
+        return value;
+    }
+
+    public Path createClasspath()
+        throws TaskException
+    {
+        if( this.classpath == null )
+        {
+            this.classpath = new Path( getProject() );
+        }
+        return this.classpath.createPath();
+    }
+
+    public void execute()
+        throws TaskException
+    {
+        if( name != null )
+        {
+            if( value == null && ref == null )
+            {
+                throw new TaskException( "You must specify value, location or refid with the name attribute" );
+            }
+        }
+        else
+        {
+            if( file == null && resource == null && env == null )
+            {
+                throw new TaskException( "You must specify file, resource or environment when not using the name attribute" );
+            }
+        }
+
+        if( ( name != null ) && ( value != null ) )
+        {
+            addProperty( name, value );
+        }
+
+        if( file != null )
+            loadFile( file );
+
+        if( resource != null )
+            loadResource( resource );
+
+        if( env != null )
+            loadEnvironment( env );
+
+        if( ( name != null ) && ( ref != null ) )
+        {
+            Object obj = ref.getReferencedObject( getProject() );
+            if( obj != null )
+            {
+                addProperty( name, obj.toString() );
+            }
+        }
+    }
+
+    public String toString()
+    {
+        return value == null ? "" : value;
+    }
+
+    protected void addProperties( Properties props )
+        throws TaskException
+    {
+        //no longer needs as ant2 properties are completely dynamic
+        //resolveAllProperties( props );
+
+        Enumeration e = props.keys();
+        while( e.hasMoreElements() )
+        {
+            String name = (String)e.nextElement();
+            String value = (String)props.getProperty( name );
+
+            String v = getProject().replaceProperties( value );
+            addProperty( name, v );
+        }
+    }
+
+    protected void addProperty( String n, String v )
+        throws TaskException
+    {
+        setProperty( n, v );
+    }
+
+    protected void loadEnvironment( String prefix )
+        throws TaskException
+    {
+        final Properties props = new Properties();
+        if( !prefix.endsWith( "." ) )
+            prefix += ".";
+
+        getLogger().debug( "Loading EnvironmentData " + prefix );
+        try
+        {
+            final Properties environment = Environment.getNativeEnvironment();
+            for( Iterator e = environment.keySet().iterator(); e.hasNext(); )
+            {
+                final String key = (String)e.next();
+                final String value = environment.getProperty( key );
+
+                if( value.equals( "" ) )
+                {
+                    getLogger().warn( "Ignoring: " + key );
+                }
+                else
+                {
+                    props.put( prefix + key, value );
+                }
+            }
+        }
+        catch( final ExecException ee )
+        {
+            throw new TaskException( ee.getMessage(), ee );
+        }
+        catch( final IOException ioe )
+        {
+            throw new TaskException( ioe.getMessage(), ioe );
+        }
+
+        addProperties( props );
+    }
+
+    protected void loadFile( File file )
+        throws TaskException
+    {
+        Properties props = new Properties();
+        getLogger().debug( "Loading " + file.getAbsolutePath() );
+        try
+        {
+            if( file.exists() )
+            {
+                FileInputStream fis = new FileInputStream( file );
+                try
+                {
+                    props.load( fis );
+                }
+                finally
+                {
+                    if( fis != null )
+                    {
+                        fis.close();
+                    }
+                }
+                addProperties( props );
+            }
+            else
+            {
+                getLogger().debug( "Unable to find property file: " + file.getAbsolutePath() );
+            }
+        }
+        catch( IOException ex )
+        {
+            throw new TaskException( "Error", ex );
+        }
+    }
+
+    protected void loadResource( String name )
+        throws TaskException
+    {
+        Properties props = new Properties();
+        getLogger().debug( "Resource Loading " + name );
+        try
+        {
+            ClassLoader cL = null;
+            InputStream is = null;
+
+            if( classpath != null )
+            {
+                cL = new AntClassLoader( getProject(), classpath );
+            }
+            else
+            {
+                cL = this.getClass().getClassLoader();
+            }
+
+            if( cL == null )
+            {
+                is = ClassLoader.getSystemResourceAsStream( name );
+            }
+            else
+            {
+                is = cL.getResourceAsStream( name );
+            }
+
+            if( is != null )
+            {
+                props.load( is );
+                addProperties( props );
+            }
+            else
+            {
+                getLogger().warn( "Unable to find resource " + name );
+            }
+        }
+        catch( IOException ex )
+        {
+            throw new TaskException( "Error", ex );
+        }
+    }
+}

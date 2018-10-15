@@ -1,0 +1,75 @@
+private static final Resources REZ =
+
+/*
+ * Copyright (C) The Apache Software Foundation. All rights reserved.
+ *
+ * This software is published under the terms of the Apache Software License
+ * version 1.1, a copy of which has been included  with this distribution in
+ * the LICENSE.txt file.
+ */
+package org.apache.myrmidon.framework.factories;
+
+import java.io.File;
+import org.apache.aut.nativelib.ExecException;
+import org.apache.aut.nativelib.impl.DefaultExecManager;
+import org.apache.avalon.excalibur.i18n.ResourceManager;
+import org.apache.avalon.excalibur.i18n.Resources;
+import org.apache.avalon.framework.parameters.Parameterizable;
+import org.apache.avalon.framework.parameters.Parameters;
+import org.apache.avalon.framework.parameters.ParameterException;
+import org.apache.myrmidon.interfaces.service.AntServiceException;
+import org.apache.myrmidon.interfaces.service.ServiceFactory;
+
+/**
+ * A Factory responsible for creating the ExecManager service.
+ *
+ * @author <a href="mailto:peter@apache.org">Peter Donald</a>
+ * @version $Revision$ $Date$
+ */
+public class ExecManagerFactory
+    implements ServiceFactory, Parameterizable
+{
+    private final static Resources REZ =
+        ResourceManager.getPackageResources( ExecManagerFactory.class );
+
+    private Parameters m_parameters;
+
+    public void parameterize( final Parameters parameters )
+        throws ParameterException
+    {
+        m_parameters = parameters;
+    }
+
+    /**
+     * Create the ExecManager Service.
+     */
+    public Object createService()
+        throws AntServiceException
+    {
+        try
+        {
+            final File home = getHomeDirectory();
+            return new DefaultExecManager( home );
+        }
+        catch( final Exception ee )
+        {
+            throw new AntServiceException( ee.getMessage(), ee );
+        }
+    }
+
+    /**
+     * Utility method to retrieve home directory.
+     */
+    private File getHomeDirectory()
+        throws Exception
+    {
+        final String home = m_parameters.getParameter( "myrmidon.home" );
+        if( null == home )
+        {
+            final String message = REZ.getString( "missing-home-dir.error" );
+            throw new AntServiceException( message );
+        }
+
+        return new File( home );
+    }
+}

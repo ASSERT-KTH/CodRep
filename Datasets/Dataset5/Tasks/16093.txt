@@ -1,0 +1,345 @@
+private Map<String, Boolean> isToBeRegisteredCache = new ConcurrentHashMap<String, Boolean>();
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+package org.apache.jmeter.protocol.java.sampler;
+
+import java.lang.reflect.Method;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.config.ConfigTestElement;
+import org.apache.jmeter.samplers.AbstractSampler;
+import org.apache.jmeter.samplers.Entry;
+import org.apache.jmeter.samplers.SampleResult;
+import org.apache.jmeter.testelement.TestElement;
+import org.apache.jmeter.testelement.TestStateListener;
+import org.apache.jmeter.testelement.property.TestElementProperty;
+import org.apache.jorphan.logging.LoggingManager;
+import org.apache.log.Logger;
+
+/**
+ * A sampler for executing custom Java code in each sample. See
+ * {@link JavaSamplerClient} and {@link AbstractJavaSamplerClient} for
+ * information on writing Java code to be executed by this sampler.
+ *
+ */
+public class JavaSampler extends AbstractSampler implements TestStateListener {
+
+    private static final Logger log = LoggingManager.getLoggerForClass();
+
+    private static final long serialVersionUID = 232L; // Remember to change this when the class changes ...
+
+    private static final Set<String> APPLIABLE_CONFIG_CLASSES = new HashSet<String>(
+            Arrays.asList(new String[]{
+                    "org.apache.jmeter.protocol.java.config.gui.JavaConfigGui",
+                    "org.apache.jmeter.config.gui.SimpleConfigGui"}));
+
+    /**
+     * Property key representing the classname of the JavaSamplerClient to user.
+     */
+    public static final String CLASSNAME = "classname";
+
+    /**
+     * Property key representing the arguments for the JavaSamplerClient.
+     */
+    public static final String ARGUMENTS = "arguments";
+
+    /**
+     * The JavaSamplerClient instance used by this sampler to actually perform
+     * the sample.
+     */
+    private transient JavaSamplerClient javaClient = null;
+
+    /**
+     * The JavaSamplerContext instance used by this sampler to hold information
+     * related to the test run, such as the parameters specified for the sampler
+     * client.
+     */
+    private transient JavaSamplerContext context = null;
+
+    /**
+     * Cache of classname, boolean that holds information about a class and wether or not it should 
+     * be registered for cleanup.
+     * This is done to avoid using reflection on each registration
+     */
+    private transient Map<String, Boolean> isToBeRegisteredCache = new ConcurrentHashMap<String, Boolean>();
+
+    /**
+     * Set used to register all JavaSamplerClient and JavaSamplerContext. 
+     * This is used so that the JavaSamplerClient can be notified when the test ends.
+     */
+    private static final Set<Object[]> javaClientAndContextSet = new HashSet<Object[]>();
+
+    /**
+     * Create a JavaSampler.
+     */
+    public JavaSampler() {
+        setArguments(new Arguments());    
+    }
+
+    /**
+     * Set the arguments (parameters) for the JavaSamplerClient to be executed
+     * with.
+     *
+     * @param args
+     *            the new arguments. These replace any existing arguments.
+     */
+    public void setArguments(Arguments args) {
+        setProperty(new TestElementProperty(ARGUMENTS, args));
+    }
+
+    /**
+     * Get the arguments (parameters) for the JavaSamplerClient to be executed
+     * with.
+     *
+     * @return the arguments
+     */
+    public Arguments getArguments() {
+        return (Arguments) getProperty(ARGUMENTS).getObjectValue();
+    }
+
+    /**
+     * Sets the Classname attribute of the JavaConfig object
+     *
+     * @param classname
+     *            the new Classname value
+     */
+    public void setClassname(String classname) {
+        setProperty(CLASSNAME, classname);
+    }
+
+    /**
+     * Gets the Classname attribute of the JavaConfig object
+     *
+     * @return the Classname value
+     */
+    public String getClassname() {
+        return getPropertyAsString(CLASSNAME);
+    }
+
+    /**
+     * Performs a test sample.
+     *
+     * The <code>sample()</code> method retrieves the reference to the Java
+     * client and calls its <code>runTest()</code> method.
+     *
+     * @see JavaSamplerClient#runTest(JavaSamplerContext)
+     *
+     * @param entry
+     *            the Entry for this sample
+     * @return test SampleResult
+     * @throws NoSuchMethodException 
+     * @throws SecurityException 
+     */
+    public SampleResult sample(Entry entry) {        
+        try {
+            Arguments args = getArguments();
+            args.addArgument(TestElement.NAME, getName()); // Allow Sampler access
+                                                            // to test element name
+            context = new JavaSamplerContext(args);
+            if (javaClient == null) {
+                log.debug(whoAmI() + "\tCreating Java Client");
+                createJavaClient();
+                registerForCleanup(javaClient, context);
+                javaClient.setupTest(context);
+            }
+    
+            SampleResult result = javaClient.runTest(context);
+    
+            // Only set the default label if it has not been set
+            if (result != null && result.getSampleLabel().length() == 0) {
+                result.setSampleLabel(getName());
+            }
+    
+            return result;
+        } catch(Exception ex) {
+            SampleResult sampleResultIfError = new SampleResult();
+            sampleResultIfError.setSampleLabel(getName());
+            sampleResultIfError.setSuccessful(false);
+            sampleResultIfError.setResponseCode("500"); // $NON-NLS-1$
+            sampleResultIfError.setResponseMessage(ExceptionUtils.getRootCauseMessage(ex));
+            sampleResultIfError.setResponseData(ExceptionUtils.getStackTrace(ex), "UTF-8");
+            return sampleResultIfError;
+        }
+    }
+
+    /**
+     * Only register jsClient if it contains a custom teardownTest method
+     * @param jsClient JavaSamplerClient
+     * @param jsContext JavaSamplerContext
+     * @throws NoSuchMethodException 
+     * @throws SecurityException 
+     */
+    private final void registerForCleanup(JavaSamplerClient jsClient,
+            JavaSamplerContext jsContext) throws SecurityException, NoSuchMethodException {
+        if(isToBeRegistered(jsClient.getClass())) {
+            javaClientAndContextSet.add(new Object[]{jsClient, jsContext});
+        }
+    }
+
+    /**
+     * Tests clazz to see if a custom teardown method has been written and caches the test result.
+     * If classes uses {@link AbstractJavaSamplerClient#teardownTest(JavaSamplerContext)} then it won't
+     * be registered for cleanup as it does nothing.
+     * @param clazz Class to be verified
+     * @return true if clazz should be registered for cleanup
+     * @throws SecurityException
+     * @throws NoSuchMethodException
+     */
+    private boolean isToBeRegistered(Class<? extends JavaSamplerClient> clazz) throws SecurityException, NoSuchMethodException {
+        Boolean isToBeRegistered = isToBeRegisteredCache.get(clazz.getName());
+        if(isToBeRegistered == null) {
+            Method method = clazz.getMethod("teardownTest", new Class[]{JavaSamplerContext.class});
+            isToBeRegistered = Boolean.valueOf(!method.getDeclaringClass().equals(AbstractJavaSamplerClient.class));
+            isToBeRegisteredCache.put(clazz.getName(), isToBeRegistered);
+        } 
+        return isToBeRegistered.booleanValue();
+    }
+
+    /**
+     * Returns reference to <code>JavaSamplerClient</code>.
+     *
+     * The <code>createJavaClient()</code> method uses reflection to create an
+     * instance of the specified Java protocol client. If the class can not be
+     * found, the method returns a reference to <code>this</code> object.
+     *
+     * @return JavaSamplerClient reference.
+     */
+    private JavaSamplerClient createJavaClient() {
+        if (javaClient == null) {
+            try {
+                Class<?> javaClass = Class.forName(getClassname().trim(), false, Thread.currentThread()
+                        .getContextClassLoader());
+                javaClient = (JavaSamplerClient) javaClass.newInstance();
+                context = new JavaSamplerContext(getArguments());
+
+                if (log.isDebugEnabled()) {
+                    log.debug(whoAmI() + "\tCreated:\t" + getClassname() + "@"
+                            + Integer.toHexString(javaClient.hashCode()));
+                }
+            } catch (Exception e) {
+                log.error(whoAmI() + "\tException creating: " + getClassname(), e);
+                javaClient = new ErrorSamplerClient();
+            }
+        }
+        return javaClient;
+    }
+
+    /**
+     * Retrieves reference to JavaSamplerClient.
+     *
+     * Convience method used to check for null reference without actually
+     * creating a JavaSamplerClient
+     *
+     * @return reference to JavaSamplerClient NOTUSED private JavaSamplerClient
+     *         retrieveJavaClient() { return javaClient; }
+     */
+
+    /**
+     * Generate a String identifier of this instance for debugging purposes.
+     *
+     * @return a String identifier for this sampler instance
+     */
+    private String whoAmI() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(Thread.currentThread().getName());
+        sb.append("@");
+        sb.append(Integer.toHexString(hashCode()));
+        sb.append("-");
+        sb.append(getName());
+        return sb.toString();
+    }
+
+    // TestStateListener implementation
+    /* Implements TestStateListener.testStarted() */
+    public void testStarted() {
+        log.debug(whoAmI() + "\ttestStarted");
+    }
+
+    /* Implements TestStateListener.testStarted(String) */
+    public void testStarted(String host) {
+        log.debug(whoAmI() + "\ttestStarted(" + host + ")");
+    }
+
+    /**
+     * Method called at the end of the test. This is called only on one instance
+     * of JavaSampler. This method will loop through all of the other
+     * JavaSamplers which have been registered (automatically in the
+     * constructor) and notify them that the test has ended, allowing the
+     * JavaSamplerClients to cleanup.
+     */
+    public void testEnded() {
+        log.debug(whoAmI() + "\ttestEnded");
+        synchronized (javaClientAndContextSet) {
+            for (Object[] javaClientAndContext : javaClientAndContextSet) {
+                JavaSamplerClient jsClient = (JavaSamplerClient) javaClientAndContext[0];
+                JavaSamplerContext jsContext = (JavaSamplerContext) javaClientAndContext[1];
+                if (jsClient != null) {
+                    jsClient.teardownTest(jsContext);
+                }
+            }
+            javaClientAndContextSet.clear();
+        }
+        isToBeRegisteredCache.clear();
+    }
+
+    /* Implements TestStateListener.testEnded(String) */
+    public void testEnded(String host) {
+        testEnded();
+    }
+
+    /**
+     * A {@link JavaSamplerClient} implementation used for error handling. If an
+     * error occurs while creating the real JavaSamplerClient object, it is
+     * replaced with an instance of this class. Each time a sample occurs with
+     * this class, the result is marked as a failure so the user can see that
+     * the test failed.
+     */
+    class ErrorSamplerClient extends AbstractJavaSamplerClient {
+        /**
+         * Return SampleResult with data on error.
+         *
+         * @see JavaSamplerClient#runTest(JavaSamplerContext)
+         */
+        public SampleResult runTest(JavaSamplerContext p_context) {
+            log.debug(whoAmI() + "\trunTest");
+            Thread.yield();
+            SampleResult results = new SampleResult();
+            results.setSuccessful(false);
+            results.setResponseData(("Class not found: " + getClassname()), null);
+            results.setSampleLabel("ERROR: " + getClassname());
+            return results;
+        }
+    }
+
+    /**
+     * @see org.apache.jmeter.samplers.AbstractSampler#applies(org.apache.jmeter.config.ConfigTestElement)
+     */
+    @Override
+    public boolean applies(ConfigTestElement configElement) {
+        String guiClass = configElement.getProperty(TestElement.GUI_CLASS).getStringValue();
+        return APPLIABLE_CONFIG_CLASSES.contains(guiClass);
+    }
+}

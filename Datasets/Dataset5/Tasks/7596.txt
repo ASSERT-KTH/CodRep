@@ -1,0 +1,585 @@
+public class DateTime extends Composite {
+
+/*******************************************************************************
+ * Copyright (c) 2000, 2006 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * Contributors:
+ *     IBM Corporation - initial API and implementation
+ *******************************************************************************/
+package org.eclipse.swt.widgets;
+
+import java.text.DateFormatSymbols;
+import java.util.Calendar;
+
+import org.eclipse.swt.*;
+import org.eclipse.swt.events.*;
+import org.eclipse.swt.graphics.*;
+import org.eclipse.swt.internal.carbon.LongDateRec;
+import org.eclipse.swt.internal.carbon.OS;
+
+/*public*/ class DateTime extends Composite {
+	LongDateRec dateRec;
+
+	static final int MIN_YEAR = 1752; // Gregorian switchover in North America: September 19, 1752
+	static final int MAX_YEAR = 9999;
+	
+	/* Emulated Calendar variables */
+	Color foreground, background;
+	Calendar calendar;
+	DateFormatSymbols formatSymbols;
+	Button monthDown, monthUp, yearDown, yearUp;
+	static final int MARGIN_WIDTH = 2;
+	static final int MARGIN_HEIGHT = 1;
+
+public DateTime (Composite parent, int style) {
+	super (parent, checkStyle (style) | ((style & SWT.CALENDAR) != 0 ? SWT.NO_REDRAW_RESIZE : 0));
+	if ((this.style & SWT.CALENDAR) != 0) {
+		calendar = Calendar.getInstance();
+		formatSymbols = new DateFormatSymbols();
+
+		Listener listener = new Listener() {
+			public void handleEvent(Event event) {
+				switch(event.type) {
+					case SWT.Paint:		handlePaint(event); break;
+					case SWT.Resize:	handleResize(event); break;
+					case SWT.MouseDown:	handleMouseDown(event); break;
+					case SWT.KeyDown:	handleKeyDown(event); break;
+					case SWT.Traverse:	handleTraverse(event); break;
+				}
+			}
+		};
+		addListener(SWT.Paint, listener);
+		addListener(SWT.Resize, listener);
+		addListener(SWT.MouseDown, listener);
+		addListener(SWT.KeyDown, listener);
+		addListener(SWT.Traverse, listener);
+		yearDown = new Button(this, SWT.ARROW | SWT.LEFT);
+		//yearDown.setToolTipText(SWT.getMessage ("SWT_Last_Year")); //$NON-NLS-1$
+		monthDown = new Button(this, SWT.ARROW | SWT.LEFT);
+		//monthDown.setToolTipText(SWT.getMessage ("SWT_Last_Month")); //$NON-NLS-1$
+		monthUp = new Button(this, SWT.ARROW | SWT.RIGHT);
+		//monthUp.setToolTipText(SWT.getMessage ("SWT_Next_Month")); //$NON-NLS-1$
+		yearUp = new Button(this, SWT.ARROW | SWT.RIGHT);
+		//yearUp.setToolTipText(SWT.getMessage ("SWT_Next_Year")); //$NON-NLS-1$
+		listener = new Listener() {
+			public void handleEvent(Event event) {
+				handleSelection(event);
+			}
+		};
+		yearDown.addListener(SWT.Selection, listener);
+		monthDown.addListener(SWT.Selection, listener);
+		monthUp.addListener(SWT.Selection, listener);
+		yearUp.addListener(SWT.Selection, listener);
+	
+	}
+}
+
+static int checkStyle (int style) {
+	/*
+	* Even though it is legal to create this widget
+	* with scroll bars, they serve no useful purpose
+	* because they do not automatically scroll the
+	* widget's client area.  The fix is to clear
+	* the SWT style.
+	*/
+	style &= ~(SWT.H_SCROLL | SWT.V_SCROLL);
+	return checkBits (style, SWT.DATE, SWT.TIME, SWT.CALENDAR, 0, 0, 0);
+}
+
+protected void checkSubclass () {
+	if (!isValidSubclass ()) error (SWT.ERROR_INVALID_SUBCLASS);
+}
+
+public void addSelectionListener (SelectionListener listener) {
+	checkWidget ();
+	if (listener == null) error (SWT.ERROR_NULL_ARGUMENT);
+	TypedListener typedListener = new TypedListener (listener);
+	addListener (SWT.Selection, typedListener);
+	addListener (SWT.DefaultSelection, typedListener);
+}
+
+public Point computeSize (int wHint, int hHint, boolean changed) {
+	checkWidget ();
+	int width = 0, height = 0;
+	if (wHint == SWT.DEFAULT || hHint == SWT.DEFAULT) {
+		if ((style & SWT.CALENDAR) != 0) {
+			Point cellSize = getCellSize(null);
+			Point buttonSize = monthDown.computeSize(SWT.DEFAULT, SWT.DEFAULT, changed);
+			width = cellSize.x * 7;
+			height = cellSize.y * 7 + Math.max(cellSize.y, buttonSize.y);
+		} else {
+			// TODO: get the height of the current font
+			height = 20;
+			// TODO: max with the height of the up/down buttons
+			int upDownHeight = 24;
+			height = Math.max (height, upDownHeight);
+			
+			// TODO: determine the stringWidth of date or time string in current font (take code from GC)
+			String string = "00/00/0000"; // TODO: these strings should be locale-specific
+			if ((style & SWT.TIME) != 0) string = "00:00:00 AM";
+			GC gc = new GC(this);
+			width = gc.stringExtent(string).x;
+			gc.dispose();
+			// TODO: max with the height of the up/down buttons (maybe plus some margin?)
+			int upDownWidth = 20;
+			width += upDownWidth + 5; // MARGIN
+		}
+	}
+	if (width == 0) width = DEFAULT_WIDTH;
+	if (height == 0) height = DEFAULT_HEIGHT;
+	if (wHint != SWT.DEFAULT) width = wHint;
+	if (hHint != SWT.DEFAULT) height = hHint;
+	int border = getBorderWidth ();
+	width += border * 2; height += border * 2;
+	return new Point (width, height);
+}
+
+void createHandle () {
+	int clockType = 0;
+	if ((style & SWT.TIME) != 0) clockType = OS.kControlClockTypeHourMinuteSecond;
+	if ((style & SWT.DATE) != 0) clockType = OS.kControlClockTypeMonthDayYear;
+	if (clockType != 0) { /* SWT.DATE and SWT.TIME */
+		int clockFlags = OS.kControlClockFlagStandard;
+		int [] outControl = new int [1];
+		int window = OS.GetControlOwner (parent.handle);
+		OS.CreateClockControl(window, null, clockType, clockFlags, outControl);
+		if (outControl [0] == 0) error (SWT.ERROR_NO_HANDLES);
+		handle = outControl [0];
+	} else { /* SWT.CALENDAR */
+		// TODO: on Cocoa, can use NSDatePicker - otherwise, use emulated:
+		super.createHandle();
+	}
+}
+
+void createWidget() {
+	super.createWidget ();
+	getDate();
+}
+
+void drawDay(GC gc, Point cellSize, int day) {
+	int cell = getCell(day);
+	Point location = getCellLocation(cell, cellSize);
+	String str = String.valueOf(day);
+	Point extent = gc.stringExtent(str);
+	int date = calendar.get(Calendar.DAY_OF_MONTH);
+	if (day == date) {
+		Display display = getDisplay();
+		gc.setBackground(display.getSystemColor(SWT.COLOR_LIST_SELECTION));
+		gc.setForeground(display.getSystemColor(SWT.COLOR_LIST_SELECTION_TEXT));
+		gc.fillRectangle(location.x, location.y, cellSize.x, cellSize.y);
+	}
+	gc.drawString(str, location.x + (cellSize.x - extent.x) / 2, location.y + (cellSize.y - extent.y) / 2, true);
+	if (day == date) {
+		gc.setBackground(getBackground());
+		gc.setForeground(getForeground());
+	}
+}
+
+void drawDays(GC gc, Point cellSize, Rectangle client) {
+	gc.setBackground(getBackground());
+	gc.setForeground(getForeground());
+	gc.fillRectangle(0, cellSize.y, client.width, cellSize.y * 7);
+	int firstDay = calendar.getActualMinimum(Calendar.DAY_OF_MONTH);
+	int lastDay = calendar.getActualMaximum(Calendar.DAY_OF_MONTH);
+	for (int day = firstDay; day <= lastDay; day++) {
+		drawDay(gc, cellSize, day);
+	}
+}
+
+void drawDaysOfWeek(GC gc, Point cellSize, Rectangle client) {
+	Display display = getDisplay();
+	gc.setBackground(display.getSystemColor(SWT.COLOR_WIDGET_BACKGROUND));
+	gc.setForeground(display.getSystemColor(SWT.COLOR_WIDGET_FOREGROUND));
+	gc.fillRectangle(0, 0, client.width, cellSize.y);
+	String[] days = formatSymbols.getShortWeekdays();
+	int x = 0, y = 0; 
+	for (int i = 1; i < days.length; i++) {
+		String day = days[i];
+		Point extent = gc.stringExtent(day);
+		gc.drawString(day, x + (cellSize.x - extent.x) / 2, y + (cellSize.y - extent.y) / 2, true);
+		x += cellSize.x;
+	}
+	gc.drawLine(0, cellSize.y - 1, client.width, cellSize.y - 1);
+}
+
+void drawMonth(GC gc, Point cellSize, Rectangle client) {
+	Display display = getDisplay();
+	gc.setBackground(display.getSystemColor(SWT.COLOR_WIDGET_BACKGROUND));
+	gc.setForeground(display.getSystemColor(SWT.COLOR_WIDGET_FOREGROUND));
+	int y = cellSize.y * 7;
+	gc.fillRectangle(0, y, client.width, cellSize.y);
+	gc.drawLine(0, y - 1, client.width, y - 1);
+	String str = formatSymbols.getShortMonths()[calendar.get(Calendar.MONTH)] + ", " + calendar.get(Calendar.YEAR);
+	Point extent = gc.stringExtent(str);
+	gc.drawString(str, (cellSize.x * 7 - extent.x) / 2, y + (cellSize.y - extent.y) / 2, true);
+}
+
+void handleKeyDown(Event event) {
+	int newDay = calendar.get(Calendar.DAY_OF_MONTH);
+	switch (event.keyCode) {
+		case SWT.ARROW_DOWN: newDay += 7; break;
+		case SWT.ARROW_UP: newDay -= 7; break;
+		case SWT.ARROW_RIGHT: newDay += 1; break;
+		case SWT.ARROW_LEFT: newDay -= 1; break;
+	}
+	setDay(newDay, true);
+}
+
+void handleMouseDown(Event event) {
+	setFocus();
+	Point cellSize = getCellSize(null);
+	int column = event.x / cellSize.x;
+	int row = event.y / cellSize.y;	
+	int cell = row * 7 + column;
+	int newDay = getDate(cell);
+	setDay(newDay, true);
+}
+
+void handlePaint(Event event) {
+	GC gc = event.gc;
+	Rectangle client = getClientArea();
+	Point cellSize = getCellSize(gc);
+	drawDaysOfWeek(gc, cellSize, client);
+	drawDays(gc, cellSize, client);
+	drawMonth(gc, cellSize, client);
+}
+
+void handleResize(Event event) {
+	yearDown.pack();
+	monthDown.pack();
+	monthUp.pack();
+	yearUp.pack();
+	Point cellSize = getCellSize(null);
+	Point size = monthDown.getSize();
+	int height = Math.max(cellSize.y, size.y);
+	int y = cellSize.y * 7 + (height - size.y) / 2;
+	yearDown.setLocation(0, y);
+	monthDown.setLocation(size.x, y);
+	int x = cellSize.x * 7 - size.x;
+	monthUp.setLocation(x - size.x, y);
+	yearUp.setLocation(x, y);
+}
+
+void handleSelection(Event event) {
+	if (event.widget == monthDown) {
+		calendar.add(Calendar.MONTH, -1);
+	} else if (event.widget == monthUp) {
+		calendar.add(Calendar.MONTH, 1);
+	} else if (event.widget == yearDown) {
+		calendar.add(Calendar.YEAR, -1);
+	} else if (event.widget == yearUp) {				
+		calendar.add(Calendar.YEAR, 1);
+	} else {
+		return;
+	}
+	redraw();
+	notifyListeners(SWT.Selection, new Event());
+}
+
+void handleTraverse(Event event) {
+	switch (event.detail) {
+		case SWT.TRAVERSE_ESCAPE:
+		case SWT.TRAVERSE_PAGE_NEXT:
+		case SWT.TRAVERSE_PAGE_PREVIOUS:
+		case SWT.TRAVERSE_RETURN:
+		case SWT.TRAVERSE_TAB_NEXT:
+		case SWT.TRAVERSE_TAB_PREVIOUS:
+			event.doit = true;
+			break;
+	}	
+}
+
+Point getCellSize(GC gc) {
+	boolean dispose = gc == null; 
+	if (gc == null) gc = new GC(this);
+	int width = 0, height = 0;
+	String[] days = formatSymbols.getShortWeekdays();
+	for (int i = 0; i < days.length; i++) {
+		Point extent = gc.stringExtent(days[i]);
+		width = Math.max(width, extent.x);
+		height = Math.max(height, extent.y);
+	}
+	int firstDay = calendar.getMinimum(Calendar.DAY_OF_MONTH);
+	int lastDay = calendar.getMaximum(Calendar.DAY_OF_MONTH);
+	for (int day = firstDay; day <= lastDay; day++) {
+		Point extent = gc.stringExtent(String.valueOf(day));
+		width = Math.max(width, extent.x);
+		height = Math.max(height, extent.y);	
+	}
+	if (dispose) gc.dispose();
+	return new Point(width + MARGIN_WIDTH * 2, height + MARGIN_HEIGHT * 2);
+}
+
+Point getCellLocation(int cell, Point cellSize) {
+	return new Point(cell % 7 * cellSize.x, cell / 7 * cellSize.y);
+}
+
+int getCell(int date) {
+	int day = calendar.get(Calendar.DAY_OF_MONTH);
+	calendar.set(Calendar.DAY_OF_MONTH, 1);
+	int result = date + calendar.get(Calendar.DAY_OF_WEEK) + 5;
+	calendar.set(Calendar.DAY_OF_MONTH, day);
+	return result;
+}
+
+void getDate() {
+	dateRec = new LongDateRec ();
+	OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+}
+
+int getDate(int cell) {
+	int day = calendar.get(Calendar.DAY_OF_MONTH);
+	calendar.set(Calendar.DAY_OF_MONTH, 1);
+	int result = cell - calendar.get(Calendar.DAY_OF_WEEK) - 5;
+	calendar.set(Calendar.DAY_OF_MONTH, day);
+	return result;
+}
+
+public Color getBackground() {
+	checkWidget();
+	if (background == null) {
+		return getDisplay().getSystemColor(SWT.COLOR_LIST_BACKGROUND);
+	}
+	return background;
+}
+
+public Color getForeground() {
+	checkWidget();
+	if (foreground == null) {
+		return getDisplay().getSystemColor(SWT.COLOR_LIST_FOREGROUND);
+	}
+	return foreground;
+}
+
+public int getDay () {
+	checkWidget ();
+	if ((style & SWT.CALENDAR) != 0) {
+		return calendar.get(Calendar.DAY_OF_MONTH);
+	}
+	getDate();
+	return dateRec.day;
+}
+
+public int getHour () {
+	checkWidget ();
+	if ((style & SWT.CALENDAR) != 0) {
+		return calendar.get(Calendar.HOUR_OF_DAY);
+	}
+	getDate();
+	return dateRec.hour;
+}
+
+public int getMinute () {
+	checkWidget ();
+	if ((style & SWT.CALENDAR) != 0) {
+		return calendar.get(Calendar.MINUTE);
+	}
+	getDate();
+	return dateRec.minute;
+}
+
+public int getMonth () {
+	checkWidget ();
+	if ((style & SWT.CALENDAR) != 0) {
+		return calendar.get(Calendar.MONTH) + 1;
+	}
+	getDate();
+	return dateRec.month;
+}
+
+public int getSecond () {
+	checkWidget ();
+	if ((style & SWT.CALENDAR) != 0) {
+		return calendar.get(Calendar.SECOND);
+	}
+	getDate();
+	return dateRec.second;
+}
+
+public int getYear () {
+	checkWidget ();
+	if ((style & SWT.CALENDAR) != 0) {
+		return calendar.get(Calendar.YEAR);
+	}
+	getDate();
+	return dateRec.year;
+}
+
+void hookEvents () {
+	super.hookEvents ();
+	if (OS.VERSION >= 0x1040) {
+		int clockProc = display.clockProc;
+		int [] mask = new int [] {
+				OS.kEventClassClockView, OS.kEventClockDateOrTimeChanged,
+		};
+		int controlTarget = OS.GetControlEventTarget (handle);
+		OS.InstallEventHandler (controlTarget, clockProc, mask.length / 2, mask, handle, null);
+	}
+}
+
+boolean isValid(int fieldName, int value) {
+	Calendar calendar = Calendar.getInstance();
+	calendar.set(Calendar.YEAR, dateRec.year);
+	calendar.set(Calendar.MONTH, dateRec.month - 1);
+	int min = calendar.getActualMinimum(fieldName);
+	int max = calendar.getActualMaximum(fieldName);
+	return value >= min && value <= max;
+}
+
+int kEventClockDateOrTimeChanged (int nextHandler, int theEvent, int userData) {
+	sendSelectionEvent ();
+	return OS.noErr;
+}
+
+int kEventControlHit (int nextHandler, int theEvent, int userData) {
+	int result = super.kEventControlHit (nextHandler, theEvent, userData);
+	if (result == OS.noErr) return result;
+	if (OS.VERSION < 0x1040) sendSelectionEvent ();
+	return result;
+}
+
+int kEventTextInputUnicodeForKeyEvent (int nextHandler, int theEvent, int userData) {
+	int result = super.kEventTextInputUnicodeForKeyEvent (nextHandler, theEvent, userData);
+	if (result == OS.noErr) return result;
+	if (OS.VERSION < 0x1040) sendSelectionEvent ();
+	return result;
+}
+
+void redraw(int cell, Point cellSize) {
+	Point location = getCellLocation(cell, cellSize);
+	redraw(location.x, location.y, cellSize.x, cellSize.y, false);	
+}
+
+void releaseWidget () {
+	super.releaseWidget();
+	dateRec = null;
+}
+
+public void removeSelectionListener (SelectionListener listener) {
+	checkWidget ();
+	if (listener == null) error (SWT.ERROR_NULL_ARGUMENT);
+	if (eventTable == null) return;
+	eventTable.unhook (SWT.Selection, listener);
+	eventTable.unhook (SWT.DefaultSelection, listener);	
+}
+
+void sendSelectionEvent () {
+	LongDateRec rec = new LongDateRec ();
+	OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, rec, null);
+	if (rec.second != dateRec.second ||
+		rec.minute != dateRec.minute ||
+		rec.hour != dateRec.hour ||
+		rec.day != dateRec.day ||
+		rec.month != dateRec.month ||
+		rec.year != dateRec.year) {
+		dateRec = rec;
+		postEvent (SWT.Selection);
+	}
+}
+
+public void setBackground(Color color) {
+	checkWidget();
+	super.setBackground(color);
+	background = color;
+}
+
+public void setForeground(Color color) {
+	checkWidget();
+	super.setForeground(color);
+	foreground = color;
+}
+
+void setDay(int newDay, boolean notify) {
+	int firstDay = calendar.getActualMinimum(Calendar.DAY_OF_MONTH);
+	int lastDay = calendar.getActualMaximum(Calendar.DAY_OF_MONTH);
+	if (!(firstDay <= newDay && newDay <= lastDay)) return;
+	Point cellSize = getCellSize(null);
+	redraw(getCell(calendar.get(Calendar.DAY_OF_MONTH)), cellSize);
+	calendar.set(Calendar.DAY_OF_MONTH, newDay);
+	redraw(getCell(calendar.get(Calendar.DAY_OF_MONTH)), cellSize);
+	if (notify) notifyListeners(SWT.Selection, new Event());
+}
+
+public void setDay (int day) {
+	checkWidget ();
+	if (!isValid(Calendar.DAY_OF_MONTH, day)) return;
+	if ((style & SWT.CALENDAR) != 0) {
+		setDay(day, false);
+	} else {
+		dateRec.day = (short)day;
+		OS.SetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec);
+		OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+		redraw();
+	}
+}
+
+public void setHour (int hour) {
+	checkWidget ();
+	if (!isValid(Calendar.HOUR_OF_DAY, hour)) return;
+	if ((style & SWT.CALENDAR) != 0) {
+		calendar.set(Calendar.HOUR_OF_DAY, hour);
+	} else {
+		dateRec.hour = (short)hour;
+		OS.SetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec);
+		OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+	}
+	redraw();
+}
+
+public void setMinute (int minute) {
+	checkWidget ();
+	if (!isValid(Calendar.MINUTE, minute)) return;
+	if ((style & SWT.CALENDAR) != 0) {
+		calendar.set(Calendar.MINUTE, minute);
+	} else {
+		dateRec.minute = (short)minute;
+		OS.SetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec);
+		OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+	}
+	redraw();
+}
+
+public void setMonth (int month) {
+	checkWidget ();
+	if (!isValid(Calendar.MONTH, month - 1)) return;
+	if ((style & SWT.CALENDAR) != 0) {
+		calendar.set(Calendar.MONTH, month - 1);
+	} else {
+		dateRec.month = (short)month;
+		OS.SetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec);
+		OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+	}
+	redraw();
+}
+
+public void setSecond (int second) {
+	checkWidget ();
+	if (!isValid(Calendar.SECOND, second)) return;
+	if ((style & SWT.CALENDAR) != 0) {
+		calendar.set(Calendar.SECOND, second);
+	} else {
+		dateRec.second = (short)second;
+		OS.SetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec);
+		OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+	}
+	redraw();
+}
+
+public void setYear (int year) {
+	checkWidget ();
+	//if (!isValid(Calendar.YEAR, year)) return;
+	if (year < MIN_YEAR || year > MAX_YEAR) return;
+	if ((style & SWT.CALENDAR) != 0) {
+		calendar.set(Calendar.YEAR, year);
+	} else {
+		dateRec.year = (short)year;
+		OS.SetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec);
+		OS.GetControlData (handle, (short)OS.kControlEntireControl, OS.kControlClockLongDateTag, LongDateRec.sizeof, dateRec, null);
+	}
+	redraw();
+}
+}

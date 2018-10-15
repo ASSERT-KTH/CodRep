@@ -1,0 +1,338 @@
+if (exactType.isParameterizedType()) {
+
+/* *******************************************************************
+ * Copyright (c) 2002 Palo Alto Research Center, Incorporated (PARC).
+ * All rights reserved. 
+ * This program and the accompanying materials are made available 
+ * under the terms of the Common Public License v1.0 
+ * which accompanies this distribution and is available at 
+ * http://www.eclipse.org/legal/cpl-v10.html 
+ *  
+ * Contributors: 
+ *     PARC     initial implementation 
+ * ******************************************************************/
+
+
+package org.aspectj.weaver.patterns;
+
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
+
+import org.aspectj.bridge.ISourceLocation;
+import org.aspectj.bridge.MessageUtil;
+import org.aspectj.lang.JoinPoint;
+import org.aspectj.util.FuzzyBoolean;
+import org.aspectj.weaver.Checker;
+import org.aspectj.weaver.ISourceContext;
+import org.aspectj.weaver.IntMap;
+import org.aspectj.weaver.Member;
+import org.aspectj.weaver.ResolvedMember;
+import org.aspectj.weaver.ResolvedType;
+import org.aspectj.weaver.Shadow;
+import org.aspectj.weaver.ShadowMunger;
+import org.aspectj.weaver.UnresolvedType;
+import org.aspectj.weaver.VersionedDataInputStream;
+import org.aspectj.weaver.WeaverMessages;
+import org.aspectj.weaver.World;
+import org.aspectj.weaver.ast.Literal;
+import org.aspectj.weaver.ast.Test;
+
+public class KindedPointcut extends Pointcut {
+	Shadow.Kind kind;
+	private SignaturePattern signature;
+	private Set matchKinds;
+    
+    private ShadowMunger munger = null; // only set after concretization
+
+    public KindedPointcut(
+        Shadow.Kind kind,
+        SignaturePattern signature) {
+        this.kind = kind;
+        this.signature = signature;
+        this.pointcutKind = KINDED;
+        this.matchKinds = new HashSet();
+        matchKinds.add(kind);
+    }
+    public KindedPointcut(
+        Shadow.Kind kind,
+        SignaturePattern signature,
+        ShadowMunger munger) {
+        this(kind, signature);
+        this.munger = munger;
+    }
+
+    public SignaturePattern getSignature() {
+        return signature;
+    }
+
+    /* (non-Javadoc)
+	 * @see org.aspectj.weaver.patterns.Pointcut#couldMatchKinds()
+	 */
+	public Set couldMatchKinds() {
+		return matchKinds;
+	}
+	
+	public boolean couldEverMatchSameJoinPointsAs(KindedPointcut other) {
+		if (this.kind != other.kind) return false;
+		String myName = signature.getName().maybeGetSimpleName();
+		String yourName = other.signature.getName().maybeGetSimpleName();
+		if (myName != null && yourName != null) {
+			if ( !myName.equals(yourName)) {
+				return false;
+			}
+		}
+		if (signature.getParameterTypes().ellipsisCount == 0) {
+			if (other.signature.getParameterTypes().ellipsisCount == 0) {
+				if (signature.getParameterTypes().getTypePatterns().length !=
+					other.signature.getParameterTypes().getTypePatterns().length) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+	
+    public FuzzyBoolean fastMatch(FastMatchInfo info) {
+    	if (info.getKind() != null) {
+			if (info.getKind() != kind) return FuzzyBoolean.NO;
+    	}
+
+		return FuzzyBoolean.MAYBE;
+	}	
+	
+	public FuzzyBoolean fastMatch(Class targetType) {
+		return FuzzyBoolean.fromBoolean(signature.couldMatch(targetType));
+	}
+
+	
+	protected FuzzyBoolean matchInternal(Shadow shadow) {
+		if (shadow.getKind() != kind) return FuzzyBoolean.NO;
+
+		if (!signature.matches(shadow.getSignature(), shadow.getIWorld())){
+
+            if(kind == Shadow.MethodCall) {
+                warnOnConfusingSig(shadow);
+                warnOnBridgeMethod(shadow);
+            }
+            return FuzzyBoolean.NO; 
+        }
+
+		return FuzzyBoolean.YES;
+	}
+	
+	
+	private void warnOnBridgeMethod(Shadow shadow) {
+		if (shadow.getIWorld().getLint().noJoinpointsForBridgeMethods.isEnabled()) {
+			ResolvedMember rm = shadow.getSignature().resolve(shadow.getIWorld());
+			if (rm!=null) {
+             	int shadowModifiers = rm.getModifiers(); //shadow.getSignature().getModifiers(shadow.getIWorld());
+			    if (ResolvedType.hasBridgeModifier(shadowModifiers)) {
+				  shadow.getIWorld().getLint().noJoinpointsForBridgeMethods.signal(new String[]{},getSourceLocation(),
+						new ISourceLocation[]{shadow.getSourceLocation()});
+			    }
+            }
+        }
+	}
+	
+	public FuzzyBoolean match(JoinPoint.StaticPart jpsp) {
+		if (jpsp.getKind().equals(kind.getName())) {
+			if (signature.matches(jpsp)) {
+				return FuzzyBoolean.YES;
+			}
+		}
+		return FuzzyBoolean.NO;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.aspectj.weaver.patterns.Pointcut#matchesDynamically(java.lang.Object, java.lang.Object, java.lang.Object[])
+	 */
+	public boolean matchesDynamically(Object thisObject, Object targetObject,
+			Object[] args) {
+		return true;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.aspectj.weaver.patterns.Pointcut#matchesStatically(java.lang.String, java.lang.reflect.Member, java.lang.Class, java.lang.Class, java.lang.reflect.Member)
+	 */
+	public FuzzyBoolean matchesStatically(String joinpointKind,
+			java.lang.reflect.Member member, Class thisClass,
+			Class targetClass, java.lang.reflect.Member withinCode) {
+		if (joinpointKind.equals(kind.getName()))  {
+			return FuzzyBoolean.fromBoolean(signature.matches(targetClass,member));			
+		}
+		return FuzzyBoolean.NO;
+	}
+	
+	private void warnOnConfusingSig(Shadow shadow) {
+		// Don't do all this processing if we don't need to !
+		if (!shadow.getIWorld().getLint().unmatchedSuperTypeInCall.isEnabled()) return;
+		
+        // no warnings for declare error/warning
+        if (munger instanceof Checker) return;
+        
+        World world = shadow.getIWorld();
+        
+		// warning never needed if the declaring type is any
+		UnresolvedType exactDeclaringType = signature.getDeclaringType().getExactType();
+        
+		ResolvedType shadowDeclaringType =
+			shadow.getSignature().getDeclaringType().resolve(world);
+        
+		if (signature.getDeclaringType().isStar()
+			|| exactDeclaringType== ResolvedType.MISSING)
+			return;
+
+        // warning not needed if match type couldn't ever be the declaring type
+		if (!shadowDeclaringType.isAssignableFrom(exactDeclaringType.resolve(world))) {
+            return;
+		}
+
+		// if the method in the declaring type is *not* visible to the
+		// exact declaring type then warning not needed.
+		int shadowModifiers = shadow.getSignature().resolve(world).getModifiers();
+		if (!ResolvedType
+			.isVisible(
+				shadowModifiers,
+				shadowDeclaringType,
+				exactDeclaringType.resolve(world))) {
+			return;
+		}
+		
+		if (!signature.getReturnType().matchesStatically(shadow.getSignature().getReturnType().resolve(world))) {
+			// Covariance issue...
+			// The reason we didn't match is that the type pattern for the pointcut (Car) doesn't match the
+			// return type for the specific declaration at the shadow. (FastCar Sub.getCar())
+			// XXX Put out another XLINT in this case?
+			return;
+		}
+		// PR60015 - Don't report the warning if the declaring type is object and 'this' is an interface
+		if (exactDeclaringType.resolve(world).isInterface() && shadowDeclaringType.equals(world.resolve("java.lang.Object"))) {
+			return;
+		}
+
+		SignaturePattern nonConfusingPattern =
+			new SignaturePattern(
+				signature.getKind(),
+				signature.getModifiers(),
+				signature.getReturnType(),
+				TypePattern.ANY,
+				signature.getName(), 
+				signature.getParameterTypes(),
+				signature.getThrowsPattern(),
+				signature.getAnnotationPattern());
+
+		if (nonConfusingPattern
+			.matches(shadow.getSignature(), shadow.getIWorld())) {
+                shadow.getIWorld().getLint().unmatchedSuperTypeInCall.signal(
+                    new String[] {
+                        shadow.getSignature().getDeclaringType().toString(),
+                        signature.getDeclaringType().toString()
+                    },
+                    this.getSourceLocation(),
+                    new ISourceLocation[] {shadow.getSourceLocation()} );               
+		}
+	}
+
+	public boolean equals(Object other) {
+		if (!(other instanceof KindedPointcut)) return false;
+		KindedPointcut o = (KindedPointcut)other;
+		return o.kind == this.kind && o.signature.equals(this.signature);
+	}
+    
+    public int hashCode() {
+        int result = 17;
+        result = 37*result + kind.hashCode();
+        result = 37*result + signature.hashCode();
+        return result;
+    }
+	
+	public String toString() {
+		StringBuffer buf = new StringBuffer();
+		buf.append(kind.getSimpleName());
+		buf.append("(");
+		buf.append(signature.toString());
+		buf.append(")");
+		return buf.toString();
+	}
+	
+	
+	public void postRead(ResolvedType enclosingType) {
+		signature.postRead(enclosingType);
+	}
+
+	public void write(DataOutputStream s) throws IOException {
+		s.writeByte(Pointcut.KINDED);
+		kind.write(s);
+		signature.write(s);
+		writeLocation(s);
+	}
+	
+	public static Pointcut read(VersionedDataInputStream s, ISourceContext context) throws IOException {
+		Shadow.Kind kind = Shadow.Kind.read(s);
+		SignaturePattern sig = SignaturePattern.read(s, context);
+		KindedPointcut ret = new KindedPointcut(kind, sig);
+		ret.readLocation(context, s);
+		return ret;
+	}
+
+	// XXX note: there is no namebinding in any kinded pointcut.
+	// still might want to do something for better error messages
+	// We want to do something here to make sure we don't sidestep the parameter
+	// list in capturing type identifiers.
+	public void resolveBindings(IScope scope, Bindings bindings) {
+		if (kind == Shadow.Initialization) {
+//			scope.getMessageHandler().handleMessage(
+//				MessageUtil.error(
+//					"initialization unimplemented in 1.1beta1",
+//					this.getSourceLocation()));
+		}
+		signature = signature.resolveBindings(scope, bindings);
+		
+		
+		if (kind == Shadow.ConstructorExecution) { 		// Bug fix 60936
+		  if (signature.getDeclaringType() != null) {
+			World world = scope.getWorld();
+			UnresolvedType exactType = signature.getDeclaringType().getExactType();
+			if (signature.getKind() == Member.CONSTRUCTOR &&
+				!exactType.equals(ResolvedType.MISSING) &&
+				exactType.resolve(world).isInterface() &&
+				!signature.getDeclaringType().isIncludeSubtypes()) {
+					world.getLint().noInterfaceCtorJoinpoint.signal(exactType.toString(), getSourceLocation());
+				}
+		  }
+		}
+		
+		// only allow parameterized types with extends...
+		if (kind == Shadow.StaticInitialization) {
+			UnresolvedType exactType = signature.getDeclaringType().getExactType();
+			if (exactType.isParameterizedType() && !signature.getDeclaringType().isIncludeSubtypes()) {
+				scope.message(MessageUtil.error(WeaverMessages.format(WeaverMessages.NO_STATIC_INIT_JPS_FOR_PARAMETERIZED_TYPES),
+						getSourceLocation()));
+			}
+		}
+	}
+	
+	public void resolveBindingsFromRTTI() {
+		signature = signature.resolveBindingsFromRTTI();
+	}
+	
+	protected Test findResidueInternal(Shadow shadow, ExposedState state) {
+		return match(shadow).alwaysTrue() ? Literal.TRUE : Literal.FALSE;
+	}
+	
+	public Pointcut concretize1(ResolvedType inAspect, IntMap bindings) {
+		Pointcut ret = new KindedPointcut(kind, signature, bindings.getEnclosingAdvice());
+        ret.copyLocationFrom(this);
+        return ret;
+	}
+
+	public Shadow.Kind getKind() {
+		return kind;
+	}
+
+    public Object accept(PatternNodeVisitor visitor, Object data) {
+        return visitor.visit(this, data);
+    }
+}

@@ -1,0 +1,1216 @@
+public static AsmHierarchyBuilder asmHierarchyBuilder = new AsmHierarchyBuilder();
+
+/* *******************************************************************
+ * Copyright (c) 2002 Palo Alto Research Center, Incorporated (PARC).
+ * All rights reserved. 
+ * This program and the accompanying materials are made available 
+ * under the terms of the Common Public License v1.0 
+ * which accompanies this distribution and is available at 
+ * http://www.eclipse.org/legal/cpl-v10.html 
+ *  
+ * Contributors: 
+ *     PARC     initial implementation 
+ * ******************************************************************/
+
+
+package org.aspectj.ajdt.internal.core.builder;
+
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.JarInputStream;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
+import java.util.zip.ZipEntry;
+
+import org.aspectj.ajdt.internal.compiler.AjCompilerAdapter;
+import org.aspectj.ajdt.internal.compiler.IBinarySourceProvider;
+import org.aspectj.ajdt.internal.compiler.ICompilerAdapter;
+import org.aspectj.ajdt.internal.compiler.ICompilerAdapterFactory;
+import org.aspectj.ajdt.internal.compiler.IIntermediateResultsRequestor;
+import org.aspectj.ajdt.internal.compiler.IOutputClassFileNameProvider;
+import org.aspectj.ajdt.internal.compiler.InterimCompilationResult;
+import org.aspectj.ajdt.internal.compiler.lookup.AjLookupEnvironment;
+import org.aspectj.ajdt.internal.compiler.lookup.AnonymousClassPublisher;
+import org.aspectj.ajdt.internal.compiler.lookup.EclipseFactory;
+import org.aspectj.ajdt.internal.compiler.problem.AjProblemReporter;
+import org.aspectj.asm.AsmManager;
+import org.aspectj.asm.IHierarchy;
+import org.aspectj.asm.IProgramElement;
+import org.aspectj.asm.internal.ProgramElement;
+import org.aspectj.bridge.AbortException;
+import org.aspectj.bridge.CountingMessageHandler;
+import org.aspectj.bridge.ILifecycleAware;
+import org.aspectj.bridge.IMessage;
+import org.aspectj.bridge.IMessageHandler;
+import org.aspectj.bridge.IProgressListener;
+import org.aspectj.bridge.Message;
+import org.aspectj.bridge.MessageUtil;
+import org.aspectj.bridge.SourceLocation;
+import org.aspectj.bridge.Version;
+import org.aspectj.bridge.context.CompilationAndWeavingContext;
+import org.aspectj.bridge.context.ContextFormatter;
+import org.aspectj.bridge.context.ContextToken;
+import org.aspectj.org.eclipse.jdt.core.compiler.CharOperation;
+import org.aspectj.org.eclipse.jdt.core.compiler.IProblem;
+import org.aspectj.org.eclipse.jdt.internal.compiler.ClassFile;
+import org.aspectj.org.eclipse.jdt.internal.compiler.CompilationResult;
+import org.aspectj.org.eclipse.jdt.internal.compiler.DefaultErrorHandlingPolicies;
+import org.aspectj.org.eclipse.jdt.internal.compiler.ICompilerRequestor;
+import org.aspectj.org.eclipse.jdt.internal.compiler.IProblemFactory;
+import org.aspectj.org.eclipse.jdt.internal.compiler.batch.ClasspathDirectory;
+import org.aspectj.org.eclipse.jdt.internal.compiler.batch.CompilationUnit;
+import org.aspectj.org.eclipse.jdt.internal.compiler.batch.FileSystem;
+import org.aspectj.org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+import org.aspectj.org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+import org.aspectj.org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+import org.aspectj.org.eclipse.jdt.internal.compiler.parser.Parser;
+import org.aspectj.org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+import org.aspectj.org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+import org.aspectj.util.FileUtil;
+import org.aspectj.weaver.Dump;
+import org.aspectj.weaver.ResolvedType;
+import org.aspectj.weaver.World;
+import org.aspectj.weaver.bcel.BcelWeaver;
+import org.aspectj.weaver.bcel.BcelWorld;
+import org.aspectj.weaver.bcel.UnwovenClassFile;
+import org.eclipse.core.runtime.OperationCanceledException;
+//import org.aspectj.org.eclipse.jdt.internal.compiler.util.HashtableOfObject;
+
+public class AjBuildManager implements IOutputClassFileNameProvider,IBinarySourceProvider,ICompilerAdapterFactory {
+	private static final String CROSSREFS_FILE_NAME = "build.lst";
+	private static final String CANT_WRITE_RESULT = "unable to write compilation result";
+	private static final String MANIFEST_NAME = "META-INF/MANIFEST.MF";
+	static final boolean COPY_INPATH_DIR_RESOURCES = false;
+    static final boolean FAIL_IF_RUNTIME_NOT_FOUND = false;
+    
+    private static final FileFilter binarySourceFilter = 
+		new FileFilter() {
+			public boolean accept(File f) {
+				return f.getName().endsWith(".class");
+			}};
+			
+	/**
+	 * This builder is static so that it can be subclassed and reset.  However, note
+	 * that there is only one builder present, so if two extendsion reset it, only
+	 * the latter will get used.
+	 */
+	private static AsmHierarchyBuilder asmHierarchyBuilder = new AsmHierarchyBuilder();
+	
+	static {
+		CompilationAndWeavingContext.registerFormatter(
+				CompilationAndWeavingContext.BATCH_BUILD, new AjBuildContexFormatter());
+		CompilationAndWeavingContext.registerFormatter(
+				CompilationAndWeavingContext.INCREMENTAL_BUILD, new AjBuildContexFormatter());		
+	}
+	
+	private IProgressListener progressListener = null;
+	
+	private int compiledCount;
+	private int sourceFileCount;
+
+	private JarOutputStream zos;
+	private boolean batchCompile = true;
+	private INameEnvironment environment;
+	
+	private Map /* String -> List<UCF>*/ binarySourcesForTheNextCompile = new HashMap();
+	
+	// FIXME asc should this really be in here?
+	private IHierarchy structureModel;
+	public AjBuildConfig buildConfig;
+	private List aspectNames = new LinkedList();
+	
+	AjState state = new AjState(this);
+    
+	
+	public BcelWeaver getWeaver() { return state.getWeaver();}
+	public BcelWorld getBcelWorld() { return state.getBcelWorld();}
+	
+	public CountingMessageHandler handler;
+
+	public AjBuildManager(IMessageHandler holder) {
+		super();
+        this.handler = CountingMessageHandler.makeCountingMessageHandler(holder);
+	}
+
+    /** @return true if we should generate a model as a side-effect */
+    public boolean doGenerateModel() {
+        return buildConfig.isGenerateModelMode();
+    }
+
+	public boolean batchBuild(
+        AjBuildConfig buildConfig, 
+        IMessageHandler baseHandler) 
+        throws IOException, AbortException {
+        return doBuild(buildConfig, baseHandler, true);
+    }
+
+    public boolean incrementalBuild(
+        AjBuildConfig buildConfig, 
+        IMessageHandler baseHandler) 
+        throws IOException, AbortException {
+        return doBuild(buildConfig, baseHandler, false);
+    }
+    
+
+    /** @throws AbortException if check for runtime fails */
+    protected boolean doBuild(
+        AjBuildConfig buildConfig, 
+        IMessageHandler baseHandler, 
+        boolean batch) throws IOException, AbortException {
+        boolean ret = true;
+    	batchCompile = batch;
+    	
+    	if (baseHandler instanceof ILifecycleAware) {
+    		((ILifecycleAware)baseHandler).buildStarting(!batch);
+    	}
+    	CompilationAndWeavingContext.reset();
+    	int phase = batch ? CompilationAndWeavingContext.BATCH_BUILD : CompilationAndWeavingContext.INCREMENTAL_BUILD;
+    	ContextToken ct = CompilationAndWeavingContext.enteringPhase(phase ,buildConfig);
+        try {
+        	if (batch) {
+        		this.state = new AjState(this);
+        	}
+        	
+            boolean canIncremental = state.prepareForNextBuild(buildConfig);
+            if (!canIncremental && !batch) { // retry as batch?
+               	CompilationAndWeavingContext.leavingPhase(ct);
+            	return doBuild(buildConfig, baseHandler, true);
+            }
+            this.handler = 
+                CountingMessageHandler.makeCountingMessageHandler(baseHandler);
+            // XXX duplicate, no? remove?
+            String check = checkRtJar(buildConfig);
+            if (check != null) {
+                if (FAIL_IF_RUNTIME_NOT_FOUND) {
+                    MessageUtil.error(handler, check);
+                   	CompilationAndWeavingContext.leavingPhase(ct);
+                    return false;
+                } else {
+                    MessageUtil.warn(handler, check);
+                }
+            }
+            // if (batch) {
+                setBuildConfig(buildConfig);
+            //}
+            if (batch || !AsmManager.attemptIncrementalModelRepairs) {
+//                if (buildConfig.isEmacsSymMode() || buildConfig.isGenerateModelMode()) { 
+                	setupModel(buildConfig);
+//                }
+            }
+            if (batch) {
+                initBcelWorld(handler);
+            }
+            if (handler.hasErrors()) {
+               	CompilationAndWeavingContext.leavingPhase(ct);
+                return false;
+            }
+            
+            if (buildConfig.getOutputJar() != null) {
+            	if (!openOutputStream(buildConfig.getOutputJar())) {
+                   	CompilationAndWeavingContext.leavingPhase(ct);
+                   	return false;
+            	}
+            }
+            
+            if (batch) {
+                // System.err.println("XXXX batch: " + buildConfig.getFiles());
+                if (buildConfig.isEmacsSymMode() || buildConfig.isGenerateModelMode()) {  
+                    getWorld().setModel(AsmManager.getDefault().getHierarchy());
+                    // in incremental build, only get updated model?
+                }
+                binarySourcesForTheNextCompile = state.getBinaryFilesToCompile(true);
+                performCompilation(buildConfig.getFiles());
+                if (handler.hasErrors()) {
+                   	CompilationAndWeavingContext.leavingPhase(ct);
+                    return false;
+                }
+
+				if (AsmManager.isReporting())
+				    AsmManager.getDefault().reportModelInfo("After a batch build");
+		
+            } else {
+// done already?
+//                if (buildConfig.isEmacsSymMode() || buildConfig.isGenerateModelMode()) {  
+//                    bcelWorld.setModel(StructureModelManager.INSTANCE.getStructureModel());
+//                }
+                // System.err.println("XXXX start inc ");
+                binarySourcesForTheNextCompile = state.getBinaryFilesToCompile(true);
+                List files = state.getFilesToCompile(true);
+				if (buildConfig.isEmacsSymMode() || buildConfig.isGenerateModelMode())
+				if (AsmManager.attemptIncrementalModelRepairs)
+				    AsmManager.getDefault().processDelta(files,state.getAddedFiles(),state.getDeletedFiles());
+                boolean hereWeGoAgain = !(files.isEmpty() && binarySourcesForTheNextCompile.isEmpty());
+                for (int i = 0; (i < 5) && hereWeGoAgain; i++) {
+                    // System.err.println("XXXX inc: " + files);
+               
+                    performCompilation(files);
+                    if (handler.hasErrors() || (progressListener!=null && progressListener.isCancelledRequested())) {
+                       	CompilationAndWeavingContext.leavingPhase(ct);
+                        return false;
+                    } 
+                    
+                    if (state.requiresFullBatchBuild()) {
+                    	return batchBuild(buildConfig, baseHandler);
+                    }
+                    
+                    binarySourcesForTheNextCompile = state.getBinaryFilesToCompile(false);
+                    files = state.getFilesToCompile(false);
+                    hereWeGoAgain = !(files.isEmpty() && binarySourcesForTheNextCompile.isEmpty());
+                    // TODO Andy - Needs some thought here...
+                    // I think here we might want to pass empty addedFiles/deletedFiles as they were
+                    // dealt with on the first call to processDelta - we are going through this loop
+                    // again because in compiling something we found something else we needed to
+                    // rebuild.  But what case causes this?
+                    if (hereWeGoAgain) {
+					  if (buildConfig.isEmacsSymMode() || buildConfig.isGenerateModelMode())
+					    if (AsmManager.attemptIncrementalModelRepairs)
+						  AsmManager.getDefault().processDelta(files,state.getAddedFiles(),state.getDeletedFiles());
+                    }
+                }
+                if (!files.isEmpty()) {
+                   	CompilationAndWeavingContext.leavingPhase(ct);
+                    return batchBuild(buildConfig, baseHandler);
+                } else {                
+                	if (AsmManager.isReporting()) 
+			    	    AsmManager.getDefault().reportModelInfo("After an incremental build");
+                }
+            }
+
+            // XXX not in Mik's incremental
+            if (buildConfig.isEmacsSymMode()) {
+                new org.aspectj.ajdt.internal.core.builder.EmacsStructureModelManager().externalizeModel();
+            }
+            
+            // for bug 113554: support ajsym file generation for command line builds
+            if (buildConfig.isGenerateCrossRefsMode()) {
+                String configFileProxy = buildConfig.getOutputDir().getAbsolutePath() 
+            		+ File.separator 
+            		+ CROSSREFS_FILE_NAME; 
+            	AsmManager.getDefault().writeStructureModel(configFileProxy);
+            }
+            
+            // have to tell state we succeeded or next is not incremental
+            state.successfulCompile(buildConfig,batch);
+
+            copyResourcesToDestination();
+            
+            if (buildConfig.getOutxmlName() != null) {
+            	writeOutxmlFile();
+            }
+            
+            /*boolean weaved = *///weaveAndGenerateClassFiles();
+            // if not weaved, then no-op build, no model changes
+            // but always returns true
+            // XXX weaved not in Mik's incremental
+            if (buildConfig.isGenerateModelMode()) {
+                AsmManager.getDefault().fireModelUpdated();  
+            }
+           	CompilationAndWeavingContext.leavingPhase(ct);
+            
+        } finally {
+        	if (baseHandler instanceof ILifecycleAware) {
+        		((ILifecycleAware)baseHandler).buildFinished(!batch);
+        	}
+        	if (zos != null) {
+        		closeOutputStream(buildConfig.getOutputJar());
+        	}
+            ret = !handler.hasErrors();
+            if (getBcelWorld()!=null) getBcelWorld().tidyUp();
+            // bug 59895, don't release reference to handler as may be needed by a nested call
+            //handler = null;
+        }
+        return ret;
+    }
+    
+
+	private boolean openOutputStream(File outJar)  {
+		try {
+			OutputStream os = FileUtil.makeOutputStream(buildConfig.getOutputJar());
+			zos = new JarOutputStream(os,getWeaver().getManifest(true));
+		} catch (IOException ex) {
+			IMessage message = 
+				new Message("Unable to open outjar " 
+								+ outJar.getPath() 
+								+ "(" + ex.getMessage() 
+								+ ")",
+							new SourceLocation(outJar,0),
+							true);
+			handler.handleMessage(message);
+			return false;
+		}
+		return true;
+	}
+
+	private void closeOutputStream(File outJar) {
+		try {
+			if (zos != null) zos.close();
+			zos = null;
+			
+			/* Ensure we don't write an incomplete JAR bug-71339 */
+			if (handler.hasErrors()) {
+				outJar.delete(); 
+			}
+		} catch (IOException ex) {
+			IMessage message = 
+				new Message("Unable to write outjar " 
+								+ outJar.getPath() 
+								+ "(" + ex.getMessage() 
+								+ ")",
+							new SourceLocation(outJar,0),
+							true);
+			handler.handleMessage(message);
+		}
+	}
+
+	
+	private void copyResourcesToDestination() throws IOException {
+		// resources that we need to copy are contained in the injars and inpath only
+		for (Iterator i = buildConfig.getInJars().iterator(); i.hasNext(); ) {
+			File inJar = (File)i.next();
+			copyResourcesFromJarFile(inJar);
+		}
+		
+		for (Iterator i = buildConfig.getInpath().iterator(); i.hasNext(); ) {
+			File inPathElement = (File)i.next();
+			if (inPathElement.isDirectory()) {				
+				copyResourcesFromDirectory(inPathElement);
+			} else {
+				copyResourcesFromJarFile(inPathElement);
+			}
+		}	
+		
+		if (buildConfig.getSourcePathResources() != null) {
+			for (Iterator i = buildConfig.getSourcePathResources().keySet().iterator(); i.hasNext(); ) {
+				String resource = (String)i.next();
+				File from = (File)buildConfig.getSourcePathResources().get(resource);
+				copyResourcesFromFile(from,resource,from);
+			}
+		}
+		
+		writeManifest();
+    }
+	
+	private void copyResourcesFromJarFile(File jarFile) throws IOException {
+		JarInputStream inStream = null;
+		try {
+			inStream = new JarInputStream(new FileInputStream(jarFile));
+			while (true) {
+				ZipEntry entry = inStream.getNextEntry();
+				if (entry == null) break;
+			
+				String filename = entry.getName();
+//				System.out.println("? copyResourcesFromJarFile() filename='" + filename +"'");
+	
+				if (!entry.isDirectory() && acceptResource(filename)) {
+					byte[] bytes = FileUtil.readAsByteArray(inStream);
+					writeResource(filename,bytes,jarFile);
+				}
+	
+				inStream.closeEntry();
+			}
+		} finally {
+			if (inStream != null) inStream.close();
+		}
+	}
+	
+	private void copyResourcesFromDirectory(File dir) throws IOException {
+		if (!COPY_INPATH_DIR_RESOURCES) return;
+		// Get a list of all files (i.e. everything that isnt a directory)
+		File[] files = FileUtil.listFiles(dir,new FileFilter() {
+			public boolean accept(File f) {
+				boolean accept = !(f.isDirectory() || f.getName().endsWith(".class")) ;
+				return accept;
+			}
+		});
+		
+		// For each file, add it either as a real .class file or as a resource
+		for (int i = 0; i < files.length; i++) {
+			// ASSERT: files[i].getAbsolutePath().startsWith(inFile.getAbsolutePath()
+			// or we are in trouble...
+			String filename = files[i].getAbsolutePath().substring(
+			                    dir.getAbsolutePath().length()+1);
+			copyResourcesFromFile(files[i],filename,dir);
+		}		
+	}
+	
+	private void copyResourcesFromFile(File f,String filename,File src) throws IOException {
+		if (!acceptResource(filename)) return;
+		FileInputStream fis = null;
+		try {
+			fis = new FileInputStream(f);
+			byte[] bytes = FileUtil.readAsByteArray(fis);
+			// String relativePath = files[i].getPath();
+			
+			writeResource(filename,bytes,src);
+		} finally {
+			if (fis != null) fis.close();
+		}	
+	}
+    
+	private void writeResource(String filename, byte[] content, File srcLocation) throws IOException {
+		if (state.hasResource(filename)) {
+			IMessage msg = new Message("duplicate resource: '" + filename + "'",
+									   IMessage.WARNING,
+									   null,
+									   new SourceLocation(srcLocation,0));
+			handler.handleMessage(msg);
+			return;
+		}
+		if (zos != null) {
+			ZipEntry newEntry = new ZipEntry(filename);  //??? get compression scheme right
+			
+			zos.putNextEntry(newEntry);
+			zos.write(content);
+			zos.closeEntry();
+		} else {
+			OutputStream fos = 
+				FileUtil.makeOutputStream(new File(buildConfig.getOutputDir(),filename));
+			fos.write(content);
+			fos.close();
+		}
+		state.recordResource(filename);
+	}
+	
+	/*
+	 * If we are writing to an output directory copy the manifest but only
+	 * if we already have one
+	 */    
+	private void writeManifest () throws IOException {
+		Manifest manifest = getWeaver().getManifest(false);
+		if (manifest != null && zos == null) {
+			OutputStream fos = 
+				FileUtil.makeOutputStream(new File(buildConfig.getOutputDir(),MANIFEST_NAME));
+			manifest.write(fos);	
+			fos.close();
+		}
+	}
+
+	private boolean acceptResource(String resourceName) {
+		if (  
+				(resourceName.startsWith("CVS/")) ||
+				(resourceName.indexOf("/CVS/") != -1) ||
+				(resourceName.endsWith("/CVS")) ||
+				(resourceName.endsWith(".class")) ||
+				(resourceName.startsWith(".svn/")) || 
+				(resourceName.indexOf("/.svn/")!=-1) ||
+				(resourceName.endsWith("/.svn")) ||
+				(resourceName.toUpperCase().equals(MANIFEST_NAME))
+		    )
+		{
+			return false;
+		} else {
+			return true;
+		}
+	}
+	
+	private void writeOutxmlFile () throws IOException {
+		String filename = buildConfig.getOutxmlName();
+//		System.err.println("? AjBuildManager.writeOutxmlFile() outxml=" + filename);
+//		System.err.println("? AjBuildManager.writeOutxmlFile() outputDir=" + buildConfig.getOutputDir());
+		
+		ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		PrintStream ps = new PrintStream(baos);
+		ps.println("<aspectj>");
+		ps.println("<aspects>");
+		for (Iterator i = aspectNames.iterator(); i.hasNext();) {
+			String name = (String)i.next();
+			ps.println("<aspect name=\"" + name + "\"/>");
+		}
+		ps.println("</aspects>");
+		ps.println("</aspectj>");
+		ps.println();
+		ps.close();
+
+		if (zos != null) {
+			ZipEntry newEntry = new ZipEntry(filename);
+			
+			zos.putNextEntry(newEntry);
+			zos.write(baos.toByteArray());
+			zos.closeEntry();
+		} else {
+			OutputStream fos = 
+				FileUtil.makeOutputStream(new File(buildConfig.getOutputDir(),filename));
+			fos.write(baos.toByteArray());
+			fos.close();
+		}
+	}
+	
+//	public static void dumprels() {
+//		IRelationshipMap irm = AsmManager.getDefault().getRelationshipMap();
+//		int ctr = 1;
+//		Set entries = irm.getEntries();
+//		for (Iterator iter = entries.iterator(); iter.hasNext();) {
+//			String hid = (String) iter.next();
+//			List rels =  irm.get(hid);
+//			for (Iterator iterator = rels.iterator(); iterator.hasNext();) {
+//				IRelationship ir = (IRelationship) iterator.next();
+//				List targets = ir.getTargets();
+//				for (Iterator iterator2 = targets.iterator();
+//					iterator2.hasNext();
+//					) {
+//					String thid = (String) iterator2.next();
+//					System.err.println("Hid:"+(ctr++)+":(targets="+targets.size()+") "+hid+" ("+ir.getName()+") "+thid);
+//				}
+//			}
+//		}
+//	}
+	
+	
+    /**
+     * Responsible for managing the ASM model between builds.  Contains the policy for
+     * maintaining the persistance of elements in the model.
+     * 
+     * This code is driven before each 'fresh' (batch) build to create
+     * a new model.
+     */
+     private void setupModel(AjBuildConfig config) {
+     	AsmManager.setCreatingModel(config.isEmacsSymMode() || config.isGenerateModelMode());
+     	if (!AsmManager.isCreatingModel()) return;
+
+		AsmManager.getDefault().createNewASM();
+		// AsmManager.getDefault().getRelationshipMap().clear();
+		IHierarchy model = AsmManager.getDefault().getHierarchy();
+        String rootLabel = "<root>";
+        	
+		
+        IProgramElement.Kind kind = IProgramElement.Kind.FILE_JAVA;
+        if (buildConfig.getConfigFile() != null) {
+           	rootLabel = buildConfig.getConfigFile().getName();
+           	model.setConfigFile(buildConfig.getConfigFile().getAbsolutePath());
+           	kind = IProgramElement.Kind.FILE_LST;  
+        }
+        model.setRoot(new ProgramElement(rootLabel, kind, new ArrayList()));
+                
+        model.setFileMap(new HashMap());
+        setStructureModel(model);
+		state.setStructureModel(model);
+		state.setRelationshipMap(AsmManager.getDefault().getRelationshipMap());
+    }
+    
+//    
+//    private void dumplist(List l) {
+//    	System.err.println("---- "+l.size());
+//    	for (int i =0 ;i<l.size();i++) System.err.println(i+"\t "+l.get(i));
+//    }
+//    private void accumulateFileNodes(IProgramElement ipe,List store) {
+//    	if (ipe.getKind()==IProgramElement.Kind.FILE_JAVA ||
+//    	    ipe.getKind()==IProgramElement.Kind.FILE_ASPECTJ) {
+//    	    	if (!ipe.getName().equals("<root>")) {
+//    	    		store.add(ipe);
+//    	    		return;
+//    	    	}
+//    	}
+//    	for (Iterator i = ipe.getChildren().iterator();i.hasNext();) {
+//    		accumulateFileNodes((IProgramElement)i.next(),store);
+//    	}
+//    }
+    
+    /** init only on initial batch compile? no file-specific options */
+	private void initBcelWorld(IMessageHandler handler) throws IOException {
+		List cp = buildConfig.getBootclasspath();
+		cp.addAll(buildConfig.getClasspath());
+		BcelWorld bcelWorld = new BcelWorld(cp, handler, null);
+		bcelWorld.setBehaveInJava5Way(buildConfig.getBehaveInJava5Way());
+		bcelWorld.performExtraConfiguration(buildConfig.getXconfigurationInfo());
+		bcelWorld.setTargetAspectjRuntimeLevel(buildConfig.getTargetAspectjRuntimeLevel());
+		bcelWorld.setOptionalJoinpoints(buildConfig.getXJoinpoints());
+		bcelWorld.setXnoInline(buildConfig.isXnoInline());
+		bcelWorld.setXlazyTjp(buildConfig.isXlazyTjp());
+		bcelWorld.setXHasMemberSupportEnabled(buildConfig.isXHasMemberEnabled());
+		bcelWorld.setPinpointMode(buildConfig.isXdevPinpoint());
+		BcelWeaver bcelWeaver = new BcelWeaver(bcelWorld);
+		state.setWorld(bcelWorld);
+		state.setWeaver(bcelWeaver);
+		state.clearBinarySourceFiles();
+		
+		for (Iterator i = buildConfig.getAspectpath().iterator(); i.hasNext();) {
+			File f = (File) i.next();
+			if (!f.exists()) {
+				IMessage message = new Message("invalid aspectpath entry: "+f.getName(),null,true);
+				handler.handleMessage(message);
+			} else {
+				bcelWeaver.addLibraryJarFile(f);
+			}
+		}
+		
+//		String lintMode = buildConfig.getLintMode();
+		
+		if (buildConfig.getLintMode().equals(AjBuildConfig.AJLINT_DEFAULT)) {
+			bcelWorld.getLint().loadDefaultProperties();
+		} else {
+			bcelWorld.getLint().setAll(buildConfig.getLintMode());
+		}
+		
+		if (buildConfig.getLintSpecFile() != null) {
+			bcelWorld.getLint().setFromProperties(buildConfig.getLintSpecFile());
+		}
+		
+		//??? incremental issues
+		for (Iterator i = buildConfig.getInJars().iterator(); i.hasNext(); ) {
+			File inJar = (File)i.next();
+			List unwovenClasses = bcelWeaver.addJarFile(inJar, buildConfig.getOutputDir(),false);
+			state.recordBinarySource(inJar.getPath(), unwovenClasses);
+		}
+		
+		for (Iterator i = buildConfig.getInpath().iterator(); i.hasNext(); ) {
+			File inPathElement = (File)i.next();
+			if (!inPathElement.isDirectory()) {
+				// its a jar file on the inpath
+				// the weaver method can actually handle dirs, but we don't call it, see next block
+				List unwovenClasses = bcelWeaver.addJarFile(inPathElement,buildConfig.getOutputDir(),true);
+				state.recordBinarySource(inPathElement.getPath(),unwovenClasses);
+			} else {
+				// add each class file in an in-dir individually, this gives us the best error reporting
+				// (they are like 'source' files then), and enables a cleaner incremental treatment of
+				// class file changes in indirs.
+				File[] binSrcs = FileUtil.listFiles(inPathElement, binarySourceFilter);
+				for (int j = 0; j < binSrcs.length; j++) {
+					UnwovenClassFile ucf = 
+						bcelWeaver.addClassFile(binSrcs[j], inPathElement, buildConfig.getOutputDir());
+					List ucfl = new ArrayList();
+					ucfl.add(ucf);
+					state.recordBinarySource(binSrcs[j].getPath(),ucfl);
+				}
+			}
+		}
+		
+		bcelWeaver.setReweavableMode(buildConfig.isXNotReweavable());
+
+		//check for org.aspectj.runtime.JoinPoint
+		ResolvedType joinPoint = bcelWorld.resolve("org.aspectj.lang.JoinPoint");
+		if (joinPoint.isMissing()) {
+			IMessage message = 
+				new Message("classpath error: unable to find org.aspectj.lang.JoinPoint (check that aspectjrt.jar is in your classpath)",
+							null,
+							true);
+				handler.handleMessage(message);
+		}
+	}
+	
+	public World getWorld() {
+		return getBcelWorld();
+	}
+	
+	void addAspectClassFilesToWeaver(List addedClassFiles) throws IOException {
+		for (Iterator i = addedClassFiles.iterator(); i.hasNext(); ) {
+			UnwovenClassFile classFile = (UnwovenClassFile) i.next();
+			getWeaver().addClassFile(classFile);
+		}
+	}
+
+//	public boolean weaveAndGenerateClassFiles() throws IOException {
+//		handler.handleMessage(MessageUtil.info("weaving"));
+//		if (progressListener != null) progressListener.setText("weaving aspects");
+//		bcelWeaver.setProgressListener(progressListener, 0.5, 0.5/state.addedClassFiles.size());
+//		//!!! doesn't provide intermediate progress during weaving
+//		// XXX add all aspects even during incremental builds?
+//        addAspectClassFilesToWeaver(state.addedClassFiles);
+//		if (buildConfig.isNoWeave()) {
+//			if (buildConfig.getOutputJar() != null) {
+//				bcelWeaver.dumpUnwoven(buildConfig.getOutputJar());
+//			} else {
+//				bcelWeaver.dumpUnwoven();
+//				bcelWeaver.dumpResourcesToOutPath();
+//			}
+//		} else {
+//			if (buildConfig.getOutputJar() != null) {
+//				bcelWeaver.weave(buildConfig.getOutputJar());
+//			} else {
+//				bcelWeaver.weave();
+//				bcelWeaver.dumpResourcesToOutPath();
+//			}
+//		}
+//		if (progressListener != null) progressListener.setProgress(1.0);
+//		return true;
+//        //return messageAdapter.getErrorCount() == 0; //!javaBuilder.notifier.anyErrors();
+//	}
+	
+	public FileSystem getLibraryAccess(String[] classpaths, String[] filenames) {
+		String defaultEncoding = buildConfig.getOptions().defaultEncoding;
+		if ("".equals(defaultEncoding)) //$NON-NLS-1$
+			defaultEncoding = null; //$NON-NLS-1$	
+		// Bug 46671: We need an array as long as the number of elements in the classpath - *even though* not every
+		// element of the classpath is likely to be a directory.  If we ensure every element of the array is set to
+		// only look for BINARY, then we make sure that for any classpath element that is a directory, we won't build
+		// a classpathDirectory object that will attempt to look for source when it can't find binary.
+		int[] classpathModes = new int[classpaths.length];
+		for (int i =0 ;i<classpaths.length;i++) classpathModes[i]=ClasspathDirectory.BINARY;
+		return new FileSystem(classpaths, filenames, defaultEncoding,classpathModes);
+	}
+	
+	public IProblemFactory getProblemFactory() {
+		return new DefaultProblemFactory(Locale.getDefault());
+	}
+    
+	/*
+	 *  Build the set of compilation source units
+	 */
+	public CompilationUnit[] getCompilationUnits(String[] filenames, String[] encodings) {
+		int fileCount = filenames.length;
+		CompilationUnit[] units = new CompilationUnit[fileCount];
+//		HashtableOfObject knownFileNames = new HashtableOfObject(fileCount);
+
+		String defaultEncoding = buildConfig.getOptions().defaultEncoding;
+		if ("".equals(defaultEncoding)) //$NON-NLS-1$
+			defaultEncoding = null; //$NON-NLS-1$
+
+		for (int i = 0; i < fileCount; i++) {
+			String encoding = encodings[i];
+			if (encoding == null)
+				encoding = defaultEncoding;
+			units[i] = new CompilationUnit(null, filenames[i], encoding);
+		}
+		return units;
+	}
+    
+	public String extractDestinationPathFromSourceFile(CompilationResult result) {
+		ICompilationUnit compilationUnit = result.compilationUnit;
+		if (compilationUnit != null) {
+			char[] fileName = compilationUnit.getFileName();
+			int lastIndex = CharOperation.lastIndexOf(java.io.File.separatorChar, fileName);
+			if (lastIndex == -1) {
+				return System.getProperty("user.dir"); //$NON-NLS-1$
+			}
+			return new String(CharOperation.subarray(fileName, 0, lastIndex));
+		}
+		return System.getProperty("user.dir"); //$NON-NLS-1$
+	}
+    
+    
+	public void performCompilation(List files) {
+		if (progressListener != null) {
+			compiledCount=0;
+			sourceFileCount = files.size();
+			progressListener.setText("compiling source files");
+		}
+		//System.err.println("got files: " + files);
+		String[] filenames = new String[files.size()];
+		String[] encodings = new String[files.size()];
+		//System.err.println("filename: " + this.filenames);
+		for (int i=0; i < files.size(); i++) {
+			filenames[i] = ((File)files.get(i)).getPath();
+		}
+		
+		List cps = buildConfig.getFullClasspath();
+		Dump.saveFullClasspath(cps);
+		String[] classpaths = new String[cps.size()];
+		for (int i=0; i < cps.size(); i++) {
+			classpaths[i] = (String)cps.get(i);
+		}
+		
+		//System.out.println("compiling");
+		environment = getLibraryAccess(classpaths, filenames);
+		
+		if (!state.getClassNameToUCFMap().isEmpty()) {
+			environment = new StatefulNameEnvironment(environment, state.getClassNameToUCFMap());
+		}
+		
+		org.aspectj.ajdt.internal.compiler.CompilerAdapter.setCompilerAdapterFactory(this);
+		org.aspectj.org.eclipse.jdt.internal.compiler.Compiler compiler = 
+			new org.aspectj.org.eclipse.jdt.internal.compiler.Compiler(environment,
+					DefaultErrorHandlingPolicies.proceedWithAllProblems(),
+				    buildConfig.getOptions().getMap(),
+					getBatchRequestor(),
+					getProblemFactory());
+		
+		CompilerOptions options = compiler.options;
+
+		options.produceReferenceInfo = true; //TODO turn off when not needed
+		
+		try {
+		 	compiler.compile(getCompilationUnits(filenames, encodings));
+		} catch (OperationCanceledException oce) {
+			handler.handleMessage(new Message("build cancelled:"+oce.getMessage(),IMessage.WARNING,null,null));
+		}
+		// cleanup
+		org.aspectj.ajdt.internal.compiler.CompilerAdapter.setCompilerAdapterFactory(null);
+		AnonymousClassPublisher.aspectOf().setAnonymousClassCreationListener(null);
+		environment.cleanup();
+		environment = null;
+	}
+
+	/*
+	 * Answer the component to which will be handed back compilation results from the compiler
+	 */
+	public IIntermediateResultsRequestor getInterimResultRequestor() {
+		return new IIntermediateResultsRequestor() {
+			public void acceptResult(InterimCompilationResult result) {
+				if (progressListener != null) {
+					compiledCount++;
+					progressListener.setProgress((compiledCount/2.0)/sourceFileCount);
+					progressListener.setText("compiled: " + result.fileName());
+				}
+				state.noteResult(result);
+				
+				if (progressListener!=null && progressListener.isCancelledRequested()) { 
+					throw new AbortCompilation(true,
+					  new OperationCanceledException("Compilation cancelled as requested"));
+				}
+			}
+		};
+	}
+	
+	public ICompilerRequestor getBatchRequestor() {
+		return new ICompilerRequestor() {
+			
+			public void acceptResult(CompilationResult unitResult) {
+				// end of compile, must now write the results to the output destination
+				// this is either a jar file or a file in a directory
+				if (!(unitResult.hasErrors() && !proceedOnError())) {			
+					Collection classFiles = unitResult.compiledTypes.values();
+					boolean shouldAddAspectName = (buildConfig.getOutxmlName() != null);
+					for (Iterator iter = classFiles.iterator(); iter.hasNext();) {
+						ClassFile classFile = (ClassFile) iter.next();					
+						String filename = new String(classFile.fileName());
+						String classname = filename.replace('/', '.');
+						filename = filename.replace('/', File.separatorChar) + ".class";
+						try {
+							if (buildConfig.getOutputJar() == null) {
+								writeDirectoryEntry(unitResult, classFile,filename);
+							} else {
+								writeZipEntry(classFile,filename);
+							}
+							if (shouldAddAspectName) addAspectName(classname);
+						} catch (IOException ex) {
+							IMessage message = EclipseAdapterUtils.makeErrorMessage(
+									new String(unitResult.fileName),
+									CANT_WRITE_RESULT,
+									ex);
+							handler.handleMessage(message);
+						}
+
+					}
+				}
+				
+				if (unitResult.hasProblems() || unitResult.hasTasks()) {
+					IProblem[] problems = unitResult.getAllProblems();
+					for (int i=0; i < problems.length; i++) {
+						IMessage message =
+							EclipseAdapterUtils.makeMessage(unitResult.compilationUnit, problems[i]);
+						handler.handleMessage(message);
+					}
+				}
+
+			}
+			
+			private void writeDirectoryEntry(
+					CompilationResult unitResult, 
+					ClassFile classFile, 
+					String filename) 
+			throws IOException {
+				File destinationPath = buildConfig.getOutputDir();
+				String outFile;
+				if (destinationPath == null) {
+					outFile = new File(filename).getName();
+					outFile = new File(extractDestinationPathFromSourceFile(unitResult), outFile).getPath();
+				} else {
+					outFile = new File(destinationPath, filename).getPath();
+				}
+				BufferedOutputStream os =
+					FileUtil.makeOutputStream(new File(outFile));
+				os.write(classFile.getBytes());
+				os.close();
+			}
+			
+			private void writeZipEntry(ClassFile classFile, String name) 
+			throws IOException {
+				name = name.replace(File.separatorChar,'/');
+				ZipEntry newEntry = new ZipEntry(name);  //??? get compression scheme right
+				
+				zos.putNextEntry(newEntry);
+				zos.write(classFile.getBytes());
+				zos.closeEntry();
+			}
+			
+			private void addAspectName (String name) {
+				BcelWorld world = getBcelWorld();
+				ResolvedType type = world.resolve(name);
+//				System.err.println("? writeAspectName() type=" + type);
+				if (type.isAspect()) {
+					aspectNames.add(name);
+				}
+			}
+		};
+	}
+	
+	protected boolean proceedOnError() {
+		return buildConfig.getProceedOnError();
+	}
+
+//	public void noteClassFiles(AjCompiler.InterimResult result) {
+//		if (result == null) return;
+//		CompilationResult unitResult = result.result;
+//		String sourceFileName = result.fileName();
+//		if (!(unitResult.hasErrors() && !proceedOnError())) {
+//			List unwovenClassFiles = new ArrayList();
+//			Enumeration classFiles = unitResult.compiledTypes.elements();
+//			while (classFiles.hasMoreElements()) {
+//				ClassFile classFile = (ClassFile) classFiles.nextElement();
+//				String filename = new String(classFile.fileName());
+//				filename = filename.replace('/', File.separatorChar) + ".class";
+//				
+//				File destinationPath = buildConfig.getOutputDir();
+//				if (destinationPath == null) {
+//					filename = new File(filename).getName();
+//					filename = new File(extractDestinationPathFromSourceFile(unitResult), filename).getPath();
+//				} else {
+//					filename = new File(destinationPath, filename).getPath();
+//				}
+//				
+//				//System.out.println("classfile: " + filename);
+//				unwovenClassFiles.add(new UnwovenClassFile(filename, classFile.getBytes()));
+//			}
+//			state.noteClassesFromFile(unitResult, sourceFileName, unwovenClassFiles);
+////			System.out.println("file: " + sourceFileName);
+////			for (int i=0; i < unitResult.simpleNameReferences.length; i++) {
+////				System.out.println("simple: " + new String(unitResult.simpleNameReferences[i]));
+////			}
+////			for (int i=0; i < unitResult.qualifiedReferences.length; i++) {
+////				System.out.println("qualified: " +
+////					new String(CharOperation.concatWith(unitResult.qualifiedReferences[i], '/')));
+////			}
+//		} else {
+//			state.noteClassesFromFile(null, sourceFileName, Collections.EMPTY_LIST);
+//		}
+//	}
+//    
+
+	private void setBuildConfig(AjBuildConfig buildConfig) {
+		this.buildConfig = buildConfig;
+		handler.reset();
+	}
+	
+	String makeClasspathString(AjBuildConfig buildConfig) {
+		if (buildConfig == null || buildConfig.getFullClasspath() == null) return "";
+		StringBuffer buf = new StringBuffer();
+		boolean first = true;
+		for (Iterator it = buildConfig.getFullClasspath().iterator(); it.hasNext(); ) {
+			if (first) { first = false; }
+			else { buf.append(File.pathSeparator); }
+			buf.append(it.next().toString());
+		}
+		return buf.toString();
+	}
+	
+	
+	/**
+	 * This will return null if aspectjrt.jar is present and has the correct version.
+	 * Otherwise it will return a string message indicating the problem.
+	 */
+	public String checkRtJar(AjBuildConfig buildConfig) {
+        // omitting dev info
+		if (Version.text.equals(Version.DEVELOPMENT)) {
+			// in the development version we can't do this test usefully
+//			MessageUtil.info(holder, "running development version of aspectj compiler");
+			return null;
+		}
+		
+		if (buildConfig == null || buildConfig.getFullClasspath() == null) return "no classpath specified";
+		
+		String ret = null;
+		for (Iterator it = buildConfig.getFullClasspath().iterator(); it.hasNext(); ) {
+			File p = new File( (String)it.next() );
+			// pr112830, allow variations on aspectjrt.jar of the form aspectjrtXXXXXX.jar
+			if (p.isFile() && p.getName().startsWith("aspectjrt") && p.getName().endsWith(".jar")) {
+
+				try {
+                    String version = null;
+                    Manifest manifest = new JarFile(p).getManifest();
+                    if (manifest == null) {
+                    	ret = "no manifest found in " + p.getAbsolutePath() + 
+								", expected " + Version.text;
+                    	continue;
+                    }
+                    Attributes attr = manifest.getAttributes("org/aspectj/lang/");
+                    if (null != attr) {
+                        version = attr.getValue(Attributes.Name.IMPLEMENTATION_VERSION);
+                        if (null != version) {
+                            version = version.trim();
+                        }
+                    }
+					// assume that users of development aspectjrt.jar know what they're doing
+					if (Version.DEVELOPMENT.equals(version)) {
+//						MessageUtil.info(holder,
+//							"running with development version of aspectjrt.jar in " + 
+//							p.getAbsolutePath());
+                        return null;
+					} else if (!Version.text.equals(version)) {
+						ret =  "bad version number found in " + p.getAbsolutePath() + 
+								" expected " + Version.text + " found " + version;
+						continue;
+					}
+				} catch (IOException ioe) {
+					ret = "bad jar file found in " + p.getAbsolutePath() + " error: " + ioe;
+				}
+				return null; // this is the "OK" return value!
+			} else {
+				// might want to catch other classpath errors
+			}
+		}
+		
+		if (ret != null) return ret; // last error found in potentially matching jars...
+		
+		return "couldn't find aspectjrt.jar on classpath, checked: " + makeClasspathString(buildConfig);
+	}
+	
+
+	public String toString() {
+		StringBuffer buf = new StringBuffer();
+		buf.append("AjBuildManager(");
+		buf.append(")");
+		return buf.toString();
+	}
+
+
+	public void setStructureModel(IHierarchy structureModel) {
+		this.structureModel = structureModel;
+	}
+
+	/**
+	 * Returns null if there is no structure model
+	 */
+	public IHierarchy getStructureModel() {
+		return structureModel;
+	}
+    
+	public IProgressListener getProgressListener() {
+		return progressListener;
+	}
+
+	public void setProgressListener(IProgressListener progressListener) {
+		this.progressListener = progressListener;
+	}
+	
+	
+	/* (non-Javadoc)
+	 * @see org.aspectj.ajdt.internal.compiler.AjCompiler.IOutputClassFileNameProvider#getOutputClassFileName(char[])
+	 */
+	public String getOutputClassFileName(char[] eclipseClassFileName, CompilationResult result) {
+		String filename = new String(eclipseClassFileName);
+		filename = filename.replace('/', File.separatorChar) + ".class";
+		File destinationPath = buildConfig.getOutputDir();
+		String outFile;
+		if (destinationPath == null) {
+			outFile = new File(filename).getName();
+			outFile = new File(extractDestinationPathFromSourceFile(result), outFile).getPath();
+		} else {
+			outFile = new File(destinationPath, filename).getPath();
+		}
+		return outFile;		
+	}
+
+	/* (non-Javadoc)
+	 * @see org.eclipse.jdt.internal.compiler.ICompilerAdapterFactory#getAdapter(org.eclipse.jdt.internal.compiler.Compiler)
+	 */
+	public ICompilerAdapter getAdapter(org.aspectj.org.eclipse.jdt.internal.compiler.Compiler forCompiler) {
+		// complete compiler config and return a suitable adapter...
+		populateCompilerOptionsFromLintSettings(forCompiler);
+		AjProblemReporter pr =
+			new AjProblemReporter(DefaultErrorHandlingPolicies.proceedWithAllProblems(),
+								  forCompiler.options, getProblemFactory());
+		
+		forCompiler.problemReporter = pr;
+			
+		AjLookupEnvironment le =
+			new AjLookupEnvironment(forCompiler, forCompiler.options, pr, environment);
+		EclipseFactory factory = new EclipseFactory(le,this);
+		le.factory = factory;
+		pr.factory = factory;
+		
+		forCompiler.lookupEnvironment = le;
+		
+		forCompiler.parser =
+			new Parser(
+				pr, 
+				forCompiler.options.parseLiteralExpressionsAsConstants);
+		
+		return new AjCompilerAdapter(forCompiler,batchCompile,getBcelWorld(),getWeaver(),
+						factory,
+						getInterimResultRequestor(),
+						progressListener,
+						this,  // IOutputFilenameProvider
+						this,  // IBinarySourceProvider
+						state.getBinarySourceMap(),
+						buildConfig.isNoWeave(),
+						buildConfig.getProceedOnError(),
+						buildConfig.isNoAtAspectJAnnotationProcessing(),
+						state);
+	}
+	
+	/**
+	 * Some AspectJ lint options need to be known about in the compiler. This is 
+	 * how we pass them over...
+	 * @param forCompiler
+	 */
+	private void populateCompilerOptionsFromLintSettings(org.aspectj.org.eclipse.jdt.internal.compiler.Compiler forCompiler) {
+		BcelWorld world = this.state.getBcelWorld();
+		IMessage.Kind swallowedExceptionKind = world.getLint().swallowedExceptionInCatchBlock.getKind();
+		Map optionsMap = new HashMap();
+		optionsMap.put(CompilerOptions.OPTION_ReportSwallowedExceptionInCatchBlock, 
+				       swallowedExceptionKind == null ? "ignore" : swallowedExceptionKind.toString());
+		forCompiler.options.set(optionsMap);
+	}
+
+	/* (non-Javadoc)
+	 * @see org.aspectj.ajdt.internal.compiler.IBinarySourceProvider#getBinarySourcesForThisWeave()
+	 */
+	public Map getBinarySourcesForThisWeave() {
+		return binarySourcesForTheNextCompile;
+	}
+
+    public static AsmHierarchyBuilder getAsmHierarchyBuilder() {
+        return asmHierarchyBuilder;
+    }
+
+    /**
+     * Override the the default hierarchy builder.
+     */
+    public static void setAsmHierarchyBuilder(AsmHierarchyBuilder newBuilder) {
+        asmHierarchyBuilder = newBuilder;
+    }
+    
+    public AjState getState() {
+        return state;
+    }
+
+	public void setState(AjState buildState) {
+		state = buildState;
+	}
+	
+	private static class AjBuildContexFormatter implements ContextFormatter {
+
+		public String formatEntry(int phaseId, Object data) {
+			StringBuffer sb = new StringBuffer();
+			if (phaseId == CompilationAndWeavingContext.BATCH_BUILD) {
+				sb.append("batch building ");
+			} else {
+				sb.append("incrementally building ");
+			}
+			AjBuildConfig config = (AjBuildConfig) data;
+			List classpath = config.getClasspath();
+			sb.append("with classpath: ");
+			for (Iterator iter = classpath.iterator(); iter.hasNext();) {
+				sb.append(iter.next().toString());
+				sb.append(File.pathSeparator);				
+			}
+			return sb.toString();
+		}
+		
+	}
+}

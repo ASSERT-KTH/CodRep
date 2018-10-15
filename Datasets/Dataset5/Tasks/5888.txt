@@ -1,0 +1,29 @@
+public int oInst;
+
+/*******************************************************************************
+ * Copyright (c) 2000, 2006 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * Contributors:
+ *     IBM Corporation - initial API and implementation
+ *******************************************************************************/
+package org.eclipse.swt.internal.ole.win32;
+
+public class VARDESC {
+	public int memid;
+	public int /*long*/ lpstrSchema;
+	public int /*long*/ oInst;
+//	ELEMDESC elemdescVar
+//	TYPEDESC elemdescVar.tdesc
+	public int /*long*/ elemdescVar_tdesc_union;
+	public short elemdescVar_tdesc_vt;
+//	PARAMDESC elemdescFunc.paramdesc
+	public int /*long*/ elemdescVar_paramdesc_pparamdescex;
+	public short elemdescVar_paramdesc_wParamFlags;
+	public short wVarFlags;
+	public int varkind;
+	public static final int sizeof = COM.VARDESC_sizeof ();
+}
