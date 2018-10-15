@@ -32,7 +32,7 @@ To be informed about news, intermediate rankings and final results, register to 
 
 Registered participants:
 
-1. [Saint Petersburg Academic University](https://github.com/KTH/CodRep-competition/issues/11)
+1. [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11)
 1. [Microsoft Research](https://github.com/KTH/CodRep-competition/issues/14)
 1. [The University of Edinburgh](https://github.com/KTH/CodRep-competition/issues/15)
 1. [Inria](https://github.com/KTH/CodRep-competition/issues/16)
