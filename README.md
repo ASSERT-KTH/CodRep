@@ -160,10 +160,11 @@ The datasets used in this competition are from:
 
 | Directory | Total source code files | Lines of code (LOC) |
 | --- | --- |--- |
-| Dataset1/ | 4394 | 2291002 |
-| Dataset2/ | 11069 | 5530782 |
-| Dataset3/ | 18633 | 4242795 |
-| Dataset4/ | 17132 | 3859917 |
+| Dataset1/ | 3858 | 2056900 |
+| Dataset2/ | 10088 | 5388282 |
+| Dataset3/ | 15326 | 627593 |
+| Dataset4/ | 10431 | 2308279 |
+| Dataset5/ | 18366 | 2785599 |
 
 ## Command-line interface
 
