@@ -1,356 +1,274 @@
-String result = response.getContentAsString().replace("\r\n", "\n");
+public static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("persistenceunit");
 
 /*
- * Copyright 2002-2012 the original author or authors.
+ * JBoss, Home of Professional Open Source.
+ * Copyright 2011, Red Hat, Inc., and individual contributors
+ * as indicated by the @author tags. See the copyright.txt file in the
+ * distribution for a full listing of individual contributors.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as
+ * published by the Free Software Foundation; either version 2.1 of
+ * the License, or (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this software; if not, write to the Free
+ * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.springframework.web.servlet.view.json;
+package org.jboss.as.jpa.service;
 
-import static org.easymock.EasyMock.createMock;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertTrue;
+import org.jboss.as.jpa.config.PersistenceUnitMetadata;
+import org.jboss.as.jpa.container.PersistenceUnitSearch;
+import org.jboss.as.jpa.hibernate.HibernateAnnotationScanner;
+import org.jboss.as.jpa.persistenceprovider.PersistenceProviderAdapterRegistry;
+import org.jboss.as.jpa.spi.PersistenceProviderAdaptor;
+import org.jboss.as.server.deployment.DeploymentUnit;
+import org.jboss.as.server.deployment.module.ResourceRoot;
+import org.jboss.modules.Module;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
 
-import java.io.IOException;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.PersistenceException;
+import javax.persistence.spi.PersistenceProvider;
+import javax.persistence.spi.PersistenceProviderResolverHolder;
+import javax.sql.DataSource;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-import org.codehaus.jackson.JsonGenerator;
-import org.codehaus.jackson.map.JsonSerializer;
-import org.codehaus.jackson.map.ObjectMapper;
-import org.codehaus.jackson.map.SerializationConfig;
-import org.codehaus.jackson.map.SerializerFactory;
-import org.codehaus.jackson.map.SerializerProvider;
-import org.codehaus.jackson.map.annotate.JsonSerialize;
-import org.codehaus.jackson.map.ser.BeanSerializerFactory;
-import org.junit.Before;
-import org.junit.Test;
-import org.mozilla.javascript.Context;
-import org.mozilla.javascript.ContextFactory;
-import org.mozilla.javascript.ScriptableObject;
-import org.springframework.mock.web.MockHttpServletRequest;
-import org.springframework.mock.web.MockHttpServletResponse;
-import org.springframework.ui.ModelMap;
-import org.springframework.validation.BindingResult;
 
 /**
- * @author Jeremy Grelle
- * @author Arjen Poutsma
+ * Persistence Unit service that is created for each deployed persistence unit that will be referenced by the
+ * persistence context/unit injector.
+ * <p/>
+ * The persistence unit scoped
+ *
+ * @author Scott Marlow
  */
-public class MappingJacksonJsonViewTests {
+public class PersistenceUnitService implements Service<PersistenceUnitService> {
+
+    public static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("jpa", "persistenceunit");
+
+    private final InjectedValue<Map> properties = new InjectedValue<Map>();
+
+    private final InjectedValue<DataSource> jtaDataSource = new InjectedValue<DataSource>();
+    private final InjectedValue<DataSource> nonJtaDataSource = new InjectedValue<DataSource>();
+
+    private EntityManagerFactory entityManagerFactory;
+    private PersistenceUnitMetadata pu;
+
+    /**
+     * Map of PersistenceUnitService keyed by the scoped persistence unit name.  The scoped name identifies the deployment
+     * location.
+     * <p/>
+     */
+    private static ConcurrentHashMap<String, PersistenceUnitService> persistenceServiceBackdoor = new ConcurrentHashMap<String, PersistenceUnitService>();
+
+    public PersistenceUnitService(PersistenceUnitMetadata pu, ResourceRoot resourceRoot) {
+        this.pu = pu;
+    }
+
+    @Override
+    public void start(StartContext context) throws StartException {
+        try {
+            PersistenceProvider provider = lookupProvider(pu.getPersistenceProviderClassName());
+
+            pu.setJtaDataSource(jtaDataSource.getOptionalValue());
+            pu.setNonJtaDataSource(nonJtaDataSource.getOptionalValue());
+            this.entityManagerFactory = createContainerEntityManagerFactory(provider);
+            register(this);
+
+        } finally {
+            pu.setTempClassloader(null);    // release the temp classloader (only needed when creating the EMF)
+        }
+    }
+
+    @Override
+    public void stop(StopContext context) {
+        try {
+            if (entityManagerFactory != null) {
+                entityManagerFactory.close();
+                entityManagerFactory = null;
+            }
+        } finally {
+            unregister(this);
+        }
+    }
+
+    @Override
+    public PersistenceUnitService getValue() throws IllegalStateException, IllegalArgumentException {
+        return this;
+    }
+
+    /**
+     * Creates an entity manager via EntityManagerFactory.createContainerEntityManagerFactory
+     *
+     * @param scopedPersistenceUnitName identifies the deployment target
+     * @return created EntityManager
+     */
+    public EntityManager createEntityManager(String scopedPersistenceUnitName) {
+        return entityManagerFactory.createEntityManager(properties.getValue());
+    }
+
+    /**
+     * Get the entity manager factory
+     *
+     * @return
+     */
+    public EntityManagerFactory getEntityManagerFactory() {
+        return entityManagerFactory;
+    }
+
+    private String createScopedName(String appName, DeploymentUnit deploymentUnit, Module module, String persistenceUnitName) {
+        // persistenceUnitName must be a simple name
+        assert persistenceUnitName.indexOf('/') == -1;
+        assert persistenceUnitName.indexOf('#') == -1;
+
+        String modulePath = "";//module.getModuleLoader().toString(); // javaEEModuleInformer.getModulePath(deploymentUnit);
+        String unitName = (appName != null ? appName + "/" : "") + modulePath + "#" + persistenceUnitName;
+        return "persistence.unit:unitName=" + unitName;
+    }
+
+    /**
+     * Resolve persistence unit by persistence unit name within the specified deployment.
+     * <p/>
+     * returns fully qualified (scoped) persistence unit name
+     */
+    public String resolvePersistenceUnitSupplier(DeploymentUnit deploymentUnit, String persistenceUnitName) {
+        return PersistenceUnitSearch.resolvePersistenceUnitSupplier(deploymentUnit, persistenceUnitName);
+    }
+
+    public Injector<Map> getPropertiesInjector() {
+        return properties;
+    }
+
+    public Injector<DataSource> getJtaDataSourceInjector() {
+        return jtaDataSource;
+    }
+
+    public Injector<DataSource> getNonJtaDataSourceInjector() {
+        return nonJtaDataSource;
+    }
+
+    /**
+     * Returns the Persistence Unit service name used for creation or lookup.
+     * The service name contains the unique fully scoped persistence unit name
+     *
+     * @param pu persistence unit definition
+     * @return
+     */
+    public static ServiceName getPUServiceName(PersistenceUnitMetadata pu) {
+        return PersistenceUnitService.SERVICE_NAME.append(pu.getScopedPersistenceUnitName());
+    }
+
+    public static ServiceName getPUServiceName(String scopedPersistenceUnitName) {
+        return PersistenceUnitService.SERVICE_NAME.append(scopedPersistenceUnitName);
+    }
+
+
+    public static PersistenceUnitService getPersistenceUnitService(String scopedPersistenceUnitName) {
+        return persistenceServiceBackdoor.get(scopedPersistenceUnitName);
+    }
+
+    private static void register(PersistenceUnitService service) {
+
+        if (persistenceServiceBackdoor.containsKey(service.pu.getScopedPersistenceUnitName()))
+            throw new RuntimeException("Persistence Unit is already registered: " + service.pu.getScopedPersistenceUnitName());
+        persistenceServiceBackdoor.put(service.pu.getScopedPersistenceUnitName(), service);
+    }
+
+    private static void unregister(PersistenceUnitService service) {
+        String name = service.pu.getScopedPersistenceUnitName();
+        Object removedValue = persistenceServiceBackdoor.remove(name);
+        // if we have a leak due to have the wrong name, we need to know.
+        // Also need to know if we attempt to remove the same unit multiple times.
+        if (removedValue == null) {
+            throw new RuntimeException("Could not remove Persistence Unit Service" + name);
+        }
+    }
+
+    /**
+     * Look up the persistence provider
+     *
+     * @param providerName
+     * @return
+     */
+    private PersistenceProvider lookupProvider(String providerName) {
+        List<PersistenceProvider> providers =
+            PersistenceProviderResolverHolder.getPersistenceProviderResolver().getPersistenceProviders();
+        for (PersistenceProvider provider : providers) {
+            if (provider.getClass().getName().equals(providerName)) {
+                return provider;
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        for (PersistenceProvider provider : providers) {
+            sb.append(provider.getClass().getName()).append(", ");
+        }
+        throw new PersistenceException("PersistenceProvider '" + providerName + "' not found in {" + sb.toString() + "}");
+    }
+
+
+    /**
+     * Attempt Hack around JBTM-828 by setting the TCCL to include arjuna.
+     *
+     * @param provider
+     * @return EntityManagerFactory
+     */
+    private EntityManagerFactory createContainerEntityManagerFactory(PersistenceProvider provider) {
+
+        PersistenceProviderAdaptor adaptor = PersistenceProviderAdapterRegistry.getPersistenceProviderAdaptor(pu.getPersistenceProviderClassName());
+        adaptor.beforeCreateContainerEntityManagerFactory(pu);
+        AccessController.doPrivileged(new SetContextLoaderAction(com.arjuna.ats.jbossatx.jta.TransactionManagerService.class
+            .getClassLoader()));
+        try {
+            return provider.createContainerEntityManagerFactory(pu, properties.getValue());
+        } finally {
+            try {
+                AccessController.doPrivileged(CLEAR_ACTION);
+            } finally {
+                try {
+                    adaptor.afterCreateContainerEntityManagerFactory(pu);
+                } finally {
+                    pu.setAnnotationIndex(null);    // close reference to Annotation Index (only needed during call to createContainerEntityManagerFactory)
+                    pu.setTempClassloader(null);    // close reference to temp classloader (only needed during call to createEntityManagerFactory)
+
+                }
+            }
+        }
+    }
+
+    private static final SetContextLoaderAction CLEAR_ACTION = new SetContextLoaderAction(null);
+
+    private static class SetContextLoaderAction implements PrivilegedAction<Void> {
+
+        private final ClassLoader classLoader;
+
+        public SetContextLoaderAction(final ClassLoader classLoader) {
+            this.classLoader = classLoader;
+        }
+
+        public Void run() {
+            Thread.currentThread().setContextClassLoader(classLoader);
+            return null;
+        }
+    }
 
-	private MappingJacksonJsonView view;
 
-	private MockHttpServletRequest request;
-
-	private MockHttpServletResponse response;
-
-	private Context jsContext;
-
-	private ScriptableObject jsScope;
-
-	@Before
-	public void setUp() {
-		request = new MockHttpServletRequest();
-		response = new MockHttpServletResponse();
-
-		jsContext = ContextFactory.getGlobal().enterContext();
-		jsScope = jsContext.initStandardObjects();
-
-		view = new MappingJacksonJsonView();
-	}
-
-	@Test
-	public void isExposePathVars() {
-		assertEquals("Must not expose path variables", false, view.isExposePathVariables());
-	}
-
-	@Test
-	public void renderSimpleMap() throws Exception {
-
-		Map<String, Object> model = new HashMap<String, Object>();
-		model.put("bindingResult", createMock("binding_result", BindingResult.class));
-		model.put("foo", "bar");
-
-		view.setUpdateContentLength(true);
-		view.render(model, request, response);
-
-		assertEquals("no-cache", response.getHeader("Pragma"));
-		assertEquals("no-cache, no-store, max-age=0", response.getHeader("Cache-Control"));
-		assertNotNull(response.getHeader("Expires"));
-
-		assertEquals(MappingJacksonJsonView.DEFAULT_CONTENT_TYPE, response.getContentType());
-
-		String jsonResult = response.getContentAsString();
-		assertTrue(jsonResult.length() > 0);
-		assertEquals(jsonResult.length(), response.getContentLength());
-
-		validateResult();
-	}
-
-	@Test
-	public void renderCaching() throws Exception {
-		view.setDisableCaching(false);
-
-		Map<String, Object> model = new HashMap<String, Object>();
-		model.put("bindingResult", createMock("binding_result", BindingResult.class));
-		model.put("foo", "bar");
-
-		view.render(model, request, response);
-
-		assertNull(response.getHeader("Pragma"));
-		assertNull(response.getHeader("Cache-Control"));
-		assertNull(response.getHeader("Expires"));
-	}
-
-	@Test
-	public void renderSimpleMapPrefixed() throws Exception {
-		view.setPrefixJson(true);
-		renderSimpleMap();
-	}
-
-	@Test
-	public void renderSimpleBean() throws Exception {
-
-		Object bean = new TestBeanSimple();
-		Map<String, Object> model = new HashMap<String, Object>();
-		model.put("bindingResult", createMock("binding_result", BindingResult.class));
-		model.put("foo", bean);
-
-		view.setUpdateContentLength(true);
-		view.render(model, request, response);
-
-		assertTrue(response.getContentAsString().length() > 0);
-		assertEquals(response.getContentAsString().length(), response.getContentLength());
-
-		validateResult();
-	}
-
-	@Test
-	public void renderWithPrettyPrint() throws Exception {
-
-		ModelMap model = new ModelMap("foo", new TestBeanSimple());
-
-		view.setPrettyPrint(true);
-		view.render(model, request, response);
-
-		String result = response.getContentAsString();
-		assertTrue("Pretty printing not applied:\n" + result, result.startsWith("{\n  \"foo\" : {\n    "));
-
-		validateResult();
-	}
-
-	@Test
-	public void renderSimpleBeanPrefixed() throws Exception {
-
-		view.setPrefixJson(true);
-		renderSimpleBean();
-	}
-
-	@Test
-	public void renderWithCustomSerializerLocatedByAnnotation() throws Exception {
-
-		Object bean = new TestBeanSimpleAnnotated();
-		Map<String, Object> model = new HashMap<String, Object>();
-		model.put("foo", bean);
-
-		view.render(model, request, response);
-
-		assertTrue(response.getContentAsString().length() > 0);
-		assertEquals("{\"foo\":{\"testBeanSimple\":\"custom\"}}", response.getContentAsString());
-
-		validateResult();
-	}
-
-	@Test
-	public void renderWithCustomSerializerLocatedByFactory() throws Exception {
-
-		SerializerFactory factory = new DelegatingSerializerFactory();
-		ObjectMapper mapper = new ObjectMapper();
-		mapper.setSerializerFactory(factory);
-		view.setObjectMapper(mapper);
-
-		Object bean = new TestBeanSimple();
-		Map<String, Object> model = new HashMap<String, Object>();
-		model.put("foo", bean);
-		model.put("bar", new TestChildBean());
-
-		view.render(model, request, response);
-
-		String result = response.getContentAsString();
-		assertTrue(result.length() > 0);
-		assertTrue(result.contains("\"foo\":{\"testBeanSimple\":\"custom\"}"));
-
-		validateResult();
-	}
-
-	@Test
-	public void renderOnlyIncludedAttributes() throws Exception {
-
-		Set<String> attrs = new HashSet<String>();
-		attrs.add("foo");
-		attrs.add("baz");
-		attrs.add("nil");
-
-		view.setModelKeys(attrs);
-		Map<String, Object> model = new HashMap<String, Object>();
-		model.put("foo", "foo");
-		model.put("bar", "bar");
-		model.put("baz", "baz");
-
-		view.render(model, request, response);
-
-		String result = response.getContentAsString();
-		assertTrue(result.length() > 0);
-		assertTrue(result.contains("\"foo\":\"foo\""));
-		assertTrue(result.contains("\"baz\":\"baz\""));
-
-		validateResult();
-	}
-
-	@Test
-	public void filterSingleKeyModel() throws Exception {
-		view.setExtractValueFromSingleKeyModel(true);
-
-		Map<String, Object> model = new HashMap<String, Object>();
-		TestBeanSimple bean = new TestBeanSimple();
-		model.put("foo", bean);
-
-		Object actual = view.filterModel(model);
-
-		assertSame(bean, actual);
-	}
-
-	@SuppressWarnings("rawtypes")
-	@Test
-	public void filterTwoKeyModel() throws Exception {
-		view.setExtractValueFromSingleKeyModel(true);
-
-		Map<String, Object> model = new HashMap<String, Object>();
-		TestBeanSimple bean1 = new TestBeanSimple();
-		TestBeanSimple bean2 = new TestBeanSimple();
-		model.put("foo1", bean1);
-		model.put("foo2", bean2);
-
-		Object actual = view.filterModel(model);
-
-		assertTrue(actual instanceof Map);
-		assertSame(bean1, ((Map) actual).get("foo1"));
-		assertSame(bean2, ((Map) actual).get("foo2"));
-	}
-
-	private void validateResult() throws Exception {
-		Object jsResult =
-				jsContext.evaluateString(jsScope, "(" + response.getContentAsString() + ")", "JSON Stream", 1, null);
-		assertNotNull("Json Result did not eval as valid JavaScript", jsResult);
-	}
-
-
-	public static class TestBeanSimple {
-
-		private String value = "foo";
-
-		private boolean test = false;
-
-		private long number = 42;
-
-		private TestChildBean child = new TestChildBean();
-
-		public String getValue() {
-			return value;
-		}
-
-		public boolean getTest() {
-			return test;
-		}
-
-		public long getNumber() {
-			return number;
-		}
-
-		public Date getNow() {
-			return new Date();
-		}
-
-		public TestChildBean getChild() {
-			return child;
-		}
-	}
-
-	@JsonSerialize(using=TestBeanSimpleSerializer.class)
-	public static class TestBeanSimpleAnnotated extends TestBeanSimple {
-
-	}
-
-	public static class TestChildBean {
-
-		private String value = "bar";
-
-		private String baz = null;
-
-		private TestBeanSimple parent = null;
-
-		public String getValue() {
-			return value;
-		}
-
-		public String getBaz() {
-			return baz;
-		}
-
-		public TestBeanSimple getParent() {
-			return parent;
-		}
-
-		public void setParent(TestBeanSimple parent) {
-			this.parent = parent;
-		}
-	}
-
-	public static class TestBeanSimpleSerializer extends JsonSerializer<TestBeanSimple> {
-
-		@Override
-		public void serialize(TestBeanSimple value, JsonGenerator jgen, SerializerProvider provider)
-				throws IOException {
-
-			jgen.writeStartObject();
-			jgen.writeFieldName("testBeanSimple");
-			jgen.writeString("custom");
-			jgen.writeEndObject();
-
-		}
-	}
-
-	public static class DelegatingSerializerFactory extends SerializerFactory {
-
-		private SerializerFactory delegate = BeanSerializerFactory.instance;
-
-		@Override
-		@SuppressWarnings("unchecked")
-		public <T> JsonSerializer<T> createSerializer(Class<T> type, SerializationConfig config) {
-			if (type == TestBeanSimple.class) {
-				return (JsonSerializer<T>) new TestBeanSimpleSerializer();
-			}
-			else {
-				return delegate.createSerializer(type, config);
-			}
-		}
-	}
 }

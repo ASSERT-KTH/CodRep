@@ -1,4 +1,4 @@
-clusterService.submitStateUpdateTask("cluster_health (wait_for_events [" + request.waitForEvents() + "])", request.waitForEvents(), new ProcessedClusterStateUpdateTask() {
+return lastIndexVersion != indexCommit.getGeneration();
 
 /*
  * Licensed to ElasticSearch and Shay Banon under one
@@ -19,299 +19,137 @@ clusterService.submitStateUpdateTask("cluster_health (wait_for_events [" + reque
  * under the License.
  */
 
-package org.elasticsearch.action.admin.cluster.health;
+package org.elasticsearch.index.gateway;
 
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.action.support.master.TransportMasterNodeOperationAction;
-import org.elasticsearch.cluster.ClusterName;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.ProcessedClusterStateUpdateTask;
-import org.elasticsearch.cluster.metadata.IndexMetaData;
-import org.elasticsearch.cluster.routing.IndexRoutingTable;
-import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
-import org.elasticsearch.cluster.routing.RoutingTableValidation;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.indices.IndexMissingException;
-import org.elasticsearch.rest.RestStatus;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.TransportService;
-
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.index.CloseableIndexComponent;
+import org.elasticsearch.index.deletionpolicy.SnapshotIndexCommit;
+import org.elasticsearch.index.shard.IndexShardComponent;
+import org.elasticsearch.index.translog.Translog;
 
 /**
  *
  */
-public class TransportClusterHealthAction extends TransportMasterNodeOperationAction<ClusterHealthRequest, ClusterHealthResponse> {
+public interface IndexShardGateway extends IndexShardComponent, CloseableIndexComponent {
 
-    private final ClusterName clusterName;
+    String type();
 
-    @Inject
-    public TransportClusterHealthAction(Settings settings, TransportService transportService, ClusterService clusterService, ThreadPool threadPool,
-                                        ClusterName clusterName) {
-        super(settings, transportService, clusterService, threadPool);
-        this.clusterName = clusterName;
+    /**
+     * The last / on going recovery status.
+     */
+    RecoveryStatus recoveryStatus();
+
+    /**
+     * The last snapshot status performed. Can be <tt>null</tt>.
+     */
+    SnapshotStatus lastSnapshotStatus();
+
+    /**
+     * The current snapshot status being performed. Can be <tt>null</tt> indicating that no snapshot
+     * is being executed currently.
+     */
+    SnapshotStatus currentSnapshotStatus();
+
+    /**
+     * Recovers the state of the shard from the gateway.
+     */
+    void recover(boolean indexShouldExists, RecoveryStatus recoveryStatus) throws IndexShardGatewayRecoveryException;
+
+    /**
+     * Snapshots the given shard into the gateway.
+     */
+    SnapshotStatus snapshot(Snapshot snapshot) throws IndexShardGatewaySnapshotFailedException;
+
+    /**
+     * Returns <tt>true</tt> if snapshot is even required on this gateway (i.e. mainly handles recovery).
+     */
+    boolean requiresSnapshot();
+
+    /**
+     * Returns <tt>true</tt> if this gateway requires scheduling management for snapshot
+     * operations.
+     */
+    boolean requiresSnapshotScheduling();
+
+    SnapshotLock obtainSnapshotLock() throws Exception;
+
+    public static interface SnapshotLock {
+        void release();
     }
 
-    @Override
-    protected String executor() {
-        return ThreadPool.Names.GENERIC;
-    }
+    public static final SnapshotLock NO_SNAPSHOT_LOCK = new SnapshotLock() {
+        @Override
+        public void release() {
+        }
+    };
 
-    @Override
-    protected String transportAction() {
-        return ClusterHealthAction.NAME;
-    }
+    public static class Snapshot {
+        private final SnapshotIndexCommit indexCommit;
+        private final Translog.Snapshot translogSnapshot;
 
-    @Override
-    protected ClusterHealthRequest newRequest() {
-        return new ClusterHealthRequest();
-    }
+        private final long lastIndexVersion;
+        private final long lastTranslogId;
+        private final long lastTranslogLength;
+        private final int lastTotalTranslogOperations;
 
-    @Override
-    protected ClusterHealthResponse newResponse() {
-        return new ClusterHealthResponse();
-    }
-
-    @Override
-    protected ClusterHealthResponse masterOperation(ClusterHealthRequest request, ClusterState unusedState) throws ElasticSearchException {
-        long endTime = System.currentTimeMillis() + request.timeout().millis();
-
-        if (request.waitForEvents() != null) {
-            final CountDownLatch latch = new CountDownLatch(1);
-            clusterService.submitStateUpdateTask("cluster_reroute (api)", request.waitForEvents(), new ProcessedClusterStateUpdateTask() {
-                @Override
-                public ClusterState execute(ClusterState currentState) {
-                    return currentState;
-                }
-
-                @Override
-                public void clusterStateProcessed(ClusterState clusterState) {
-                    latch.countDown();
-                }
-            });
-
-            try {
-                latch.await(request.timeout().millis(), TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                // ignore
-            }
+        public Snapshot(SnapshotIndexCommit indexCommit, Translog.Snapshot translogSnapshot, long lastIndexVersion, long lastTranslogId, long lastTranslogLength, int lastTotalTranslogOperations) {
+            this.indexCommit = indexCommit;
+            this.translogSnapshot = translogSnapshot;
+            this.lastIndexVersion = lastIndexVersion;
+            this.lastTranslogId = lastTranslogId;
+            this.lastTranslogLength = lastTranslogLength;
+            this.lastTotalTranslogOperations = lastTotalTranslogOperations;
         }
 
-
-        int waitFor = 5;
-        if (request.waitForStatus() == null) {
-            waitFor--;
-        }
-        if (request.waitForRelocatingShards() == -1) {
-            waitFor--;
-        }
-        if (request.waitForActiveShards() == -1) {
-            waitFor--;
-        }
-        if (request.waitForNodes().isEmpty()) {
-            waitFor--;
-        }
-        if (request.indices().length == 0) { // check that they actually exists in the meta data
-            waitFor--;
-        }
-        if (waitFor == 0) {
-            // no need to wait for anything
-            ClusterState clusterState = clusterService.state();
-            return clusterHealth(request, clusterState);
-        }
-        while (true) {
-            int waitForCounter = 0;
-            ClusterState clusterState = clusterService.state();
-            ClusterHealthResponse response = clusterHealth(request, clusterState);
-            if (request.waitForStatus() != null && response.getStatus().value() <= request.waitForStatus().value()) {
-                waitForCounter++;
-            }
-            if (request.waitForRelocatingShards() != -1 && response.getRelocatingShards() <= request.waitForRelocatingShards()) {
-                waitForCounter++;
-            }
-            if (request.waitForActiveShards() != -1 && response.getActiveShards() >= request.waitForActiveShards()) {
-                waitForCounter++;
-            }
-            if (request.indices().length > 0) {
-                try {
-                    clusterState.metaData().concreteIndices(request.indices());
-                    waitForCounter++;
-                } catch (IndexMissingException e) {
-                    response.status = ClusterHealthStatus.RED; // no indices, make sure its RED
-                    // missing indices, wait a bit more...
-                }
-            }
-            if (!request.waitForNodes().isEmpty()) {
-                if (request.waitForNodes().startsWith(">=")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(2));
-                    if (response.getNumberOfNodes() >= expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith("ge(")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(3, request.waitForNodes().length() - 1));
-                    if (response.getNumberOfNodes() >= expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith("<=")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(2));
-                    if (response.getNumberOfNodes() <= expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith("le(")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(3, request.waitForNodes().length() - 1));
-                    if (response.getNumberOfNodes() <= expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith(">")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(1));
-                    if (response.getNumberOfNodes() > expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith("gt(")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(3, request.waitForNodes().length() - 1));
-                    if (response.getNumberOfNodes() > expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith("<")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(1));
-                    if (response.getNumberOfNodes() < expected) {
-                        waitForCounter++;
-                    }
-                } else if (request.waitForNodes().startsWith("lt(")) {
-                    int expected = Integer.parseInt(request.waitForNodes().substring(3, request.waitForNodes().length() - 1));
-                    if (response.getNumberOfNodes() < expected) {
-                        waitForCounter++;
-                    }
-                } else {
-                    int expected = Integer.parseInt(request.waitForNodes());
-                    if (response.getNumberOfNodes() == expected) {
-                        waitForCounter++;
-                    }
-                }
-            }
-            if (waitForCounter == waitFor) {
-                return response;
-            }
-            if (System.currentTimeMillis() > endTime) {
-                response.timedOut = true;
-                return response;
-            }
-            try {
-                Thread.sleep(200);
-            } catch (InterruptedException e) {
-                response.timedOut = true;
-                // we got interrupted, bail
-                return response;
-            }
-        }
-    }
-
-    private ClusterHealthResponse clusterHealth(ClusterHealthRequest request, ClusterState clusterState) {
-        if (logger.isTraceEnabled()) {
-            logger.trace("Calculating health based on state version [{}]", clusterState.version());
-        }
-        RoutingTableValidation validation = clusterState.routingTable().validate(clusterState.metaData());
-        ClusterHealthResponse response = new ClusterHealthResponse(clusterName.value(), validation.failures());
-        response.numberOfNodes = clusterState.nodes().size();
-        response.numberOfDataNodes = clusterState.nodes().dataNodes().size();
-
-        for (String index : clusterState.metaData().concreteIndicesIgnoreMissing(request.indices())) {
-            IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(index);
-            IndexMetaData indexMetaData = clusterState.metaData().index(index);
-            if (indexRoutingTable == null) {
-                continue;
-            }
-            ClusterIndexHealth indexHealth = new ClusterIndexHealth(index, indexMetaData.numberOfShards(), indexMetaData.numberOfReplicas(), validation.indexFailures(indexMetaData.index()));
-
-            for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
-                ClusterShardHealth shardHealth = new ClusterShardHealth(shardRoutingTable.shardId().id());
-                for (ShardRouting shardRouting : shardRoutingTable) {
-                    if (shardRouting.active()) {
-                        shardHealth.activeShards++;
-                        if (shardRouting.relocating()) {
-                            // the shard is relocating, the one he is relocating to will be in initializing state, so we don't count it
-                            shardHealth.relocatingShards++;
-                        }
-                        if (shardRouting.primary()) {
-                            shardHealth.primaryActive = true;
-                        }
-                    } else if (shardRouting.initializing()) {
-                        shardHealth.initializingShards++;
-                    } else if (shardRouting.unassigned()) {
-                        shardHealth.unassignedShards++;
-                    }
-                }
-                if (shardHealth.primaryActive) {
-                    if (shardHealth.activeShards == shardRoutingTable.size()) {
-                        shardHealth.status = ClusterHealthStatus.GREEN;
-                    } else {
-                        shardHealth.status = ClusterHealthStatus.YELLOW;
-                    }
-                } else {
-                    shardHealth.status = ClusterHealthStatus.RED;
-                }
-                indexHealth.shards.put(shardHealth.getId(), shardHealth);
-            }
-
-            for (ClusterShardHealth shardHealth : indexHealth) {
-                if (shardHealth.isPrimaryActive()) {
-                    indexHealth.activePrimaryShards++;
-                }
-                indexHealth.activeShards += shardHealth.activeShards;
-                indexHealth.relocatingShards += shardHealth.relocatingShards;
-                indexHealth.initializingShards += shardHealth.initializingShards;
-                indexHealth.unassignedShards += shardHealth.unassignedShards;
-            }
-            // update the index status
-            indexHealth.status = ClusterHealthStatus.GREEN;
-            if (!indexHealth.getValidationFailures().isEmpty()) {
-                indexHealth.status = ClusterHealthStatus.RED;
-            } else if (indexHealth.getShards().isEmpty()) { // might be since none has been created yet (two phase index creation)
-                indexHealth.status = ClusterHealthStatus.RED;
-            } else {
-                for (ClusterShardHealth shardHealth : indexHealth) {
-                    if (shardHealth.getStatus() == ClusterHealthStatus.RED) {
-                        indexHealth.status = ClusterHealthStatus.RED;
-                        break;
-                    }
-                    if (shardHealth.getStatus() == ClusterHealthStatus.YELLOW) {
-                        indexHealth.status = ClusterHealthStatus.YELLOW;
-                    }
-                }
-            }
-
-            response.indices.put(indexHealth.getIndex(), indexHealth);
+        /**
+         * Indicates that the index has changed from the latest snapshot.
+         */
+        public boolean indexChanged() {
+            return lastIndexVersion != indexCommit.getVersion();
         }
 
-        for (ClusterIndexHealth indexHealth : response) {
-            response.activePrimaryShards += indexHealth.activePrimaryShards;
-            response.activeShards += indexHealth.activeShards;
-            response.relocatingShards += indexHealth.relocatingShards;
-            response.initializingShards += indexHealth.initializingShards;
-            response.unassignedShards += indexHealth.unassignedShards;
+        /**
+         * Indicates that a new transaction log has been created. Note check this <b>before</b> you
+         * check {@link #sameTranslogNewOperations()}.
+         */
+        public boolean newTranslogCreated() {
+            return translogSnapshot.translogId() != lastTranslogId;
         }
 
-        response.status = ClusterHealthStatus.GREEN;
-        if (!response.getValidationFailures().isEmpty()) {
-            response.status = ClusterHealthStatus.RED;
-        } else if (clusterState.blocks().hasGlobalBlock(RestStatus.SERVICE_UNAVAILABLE)) {
-            response.status = ClusterHealthStatus.RED;
-        } else {
-            for (ClusterIndexHealth indexHealth : response) {
-                if (indexHealth.getStatus() == ClusterHealthStatus.RED) {
-                    response.status = ClusterHealthStatus.RED;
-                    break;
-                }
-                if (indexHealth.getStatus() == ClusterHealthStatus.YELLOW) {
-                    response.status = ClusterHealthStatus.YELLOW;
-                }
+        /**
+         * Indicates that the same translog exists, but new operations have been appended to it. Throws
+         * {@link ElasticSearchIllegalStateException} if {@link #newTranslogCreated()} is <tt>true</tt>, so
+         * always check that first.
+         */
+        public boolean sameTranslogNewOperations() {
+            if (newTranslogCreated()) {
+                throw new ElasticSearchIllegalStateException("Should not be called when there is a new translog");
             }
+            return translogSnapshot.length() > lastTranslogLength;
         }
 
-        return response;
+        public SnapshotIndexCommit indexCommit() {
+            return indexCommit;
+        }
+
+        public Translog.Snapshot translogSnapshot() {
+            return translogSnapshot;
+        }
+
+        public long lastIndexVersion() {
+            return lastIndexVersion;
+        }
+
+        public long lastTranslogId() {
+            return lastTranslogId;
+        }
+
+        public long lastTranslogLength() {
+            return lastTranslogLength;
+        }
+
+        public int lastTotalTranslogOperations() {
+            return this.lastTotalTranslogOperations;
+        }
     }
 }

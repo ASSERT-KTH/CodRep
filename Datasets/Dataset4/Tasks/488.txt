@@ -1,4 +1,4 @@
-"tests.bwc", "tests.bwc.version");
+super(name, factories, valuesSource, format, estimatedBucketCount, null, bucketCountThresholds, aggregationContext, parent, SubAggCollectionMode.DEPTH_FIRST);
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,147 +18,97 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.test.junit.listeners;
+package org.elasticsearch.search.aggregations.bucket.significant;
 
-import com.carrotsearch.randomizedtesting.RandomizedContext;
-import com.carrotsearch.randomizedtesting.ReproduceErrorMessageBuilder;
-import com.carrotsearch.randomizedtesting.TraceFormatting;
-import org.apache.lucene.util.AbstractRandomizedTest;
-import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.logging.ESLogger;
-import org.elasticsearch.common.logging.Loggers;
-import org.elasticsearch.test.ElasticsearchTestCase;
-import org.elasticsearch.test.InternalTestCluster;
-import org.elasticsearch.test.rest.ElasticsearchRestTests;
-import org.junit.internal.AssumptionViolatedException;
-import org.junit.runner.Description;
-import org.junit.runner.notification.Failure;
-import org.junit.runner.notification.RunListener;
+import org.apache.lucene.index.IndexReader;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.lease.Releasables;
+import org.elasticsearch.search.aggregations.Aggregator;
+import org.elasticsearch.search.aggregations.AggregatorFactories;
+import org.elasticsearch.search.aggregations.bucket.terms.LongTermsAggregator;
+import org.elasticsearch.search.aggregations.support.AggregationContext;
+import org.elasticsearch.search.aggregations.support.ValuesSource;
+import org.elasticsearch.search.aggregations.support.format.ValueFormat;
+import org.elasticsearch.search.internal.ContextIndexSearcher;
 
-import static com.carrotsearch.randomizedtesting.SysGlobals.SYSPROP_ITERATIONS;
-import static com.carrotsearch.randomizedtesting.SysGlobals.SYSPROP_TESTMETHOD;
-import static org.elasticsearch.test.ElasticsearchIntegrationTest.TESTS_CLUSTER;
-import static org.elasticsearch.test.rest.ElasticsearchRestTests.REST_TESTS_BLACKLIST;
-import static org.elasticsearch.test.rest.ElasticsearchRestTests.REST_TESTS_SPEC;
-import static org.elasticsearch.test.rest.ElasticsearchRestTests.REST_TESTS_SUITE;
-
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
 
 /**
- * A {@link RunListener} that emits to {@link System#err} a string with command
- * line parameters allowing quick test re-run under MVN command line.
+ *
  */
-public class ReproduceInfoPrinter extends RunListener {
+public class SignificantLongTermsAggregator extends LongTermsAggregator {
 
-    protected final ESLogger logger = Loggers.getLogger(ElasticsearchTestCase.class);
+    public SignificantLongTermsAggregator(String name, AggregatorFactories factories, ValuesSource.Numeric valuesSource, @Nullable ValueFormat format,
+              long estimatedBucketCount, BucketCountThresholds bucketCountThresholds,
+              AggregationContext aggregationContext, Aggregator parent, SignificantTermsAggregatorFactory termsAggFactory) {
+
+        super(name, factories, valuesSource, format, estimatedBucketCount, null, bucketCountThresholds, aggregationContext, parent);
+        this.termsAggFactory = termsAggFactory;
+    }
+
+    protected long numCollectedDocs;
+    private final SignificantTermsAggregatorFactory termsAggFactory;
 
     @Override
-    public void testStarted(Description description) throws Exception {
-        logger.info("Test {} started", description.getDisplayName());
+    public void collect(int doc, long owningBucketOrdinal) throws IOException {
+        super.collect(doc, owningBucketOrdinal);
+        numCollectedDocs++;
     }
 
     @Override
-    public void testFinished(Description description) throws Exception {
-        logger.info("Test {} finished", description.getDisplayName());
+    public SignificantLongTerms buildAggregation(long owningBucketOrdinal) {
+        assert owningBucketOrdinal == 0;
+
+        final int size = (int) Math.min(bucketOrds.size(), bucketCountThresholds.getShardSize());
+
+        long supersetSize = termsAggFactory.prepareBackground(context);
+        long subsetSize = numCollectedDocs;
+
+        BucketSignificancePriorityQueue ordered = new BucketSignificancePriorityQueue(size);
+        SignificantLongTerms.Bucket spare = null;
+        for (long i = 0; i < bucketOrds.size(); i++) {
+            if (spare == null) {
+                spare = new SignificantLongTerms.Bucket(0, 0, 0, 0, 0, null);
+            }
+            spare.term = bucketOrds.get(i);
+            spare.subsetDf = bucketDocCount(i);
+            spare.subsetSize = subsetSize;
+            spare.supersetDf = termsAggFactory.getBackgroundFrequency(spare.term);
+            spare.supersetSize = supersetSize;
+            assert spare.subsetDf <= spare.supersetDf;
+            // During shard-local down-selection we use subset/superset stats that are for this shard only
+            // Back at the central reducer these properties will be updated with global stats
+            spare.updateScore();
+
+            spare.bucketOrd = i;
+            if (spare.subsetDf >= bucketCountThresholds.getShardMinDocCount()) {
+                spare = (SignificantLongTerms.Bucket) ordered.insertWithOverflow(spare);
+            }
+        }
+
+        final InternalSignificantTerms.Bucket[] list = new InternalSignificantTerms.Bucket[ordered.size()];
+        for (int i = ordered.size() - 1; i >= 0; i--) {
+            final SignificantLongTerms.Bucket bucket = (SignificantLongTerms.Bucket) ordered.pop();
+            bucket.aggregations = bucketAggregations(bucket.bucketOrd);
+            list[i] = bucket;
+        }
+        return new SignificantLongTerms(subsetSize, supersetSize, name, formatter, bucketCountThresholds.getRequiredSize(), bucketCountThresholds.getMinDocCount(), Arrays.asList(list));
     }
 
     @Override
-    public void testFailure(Failure failure) throws Exception {
-        // Ignore assumptions.
-        if (failure.getException() instanceof AssumptionViolatedException) {
-            return;
-        }
-
-        final Description d = failure.getDescription();
-        final StringBuilder b = new StringBuilder();
-        b.append("FAILURE  : ").append(d.getDisplayName()).append("\n");
-        b.append("REPRODUCE WITH  : mvn clean test");
-        MavenMessageBuilder mavenMessageBuilder = new MavenMessageBuilder(b);
-        mavenMessageBuilder.appendAllOpts(failure.getDescription());
-
-        //ElasticsearchRestTests is a special case as it allows for additional parameters
-        if (ElasticsearchRestTests.class.isAssignableFrom(failure.getDescription().getTestClass())) {
-            mavenMessageBuilder.appendRestTestsProperties();
-        }
-
-        b.append("\n");
-        b.append("Throwable:\n");
-        if (failure.getException() != null) {
-            traces().formatThrowable(b, failure.getException());
-        }
-
-        logger.error(b.toString());
+    public SignificantLongTerms buildEmptyAggregation() {
+        // We need to account for the significance of a miss in our global stats - provide corpus size as context
+        ContextIndexSearcher searcher = context.searchContext().searcher();
+        IndexReader topReader = searcher.getIndexReader();
+        int supersetSize = topReader.numDocs();
+        return new SignificantLongTerms(0, supersetSize, name, formatter, bucketCountThresholds.getRequiredSize(), bucketCountThresholds.getMinDocCount(), Collections.<InternalSignificantTerms.Bucket>emptyList());
     }
 
-    protected TraceFormatting traces() {
-        TraceFormatting traces = new TraceFormatting();
-        try {
-            traces = RandomizedContext.current().getRunner().getTraceFormatting();
-        } catch (IllegalStateException e) {
-            // Ignore if no context.
-        }
-        return traces;
+    @Override
+    public void doClose() {
+        Releasables.close(bucketOrds, termsAggFactory);
     }
 
-    protected static class MavenMessageBuilder extends ReproduceErrorMessageBuilder {
-
-        public MavenMessageBuilder(StringBuilder b) {
-            super(b);
-        }
-
-        @Override
-        public ReproduceErrorMessageBuilder appendAllOpts(Description description) {
-            super.appendAllOpts(description);
-
-            if (description.getMethodName() != null) {
-                //prints out the raw method description instead of methodName(description) which filters out the parameters
-                super.appendOpt(SYSPROP_TESTMETHOD(), "\"" + description.getMethodName() + "\"");
-            }
-
-            return appendESProperties();
-        }
-
-        /**
-         * Append a single VM option.
-         */
-        @Override
-        public ReproduceErrorMessageBuilder appendOpt(String sysPropName, String value) {
-            if (sysPropName.equals(SYSPROP_ITERATIONS())) { // we don't want the iters to be in there!
-                return this;
-            }
-            if (sysPropName.equals(SYSPROP_TESTMETHOD())) {
-                //don't print out the test method, we print it ourselves in appendAllOpts
-                //without filtering out the parameters (needed for REST tests)
-                return this;
-            }
-            if (Strings.hasLength(value)) {
-                return super.appendOpt(sysPropName, value);
-            }
-            return this;
-        }
-
-        public ReproduceErrorMessageBuilder appendESProperties() {
-            appendProperties("es.logger.level", "es.node.mode", "es.node.local", TESTS_CLUSTER, InternalTestCluster.TESTS_ENABLE_MOCK_MODULES,
-                    "tests.assertion.disabled", "tests.security.manager", "tests.nightly", "tests.jvms", "tests.client.ratio", "tests.heap.size",
-                    "tests.bwc", "tests.bwc.path", "tests.bwc.version");
-            if (System.getProperty("tests.jvm.argline") != null && !System.getProperty("tests.jvm.argline").isEmpty()) {
-                appendOpt("tests.jvm.argline", "\"" + System.getProperty("tests.jvm.argline") + "\"");
-            }
-            appendOpt(AbstractRandomizedTest.SYSPROP_PROCESSORS, Integer.toString(AbstractRandomizedTest.TESTS_PROCESSORS));
-            return this;
-        }
-
-        public ReproduceErrorMessageBuilder appendRestTestsProperties() {
-            return appendProperties(REST_TESTS_SUITE, REST_TESTS_SPEC, REST_TESTS_BLACKLIST);
-        }
-
-        protected ReproduceErrorMessageBuilder appendProperties(String... properties) {
-            for (String sysPropName : properties) {
-                if (Strings.hasLength(System.getProperty(sysPropName))) {
-                    appendOpt(sysPropName, System.getProperty(sysPropName));
-                }
-            }
-            return this;
-        }
-
-    }
 }

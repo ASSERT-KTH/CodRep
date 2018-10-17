@@ -1,4 +1,4 @@
-import static org.elasticsearch.util.concurrent.ConcurrentCollections.*;
+return BlobStoreIndexShardGateway.buildVirtualBlobs(indexContainer, indexContainer.listBlobs(), null);
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,181 +19,90 @@ import static org.elasticsearch.util.concurrent.ConcurrentCollections.*;
  * under the License.
  */
 
-package org.elasticsearch.index.store.memory;
+package org.elasticsearch.index.gateway.blobstore;
 
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.SingleInstanceLockFactory;
-import org.elasticsearch.util.SizeUnit;
-import org.elasticsearch.util.SizeValue;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.common.blobstore.BlobMetaData;
+import org.elasticsearch.common.blobstore.BlobPath;
+import org.elasticsearch.common.blobstore.BlobStore;
+import org.elasticsearch.common.blobstore.ImmutableBlobContainer;
+import org.elasticsearch.common.collect.ImmutableMap;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.gateway.Gateway;
+import org.elasticsearch.gateway.blobstore.BlobStoreGateway;
+import org.elasticsearch.gateway.none.NoneGateway;
+import org.elasticsearch.index.AbstractIndexComponent;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.gateway.IndexGateway;
+import org.elasticsearch.index.settings.IndexSettings;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.util.Map;
-import java.util.Queue;
-import java.util.concurrent.ArrayBlockingQueue;
-
-import static org.elasticsearch.util.concurrent.ConcurrentMaps.*;
 
 /**
- * @author kimchy (Shay Banon)
+ * @author kimchy (shay.banon)
  */
-public class HeapDirectory extends Directory {
+public abstract class BlobStoreIndexGateway extends AbstractIndexComponent implements IndexGateway {
 
-    private final Map<String, HeapRamFile> files = newConcurrentMap();
+    private final BlobStoreGateway gateway;
 
-    private final Queue<byte[]> cache;
+    private final BlobStore blobStore;
 
-    private final int bufferSizeInBytes;
+    private final BlobPath indexPath;
 
-    private final SizeValue bufferSize;
+    protected ByteSizeValue chunkSize;
 
-    private final SizeValue cacheSize;
+    protected BlobStoreIndexGateway(Index index, @IndexSettings Settings indexSettings, Gateway gateway) {
+        super(index, indexSettings);
 
-    private final boolean disableCache;
-
-    public HeapDirectory() {
-        this(new SizeValue(1, SizeUnit.KB), new SizeValue(20, SizeUnit.MB), false);
-    }
-
-    public HeapDirectory(SizeValue bufferSize, SizeValue cacheSize, boolean warmCache) {
-        disableCache = cacheSize.bytes() == 0;
-        if (!disableCache && cacheSize.bytes() < bufferSize.bytes()) {
-            throw new IllegalArgumentException("Cache size [" + cacheSize + "] is smaller than buffer size [" + bufferSize + "]");
+        if (gateway.type().equals(NoneGateway.TYPE)) {
+            logger.warn("index gateway is configured, but no cluster level gateway configured, cluster level metadata will be lost on full shutdown");
         }
-        this.bufferSize = bufferSize;
-        this.bufferSizeInBytes = (int) bufferSize.bytes();
-        int numberOfCacheEntries = (int) (cacheSize.bytes() / bufferSize.bytes());
-        this.cache = disableCache ? null : new ArrayBlockingQueue<byte[]>(numberOfCacheEntries);
-        this.cacheSize = disableCache ? new SizeValue(0, SizeUnit.BYTES) : new SizeValue(numberOfCacheEntries * bufferSize.bytes(), SizeUnit.BYTES);
-        setLockFactory(new SingleInstanceLockFactory());
-        if (!disableCache && warmCache) {
-            for (int i = 0; i < numberOfCacheEntries; i++) {
-                cache.add(createBuffer());
-            }
+
+        this.gateway = (BlobStoreGateway) gateway;
+        this.blobStore = this.gateway.blobStore();
+
+        this.chunkSize = componentSettings.getAsBytesSize("chunk_size", this.gateway.chunkSize());
+
+        this.indexPath = this.gateway.basePath().add("indices").add(index.name());
+    }
+
+    public ImmutableMap<String, BlobMetaData> listIndexBlobs(int shardId) throws IOException {
+        ImmutableBlobContainer indexContainer = blobStore.immutableBlobContainer(shardIndexPath(shardId));
+        return BlobStoreIndexShardGateway.aggregateParts(indexContainer.listBlobs());
+    }
+
+    @Override public String toString() {
+        return type() + "://" + blobStore + "/" + indexPath;
+    }
+
+    public BlobStore blobStore() {
+        return blobStore;
+    }
+
+    public BlobPath indexPath() {
+        return this.indexPath;
+    }
+
+    public ByteSizeValue chunkSize() {
+        return this.chunkSize;
+    }
+
+    public BlobPath shardPath(int shardId) {
+        return indexPath.add(Integer.toString(shardId));
+    }
+
+    public BlobPath shardIndexPath(int shardId) {
+        return shardPath(shardId).add("index");
+    }
+
+    public BlobPath shardTranslogPath(int shardId) {
+        return shardPath(shardId).add("translog");
+    }
+
+    @Override public void close(boolean delete) throws ElasticSearchException {
+        if (delete) {
+            blobStore.delete(indexPath);
         }
-    }
-
-    public SizeValue bufferSize() {
-        return this.bufferSize;
-    }
-
-    public SizeValue cacheSize() {
-        return this.cacheSize;
-    }
-
-    int bufferSizeInBytes() {
-        return bufferSizeInBytes;
-    }
-
-    @Override public String[] listAll() throws IOException {
-        return files.keySet().toArray(new String[0]);
-    }
-
-    @Override public boolean fileExists(String name) throws IOException {
-        return files.containsKey(name);
-    }
-
-    @Override public long fileModified(String name) throws IOException {
-        HeapRamFile file = files.get(name);
-        if (file == null)
-            throw new FileNotFoundException(name);
-        return file.lastModified();
-    }
-
-    @Override public void touchFile(String name) throws IOException {
-        HeapRamFile file = files.get(name);
-        if (file == null)
-            throw new FileNotFoundException(name);
-
-        long ts2, ts1 = System.currentTimeMillis();
-        do {
-            try {
-                Thread.sleep(0, 1);
-            } catch (InterruptedException ie) {
-                // In 3.0 we will change this to throw
-                // InterruptedException instead
-                Thread.currentThread().interrupt();
-                throw new RuntimeException(ie);
-            }
-            ts2 = System.currentTimeMillis();
-        } while (ts1 == ts2);
-
-        file.lastModified(ts2);
-    }
-
-    @Override public void deleteFile(String name) throws IOException {
-        HeapRamFile file = files.remove(name);
-        if (file == null)
-            throw new FileNotFoundException(name);
-        file.clean();
-    }
-
-    @Override public long fileLength(String name) throws IOException {
-        HeapRamFile file = files.get(name);
-        if (file == null)
-            throw new FileNotFoundException(name);
-        return file.length();
-    }
-
-    @Override public IndexOutput createOutput(String name) throws IOException {
-        HeapRamFile file = new HeapRamFile(this);
-        HeapRamFile existing = files.put(name, file);
-        if (existing != null) {
-            existing.clean();
-        }
-        return new HeapIndexOutput(this, file);
-    }
-
-    @Override public IndexInput openInput(String name) throws IOException {
-        HeapRamFile file = files.get(name);
-        if (file == null)
-            throw new FileNotFoundException(name);
-        return new HeapIndexInput(this, file);
-    }
-
-    @Override public void close() throws IOException {
-        String[] files = listAll();
-        for (String file : files) {
-            deleteFile(file);
-        }
-        if (!disableCache) {
-            byte[] buffer = cache.poll();
-            while (buffer != null) {
-                closeBuffer(buffer);
-                buffer = cache.poll();
-            }
-        }
-    }
-
-    void releaseBuffer(byte[] buffer) {
-        if (disableCache) {
-            closeBuffer(buffer);
-            return;
-        }
-        boolean success = cache.offer(buffer);
-        if (!success) {
-            closeBuffer(buffer);
-        }
-    }
-
-    byte[] acquireBuffer() {
-        if (disableCache) {
-            return createBuffer();
-        }
-        byte[] buffer = cache.poll();
-        if (buffer == null) {
-            // everything is taken, return a new one
-            return createBuffer();
-        }
-        return buffer;
-    }
-
-    byte[] createBuffer() {
-        return new byte[bufferSizeInBytes];
-    }
-
-    void closeBuffer(byte[] buffer) {
     }
 }

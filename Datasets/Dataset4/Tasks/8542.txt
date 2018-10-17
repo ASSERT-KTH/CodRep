@@ -1,13 +1,13 @@
-proc.onOrdinal(docId, loc);
+private AggregatorFactory[] factories;
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,217 +18,214 @@ proc.onOrdinal(docId, loc);
  * specific language governing permissions and limitations
  * under the License.
  */
+package org.elasticsearch.search.aggregations;
 
-package org.elasticsearch.index.field.data.ints;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.UnmodifiableIterator;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.elasticsearch.common.lease.Releasables;
+import org.elasticsearch.common.util.ObjectArray;
+import org.elasticsearch.search.aggregations.Aggregator.BucketAggregationMode;
+import org.elasticsearch.search.aggregations.support.AggregationContext;
 
-import org.elasticsearch.common.RamUsage;
-import org.elasticsearch.common.thread.ThreadLocals;
-import org.elasticsearch.index.field.data.doubles.DoubleFieldData;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
 
 /**
- * @author kimchy (shay.banon)
+ *
  */
-public class MultiValueIntFieldData extends IntFieldData {
+public class AggregatorFactories {
 
-    private static final int VALUE_CACHE_SIZE = 10;
+    public static final AggregatorFactories EMPTY = new Empty();
 
-    private ThreadLocal<ThreadLocals.CleanableValue<double[][]>> doublesValuesCache = new ThreadLocal<ThreadLocals.CleanableValue<double[][]>>() {
-        @Override protected ThreadLocals.CleanableValue<double[][]> initialValue() {
-            double[][] value = new double[VALUE_CACHE_SIZE][];
-            for (int i = 0; i < value.length; i++) {
-                value[i] = new double[i];
-            }
-            return new ThreadLocals.CleanableValue<double[][]>(value);
-        }
-    };
+    private final AggregatorFactory[] factories;
 
-    private ThreadLocal<ThreadLocals.CleanableValue<int[][]>> valuesCache = new ThreadLocal<ThreadLocals.CleanableValue<int[][]>>() {
-        @Override protected ThreadLocals.CleanableValue<int[][]> initialValue() {
-            int[][] value = new int[VALUE_CACHE_SIZE][];
-            for (int i = 0; i < value.length; i++) {
-                value[i] = new int[i];
-            }
-            return new ThreadLocals.CleanableValue<int[][]>(value);
-        }
-    };
-
-    // order with value 0 indicates no value
-    private final int[][] ordinals;
-
-    public MultiValueIntFieldData(String fieldName, int[][] ordinals, int[] values) {
-        super(fieldName, values);
-        this.ordinals = ordinals;
+    public static Builder builder() {
+        return new Builder();
     }
 
-    @Override protected long computeSizeInBytes() {
-        long size = super.computeSizeInBytes();
-        size += RamUsage.NUM_BYTES_ARRAY_HEADER; // for the top level array
-        for (int[] ordinal : ordinals) {
-            size += RamUsage.NUM_BYTES_INT * ordinal.length + RamUsage.NUM_BYTES_ARRAY_HEADER;
-        }
-        return size;
+    private AggregatorFactories(AggregatorFactory[] factories) {
+        this.factories = factories;
     }
 
-    @Override public boolean multiValued() {
-        return true;
+    private static Aggregator createAndRegisterContextAware(AggregationContext context, AggregatorFactory factory, Aggregator parent, long estimatedBucketsCount) {
+        final Aggregator aggregator = factory.create(context, parent, estimatedBucketsCount);
+        if (aggregator.shouldCollect()) {
+            context.registerReaderContextAware(aggregator);
+        }
+        return aggregator;
     }
 
-    @Override public boolean hasValue(int docId) {
-        for (int[] ordinal : ordinals) {
-            if (ordinal[docId] != 0) {
-                return true;
+    /**
+     * Create all aggregators so that they can be consumed with multiple buckets.
+     */
+    public Aggregator[] createSubAggregators(Aggregator parent, final long estimatedBucketsCount) {
+        Aggregator[] aggregators = new Aggregator[count()];
+        for (int i = 0; i < factories.length; ++i) {
+            final AggregatorFactory factory = factories[i];
+            final Aggregator first = createAndRegisterContextAware(parent.context(), factory, parent, estimatedBucketsCount);
+            if (first.bucketAggregationMode() == BucketAggregationMode.MULTI_BUCKETS) {
+                // This aggregator already supports multiple bucket ordinals, can be used directly
+                aggregators[i] = first;
+                continue;
             }
+            // the aggregator doesn't support multiple ordinals, let's wrap it so that it does.
+            aggregators[i] = new Aggregator(first.name(), BucketAggregationMode.MULTI_BUCKETS, AggregatorFactories.EMPTY, 1, first.context(), first.parent()) {
+
+                ObjectArray<Aggregator> aggregators;
+
+                {
+                    // if estimated count is zero, we at least create a single aggregator.
+                    // The estimated count is just an estimation and we can't rely on how it's estimated (that is, an
+                    // estimation of 0 should not imply that we'll end up without any buckets)
+                    long arraySize = estimatedBucketsCount > 0 ?  estimatedBucketsCount : 1;
+                    aggregators = bigArrays.newObjectArray(arraySize);
+                    aggregators.set(0, first);
+                    for (long i = 1; i < arraySize; ++i) {
+                        aggregators.set(i, createAndRegisterContextAware(parent.context(), factory, parent, estimatedBucketsCount));
+                    }
+                }
+
+                @Override
+                public boolean shouldCollect() {
+                    return first.shouldCollect();
+                }
+
+                @Override
+                protected void doPostCollection() {
+                    for (long i = 0; i < aggregators.size(); ++i) {
+                        final Aggregator aggregator = aggregators.get(i);
+                        if (aggregator != null) {
+                            aggregator.postCollection();
+                        }
+                    }
+                }
+
+                @Override
+                public void collect(int doc, long owningBucketOrdinal) throws IOException {
+                    aggregators = bigArrays.grow(aggregators, owningBucketOrdinal + 1);
+                    Aggregator aggregator = aggregators.get(owningBucketOrdinal);
+                    if (aggregator == null) {
+                        aggregator = createAndRegisterContextAware(parent.context(), factory, parent, estimatedBucketsCount);
+                        aggregators.set(owningBucketOrdinal, aggregator);
+                    }
+                    aggregator.collect(doc, 0);
+                }
+
+                @Override
+                public void setNextReader(AtomicReaderContext reader) {
+                }
+
+                @Override
+                public InternalAggregation buildAggregation(long owningBucketOrdinal) {
+                    // The bucket ordinal may be out of range in case of eg. a terms/filter/terms where
+                    // the filter matches no document in the highest buckets of the first terms agg
+                    if (owningBucketOrdinal >= aggregators.size() || aggregators.get(owningBucketOrdinal) == null) {
+                        return first.buildEmptyAggregation();
+                    } else {
+                        return aggregators.get(owningBucketOrdinal).buildAggregation(0);
+                    }
+                }
+
+                @Override
+                public InternalAggregation buildEmptyAggregation() {
+                    return first.buildEmptyAggregation();
+                }
+
+                @Override
+                public void doRelease() {
+                    final Iterable<Aggregator> aggregatorsIter = new Iterable<Aggregator>() {
+
+                        @Override
+                        public Iterator<Aggregator> iterator() {
+                            return new UnmodifiableIterator<Aggregator>() {
+
+                                long i = 0;
+
+                                @Override
+                                public boolean hasNext() {
+                                    return i < aggregators.size();
+                                }
+
+                                @Override
+                                public Aggregator next() {
+                                    return aggregators.get(i++);
+                                }
+
+                            };
+                        }
+
+                    };
+                    Releasables.release(Iterables.concat(aggregatorsIter, Collections.singleton(aggregators)));
+                }
+            };
         }
-        return false;
+        return aggregators;
     }
 
-    @Override public void forEachValueInDoc(int docId, StringValueInDocProc proc) {
-        boolean found = false;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                found = true;
-                proc.onValue(docId, Integer.toString(values[loc]));
-            }
+    public Aggregator[] createTopLevelAggregators(AggregationContext ctx) {
+        // These aggregators are going to be used with a single bucket ordinal, no need to wrap the PER_BUCKET ones
+        Aggregator[] aggregators = new Aggregator[factories.length];
+        for (int i = 0; i < factories.length; i++) {
+            aggregators[i] = createAndRegisterContextAware(ctx, factories[i], null, 0);
         }
-        if (!found) {
-            proc.onMissing(docId);
+        return aggregators;
+    }
+
+    public int count() {
+        return factories.length;
+    }
+
+    void setParent(AggregatorFactory parent) {
+        for (AggregatorFactory factory : factories) {
+            factory.parent = parent;
         }
     }
 
-    @Override public void forEachValueInDoc(int docId, DoubleValueInDocProc proc) {
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                proc.onValue(docId, values[loc]);
-            }
+    public void validate() {
+        for (AggregatorFactory factory : factories) {
+            factory.validate();
         }
     }
 
-    @Override public void forEachValueInDoc(int docId, LongValueInDocProc proc) {
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                proc.onValue(docId, values[loc]);
-            }
+    private final static class Empty extends AggregatorFactories {
+
+        private static final AggregatorFactory[] EMPTY_FACTORIES = new AggregatorFactory[0];
+        private static final Aggregator[] EMPTY_AGGREGATORS = new Aggregator[0];
+
+        private Empty() {
+            super(EMPTY_FACTORIES);
         }
+
+        @Override
+        public Aggregator[] createSubAggregators(Aggregator parent, long estimatedBucketsCount) {
+            return EMPTY_AGGREGATORS;
+        }
+
+        @Override
+        public Aggregator[] createTopLevelAggregators(AggregationContext ctx) {
+            return EMPTY_AGGREGATORS;
+        }
+
     }
 
-    @Override public void forEachValueInDoc(int docId, MissingDoubleValueInDocProc proc) {
-        boolean found = false;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                found = true;
-                proc.onValue(docId, values[loc]);
-            }
-        }
-        if (!found) {
-            proc.onMissing(docId);
-        }
-    }
+    public static class Builder {
 
-    @Override public void forEachValueInDoc(int docId, MissingLongValueInDocProc proc) {
-        boolean found = false;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                found = true;
-                proc.onValue(docId, values[loc]);
-            }
-        }
-        if (!found) {
-            proc.onMissing(docId);
-        }
-    }
+        private List<AggregatorFactory> factories = new ArrayList<>();
 
-    @Override public void forEachValueInDoc(int docId, ValueInDocProc proc) {
-        boolean found = false;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                found = true;
-                proc.onValue(docId, values[loc]);
-            }
+        public Builder add(AggregatorFactory factory) {
+            factories.add(factory);
+            return this;
         }
-        if (!found) {
-            proc.onMissing(docId);
-        }
-    }
 
-    @Override public void forEachOrdinalInDoc(int docId, OrdinalInDocProc proc) {
-        boolean found = false;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                found = true;
-                proc.onOrdinal(docId, ordinal[docId]);
+        public AggregatorFactories build() {
+            if (factories.isEmpty()) {
+                return EMPTY;
             }
+            return new AggregatorFactories(factories.toArray(new AggregatorFactory[factories.size()]));
         }
-        if (!found) {
-            proc.onOrdinal(docId, 0);
-        }
-    }
-
-    @Override public double[] doubleValues(int docId) {
-        int length = 0;
-        for (int[] ordinal : ordinals) {
-            if (ordinal[docId] != 0) {
-                length++;
-            }
-        }
-        if (length == 0) {
-            return DoubleFieldData.EMPTY_DOUBLE_ARRAY;
-        }
-        double[] doubles;
-        if (length < VALUE_CACHE_SIZE) {
-            doubles = doublesValuesCache.get().get()[length];
-        } else {
-            doubles = new double[length];
-        }
-        int i = 0;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                doubles[i++] = values[loc];
-            }
-        }
-        return doubles;
-    }
-
-    @Override public int value(int docId) {
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                return values[loc];
-            }
-        }
-        return 0;
-    }
-
-    @Override public int[] values(int docId) {
-        int length = 0;
-        for (int[] ordinal : ordinals) {
-            if (ordinal[docId] != 0) {
-                length++;
-            }
-        }
-        if (length == 0) {
-            return EMPTY_INT_ARRAY;
-        }
-        int[] ints;
-        if (length < VALUE_CACHE_SIZE) {
-            ints = valuesCache.get().get()[length];
-        } else {
-            ints = new int[length];
-        }
-        int i = 0;
-        for (int[] ordinal : ordinals) {
-            int loc = ordinal[docId];
-            if (loc != 0) {
-                ints[i++] = values[loc];
-            }
-        }
-        return ints;
     }
 }

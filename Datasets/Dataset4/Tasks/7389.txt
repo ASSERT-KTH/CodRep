@@ -1,4 +1,4 @@
-data = FSTBytesAtomicFieldData.empty();
+List<InternalFullHistogramFacet.FullEntry> entries1 = new ArrayList<>(entries.v().size());
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,103 +18,138 @@ data = FSTBytesAtomicFieldData.empty();
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.index.fielddata.plain;
 
-import org.apache.lucene.index.*;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.IntsRef;
-import org.apache.lucene.util.fst.FST;
-import org.apache.lucene.util.fst.FST.INPUT_TYPE;
-import org.apache.lucene.util.fst.PositiveIntOutputs;
-import org.apache.lucene.util.fst.Util;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.fielddata.FieldDataType;
-import org.elasticsearch.index.fielddata.IndexFieldData;
-import org.elasticsearch.index.fielddata.IndexFieldDataCache;
-import org.elasticsearch.index.fielddata.ordinals.GlobalOrdinalsBuilder;
-import org.elasticsearch.index.fielddata.ordinals.Ordinals;
-import org.elasticsearch.index.fielddata.ordinals.OrdinalsBuilder;
-import org.elasticsearch.index.mapper.FieldMapper;
-import org.elasticsearch.index.mapper.MapperService;
-import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.indices.fielddata.breaker.CircuitBreakerService;
+package org.elasticsearch.search.facet.histogram;
+
+import com.carrotsearch.hppc.LongObjectOpenHashMap;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.search.Scorer;
+import org.elasticsearch.common.recycler.Recycler;
+import org.elasticsearch.index.fielddata.DoubleValues;
+import org.elasticsearch.index.fielddata.IndexNumericFieldData;
+import org.elasticsearch.script.SearchScript;
+import org.elasticsearch.search.facet.DoubleFacetAggregatorBase;
+import org.elasticsearch.search.facet.FacetExecutor;
+import org.elasticsearch.search.facet.InternalFacet;
+import org.elasticsearch.search.internal.SearchContext;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 /**
+ * A histogram facet collector that uses the same field as the key as well as the
+ * value.
  */
-public class FSTBytesIndexFieldData extends AbstractBytesIndexFieldData<FSTBytesAtomicFieldData> {
+public class ValueScriptHistogramFacetExecutor extends FacetExecutor {
 
-    private final CircuitBreakerService breakerService;
+    private final IndexNumericFieldData indexFieldData;
+    private final HistogramFacet.ComparatorType comparatorType;
+    final SearchScript valueScript;
+    final long interval;
 
-    public static class Builder implements IndexFieldData.Builder {
+    final Recycler.V<LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry>> entries;
 
-        @Override
-        public IndexFieldData<FSTBytesAtomicFieldData> build(Index index, @IndexSettings Settings indexSettings, FieldMapper<?> mapper,
-                                                             IndexFieldDataCache cache, CircuitBreakerService breakerService, MapperService mapperService,
-                                                             GlobalOrdinalsBuilder globalOrdinalBuilder) {
-            return new FSTBytesIndexFieldData(index, indexSettings, mapper.names(), mapper.fieldDataType(), cache, breakerService, globalOrdinalBuilder);
-        }
-    }
+    public ValueScriptHistogramFacetExecutor(IndexNumericFieldData indexFieldData, String scriptLang, String valueScript, Map<String, Object> params, long interval, HistogramFacet.ComparatorType comparatorType, SearchContext context) {
+        this.comparatorType = comparatorType;
+        this.indexFieldData = indexFieldData;
+        this.interval = interval;
+        this.valueScript = context.scriptService().search(context.lookup(), scriptLang, valueScript, params);
 
-    FSTBytesIndexFieldData(Index index, @IndexSettings Settings indexSettings, FieldMapper.Names fieldNames, FieldDataType fieldDataType,
-                           IndexFieldDataCache cache, CircuitBreakerService breakerService, GlobalOrdinalsBuilder globalOrdinalsBuilder) {
-        super(index, indexSettings, fieldNames, fieldDataType, cache, globalOrdinalsBuilder, breakerService);
-        this.breakerService = breakerService;
+        this.entries = context.cacheRecycler().longObjectMap(-1);
     }
 
     @Override
-    public FSTBytesAtomicFieldData loadDirect(AtomicReaderContext context) throws Exception {
-        AtomicReader reader = context.reader();
+    public Collector collector() {
+        return new Collector();
+    }
 
-        Terms terms = reader.terms(getFieldNames().indexName());
-        FSTBytesAtomicFieldData data = null;
-        // TODO: Use an actual estimator to estimate before loading.
-        NonEstimatingEstimator estimator = new NonEstimatingEstimator(breakerService.getBreaker());
-        if (terms == null) {
-            data = FSTBytesAtomicFieldData.empty(reader.maxDoc());
-            estimator.afterLoad(null, data.getMemorySizeInBytes());
-            return data;
+    @Override
+    public InternalFacet buildFacet(String facetName) {
+        List<InternalFullHistogramFacet.FullEntry> entries1 = new ArrayList<InternalFullHistogramFacet.FullEntry>(entries.v().size());
+        final boolean[] states = entries.v().allocated;
+        final Object[] values = entries.v().values;
+        for (int i = 0; i < states.length; i++) {
+            if (states[i]) {
+                InternalFullHistogramFacet.FullEntry value = (InternalFullHistogramFacet.FullEntry) values[i];
+                entries1.add(value);
+            }
         }
-        PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton();
-        org.apache.lucene.util.fst.Builder<Long> fstBuilder = new org.apache.lucene.util.fst.Builder<>(INPUT_TYPE.BYTE1, outputs);
-        final IntsRef scratch = new IntsRef();
 
-        final long numTerms;
-        if (regex == null && frequency == null) {
-            numTerms = terms.size();
-        } else {
-            numTerms = -1;
+        entries.release();
+        return new InternalFullHistogramFacet(facetName, comparatorType, entries1);
+    }
+
+    public static long bucket(double value, long interval) {
+        return (((long) (value / interval)) * interval);
+    }
+
+    class Collector extends FacetExecutor.Collector {
+
+        private DoubleValues values;
+        private final HistogramProc histoProc;
+
+        public Collector() {
+            histoProc = new HistogramProc(interval, valueScript, entries.v());
         }
-        final float acceptableTransientOverheadRatio = fieldDataType.getSettings().getAsFloat("acceptable_transient_overhead_ratio", OrdinalsBuilder.DEFAULT_ACCEPTABLE_OVERHEAD_RATIO);
-        boolean success = false;
-        try (OrdinalsBuilder builder = new OrdinalsBuilder(numTerms, reader.maxDoc(), acceptableTransientOverheadRatio)) {
 
-            // we don't store an ord 0 in the FST since we could have an empty string in there and FST don't support
-            // empty strings twice. ie. them merge fails for long output.
-            TermsEnum termsEnum = filter(terms, reader);
-            DocsEnum docsEnum = null;
-            for (BytesRef term = termsEnum.next(); term != null; term = termsEnum.next()) {
-                final long termOrd = builder.nextOrdinal();
-                assert termOrd > 0;
-                fstBuilder.add(Util.toIntsRef(term, scratch), (long) termOrd);
-                docsEnum = termsEnum.docs(null, docsEnum, DocsEnum.FLAG_NONE);
-                for (int docId = docsEnum.nextDoc(); docId != DocsEnum.NO_MORE_DOCS; docId = docsEnum.nextDoc()) {
-                    builder.addDoc(docId);
+        @Override
+        public void setScorer(Scorer scorer) throws IOException {
+            valueScript.setScorer(scorer);
+        }
+
+        @Override
+        public void setNextReader(AtomicReaderContext context) throws IOException {
+            values = indexFieldData.load(context).getDoubleValues();
+            valueScript.setNextReader(context);
+        }
+
+        @Override
+        public void collect(int doc) throws IOException {
+            histoProc.onDoc(doc, values);
+        }
+
+        @Override
+        public void postCollection() {
+        }
+    }
+
+    public static class HistogramProc extends DoubleFacetAggregatorBase {
+
+        private final long interval;
+
+        private final SearchScript valueScript;
+
+        final LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry> entries;
+
+        public HistogramProc(long interval, SearchScript valueScript, LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry> entries) {
+            this.interval = interval;
+            this.valueScript = valueScript;
+            this.entries = entries;
+        }
+
+        @Override
+        public void onValue(int docId, double value) {
+            valueScript.setNextDocId(docId);
+            long bucket = bucket(value, interval);
+            double scriptValue = valueScript.runAsDouble();
+
+            InternalFullHistogramFacet.FullEntry entry = entries.get(bucket);
+            if (entry == null) {
+                entry = new InternalFullHistogramFacet.FullEntry(bucket, 1, scriptValue, scriptValue, 1, scriptValue);
+                entries.put(bucket, entry);
+            } else {
+                entry.count++;
+                entry.totalCount++;
+                entry.total += scriptValue;
+                if (scriptValue < entry.min) {
+                    entry.min = scriptValue;
+                }
+                if (scriptValue > entry.max) {
+                    entry.max = scriptValue;
                 }
             }
-
-            FST<Long> fst = fstBuilder.finish();
-
-            final Ordinals ordinals = builder.build(fieldDataType.getSettings());
-
-            data = new FSTBytesAtomicFieldData(fst, ordinals);
-            success = true;
-            return data;
-        } finally {
-            if (success) {
-                estimator.afterLoad(null, data.getMemorySizeInBytes());
-            }
-
         }
     }
 }

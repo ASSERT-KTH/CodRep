@@ -1,491 +1,220 @@
-<B>Concurrency Notes</B>
+ColumnFamily purged = PrecompactedRow.removeDeletedAndOldShards(key, shouldPurge, controller, container);
 
+package org.apache.cassandra.db.compaction;
 /*
-
-   Derby - Class org.apache.derby.impl.store.access.btree.BTreeForwardScan
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-package org.apache.derby.impl.store.access.btree;
 
-import org.apache.derby.iapi.reference.SQLState;
+import java.io.DataOutput;
+import java.io.IOError;
+import java.io.IOException;
+import java.security.MessageDigest;
+import java.util.Iterator;
+import java.util.List;
 
-import org.apache.derby.iapi.services.sanity.SanityManager;
+import com.google.common.base.Predicates;
+import com.google.common.collect.Iterators;
+import org.apache.commons.collections.iterators.CollatingIterator;
 
-import org.apache.derby.iapi.error.StandardException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.derby.iapi.store.access.ScanController;
-
-import org.apache.derby.iapi.store.raw.Page;
-import org.apache.derby.iapi.store.raw.RecordHandle;
-
-import org.apache.derby.iapi.types.DataValueDescriptor;
-import org.apache.derby.iapi.types.RowLocation;
-
-import org.apache.derby.iapi.store.access.BackingStoreHashtable;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.columniterator.IColumnIterator;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.IIterableColumns;
+import org.apache.cassandra.utils.ReducingIterator;
 
 /**
-
-  A b-tree scan controller corresponds to an instance of an open b-tree scan.
-  <P>
-  <B>Concurrency Notes<\B>
-  <P>
-  The concurrency rules are derived from OpenBTree.
-  <P>
-  @see OpenBTree
-
-**/
-
-public class BTreeForwardScan extends BTreeScan
+ * LazilyCompactedRow only computes the row bloom filter and column index in memory
+ * (at construction time); it does this by reading one column at a time from each
+ * of the rows being compacted, and merging them as it does so.  So the most we have
+ * in memory at a time is the bloom filter, the index, and one column from each
+ * pre-compaction row.
+ *
+ * When write() or update() is called, a second pass is made over the pre-compaction
+ * rows to write the merged columns or update the hash, again with at most one column
+ * from each row deserialized at a time.
+ */
+public class LazilyCompactedRow extends AbstractCompactedRow implements IIterableColumns
 {
-	/*
-	** Private/Protected methods of This class, sorted alphabetically
-	*/
+    private static Logger logger = LoggerFactory.getLogger(LazilyCompactedRow.class);
 
-	/**
-	Position scan at "start" position.
-	<p>
-    Positions the scan to the slot just before the first record to be returned
-    from the scan.  Returns the start page latched, and sets "current_slot" to
-    the slot number.
+    private final List<SSTableIdentityIterator> rows;
+    private final CompactionController controller;
+    private final boolean shouldPurge;
+    private final DataOutputBuffer headerBuffer;
+    private ColumnFamily emptyColumnFamily;
+    private LazyColumnIterator reducer;
+    private int columnCount;
+    private long columnSerializedSize;
 
-	@exception  StandardException  Standard exception policy.
-	**/
-    protected void positionAtStartPosition(
-    BTreeRowPosition    pos)
-        throws StandardException
-	{
-        positionAtStartForForwardScan(pos);
-	}
+    public LazilyCompactedRow(CompactionController controller, List<SSTableIdentityIterator> rows)
+    {
+        super(rows.get(0).getKey());
+        this.rows = rows;
+        this.controller = controller;
+        this.shouldPurge = controller.shouldPurge(key);
 
-    /**
-     * Fetch the next N rows from the table.
-     * <p>
-     * Utility routine used by both fetchSet() and fetchNextGroup().
-     *
-	 * @exception  StandardException  Standard exception policy.
-     **/
-    protected int fetchRows(
-    BTreeRowPosition        pos,
-    DataValueDescriptor[][] row_array,
-    RowLocation[]           rowloc_array,
-    BackingStoreHashtable   hash_table,
-    long                    max_rowcnt,
-    int[]                   key_column_numbers)
-        throws StandardException
-	{
-
-        int                     ret_row_count     = 0;
-        DataValueDescriptor[]   fetch_row         = null;
-        RecordHandle            rh;
-
-        if (max_rowcnt == -1)
-            max_rowcnt = Long.MAX_VALUE;
-
-
-        if (this.scan_state == BTreeScan.SCAN_INPROGRESS)
+        for (IColumnIterator row : rows)
         {
-            // reposition the scan at the row just before the next one to 
-            // return.
-            // This routine handles the mess of repositioning if the row or 
-            // the page has disappeared. This can happen if a lock was not 
-            // held on the row while not holding the latch (can happen if
-            // this scan is read uncommitted).
-            //
-            // code path tested by readUncommitted.sql:TEST 1
-            //
-            if (!reposition(pos, true))
+            ColumnFamily cf = row.getColumnFamily();
+
+            if (emptyColumnFamily == null)
+                emptyColumnFamily = cf;
+            else
+                emptyColumnFamily.delete(cf);
+        }
+
+        // initialize row header so isEmpty can be called
+        headerBuffer = new DataOutputBuffer();
+        ColumnIndexer.serialize(this, headerBuffer);
+        // reach into iterator used by ColumnIndexer to get column count and size
+        // (however, if there are zero columns, iterator() will not be called by ColumnIndexer and reducer will be null)
+        columnCount = reducer == null ? 0 : reducer.size;
+        columnSerializedSize = reducer == null ? 0 : reducer.serializedSize;
+        reducer = null;
+    }
+
+    public void write(DataOutput out) throws IOException
+    {
+        DataOutputBuffer clockOut = new DataOutputBuffer();
+        ColumnFamily.serializer().serializeCFInfo(emptyColumnFamily, clockOut);
+
+        long dataSize = headerBuffer.getLength() + clockOut.getLength() + columnSerializedSize;
+        if (logger.isDebugEnabled())
+            logger.debug(String.format("header / clock / column sizes are %s / %s / %s",
+                         headerBuffer.getLength(), clockOut.getLength(), columnSerializedSize));
+        assert dataSize > 0;
+        out.writeLong(dataSize);
+        out.write(headerBuffer.getData(), 0, headerBuffer.getLength());
+        out.write(clockOut.getData(), 0, clockOut.getLength());
+        out.writeInt(columnCount);
+
+        Iterator<IColumn> iter = iterator();
+        while (iter.hasNext())
+        {
+            IColumn column = iter.next();
+            emptyColumnFamily.getColumnSerializer().serialize(column, out);
+        }
+        long secondPassColumnSize = reducer == null ? 0 : reducer.serializedSize;
+        assert secondPassColumnSize == columnSerializedSize
+               : "originally calculated column size of " + columnSerializedSize + " but now it is " + secondPassColumnSize;
+    }
+
+    public void update(MessageDigest digest)
+    {
+        // no special-case for rows.size == 1, we're actually skipping some bytes here so just
+        // blindly updating everything wouldn't be correct
+        DataOutputBuffer out = new DataOutputBuffer();
+
+        try
+        {
+            ColumnFamily.serializer().serializeCFInfo(emptyColumnFamily, out);
+            out.writeInt(columnCount);
+            digest.update(out.getData(), 0, out.getLength());
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+
+        Iterator<IColumn> iter = iterator();
+        while (iter.hasNext())
+        {
+            iter.next().updateDigest(digest);
+        }
+    }
+
+    public boolean isEmpty()
+    {
+        boolean cfIrrelevant = ColumnFamilyStore.removeDeletedCF(emptyColumnFamily, controller.gcBefore) == null;
+        return cfIrrelevant && columnCount == 0;
+    }
+
+    public int getEstimatedColumnCount()
+    {
+        int n = 0;
+        for (SSTableIdentityIterator row : rows)
+            n += row.columnCount;
+        return n;
+    }
+
+    public AbstractType getComparator()
+    {
+        return emptyColumnFamily.getComparator();
+    }
+
+    public Iterator<IColumn> iterator()
+    {
+        for (SSTableIdentityIterator row : rows)
+        {
+            row.reset();
+        }
+        reducer = new LazyColumnIterator(new CollatingIterator(getComparator().columnComparator, rows));
+        return Iterators.filter(reducer, Predicates.notNull());
+    }
+
+    public int columnCount()
+    {
+        return columnCount;
+    }
+
+    private class LazyColumnIterator extends ReducingIterator<IColumn, IColumn>
+    {
+        ColumnFamily container = emptyColumnFamily.cloneMeShallow();
+        long serializedSize = 4; // int for column count
+        int size = 0;
+
+        public LazyColumnIterator(Iterator<IColumn> source)
+        {
+            super(source);
+        }
+
+        @Override
+        protected boolean isEqual(IColumn o1, IColumn o2)
+        {
+            return o1.name().equals(o2.name());
+        }
+
+        public void reduce(IColumn current)
+        {
+            container.addColumn(current);
+        }
+
+        protected IColumn getReduced()
+        {
+            ColumnFamily purged = PrecompactedRow.removeDeletedAndOldShards(shouldPurge, controller, container);
+            if (purged == null || !purged.iterator().hasNext())
             {
-                if (SanityManager.DEBUG)
-                {
-                    SanityManager.THROWASSERT(
-                        "can not fail with 2nd param true.");
-                }
+                container.clear();
+                return null;
             }
-
+            IColumn reduced = purged.iterator().next();
+            container.clear();
+            serializedSize += reduced.serializedSize();
+            size++;
+            return reduced;
         }
-        else if (this.scan_state == SCAN_INIT)
-        {
-            // 1st positioning of scan (delayed from openScan).
-            positionAtStartPosition(pos);
-        }
-        else if (this.scan_state == SCAN_HOLD_INPROGRESS)
-        {
-            reopen();
-
-            this.scan_state = SCAN_INPROGRESS;
-
-            if (SanityManager.DEBUG)
-            {
-                SanityManager.ASSERT(scan_position.current_positionKey != null);
-            }
-
-            // reposition the scan at the row just before the next one to 
-            // return.
-            // This routine handles the mess of repositioning if the row or 
-            // the page has disappeared. This can happen if a lock was not 
-            // held on the row while not holding the latch.
-            //
-            // code path tested by holdCursor.sql: TEST 9
-            if (!reposition(pos, true))
-            {
-                if (SanityManager.DEBUG)
-                {
-                    SanityManager.THROWASSERT(
-                        "can not fail with 2nd param true.");
-                }
-            }
-
-        }
-        else if (this.scan_state == SCAN_HOLD_INIT)
-        {
-            reopen();
-
-            positionAtStartForForwardScan(scan_position);
-        }
-        else
-        {
-            if (SanityManager.DEBUG)
-                SanityManager.ASSERT(this.scan_state == SCAN_DONE);
-
-            return(0);
-        }
-
-		if (SanityManager.DEBUG)
-		{
-			SanityManager.ASSERT(
-                init_template != null, "init_template is null");
-		}
-
-        if (SanityManager.DEBUG)
-        {
-            SanityManager.ASSERT(this.container != null,
-                "BTreeScan.next() called on a closed scan.");
-
-            if (row_array != null)
-                SanityManager.ASSERT(row_array[0] != null,
-                    "first array slot in fetchNextGroup() must be non-null.");
-
-            // Btree's don't support RowLocations yet.
-            if (rowloc_array != null)
-            {
-                throw StandardException.newException(
-                        SQLState.BTREE_UNIMPLEMENTED_FEATURE);
-            }
-        }
-
-        // System.out.println("top of fetchRows, fetch_row = " + fetch_row);
-
-
-        // At this point:
-        // current_page is latched.  current_slot is the slot on current_page
-        // just before the "next" record this routine should process.
-
-        // loop through successive leaf pages and successive slots on those
-        // leaf pages.  Stop when either the last leaf is reached (current_page
-        // will be null), or when stopKeyValue is reached/passed.  Along the
-        // way apply qualifiers to skip rows which don't qualify.
-
-		while (pos.current_leaf != null)
-		{
-            // System.out.println(
-              //   "1 of fetchSet loop, ret_row_count = " + ret_row_count +
-                // "fetch_row = " + fetch_row);
-
-			while ((pos.current_slot + 1) < pos.current_leaf.page.recordCount())
-			{
-
-                // System.out.println(
-                // "2 of fetchSet loop, ret_row_count = " + ret_row_count +
-                // "fetch_row = " + fetch_row + 
-                // "hash_table = " + hash_table);
-
-
-                // unlock the previous row if doing read.
-                if (pos.current_rh != null)
-                {
-                    this.getLockingPolicy().unlockScanRecordAfterRead(
-                        pos, init_forUpdate);
-
-                    // current_rh is used to track which row we need to unlock,
-                    // at this point no row needs to be unlocked.
-                    pos.current_rh = null;
-                }
-
-                // Allocate a new row to read the row into.
-                if (fetch_row == null)
-                {
-                    if (hash_table == null)
-                    {
-                        // point at allocated row in array if one exists.
-                        if (row_array[ret_row_count] == null)
-                        {
-                            row_array[ret_row_count] = 
-                                runtime_mem.get_row_for_export(getRawTran());
-                        }
-
-                        fetch_row = row_array[ret_row_count];
-                    }
-                    else
-                    {
-                        // get a brand new row.
-                        fetch_row = 
-                            runtime_mem.get_row_for_export(getRawTran()); 
-                    }
-                }
-
-                // move scan current position forward.
-                pos.current_slot++;
-                this.stat_numrows_visited++;
-
-                rh =
-                    pos.current_leaf.page.fetchFromSlot(
-                        (RecordHandle) null,
-                        pos.current_slot, fetch_row, 
-                        init_fetchDesc,
-                        true);
-
-
-                pos.current_rh_qualified = true;
-
-                // See if this is the stop row.
-                if (init_stopKeyValue != null)
-                {
-                    // See if current row is the >= the stopKeyValue.
-                    //
-                    // ret >  0: key is greater than row on page.
-                    // ret == 0: key is exactly the row on page if full key,
-                    //           or partial match if partial key.
-                    // ret <  0: key is less    than row on page.
-                    //
-                    int ret = ControlRow.compareIndexRowToKey(
-                                fetch_row,
-                                init_stopKeyValue,
-                                fetch_row.length,
-                                0, this.getConglomerate().ascDescInfo);
-
-                    if ((ret == 0) && 
-                        (init_stopSearchOperator == ScanController.GE))
-                    {
-                        // if (partial) matched and stop is GE, end the scan.
-                        ret = 1;
-                    }
-
-                    if (ret > 0)
-                    {
-                        // This is the first non-qualifying row. We're done.
-
-                        pos.current_leaf.release();
-                        pos.current_leaf = null;
-                        positionAtDoneScan(pos);
-
-                        return(ret_row_count);
-                    }
-                }
-
-
-                // Only lock rows that are < the stopKeyValue.  No need to
-                // requalify against stop position after losing the latch
-                // as the only change that could have happened is that the
-                // row was marked deleted - the key value cannot change.
-                boolean latch_released =
-                    !this.getLockingPolicy().lockScanRow(
-                        this, this.getConglomerate(), pos, 
-                        false, 
-                        init_lock_fetch_desc,
-                        pos.current_lock_template,
-                        pos.current_lock_row_loc,
-                        false, init_forUpdate, lock_operation);
-
-                // special test to see if latch release code works
-                if (SanityManager.DEBUG)
-                {
-                    latch_released = 
-                        test_errors(
-                            this,
-                            "BTreeScan_fetchNextGroup", false, 
-                            this.getLockingPolicy(),
-                            pos.current_leaf, latch_released);
-                }
-
-                // At this point we have successfully locked this record, so
-                // remember the record handle so that it can be unlocked if
-                // necessary.  If the above lock deadlocks, we will not try
-                // to unlock a lock we never got in close(), because current_rh
-                // is null until after the lock is granted.
-                pos.current_rh = rh;
-
-                if (latch_released)
-                {
-                    // lost latch on page in order to wait for row lock.
-                    // Because we have scan lock on page, we need only
-                    // call reposition() which will use the saved record
-                    // handle to reposition to the same spot on the page.
-                    // We don't have to search the
-                    // tree again, as we have the a scan lock on the page
-                    // which means the current_rh is valid to reposition on.
-
-                    if (this.getConglomerate().isUnique())
-                    {
-                        // Handle row location changing since lock request was 
-                        // initiated.
-                        // In unique indexes, there is one case where an index 
-                        // row can have it's data lock key change (this usually
-                        // cannot happen because only inserts and deletes are 
-                        // allowed - no updates).  This case is an insert of a 
-                        // key, that exactly matches a committed deleted row, 
-                        // in a unique index.  In that case the code updates 
-                        // the RowLocation column and flips the deleted bit to
-                        // mark the row valid.  The problem is that if this 
-                        // happens while we are waiting on a lock on the old
-                        // RowLocation then when we wake up we have the wrong 
-                        // lock, and the row location we fetched earlier in
-                        // this loop is invalid.
-
-                        while (latch_released)
-                        {
-                            if (!reposition(pos, false))
-                            {
-                                if (SanityManager.DEBUG)
-                                {
-                                    // can't fail while with scan lock
-                                    SanityManager.THROWASSERT(
-                                        "can not fail holding scan lock.");
-                                }
-
-                                // reposition will set pos.current_leaf to 
-                                // null, if it returns false so if the this
-                                // ever does fail in delivered code, expect
-                                // a null pointer exception on the next line,
-                                // trying to call fetchFromSlot().
-
-                            }
-
-                            pos.current_leaf.page.fetchFromSlot(
-                                (RecordHandle) null,
-                                pos.current_slot, fetch_row, 
-                                init_fetchDesc,
-                                true);
-
-                            latch_released =
-                                !this.getLockingPolicy().lockScanRow(
-                                    this, 
-                                    this.getConglomerate(), 
-                                    pos, 
-                                    false, 
-                                    init_lock_fetch_desc,
-                                    pos.current_lock_template,
-                                    pos.current_lock_row_loc,
-                                    false, init_forUpdate, lock_operation);
-                        }
-                    }
-                    else
-                    {
-                        if (!reposition(pos, false))
-                        {
-                            if (SanityManager.DEBUG)
-                            {
-                                // can't fail while with scan lock
-                                SanityManager.THROWASSERT(
-                                    "can not fail holding scan lock.");
-                            }
-
-                            // reposition will set pos.current_leaf to 
-                            // null, if it returns false so if the this
-                            // ever does fail in delivered code, expect
-                            // a null pointer exception on the next line,
-                            // trying to call isDeletedAtSlot().
-
-                        }
-
-                    }
-                }
-
-
-                if (pos.current_leaf.page.isDeletedAtSlot(pos.current_slot))
-                {
-                    this.stat_numdeleted_rows_visited++;
-                    pos.current_rh_qualified = false;
-                }
-                else if (init_qualifier != null)
-                {
-                    // Apply qualifiers if there are any.
-                    pos.current_rh_qualified = 
-                        this.process_qualifier(fetch_row);
-                }
-
-                if (pos.current_rh_qualified)
-                {
-                    // qualifying row.  Save position, release latch and return.
-
-                    // this.current_rh is save position of scan while latch is
-                    // not held.  It currently points at the current_slot in
-                    // search (while latch is held).
-                    if (SanityManager.DEBUG)
-                    {
-                        SanityManager.ASSERT(
-                            pos.current_leaf.page.getSlotNumber(pos.current_rh)
-                                == pos.current_slot);
-                    }
-
-                    // Found qualifying row.  Are we done fetching rows for the
-                    // group?
-                    ret_row_count++;
-                    stat_numrows_qualified++;
-
-                    if (hash_table != null)
-                    {
-                        if (hash_table.putRow(false, fetch_row))
-                            fetch_row = null;
-                    }
-                    else
-                    {
-                        fetch_row = null;
-                    }
-
-                    if (max_rowcnt <= ret_row_count) 
-                    {
-                        // current_slot is invalid after releasing latch
-                        pos.current_slot = Page.INVALID_SLOT_NUMBER;
-
-                        // exit fetch row loop and return to the client.
-                        pos.current_leaf.release();
-                        pos.current_leaf = null;
-
-                        return(ret_row_count);
-                    }
-                }
-			}
-
-            // Move position of the scan to slot 0 of the next page.  If there
-            // is no next page current_page will be null.
-            positionAtNextPage(pos);
-
-            this.stat_numpages_visited++;
-		}
-
-        // Reached last leaf of tree.
-        positionAtDoneScan(pos);
-
-
-        // we need to decrement when we stop scan at the end of the table.
-        this.stat_numpages_visited--;
-
-		return(ret_row_count);
-	}
+    }
 }

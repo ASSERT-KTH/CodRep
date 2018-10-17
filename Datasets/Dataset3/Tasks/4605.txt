@@ -1,8 +1,8 @@
-log.warn("access-control/default is missing operations: " + accessControl);
+logger.debugf("Registered EJB XA resource deserializer %s", EJBXAResourceDeserializer.INSTANCE);
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2013, Red Hat, Inc., and individual contributors
+ * Copyright 2011, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,143 +22,188 @@ log.warn("access-control/default is missing operations: " + accessControl);
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.cli.accesscontrol;
+package org.jboss.as.ejb3.remote;
 
-import java.util.Iterator;
-
-import org.jboss.as.cli.Util;
-import org.jboss.as.cli.operation.OperationRequestAddress;
-import org.jboss.as.cli.operation.OperationRequestAddress.Node;
-import org.jboss.as.controller.client.ModelControllerClient;
-import org.jboss.dmr.ModelNode;
+import com.arjuna.ats.arjuna.common.Uid;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.TransactionImple;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinateTransaction;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinationManager;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.TransactionImporter;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.TransactionImporterImple;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.XATerminatorImple;
+import com.arjuna.ats.jbossatx.jta.RecoveryManagerService;
+import org.jboss.ejb.client.UserTransactionID;
+import org.jboss.ejb.client.XidTransactionID;
 import org.jboss.logging.Logger;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
+
+import javax.resource.spi.XATerminator;
+import javax.transaction.NotSupportedException;
+import javax.transaction.SystemException;
+import javax.transaction.Transaction;
+import javax.transaction.TransactionManager;
+import javax.transaction.UserTransaction;
+import javax.transaction.xa.XAException;
+import javax.transaction.xa.Xid;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 
 /**
- * @author Alexey Loubyansky
- *
+ * @author Jaikiran Pai
  */
-public class CLIAccessControl {
+public class EJBRemoteTransactionsRepository implements Service<EJBRemoteTransactionsRepository> {
 
-    private static final Logger log = Logger.getLogger(CLIAccessControl.class);
+    private static final Logger logger = Logger.getLogger(EJBRemoteTransactionsRepository.class);
 
-    public static boolean isExecute(ModelControllerClient client, OperationRequestAddress address, String operation) {
-        return isExecute(client, null, address, operation);
+    public static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("ejb").append("remote-transactions-repository");
+
+    private final InjectedValue<TransactionManager> transactionManagerInjectedValue = new InjectedValue<TransactionManager>();
+
+    private final InjectedValue<UserTransaction> userTransactionInjectedValue = new InjectedValue<UserTransaction>();
+
+    private final InjectedValue<RecoveryManagerService> recoveryManagerService = new InjectedValue<>();
+
+    private final Map<UserTransactionID, Uid> userTransactions = Collections.synchronizedMap(new HashMap<UserTransactionID, Uid>());
+
+    @Override
+    public void start(StartContext context) throws StartException {
+        recoveryManagerService.getValue().addSerializableXAResourceDeserializer(EJBXAResourceDeserializer.INSTANCE);
+        logger.debug("Registered EJB XA resource deserializer " + EJBXAResourceDeserializer.INSTANCE);
     }
 
-    public static boolean isExecute(ModelControllerClient client, String[] parent, OperationRequestAddress address, String operation) {
-        final ModelNode accessControl = getAccessControl(client, parent, address, true);
-        if(accessControl == null) {
-            return false;
-        }
+    @Override
+    public void stop(StopContext context) {
+    }
 
-        if(!accessControl.has(Util.DEFAULT)) {
-            log.warn("access-control is missing defaults: " + accessControl);
-            return false;
-        }
+    @Override
+    public EJBRemoteTransactionsRepository getValue() throws IllegalStateException, IllegalArgumentException {
+        return this;
+    }
 
-        final ModelNode defaults = accessControl.get(Util.DEFAULT);
-        if(!defaults.has(Util.OPERATIONS)) {
-            log.warn("access-control/default is missing operations: " + defaults);
-            return false;
-        }
-
-        final ModelNode operations = defaults.get(Util.OPERATIONS);
-        if(!operations.has(operation)) {
-            if(log.isTraceEnabled()) {
-                log.trace("The operation is missing in the description: " + operation);
-            }
-            return false;
-        }
-
-        final ModelNode opAC = operations.get(operation);
-        if(!opAC.has(Util.EXECUTE)) {
-            log.warn("'execute' is missing for " + operation + " in " + accessControl);
-            return false;
-        }
-
-        return opAC.get(Util.EXECUTE).asBoolean();
+    public TransactionManager getTransactionManager() {
+        return this.transactionManagerInjectedValue.getValue();
     }
 
     /**
-     * Executed read-resource-description and returns access-control info.
-     * Returns null in case there was any kind of problem.
-     *
-     * @param client
-     * @param address
-     * @return
+     * Removes any references maintained for the passed <code>{@link UserTransactionID}</code>
+     * @param userTransactionID User transaction id
+     * @return Returns the {@link Transaction} corresponding to the passed <code>userTransactionID</code>. If there
+     *          is no such transaction, then this method returns null
      */
-    public static ModelNode getAccessControl(ModelControllerClient client, OperationRequestAddress address, boolean operations) {
-        return getAccessControl(client, null, address, operations);
+    public Transaction removeUserTransaction(final UserTransactionID userTransactionID) {
+        final Uid uid = this.userTransactions.remove(userTransactionID);
+        if (uid == null) {
+            return null;
+        }
+        return TransactionImple.getTransaction(uid);
     }
 
-    public static ModelNode getAccessControl(ModelControllerClient client, String[] parent, OperationRequestAddress address, boolean operations) {
-
-        if(client == null) {
+    /**
+     * @param userTransactionID User transaction id
+     * @return Returns the {@link Transaction} corresponding to the passed <code>userTransactionID</code>. If there
+     *          is no such transaction, then this method returns null
+     */
+    public Transaction getUserTransaction(final UserTransactionID userTransactionID) {
+        final Uid uid = this.userTransactions.get(userTransactionID);
+        if (uid == null) {
             return null;
         }
-
-        if(address.endsOnType()) {
-            log.debug("The prefix ends on a type.");
-            return null;
-        }
-
-        final ModelNode request = new ModelNode();
-        setAddress(request, parent, address);
-        request.get(Util.OPERATION).set(Util.READ_RESOURCE_DESCRIPTION);
-        request.get(Util.ACCESS_CONTROL).set(Util.TRIM_DESCRIPTIONS);
-        if(operations) {
-            request.get(Util.OPERATIONS).set(true);
-        }
-
-        final ModelNode response;
-        try {
-            response = client.execute(request);
-        } catch (Exception e) {
-            log.warn("Failed to execute " + Util.READ_RESOURCE_DESCRIPTION, e);
-            return null;
-        }
-
-        if (!Util.isSuccess(response)) {
-            log.debug("Failed to execute " + Util.READ_RESOURCE_DESCRIPTION + ": " + response);
-            return null;
-        }
-
-        if(!response.has(Util.RESULT)) {
-            log.warn("Response is missing result for " + Util.READ_RESOURCE_DESCRIPTION + ": " + response);
-            return null;
-        }
-
-        final ModelNode result = response.get(Util.RESULT);
-        if(!result.has(Util.ACCESS_CONTROL)) {
-            log.warn("Result is missing access-control for " + Util.READ_RESOURCE_DESCRIPTION + ": " + response);
-            return null;
-        }
-
-        return result.get(Util.ACCESS_CONTROL);
+        return TransactionImple.getTransaction(uid);
     }
 
-    private static void setAddress(ModelNode request, String[] parent, OperationRequestAddress address) {
-        final ModelNode addressNode = request.get(Util.ADDRESS);
-        addressNode.setEmptyList();
-        if(parent != null) {
-            int i = 0;
-            while(i < parent.length) {
-                addressNode.add(parent[i++], parent[i++]);
+    /**
+     * {@link javax.transaction.UserTransaction#begin() Begins} a new {@link UserTransaction} and
+     * associates it with the passed {@link UserTransactionID}.
+     * @param userTransactionID
+     * @return Returns the transaction that has begun
+     * @throws SystemException
+     * @throws NotSupportedException
+     */
+    Transaction beginUserTransaction(final UserTransactionID userTransactionID) throws SystemException, NotSupportedException {
+        this.getUserTransaction().begin();
+        // get the tx that just got created and associated with the transaction manager
+        final TransactionImple newlyAssociatedTx = TransactionImple.getTransaction();
+        final Uid uid = newlyAssociatedTx.get_uid();
+        this.userTransactions.put(userTransactionID, uid);
+        return newlyAssociatedTx;
+    }
+
+    /**
+     * Returns a {@link SubordinateTransaction} associated with the passed {@link XidTransactionID}.
+     * If there's no such transaction, then this method returns null.
+     *
+     * @param xidTransactionID The {@link XidTransactionID}
+     * @return
+     * @throws XAException
+     */
+    public SubordinateTransaction getImportedTransaction(final XidTransactionID xidTransactionID) throws XAException {
+        final Xid xid = xidTransactionID.getXid();
+        final TransactionImporter transactionImporter = SubordinationManager.getTransactionImporter();
+        return transactionImporter.getImportedTransaction(xid);
+    }
+
+    /**
+     * Imports a {@link Transaction} into the {@link SubordinationManager} and associates it with the
+     * passed {@link org.jboss.ejb.client.XidTransactionID#getXid()}  Xid}. Returns the imported transaction
+     *
+     * @param xidTransactionID The {@link XidTransactionID}
+     * @param txTimeout The transaction timeout
+     * @return
+     * @throws XAException
+     */
+    Transaction importTransaction(final XidTransactionID xidTransactionID, final int txTimeout) throws XAException {
+        final TransactionImporter transactionImporter = SubordinationManager.getTransactionImporter();
+        return transactionImporter.importTransaction(xidTransactionID.getXid(), txTimeout);
+    }
+
+    public Xid[] getXidsToRecoverForParentNode(final String parentNodeName, int recoveryFlags) throws XAException {
+        final Set<Xid> xidsToRecover = new HashSet<Xid>();
+        final TransactionImporter transactionImporter = SubordinationManager.getTransactionImporter();
+        if (transactionImporter instanceof TransactionImporterImple) {
+            final Set<Xid> inFlightXids = ((TransactionImporterImple) transactionImporter).getInflightXids(parentNodeName);
+            if (inFlightXids != null) {
+                xidsToRecover.addAll(inFlightXids);
             }
         }
-
-        if(!address.isEmpty()) {
-            final Iterator<Node> iterator = address.iterator();
-            while (iterator.hasNext()) {
-                final OperationRequestAddress.Node node = iterator.next();
-                if (node.getName() != null) {
-                    addressNode.add(node.getType(), node.getName());
-                } else if (iterator.hasNext()) {
-                    throw new IllegalArgumentException(
-                            "The node name is not specified for type '"
-                                    + node.getType() + "'");
-                }
+        final XATerminator xaTerminator = SubordinationManager.getXATerminator();
+        if (xaTerminator instanceof XATerminatorImple) {
+            final Xid[] inDoubtTransactions = ((XATerminatorImple) xaTerminator).doRecover(null, parentNodeName);
+            if (inDoubtTransactions != null) {
+                xidsToRecover.addAll(Arrays.asList(inDoubtTransactions));
+            }
+        } else {
+            final Xid[] inDoubtTransactions = xaTerminator.recover(recoveryFlags);
+            if (inDoubtTransactions != null) {
+                xidsToRecover.addAll(Arrays.asList(inDoubtTransactions));
             }
         }
+        return xidsToRecover.toArray(new Xid[0]);
     }
+
+    public UserTransaction getUserTransaction() {
+        return this.userTransactionInjectedValue.getValue();
+    }
+
+    public Injector<TransactionManager> getTransactionManagerInjector() {
+        return this.transactionManagerInjectedValue;
+    }
+
+    public Injector<UserTransaction> getUserTransactionInjector() {
+        return this.userTransactionInjectedValue;
+    }
+
+    public Injector<RecoveryManagerService> getRecoveryManagerInjector() {
+        return this.recoveryManagerService;
+    }
+
 }

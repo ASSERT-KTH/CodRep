@@ -1,4 +1,4 @@
-for (final AtomicReaderContext ctx : reader.leaves()) {
+final List<AtomicReaderContext> leaves = reader.leaves();
 
 package org.apache.lucene.index;
 
@@ -18,354 +18,587 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 import java.io.IOException;
+import java.lang.reflect.Array;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.codecs.FieldInfosWriter;
-import org.apache.lucene.codecs.FieldsConsumer;
-import org.apache.lucene.codecs.PerDocConsumer;
-import org.apache.lucene.codecs.StoredFieldsWriter;
-import org.apache.lucene.codecs.TermVectorsWriter;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.InfoStream;
+import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
+import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.PagedBytes;
+import org.apache.lucene.util.packed.PackedInts.Reader;
 
 /**
- * The SegmentMerger class combines two or more Segments, represented by an IndexReader ({@link #add},
- * into a single Segment.  After adding the appropriate readers, call the merge method to combine the
- * segments.
+ * A wrapper for CompositeIndexReader providing access to per segment
+ * {@link DocValues}
+ * 
+ * <p><b>NOTE</b>: for multi readers, you'll get better
+ * performance by gathering the sub readers using
+ * {@link IndexReader#getTopReaderContext()} to get the
+ * atomic leaves and then operate per-AtomicReader,
+ * instead of using this class.
  *
- * @see #merge
- * @see #add
+ * @lucene.experimental
+ * @lucene.internal
  */
-final class SegmentMerger {
-  private final Directory directory;
-  private final int termIndexInterval;
-
-  private final Codec codec;
+public class MultiDocValues extends DocValues {
   
-  private final IOContext context;
+  private static DocValuesPuller DEFAULT_PULLER = new DocValuesPuller();
+  private static final DocValuesPuller NORMS_PULLER = new DocValuesPuller() {
+    public DocValues pull(AtomicReader reader, String field) throws IOException {
+      return reader.normValues(field);
+    }
+    
+    public boolean stopLoadingOnNull(AtomicReader reader, String field) {
+      // for norms we drop all norms if one leaf reader has no norms and the field is present
+      FieldInfos fieldInfos = reader.getFieldInfos();
+      FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+      return fieldInfo != null && fieldInfo.omitsNorms();
+    }
+  };
+
+  public static class DocValuesSlice {
+    public final static DocValuesSlice[] EMPTY_ARRAY = new DocValuesSlice[0];
+    final int start;
+    final int length;
+    DocValues docValues;
+
+    public DocValuesSlice(DocValues docValues, int start, int length) {
+      this.docValues = docValues;
+      this.start = start;
+      this.length = length;
+    }
+  }
   
-  private final MergeState mergeState = new MergeState();
-  private final FieldInfos.Builder fieldInfosBuilder;
+  private static class DocValuesPuller {
+    public DocValuesPuller() {}
 
-  // note, just like in codec apis Directory 'dir' is NOT the same as segmentInfo.dir!!
-  SegmentMerger(SegmentInfo segmentInfo, InfoStream infoStream, Directory dir, int termIndexInterval,
-                MergeState.CheckAbort checkAbort, PayloadProcessorProvider payloadProcessorProvider,
-                FieldInfos.FieldNumbers fieldNumbers, IOContext context) {
-    mergeState.segmentInfo = segmentInfo;
-    mergeState.infoStream = infoStream;
-    mergeState.readers = new ArrayList<AtomicReader>();
-    mergeState.checkAbort = checkAbort;
-    mergeState.payloadProcessorProvider = payloadProcessorProvider;
-    directory = dir;
-    this.termIndexInterval = termIndexInterval;
-    this.codec = segmentInfo.getCodec();
-    this.context = context;
-    this.fieldInfosBuilder = new FieldInfos.Builder(fieldNumbers);
+    public DocValues pull(AtomicReader reader, String field) throws IOException {
+      return reader.docValues(field);
+    }
+    
+    public boolean stopLoadingOnNull(AtomicReader reader, String field) {
+      return false;
+    }
   }
 
+  private DocValuesSlice[] slices;
+  private int[] starts;
+  private Type type;
+  private int valueSize;
+
+  private MultiDocValues(DocValuesSlice[] slices, int[] starts, TypePromoter promotedType) {
+    this.starts = starts;
+    this.slices = slices;
+    this.type = promotedType.type();
+    this.valueSize = promotedType.getValueSize();
+  }
   /**
-   * Add an IndexReader to the collection of readers that are to be merged
-   * @param reader
+   * Returns a single {@link DocValues} instance for this field, merging
+   * their values on the fly.
+   * 
+   * <p>
+   * <b>NOTE</b>: this is a slow way to access DocValues.
+   * It's better to get the sub-readers and iterate through them
+   * yourself.
    */
-  final void add(IndexReader reader) {
-    for (final AtomicReaderContext ctx : reader.getTopReaderContext().leaves()) {
-      final AtomicReader r = ctx.reader();
-      mergeState.readers.add(r);
-    }
+  public static DocValues getDocValues(IndexReader r, final String field) throws IOException {
+    return getDocValues(r, field, DEFAULT_PULLER);
   }
-
-  final void add(SegmentReader reader) {
-    mergeState.readers.add(reader);
-  }
-
+  
   /**
-   * Merges the readers specified by the {@link #add} method into the directory passed to the constructor
-   * @return The number of documents that were merged
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
+   * Returns a single {@link DocValues} instance for this norms field, merging
+   * their values on the fly.
+   * 
+   * <p>
+   * <b>NOTE</b>: this is a slow way to access DocValues.
+   * It's better to get the sub-readers and iterate through them
+   * yourself.
    */
-  final MergeState merge() throws IOException {
-    // NOTE: it's important to add calls to
-    // checkAbort.work(...) if you make any changes to this
-    // method that will spend alot of time.  The frequency
-    // of this check impacts how long
-    // IndexWriter.close(false) takes to actually stop the
-    // threads.
-    
-    mergeState.segmentInfo.setDocCount(setDocMaps());
-    mergeDocValuesAndNormsFieldInfos();
-    setMatchingSegmentReaders();
-    int numMerged = mergeFields();
-    assert numMerged == mergeState.segmentInfo.getDocCount();
-
-    final SegmentWriteState segmentWriteState = new SegmentWriteState(mergeState.infoStream, directory, mergeState.segmentInfo,
-                                                                      mergeState.fieldInfos, termIndexInterval, null, context);
-    mergeTerms(segmentWriteState);
-    mergePerDoc(segmentWriteState);
-    
-    if (mergeState.fieldInfos.hasNorms()) {
-      mergeNorms(segmentWriteState);
-    }
-
-    if (mergeState.fieldInfos.hasVectors()) {
-      numMerged = mergeVectors();
-      assert numMerged == mergeState.segmentInfo.getDocCount();
-    }
-    
-    // write the merged infos
-    FieldInfosWriter fieldInfosWriter = codec.fieldInfosFormat().getFieldInfosWriter();
-    fieldInfosWriter.write(directory, mergeState.segmentInfo.name, mergeState.fieldInfos, context);
-
-    return mergeState;
+  public static DocValues getNormDocValues(IndexReader r, final String field) throws IOException {
+    return getDocValues(r, field, NORMS_PULLER);
   }
-
-  private void setMatchingSegmentReaders() {
-    // If the i'th reader is a SegmentReader and has
-    // identical fieldName -> number mapping, then this
-    // array will be non-null at position i:
-    int numReaders = mergeState.readers.size();
-    mergeState.matchingSegmentReaders = new SegmentReader[numReaders];
-
-    // If this reader is a SegmentReader, and all of its
-    // field name -> number mappings match the "merged"
-    // FieldInfos, then we can do a bulk copy of the
-    // stored fields:
-    for (int i = 0; i < numReaders; i++) {
-      AtomicReader reader = mergeState.readers.get(i);
-      // TODO: we may be able to broaden this to
-      // non-SegmentReaders, since FieldInfos is now
-      // required?  But... this'd also require exposing
-      // bulk-copy (TVs and stored fields) API in foreign
-      // readers..
-      if (reader instanceof SegmentReader) {
-        SegmentReader segmentReader = (SegmentReader) reader;
-        boolean same = true;
-        FieldInfos segmentFieldInfos = segmentReader.getFieldInfos();
-        for (FieldInfo fi : segmentFieldInfos) {
-          FieldInfo other = mergeState.fieldInfos.fieldInfo(fi.number);
-          if (other == null || !other.name.equals(fi.name)) {
-            same = false;
-            break;
+  
+ 
+  private static DocValues getDocValues(IndexReader reader, final String field, final DocValuesPuller puller) throws IOException {
+    if (reader instanceof AtomicReader) {
+      // already an atomic reader
+      return puller.pull((AtomicReader) reader, field);
+    }
+    assert reader instanceof CompositeReader;
+    final List<AtomicReaderContext> leaves = reader.getTopReaderContext().leaves();
+    switch (leaves.size()) {
+      case 0:
+        // no fields
+        return null;
+      case 1:
+        // already an atomic reader / reader with one leave
+        return getDocValues(leaves.get(0).reader(), field, puller);
+      default:
+        final List<DocValuesSlice> slices = new ArrayList<DocValuesSlice>();
+        
+        TypePromoter promotedType =  TypePromoter.getIdentityPromoter();
+        
+        // gather all docvalues fields, accumulating a promoted type across 
+        // potentially incompatible types
+        for (final AtomicReaderContext ctx : leaves) {
+          final AtomicReader r = ctx.reader();
+          final DocValues d = puller.pull(r, field);
+          if (d != null) {
+            TypePromoter incoming = TypePromoter.create(d.getType(), d.getValueSize());
+            promotedType = promotedType.promote(incoming);
+          } else if (puller.stopLoadingOnNull(r, field)){
+            return null;
+          }
+          slices.add(new DocValuesSlice(d, ctx.docBase, r.maxDoc()));
+        }
+        
+        // return null if no docvalues encountered anywhere
+        if (promotedType == TypePromoter.getIdentityPromoter()) {
+          return null;
+        }
+             
+        // populate starts and fill gaps with empty docvalues 
+        int starts[] = new int[slices.size()];
+        for (int i = 0; i < slices.size(); i++) {
+          DocValuesSlice slice = slices.get(i);
+          starts[i] = slice.start;
+          if (slice.docValues == null) {
+            Type promoted = promotedType.type();
+            switch(promoted) {
+              case BYTES_FIXED_DEREF:
+              case BYTES_FIXED_STRAIGHT:
+              case BYTES_FIXED_SORTED:
+                assert promotedType.getValueSize() >= 0;
+                slice.docValues = new EmptyFixedDocValues(slice.length, promoted, promotedType.getValueSize());
+                break;
+              default:
+                slice.docValues = new EmptyDocValues(slice.length, promoted);
+            }
           }
         }
-        if (same) {
-          mergeState.matchingSegmentReaders[i] = segmentReader;
-          mergeState.matchedCount++;
-        }
-      }
+        
+        return new MultiDocValues(slices.toArray(new DocValuesSlice[slices.size()]), starts, promotedType);
+    }
+  }
+
+  @Override
+  public Source load() throws IOException {
+    return new MultiSource(slices, starts, false, type);
+  }
+
+  public static class EmptyDocValues extends DocValues {
+    final int maxDoc;
+    final Source emptySource;
+
+    public EmptyDocValues(int maxDoc, Type type) {
+      this.maxDoc = maxDoc;
+      this.emptySource = new EmptySource(type);
     }
 
-    if (mergeState.infoStream.isEnabled("SM")) {
-      mergeState.infoStream.message("SM", "merge store matchedCount=" + mergeState.matchedCount + " vs " + mergeState.readers.size());
-      if (mergeState.matchedCount != mergeState.readers.size()) {
-        mergeState.infoStream.message("SM", "" + (mergeState.readers.size() - mergeState.matchedCount) + " non-bulk merges");
-      }
+    @Override
+    public Source load() throws IOException {
+      return emptySource;
+    }
+
+    @Override
+    public Type getType() {
+      return emptySource.getType();
+    }
+
+    @Override
+    public Source getDirectSource() throws IOException {
+      return emptySource;
     }
   }
   
-  // returns an updated typepromoter (tracking type and size) given a previous one,
-  // and a newly encountered docvalues
-  private TypePromoter mergeDocValuesType(TypePromoter previous, DocValues docValues) {
-    TypePromoter incoming = TypePromoter.create(docValues.getType(),  docValues.getValueSize());
-    if (previous == null) {
-      previous = TypePromoter.getIdentityPromoter();
+  public static class EmptyFixedDocValues extends DocValues {
+    final int maxDoc;
+    final Source emptyFixedSource;
+    final int valueSize;
+
+    public EmptyFixedDocValues(int maxDoc, Type type, int valueSize) {
+      this.maxDoc = maxDoc;
+      this.emptyFixedSource = new EmptyFixedSource(type, valueSize);
+      this.valueSize = valueSize;
     }
-    return previous.promote(incoming);
+
+    @Override
+    public Source load() throws IOException {
+      return emptyFixedSource;
+    }
+
+    @Override
+    public Type getType() {
+      return emptyFixedSource.getType();
+    }
+
+    @Override
+    public int getValueSize() {
+      return valueSize;
+    }
+
+    @Override
+    public Source getDirectSource() throws IOException {
+      return emptyFixedSource;
+    }
   }
 
-  // NOTE: this is actually merging all the fieldinfos
-  public void mergeDocValuesAndNormsFieldInfos() throws IOException {
-    // mapping from all docvalues fields found to their promoted types
-    // this is because FieldInfos does not store the
-    // valueSize
-    Map<FieldInfo,TypePromoter> docValuesTypes = new HashMap<FieldInfo,TypePromoter>();
-    Map<FieldInfo,TypePromoter> normValuesTypes = new HashMap<FieldInfo,TypePromoter>();
+  private static class MultiSource extends Source {
+    private int numDocs = 0;
+    private int start = 0;
+    private Source current;
+    private final int[] starts;
+    private final DocValuesSlice[] slices;
+    private boolean direct;
+    private Object cachedArray; // cached array if supported
 
-    for (AtomicReader reader : mergeState.readers) {
-      FieldInfos readerFieldInfos = reader.getFieldInfos();
-      for (FieldInfo fi : readerFieldInfos) {
-        FieldInfo merged = fieldInfosBuilder.add(fi);
-        // update the type promotion mapping for this reader
-        if (fi.hasDocValues()) {
-          TypePromoter previous = docValuesTypes.get(merged);
-          docValuesTypes.put(merged, mergeDocValuesType(previous, reader.docValues(fi.name))); 
-        }
-        if (fi.hasNorms()) {
-          TypePromoter previous = normValuesTypes.get(merged);
-          normValuesTypes.put(merged, mergeDocValuesType(previous, reader.normValues(fi.name))); 
-        }
-      }
+    public MultiSource(DocValuesSlice[] slices, int[] starts, boolean direct, Type type) {
+      super(type);
+      this.slices = slices;
+      this.starts = starts;
+      assert slices.length != 0;
+      this.direct = direct;
     }
-    updatePromoted(normValuesTypes, true);
-    updatePromoted(docValuesTypes, false);
-    mergeState.fieldInfos = fieldInfosBuilder.finish();
-  }
-  
-  protected void updatePromoted(Map<FieldInfo,TypePromoter> infoAndPromoter, boolean norms) {
-    // update any promoted doc values types:
-    for (Map.Entry<FieldInfo,TypePromoter> e : infoAndPromoter.entrySet()) {
-      FieldInfo fi = e.getKey();
-      TypePromoter promoter = e.getValue();
-      if (promoter == null) {
-        if (norms) {
-          fi.setNormValueType(null);
-        } else {
-          fi.setDocValuesType(null);
-        }
+
+    public long getInt(int docID) {
+      final int doc = ensureSource(docID);
+      return current.getInt(doc);
+    }
+
+    private final int ensureSource(int docID) {
+      if (docID >= start && docID < start+numDocs) {
+        return docID - start;
       } else {
-        assert promoter != TypePromoter.getIdentityPromoter();
-        if (norms) {
-          if (fi.getNormType() != promoter.type() && !fi.omitsNorms()) {
-            // reset the type if we got promoted
-            fi.setNormValueType(promoter.type());
-          }  
-        } else {
-          if (fi.getDocValuesType() != promoter.type()) {
-            // reset the type if we got promoted
-            fi.setDocValuesType(promoter.type());
+        final int idx = ReaderUtil.subIndex(docID, starts);
+        assert idx >= 0 && idx < slices.length : "idx was " + idx
+            + " for doc id: " + docID + " slices : " + Arrays.toString(starts);
+        assert slices[idx] != null;
+        try {
+          if (direct) {
+            current = slices[idx].docValues.getDirectSource();
+          } else {
+            current = slices[idx].docValues.getSource();
           }
+        } catch (IOException e) {
+          throw new RuntimeException("load failed", e); // TODO how should we
+          // handle this
         }
+
+        start = slices[idx].start;
+        numDocs = slices[idx].length;
+        return docID - start;
       }
     }
-  }
 
-
-  /**
-   *
-   * @return The number of documents in all of the readers
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  private int mergeFields() throws IOException {
-    final StoredFieldsWriter fieldsWriter = codec.storedFieldsFormat().fieldsWriter(directory, mergeState.segmentInfo, context);
-    
-    try {
-      return fieldsWriter.merge(mergeState);
-    } finally {
-      fieldsWriter.close();
-    }
-  }
-
-  /**
-   * Merge the TermVectors from each of the segments into the new one.
-   * @throws IOException
-   */
-  private final int mergeVectors() throws IOException {
-    final TermVectorsWriter termVectorsWriter = codec.termVectorsFormat().vectorsWriter(directory, mergeState.segmentInfo, context);
-    
-    try {
-      return termVectorsWriter.merge(mergeState);
-    } finally {
-      termVectorsWriter.close();
-    }
-  }
-
-  // NOTE: removes any "all deleted" readers from mergeState.readers
-  private int setDocMaps() throws IOException {
-    final int numReaders = mergeState.readers.size();
-
-    // Remap docIDs
-    mergeState.docMaps = new MergeState.DocMap[numReaders];
-    mergeState.docBase = new int[numReaders];
-    mergeState.readerPayloadProcessor = new PayloadProcessorProvider.ReaderPayloadProcessor[numReaders];
-    mergeState.currentPayloadProcessor = new PayloadProcessorProvider.PayloadProcessor[numReaders];
-
-    int docBase = 0;
-
-    int i = 0;
-    while(i < mergeState.readers.size()) {
-
-      final AtomicReader reader = mergeState.readers.get(i);
-
-      mergeState.docBase[i] = docBase;
-      final MergeState.DocMap docMap = MergeState.DocMap.build(reader);
-      mergeState.docMaps[i] = docMap;
-      docBase += docMap.numDocs();
-
-      if (mergeState.payloadProcessorProvider != null) {
-        mergeState.readerPayloadProcessor[i] = mergeState.payloadProcessorProvider.getReaderProcessor(reader);
-      }
-
-      i++;
+    public double getFloat(int docID) {
+      final int doc = ensureSource(docID);
+      return current.getFloat(doc);
     }
 
-    return docBase;
-  }
-
-  private final void mergeTerms(SegmentWriteState segmentWriteState) throws IOException {
-    
-    final List<Fields> fields = new ArrayList<Fields>();
-    final List<ReaderSlice> slices = new ArrayList<ReaderSlice>();
-
-    int docBase = 0;
-
-    for(int readerIndex=0;readerIndex<mergeState.readers.size();readerIndex++) {
-      final AtomicReader reader = mergeState.readers.get(readerIndex);
-      final Fields f = reader.fields();
-      final int maxDoc = reader.maxDoc();
-      if (f != null) {
-        slices.add(new ReaderSlice(docBase, maxDoc, readerIndex));
-        fields.add(f);
-      }
-      docBase += maxDoc;
+    public BytesRef getBytes(int docID, BytesRef bytesRef) {
+      final int doc = ensureSource(docID);
+      return current.getBytes(doc, bytesRef);
     }
 
-    final FieldsConsumer consumer = codec.postingsFormat().fieldsConsumer(segmentWriteState);
-    boolean success = false;
-    try {
-      consumer.merge(mergeState,
-                     new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
-                                     slices.toArray(ReaderSlice.EMPTY_ARRAY)));
-      success = true;
-    } finally {
-      if (success) {
-        IOUtils.close(consumer);
-      } else {
-        IOUtils.closeWhileHandlingException(consumer);
-      }
-    }
-  }
-
-  private void mergePerDoc(SegmentWriteState segmentWriteState) throws IOException {
-      final PerDocConsumer docsConsumer = codec.docValuesFormat()
-          .docsConsumer(new PerDocWriteState(segmentWriteState));
-      assert docsConsumer != null;
-      boolean success = false;
+    @Override
+    public SortedSource asSortedSource() {
       try {
-        docsConsumer.merge(mergeState);
-        success = true;
-      } finally {
-        if (success) {
-          IOUtils.close(docsConsumer);
-        } else {
-          IOUtils.closeWhileHandlingException(docsConsumer);
+        if (type == Type.BYTES_FIXED_SORTED || type == Type.BYTES_VAR_SORTED) {
+          DocValues[] values = new DocValues[slices.length];
+          Comparator<BytesRef> comp = null;
+          for (int i = 0; i < values.length; i++) {
+            values[i] = slices[i].docValues;
+            if (!(values[i] instanceof EmptyDocValues)) {
+              Comparator<BytesRef> comparator = values[i].getDirectSource()
+                  .asSortedSource().getComparator();
+              assert comp == null || comp == comparator;
+              comp = comparator;
+            }
+          }
+          assert comp != null;
+          final int globalNumDocs = globalNumDocs();
+          final MergeContext ctx = SortedBytesMergeUtils.init(type, values,
+              comp, globalNumDocs);
+          List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(
+              docBases(), new MergeState.DocMap[values.length], values, ctx);
+          RecordingBytesRefConsumer consumer = new RecordingBytesRefConsumer(
+              type);
+          final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, consumer,
+              slices);
+          final int[] docToOrd = new int[globalNumDocs];
+          for (SortedSourceSlice slice : slices) {
+            slice.toAbsolutOrds(docToOrd);
+          }
+          return new MultiSortedSource(type, comp, consumer.pagedBytes,
+              ctx.sizePerValues, maxOrd, docToOrd, consumer.ordToOffset);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("load failed", e);
+      }
+      return super.asSortedSource();
+    }
+    
+    private int globalNumDocs() {
+      int docs = 0;
+      for (int i = 0; i < slices.length; i++) {
+        docs += slices[i].length;
+      }
+      return docs;
+    }
+    
+    private int[] docBases() {
+      int[] docBases = new int[slices.length];
+      for (int i = 0; i < slices.length; i++) {
+        docBases[i] = slices[i].start;
+      }
+      return docBases;
+    }
+    
+    public boolean hasArray() {
+      boolean oneRealSource = false;
+      for (DocValuesSlice slice : slices) {
+        try {
+          Source source = slice.docValues.getSource();
+          if (source instanceof EmptySource) {
+            /*
+             * empty source marks a gap in the array skip if we encounter one
+             */
+            continue;
+          }
+          oneRealSource = true;
+          if (!source.hasArray()) {
+            return false;
+          }
+        } catch (IOException e) {
+          throw new RuntimeException("load failed", e);
         }
       }
-  }
-  
-  private void mergeNorms(SegmentWriteState segmentWriteState) throws IOException {
-    final PerDocConsumer docsConsumer = codec.normsFormat()
-        .docsConsumer(new PerDocWriteState(segmentWriteState));
-    assert docsConsumer != null;
-    boolean success = false;
-    try {
-      docsConsumer.merge(mergeState);
-      success = true;
-    } finally {
-      if (success) {
-        IOUtils.close(docsConsumer);
-      } else {
-        IOUtils.closeWhileHandlingException(docsConsumer);
+      return oneRealSource;
+    }
+
+    @Override
+    public Object getArray() {
+      if (!hasArray()) {
+        return null;
+      }
+      try {
+        Class<?> componentType = null;
+        Object[] arrays = new Object[slices.length];
+        int numDocs = 0;
+        for (int i = 0; i < slices.length; i++) {
+          DocValuesSlice slice = slices[i];
+          Source source = slice.docValues.getSource();
+          Object array = null;
+          if (!(source instanceof EmptySource)) {
+            // EmptySource is skipped - marks a gap in the array
+            array = source.getArray();
+          }
+          numDocs += slice.length;
+          if (array != null) {
+            if (componentType == null) {
+              componentType = array.getClass().getComponentType();
+            }
+            assert componentType == array.getClass().getComponentType();
+          }
+          arrays[i] = array;
+        }
+        assert componentType != null;
+        synchronized (this) {
+          if (cachedArray != null) {
+            return cachedArray;
+          }
+          final Object globalArray = Array.newInstance(componentType, numDocs);
+
+          for (int i = 0; i < slices.length; i++) {
+            DocValuesSlice slice = slices[i];
+            if (arrays[i] != null) {
+              assert slice.length == Array.getLength(arrays[i]);
+              System.arraycopy(arrays[i], 0, globalArray, slice.start,
+                  slice.length);
+            }
+          }
+          return cachedArray = globalArray;
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("load failed", e);
       }
     }
   }
+  
+  private static final class RecordingBytesRefConsumer implements SortedBytesMergeUtils.BytesRefConsumer {
+    private final static int PAGED_BYTES_BITS = 15;
+    final PagedBytes pagedBytes = new PagedBytes(PAGED_BYTES_BITS);
+    long[] ordToOffset;
+    
+    public RecordingBytesRefConsumer(Type type) {
+      ordToOffset = type == Type.BYTES_VAR_SORTED ? new long[2] : null;
+    }
+    @Override
+    public void consume(BytesRef ref, int ord, long offset) {
+      pagedBytes.copy(ref);
+      if (ordToOffset != null) {
+        if (ord+1 >= ordToOffset.length) {
+          ordToOffset = ArrayUtil.grow(ordToOffset, ord + 2);
+        }
+        ordToOffset[ord+1] = offset;
+      }
+    }
+    
+  }
+  
+  private static final class MultiSortedSource extends SortedSource {
+    private final PagedBytes.Reader data;
+    private final int[] docToOrd;
+    private final long[] ordToOffset;
+    private int size;
+    private int valueCount;
+    public MultiSortedSource(Type type, Comparator<BytesRef> comparator, PagedBytes pagedBytes, int size, int numValues, int[] docToOrd, long[] ordToOffset) {
+      super(type, comparator);
+      data = pagedBytes.freeze(true);
+      this.size = size;
+      this.valueCount = numValues;
+      this.docToOrd = docToOrd;
+      this.ordToOffset = ordToOffset;
+    }
+
+    @Override
+    public int ord(int docID) {
+      return docToOrd[docID];
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      int size = this.size;
+      long offset = (ord*size);
+      if (ordToOffset != null) {
+        offset =  ordToOffset[ord];
+        size = (int) (ordToOffset[1 + ord] - offset);
+      }
+      assert size >=0;
+      return data.fillSlice(bytesRef, offset, size);
+     }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return valueCount;
+    }
+  }
+
+  // TODO: this is dup of DocValues.getDefaultSource()?
+  private static class EmptySource extends SortedSource {
+
+    public EmptySource(Type type) {
+      super(type, BytesRef.getUTF8SortedAsUnicodeComparator());
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.length = 0;
+      return ref;
+    }
+
+    @Override
+    public double getFloat(int docID) {
+      return 0d;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return 0;
+    }
+
+    @Override
+    public SortedSource asSortedSource() {
+      if (getType() == Type.BYTES_FIXED_SORTED || getType() == Type.BYTES_VAR_SORTED) {
+        
+      }
+      return super.asSortedSource();
+    }
+
+    @Override
+    public int ord(int docID) {
+      return 0;
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.length = 0;
+      bytesRef.offset = 0;
+      return bytesRef;
+    }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return 1;
+    }
+    
+  }
+  
+  private static class EmptyFixedSource extends EmptySource {
+    private final int valueSize;
+    private final byte[] valueArray;
+    public EmptyFixedSource(Type type, int valueSize) {
+      super(type);
+      this.valueSize = valueSize;
+      valueArray = new byte[valueSize];
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.grow(valueSize);
+      ref.length = valueSize;
+      Arrays.fill(ref.bytes, ref.offset, ref.offset+valueSize, (byte)0);
+      return ref;
+    }
+
+    @Override
+    public double getFloat(int docID) {
+      return 0d;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return 0;
+    }
+    
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.bytes = valueArray;
+      bytesRef.length = valueSize;
+      bytesRef.offset = 0;
+      return bytesRef;
+    }
+  }
+
+  @Override
+  public Type getType() {
+    return type;
+  }
+
+  @Override
+  public int getValueSize() {
+    return valueSize;
+  }
+
+  @Override
+  public Source getDirectSource() throws IOException {
+    return new MultiSource(slices, starts, true, type);
+  }
+  
+  
 }

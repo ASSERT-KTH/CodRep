@@ -1,4 +1,4 @@
-import static org.jboss.as.jdr.logger.JdrLogger.ROOT_LOGGER;
+import org.wildfly.security.manager.action.GetAccessControlContextAction;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -21,142 +21,184 @@ import static org.jboss.as.jdr.logger.JdrLogger.ROOT_LOGGER;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.jboss.as.jdr.util;
 
-import org.jboss.as.jdr.commands.JdrEnvironment;
-import org.jboss.vfs.VirtualFile;
+package org.jboss.as.host.controller;
 
-import java.io.ByteArrayInputStream;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipException;
-import java.util.zip.ZipOutputStream;
+import static java.security.AccessController.doPrivileged;
+import static org.jboss.as.host.controller.HostControllerMessages.MESSAGES;
 
-import static org.jboss.as.jdr.JdrLogger.ROOT_LOGGER;
+import javax.net.SocketFactory;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.util.Map;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+import org.jboss.as.process.ProcessControllerClient;
+import org.jboss.as.process.ProcessInfo;
+import org.jboss.as.process.ProcessMessageHandler;
+import org.jboss.as.process.protocol.ProtocolClient;
+import org.jboss.as.protocol.StreamUtils;
+import org.wildfly.security.manager.GetAccessControlContextAction;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.threads.JBossThreadFactory;
 
 /**
- * Abstracts the zipfile used for packaging the JDR Report.
+ * Provides a client for interacting with the process controller.
+ *
+ * @author Emanuel Muckenhuber
  */
-public class JdrZipFile {
+class ProcessControllerConnectionService implements Service<ProcessControllerConnectionService> {
 
-    ZipOutputStream zos;
-    String jbossHome;
-    JdrEnvironment env;
-    String name;
-    String baseName;
+    static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("host", "controller", "process-controller-connection");
 
-    public JdrZipFile(JdrEnvironment env) throws Exception {
-        this.env = env;
-        this.jbossHome = this.env.getJbossHome();
-        SimpleDateFormat fmt = new SimpleDateFormat("yy-MM-dd_hh-mm-ss");
-        baseName = "jdr_" + fmt.format(new Date());
+    private final HostControllerEnvironment environment;
+    private final byte[] authCode;
+    private volatile ProcessControllerClient client;
+    private volatile ServerInventory serverInventory;
 
-        if (this.env.getHostControllerName() != null) {
-            this.baseName += "." + this.env.getHostControllerName();
-        }
+    private static final int WORK_QUEUE_SIZE = 256;
+    private static final int THREAD_POOL_CORE_SIZE = 1;
+    private static final int THREAD_POOL_MAX_SIZE = 4;
 
-        if (this.env.getServerName() != null) {
-            this.baseName += "_" + this.env.getServerName();
-        }
-
-        this.name = this.env.getOutputDirectory() +
-                java.io.File.separator +
-                baseName + ".zip";
-
-        zos = new ZipOutputStream(new FileOutputStream(this.name));
+    ProcessControllerConnectionService(final HostControllerEnvironment environment, final byte[] authCode) {
+        this.environment = environment;
+        this.authCode = authCode;
     }
 
-    /**
-     * @return the full pathname to the zipfile on disk
-     */
-    public String name() {
-        return this.name;
+    void setServerInventory(ServerInventory serverInventory) {
+        this.serverInventory = serverInventory;
     }
 
-    /**
-     * Adds the contents of the {@link InputStream} to the path in the zip.
-     *
-     * This method allows for absolute control of the destination of the content to be stored.
-     * It is not common to use this method.
-     * @param is content to write
-     * @param path destination to write to in the zip file
-     */
-    public void add(InputStream is, String path) {
-        byte [] buffer = new byte[1024];
-
+    /** {@inheritDoc} */
+    @Override
+    public synchronized void start(StartContext context) throws StartException {
+        final ProcessControllerClient client;
         try {
-            String entryName = this.baseName + "/" + path;
-            ZipEntry ze = new ZipEntry(entryName);
-            zos.putNextEntry(ze);
-            int bytesRead = is.read(buffer);
-            while( bytesRead > -1 ) {
-                zos.write(buffer, 0, bytesRead);
-                bytesRead = is.read(buffer);
-            }
+            final ThreadFactory threadFactory = new JBossThreadFactory(new ThreadGroup("ProcessControllerConnection-thread"), Boolean.FALSE, null, "%G - %t", null, null, doPrivileged(GetAccessControlContextAction.getInstance()));
+            final ThreadPoolExecutor executorService = new ThreadPoolExecutor(THREAD_POOL_CORE_SIZE, THREAD_POOL_MAX_SIZE, 30L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(WORK_QUEUE_SIZE), threadFactory);
+
+            final ProtocolClient.Configuration configuration = new ProtocolClient.Configuration();
+            configuration.setReadExecutor(executorService);
+            configuration.setServerAddress(new InetSocketAddress(environment.getProcessControllerAddress(), environment.getProcessControllerPort().intValue()));
+            configuration.setBindAddress(new InetSocketAddress(environment.getHostControllerAddress(), environment.getHostControllerPort()));
+            configuration.setThreadFactory(threadFactory);
+            configuration.setSocketFactory(SocketFactory.getDefault());
+            client = ProcessControllerClient.connect(configuration, authCode, new ProcessMessageHandler() {
+                @Override
+                public void handleProcessAdded(final ProcessControllerClient client, final String processName) {
+                    if (serverInventory == null){
+                        throw MESSAGES.noServerInventory();
+                    }
+                    if(ManagedServer.isServerProcess(processName)) {
+                        serverInventory.serverProcessAdded(processName);
+                    }
+                }
+
+                @Override
+                public void handleProcessStarted(final ProcessControllerClient client, final String processName) {
+                    if (serverInventory == null){
+                        throw MESSAGES.noServerInventory();
+                    }
+                    if(ManagedServer.isServerProcess(processName)) {
+                        serverInventory.serverProcessStarted(processName);
+                    }
+                }
+
+                @Override
+                public void handleProcessStopped(final ProcessControllerClient client, final String processName, final long uptimeMillis) {
+                    if (serverInventory == null){
+                        throw MESSAGES.noServerInventory();
+                    }
+                    if(ManagedServer.isServerProcess(processName)) {
+                        serverInventory.serverProcessStopped(processName);
+                    }
+                }
+
+                @Override
+                public void handleProcessRemoved(final ProcessControllerClient client, final String processName) {
+                    if (serverInventory == null){
+                        throw MESSAGES.noServerInventory();
+                    }
+                    if(ManagedServer.isServerProcess(processName)) {
+                        serverInventory.serverProcessRemoved(processName);
+                    }
+                }
+
+                @Override
+                public void handleProcessInventory(final ProcessControllerClient client, final Map<String, ProcessInfo> inventory) {
+                    if (serverInventory == null){
+                        throw MESSAGES.noServerInventory();
+                    }
+                    serverInventory.processInventory(inventory);
+                }
+
+                @Override
+                public void handleConnectionShutdown(final ProcessControllerClient client) {
+                    if(serverInventory == null) {
+                        return;
+                    }
+                    serverInventory.connectionFinished();
+                }
+
+                @Override
+                public void handleConnectionFailure(final ProcessControllerClient client, final IOException cause) {
+                    if(serverInventory == null) {
+                        return;
+                    }
+                    serverInventory.connectionFinished();
+                }
+
+                @Override
+                public void handleConnectionFinished(final ProcessControllerClient client) {
+                    if(serverInventory == null) {
+                        return;
+                    }
+                    serverInventory.connectionFinished();
+                }
+
+                @Override
+                public void handleOperationFailed(ProcessControllerClient client, OperationType operation, String processName) {
+                    if (serverInventory == null){
+                        throw MESSAGES.noServerInventory();
+                    }
+                    if(ManagedServer.isServerProcess(processName)) {
+                        serverInventory.operationFailed(processName, operation);
+                    }
+                }
+            });
+        } catch(IOException e) {
+            throw new StartException(e);
         }
-        catch (ZipException ze) {
-            ROOT_LOGGER.debugf(ze, "%s is already in the zip", path);
+        this.client = client;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public synchronized void stop(StopContext context) {
+        final ProcessControllerClient client = this.client;
+        this.client = null;
+        StreamUtils.safeClose(client);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public synchronized ProcessControllerConnectionService getValue() throws IllegalStateException, IllegalArgumentException {
+        return this;
+    }
+
+    public synchronized ProcessControllerClient getClient() throws IllegalStateException, IllegalArgumentException {
+        final ProcessControllerClient client = this.client;
+        if(client == null) {
+            throw new IllegalStateException();
         }
-        catch (Exception e) {
-            ROOT_LOGGER.debugf(e, "Error when adding %s", path);
-        }
-        finally {
-            try {
-                zos.closeEntry();
-            }
-            catch (Exception e) {
-                ROOT_LOGGER.debugf(e, "Error when closing entry for %s", path);
-            }
-        }
+        return client;
     }
 
-    /**
-     * Adds the content of the {@link InputStream} to the zip in a location that mirrors where {@link VirtualFile file} is located.
-     *
-     * For example if {@code file} is at {@code /tmp/foo/bar} and {@code $JBOSS_HOME} is {@code tmp} then the destination will be {@code JBOSSHOME/foo/bar}
-     *
-     * @param file {@link VirtualFile} where metadata is read from
-     * @param is content to write to the zip file
-     * @throws Exception
-     */
-    public void add(VirtualFile file, InputStream is) throws Exception {
-        String name = "JBOSS_HOME" + file.getPathName().substring(this.jbossHome.length());
-        this.add(is, name);
-    }
-
-    /**
-     * Adds content to the zipfile at path
-     *
-     * path is prepended with the directory reserved for generated text files in JDR
-     *
-     * @param content
-     * @param path
-     * @throws Exception
-     */
-    public void add(String content, String path) throws Exception {
-        String name = "sos_strings/as7/" + path;
-        this.add(new ByteArrayInputStream(content.getBytes()), name);
-    }
-
-
-    /**
-     * Adds content to the zipfile in a file named logName
-     *
-     * path is prepended with the directory reserved for JDR log files
-     *
-     * @param content
-     * @param logName
-     * @throws Exception
-     */
-    public void addLog(String content, String logName) throws Exception {
-        String name = "sos_logs/" + logName;
-        this.add(new ByteArrayInputStream(content.getBytes()), name);
-    }
-
-    public void close() throws Exception {
-        this.zos.close();
-    }
 }

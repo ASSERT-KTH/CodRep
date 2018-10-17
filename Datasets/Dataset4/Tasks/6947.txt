@@ -1,4 +1,4 @@
-package org.elasticsearch.common.transport;
+logger.debug("Using [" + type() + "] filter cache with reader_cleaner_schedule[{}]", readerCleanerSchedule);
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,86 +19,110 @@ package org.elasticsearch.common.transport;
  * under the License.
  */
 
-package org.elasticsearch.util.transport;
+package org.elasticsearch.index.cache.filter.support;
 
-import org.elasticsearch.util.io.stream.StreamInput;
-import org.elasticsearch.util.io.stream.StreamOutput;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.Filter;
+import org.elasticsearch.index.AbstractIndexComponent;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.cache.filter.FilterCache;
+import org.elasticsearch.index.settings.IndexSettings;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.util.TimeValue;
+import org.elasticsearch.util.settings.Settings;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
+import java.util.Iterator;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Future;
+
+import static org.elasticsearch.util.concurrent.ConcurrentMaps.*;
+import static org.elasticsearch.util.lucene.docidset.DocIdSets.*;
 
 /**
- * A transport address used for IP socket address (wraps {@link java.net.InetSocketAddress}).
- *
- * @author kimchy (shay.banon)
+ * @author kimchy (Shay Banon)
  */
-public class InetSocketTransportAddress implements TransportAddress {
+public abstract class AbstractConcurrentMapFilterCache extends AbstractIndexComponent implements FilterCache {
 
-    private InetSocketAddress address;
+    private final ConcurrentMap<IndexReader, ConcurrentMap<Filter, DocIdSet>> cache;
 
-    InetSocketTransportAddress() {
+    private final TimeValue readerCleanerSchedule;
 
+    private final Future scheduleFuture;
+
+    protected AbstractConcurrentMapFilterCache(Index index, @IndexSettings Settings indexSettings, ThreadPool threadPool) {
+        super(index, indexSettings);
+
+        this.readerCleanerSchedule = componentSettings.getAsTime("reader_cleaner_schedule", TimeValue.timeValueMinutes(1));
+
+        logger.debug("Using [" + type() + "] filter cache with readerCleanerSchedule [{}]", readerCleanerSchedule);
+
+        this.cache = newConcurrentMap();
+        this.scheduleFuture = threadPool.scheduleWithFixedDelay(new IndexReaderCleaner(), readerCleanerSchedule);
     }
 
-    public InetSocketTransportAddress(String hostname, int port) {
-        this(new InetSocketAddress(hostname, port));
+    @Override public void close() {
+        scheduleFuture.cancel(false);
+        cache.clear();
     }
 
-    public InetSocketTransportAddress(InetAddress address, int port) {
-        this(new InetSocketAddress(address, port));
+    @Override public void clear() {
+        cache.clear();
     }
 
-    public InetSocketTransportAddress(InetSocketAddress address) {
-        this.address = address;
+    @Override public Filter cache(Filter filterToCache) {
+        return new FilterCacheFilterWrapper(filterToCache);
     }
 
-    public static InetSocketTransportAddress readInetSocketTransportAddress(StreamInput in) throws IOException {
-        InetSocketTransportAddress address = new InetSocketTransportAddress();
-        address.readFrom(in);
-        return address;
-    }
-
-    @Override public short uniqueAddressTypeId() {
-        return 1;
-    }
-
-    public InetSocketAddress address() {
-        return this.address;
-    }
-
-    @Override public void readFrom(StreamInput in) throws IOException {
-        address = new InetSocketAddress(in.readUTF(), in.readInt());
-    }
-
-    @Override public void writeTo(StreamOutput out) throws IOException {
-        // prefer host address if possible, better than hostname (for example, on rackspace cloud)
-        if (address.getAddress() != null) {
-            if (address.getAddress().getHostAddress() != null) {
-                out.writeUTF(address.getAddress().getHostAddress());
-            } else {
-                out.writeUTF(address.getHostName());
+    private class IndexReaderCleaner implements Runnable {
+        @Override public void run() {
+            for (Iterator<IndexReader> readerIt = cache.keySet().iterator(); readerIt.hasNext();) {
+                IndexReader reader = readerIt.next();
+                if (reader.getRefCount() <= 0) {
+                    readerIt.remove();
+                }
             }
-        } else {
-            out.writeUTF(address.getHostName());
         }
-        out.writeInt(address.getPort());
     }
 
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        InetSocketTransportAddress address1 = (InetSocketTransportAddress) o;
-        return address.equals(address1.address);
-    }
+    protected abstract ConcurrentMap<Filter, DocIdSet> buildMap();
 
-    @Override
-    public int hashCode() {
-        return address != null ? address.hashCode() : 0;
-    }
+    private class FilterCacheFilterWrapper extends Filter {
 
-    @Override public String toString() {
-        return "inet[" + address + "]";
+        private final Filter filter;
+
+        private FilterCacheFilterWrapper(Filter filter) {
+            this.filter = filter;
+        }
+
+        @Override public DocIdSet getDocIdSet(IndexReader reader) throws IOException {
+            ConcurrentMap<Filter, DocIdSet> cachedFilters = cache.get(reader);
+            if (cachedFilters == null) {
+                cachedFilters = buildMap();
+                cache.putIfAbsent(reader, cachedFilters);
+            }
+            DocIdSet docIdSet = cachedFilters.get(filter);
+            if (docIdSet != null) {
+                return docIdSet;
+            }
+            docIdSet = filter.getDocIdSet(reader);
+            docIdSet = cacheable(reader, docIdSet);
+            cachedFilters.putIfAbsent(filter, docIdSet);
+            return docIdSet;
+        }
+
+        public String toString() {
+            return "FilterCacheFilterWrapper(" + filter + ")";
+        }
+
+        public boolean equals(Object o) {
+            if (!(o instanceof FilterCacheFilterWrapper)) return false;
+            return this.filter.equals(((FilterCacheFilterWrapper) o).filter);
+        }
+
+        public int hashCode() {
+            return filter.hashCode() ^ 0x1117BF25;
+        }
     }
 }

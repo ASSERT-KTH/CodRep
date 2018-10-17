@@ -1,4 +1,4 @@
-precision = Distance.parseDistance(precisionAsString);
+logger.debug("Clear CacheRecycler on index [{}]", service.index());
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,138 +18,174 @@ precision = Distance.parseDistance(precisionAsString);
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.index.fielddata.plain;
 
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.packed.PackedInts;
-import org.apache.lucene.util.packed.PagedMutable;
-import org.elasticsearch.common.geo.GeoPoint;
+package org.elasticsearch.action.admin.indices.cache.clear;
+
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.action.ShardOperationFailedException;
+import org.elasticsearch.action.support.DefaultShardOperationFailedException;
+import org.elasticsearch.action.support.broadcast.BroadcastShardOperationFailedException;
+import org.elasticsearch.action.support.broadcast.TransportBroadcastOperationAction;
+import org.elasticsearch.cache.recycler.CacheRecycler;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.routing.GroupShardsIterator;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.DistanceUnit;
-import org.elasticsearch.common.unit.DistanceUnit.Distance;
-import org.elasticsearch.common.util.BigArrays;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.fielddata.*;
-import org.elasticsearch.index.fielddata.ordinals.Ordinals;
-import org.elasticsearch.index.fielddata.ordinals.Ordinals.Docs;
-import org.elasticsearch.index.fielddata.ordinals.OrdinalsBuilder;
-import org.elasticsearch.index.mapper.FieldMapper;
-import org.elasticsearch.index.mapper.geo.GeoPointFieldMapper;
-import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.indices.fielddata.breaker.CircuitBreakerService;
+import org.elasticsearch.index.mapper.internal.ParentFieldMapper;
+import org.elasticsearch.index.service.IndexService;
+import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.indices.cache.filter.terms.IndicesTermsFilterCache;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
+
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+
+import static com.google.common.collect.Lists.newArrayList;
 
 /**
+ * Indices clear cache action.
  */
-public class GeoPointCompressedIndexFieldData extends AbstractGeoPointIndexFieldData {
+public class TransportClearIndicesCacheAction extends TransportBroadcastOperationAction<ClearIndicesCacheRequest, ClearIndicesCacheResponse, ShardClearIndicesCacheRequest, ShardClearIndicesCacheResponse> {
 
-    private static final String PRECISION_KEY = "precision";
-    private static final Distance DEFAULT_PRECISION_VALUE = new Distance(1, DistanceUnit.CENTIMETERS);
-    private final CircuitBreakerService breakerService;
+    private final IndicesService indicesService;
+    private final IndicesTermsFilterCache termsFilterCache;
+    private final CacheRecycler cacheRecycler;
 
-    public static class Builder implements IndexFieldData.Builder {
-
-        @Override
-        public IndexFieldData<?> build(Index index, @IndexSettings Settings indexSettings, FieldMapper<?> mapper, IndexFieldDataCache cache,
-                                       CircuitBreakerService breakerService) {
-            FieldDataType type = mapper.fieldDataType();
-            final String precisionAsString = type.getSettings().get(PRECISION_KEY);
-            final Distance precision;
-            if (precisionAsString != null) {
-                precision = Distance.parseDistance(precisionAsString, DistanceUnit.METERS);
-            } else {
-                precision = DEFAULT_PRECISION_VALUE;
-            }
-            return new GeoPointCompressedIndexFieldData(index, indexSettings, mapper.names(), mapper.fieldDataType(), cache, precision, breakerService);
-        }
-    }
-
-    private final GeoPointFieldMapper.Encoding encoding;
-
-    public GeoPointCompressedIndexFieldData(Index index, @IndexSettings Settings indexSettings, FieldMapper.Names fieldNames,
-                                            FieldDataType fieldDataType, IndexFieldDataCache cache, Distance precision,
-                                            CircuitBreakerService breakerService) {
-        super(index, indexSettings, fieldNames, fieldDataType, cache);
-        this.encoding = GeoPointFieldMapper.Encoding.of(precision);
-        this.breakerService = breakerService;
+    @Inject
+    public TransportClearIndicesCacheAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
+                                            TransportService transportService, IndicesService indicesService, IndicesTermsFilterCache termsFilterCache,
+                                            CacheRecycler cacheRecycler) {
+        super(settings, threadPool, clusterService, transportService);
+        this.indicesService = indicesService;
+        this.termsFilterCache = termsFilterCache;
+        this.cacheRecycler = cacheRecycler;
     }
 
     @Override
-    public AtomicGeoPointFieldData<ScriptDocValues> loadDirect(AtomicReaderContext context) throws Exception {
-        AtomicReader reader = context.reader();
-
-        Terms terms = reader.terms(getFieldNames().indexName());
-        AtomicGeoPointFieldData data = null;
-        // TODO: Use an actual estimator to estimate before loading.
-        NonEstimatingEstimator estimator = new NonEstimatingEstimator(breakerService.getBreaker());
-        if (terms == null) {
-            data = new Empty(reader.maxDoc());
-            estimator.afterLoad(null, data.getMemorySizeInBytes());
-            return data;
-        }
-        final long initialSize;
-        if (terms.size() >= 0) {
-            initialSize = 1 + terms.size();
-        } else { // codec doesn't expose size
-            initialSize = 1 + Math.min(1 << 12, reader.maxDoc());
-        }
-        final int pageSize = Integer.highestOneBit(BigArrays.PAGE_SIZE_IN_BYTES * 8 / encoding.numBitsPerCoordinate() - 1) << 1;
-        PagedMutable lat = new PagedMutable(initialSize, pageSize, encoding.numBitsPerCoordinate(), PackedInts.COMPACT);
-        PagedMutable lon = new PagedMutable(initialSize, pageSize, encoding.numBitsPerCoordinate(), PackedInts.COMPACT);
-        final float acceptableTransientOverheadRatio = fieldDataType.getSettings().getAsFloat("acceptable_transient_overhead_ratio", OrdinalsBuilder.DEFAULT_ACCEPTABLE_OVERHEAD_RATIO);
-        OrdinalsBuilder builder = new OrdinalsBuilder(terms.size(), reader.maxDoc(), acceptableTransientOverheadRatio);
-        boolean success = false;
-        try {
-            final GeoPointEnum iter = new GeoPointEnum(builder.buildFromTerms(terms.iterator(null)));
-            GeoPoint point;
-            long ord = 0;
-            while ((point = iter.next()) != null) {
-                ++ord;
-                if (lat.size() <= ord) {
-                    final long newSize = BigArrays.overSize(ord + 1);
-                    lat = lat.resize(newSize);
-                    lon = lon.resize(newSize);
-                }
-                lat.set(ord, encoding.encodeCoordinate(point.getLat()));
-                lon.set(ord, encoding.encodeCoordinate(point.getLon()));
-            }
-
-            Ordinals build = builder.build(fieldDataType.getSettings());
-            if (!build.isMultiValued() && CommonSettings.removeOrdsOnSingleValue(fieldDataType)) {
-                Docs ordinals = build.ordinals();
-                int maxDoc = reader.maxDoc();
-                PagedMutable sLat = new PagedMutable(reader.maxDoc(), pageSize, encoding.numBitsPerCoordinate(), PackedInts.COMPACT);
-                PagedMutable sLon = new PagedMutable(reader.maxDoc(), pageSize, encoding.numBitsPerCoordinate(), PackedInts.COMPACT);
-                for (int i = 0; i < maxDoc; i++) {
-                    final long nativeOrdinal = ordinals.getOrd(i);
-                    sLat.set(i, lat.get(nativeOrdinal));
-                    sLon.set(i, lon.get(nativeOrdinal));
-                }
-                FixedBitSet set = builder.buildDocsWithValuesSet();
-                if (set == null) {
-                    data = new GeoPointCompressedAtomicFieldData.Single(encoding, sLon, sLat, reader.maxDoc(), ordinals.getNumOrds());
-                } else {
-                    data = new GeoPointCompressedAtomicFieldData.SingleFixedSet(encoding, sLon, sLat, reader.maxDoc(), set, ordinals.getNumOrds());
-                }
-            } else {
-                if (lat.size() != build.getMaxOrd()) {
-                    lat = lat.resize(build.getMaxOrd());
-                    lon = lon.resize(build.getMaxOrd());
-                }
-                data = new GeoPointCompressedAtomicFieldData.WithOrdinals(encoding, lon, lat, reader.maxDoc(), build);
-            }
-            success = true;
-            return data;
-        } finally {
-            if (success) {
-                estimator.afterLoad(null, data.getMemorySizeInBytes());
-            }
-            builder.close();
-        }
-
+    protected String executor() {
+        return ThreadPool.Names.MANAGEMENT;
     }
 
+    @Override
+    protected String transportAction() {
+        return ClearIndicesCacheAction.NAME;
+    }
+
+    @Override
+    protected ClearIndicesCacheRequest newRequest() {
+        return new ClearIndicesCacheRequest();
+    }
+
+    @Override
+    protected ClearIndicesCacheResponse newResponse(ClearIndicesCacheRequest request, AtomicReferenceArray shardsResponses, ClusterState clusterState) {
+        int successfulShards = 0;
+        int failedShards = 0;
+        List<ShardOperationFailedException> shardFailures = null;
+        for (int i = 0; i < shardsResponses.length(); i++) {
+            Object shardResponse = shardsResponses.get(i);
+            if (shardResponse == null) {
+                // simply ignore non active shards
+            } else if (shardResponse instanceof BroadcastShardOperationFailedException) {
+                failedShards++;
+                if (shardFailures == null) {
+                    shardFailures = newArrayList();
+                }
+                shardFailures.add(new DefaultShardOperationFailedException((BroadcastShardOperationFailedException) shardResponse));
+            } else {
+                successfulShards++;
+            }
+        }
+        return new ClearIndicesCacheResponse(shardsResponses.length(), successfulShards, failedShards, shardFailures);
+    }
+
+    @Override
+    protected ShardClearIndicesCacheRequest newShardRequest() {
+        return new ShardClearIndicesCacheRequest();
+    }
+
+    @Override
+    protected ShardClearIndicesCacheRequest newShardRequest(ShardRouting shard, ClearIndicesCacheRequest request) {
+        return new ShardClearIndicesCacheRequest(shard.index(), shard.id(), request);
+    }
+
+    @Override
+    protected ShardClearIndicesCacheResponse newShardResponse() {
+        return new ShardClearIndicesCacheResponse();
+    }
+
+    @Override
+    protected ShardClearIndicesCacheResponse shardOperation(ShardClearIndicesCacheRequest request) throws ElasticsearchException {
+        IndexService service = indicesService.indexService(request.index());
+        if (service != null) {
+            // we always clear the query cache
+            service.cache().queryParserCache().clear();
+            boolean clearedAtLeastOne = false;
+            if (request.filterCache()) {
+                clearedAtLeastOne = true;
+                service.cache().filter().clear("api");
+                termsFilterCache.clear("api");
+            }
+            if (request.filterKeys() != null && request.filterKeys().length > 0) {
+                clearedAtLeastOne = true;
+                service.cache().filter().clear("api", request.filterKeys());
+                termsFilterCache.clear("api", request.filterKeys());
+            }
+            if (request.fieldDataCache()) {
+                clearedAtLeastOne = true;
+                if (request.fields() == null || request.fields().length == 0) {
+                    service.fieldData().clear();
+                } else {
+                    for (String field : request.fields()) {
+                        service.fieldData().clearField(field);
+                    }
+                }
+            }
+            if (request.recycler()) {
+                logger.info("Clear CacheRecycler on index [{}]", service.index());
+                clearedAtLeastOne = true;
+                // cacheRecycler.clear();
+            }
+            if (request.idCache()) {
+                clearedAtLeastOne = true;
+                service.fieldData().clearField(ParentFieldMapper.NAME);
+            }
+            if (!clearedAtLeastOne) {
+                if (request.fields() != null && request.fields().length > 0) {
+                    // only clear caches relating to the specified fields
+                    for (String field : request.fields()) {
+                        service.fieldData().clearField(field);
+                    }
+                } else {
+                    service.cache().clear("api");
+                    service.fieldData().clear();
+                    termsFilterCache.clear("api");
+                }
+            }
+        }
+        return new ShardClearIndicesCacheResponse(request.index(), request.shardId());
+    }
+
+    /**
+     * The refresh request works against *all* shards.
+     */
+    @Override
+    protected GroupShardsIterator shards(ClusterState clusterState, ClearIndicesCacheRequest request, String[] concreteIndices) {
+        return clusterState.routingTable().allActiveShardsGrouped(concreteIndices, true);
+    }
+
+    @Override
+    protected ClusterBlockException checkGlobalBlock(ClusterState state, ClearIndicesCacheRequest request) {
+        return state.blocks().globalBlockedException(ClusterBlockLevel.METADATA);
+    }
+
+    @Override
+    protected ClusterBlockException checkRequestBlock(ClusterState state, ClearIndicesCacheRequest request, String[] concreteIndices) {
+        return state.blocks().indicesBlockedException(ClusterBlockLevel.METADATA, concreteIndices);
+    }
 
 }

@@ -1,13 +1,14 @@
-List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
+assert delta >= 0: "position=" + position + " lastPosition=" + lastPosition;
+
+package org.apache.lucene.index.codecs.standard;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,106 +19,261 @@ List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(co
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+/** Consumes doc & freq, writing them using the current
+ *  index file format */
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
 import java.io.IOException;
-import java.util.List;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import java.net.InetAddress;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.codecs.PostingsWriterBase;
+import org.apache.lucene.index.codecs.TermStats;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RAMOutputStream;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CodecUtil;
+import org.apache.lucene.util.IOUtils;
 
-import org.apache.log4j.Logger;
+/** @lucene.experimental */
+public final class StandardPostingsWriter extends PostingsWriterBase {
+  final static String CODEC = "StandardPostingsWriterImpl";
+  
+  // Increment version to change it:
+  final static int VERSION_START = 0;
+  final static int VERSION_CURRENT = VERSION_START;
 
-public class ReadVerbHandler implements IVerbHandler
-{
-    protected static class ReadContext
-    {
-        protected ByteArrayInputStream bufIn_;
-        protected DataOutputBuffer bufOut_ = new DataOutputBuffer();
+  IndexOutput freqOut;
+  IndexOutput proxOut;
+  final DefaultSkipListWriter skipListWriter;
+  /** Expert: The fraction of TermDocs entries stored in skip tables,
+   * used to accelerate {@link DocsEnum#advance(int)}.  Larger values result in
+   * smaller indexes, greater acceleration, but fewer accelerable cases, while
+   * smaller values result in bigger indexes, less acceleration and more
+   * accelerable cases. More detailed experiments would be useful here. */
+  static final int DEFAULT_SKIP_INTERVAL = 16;
+  final int skipInterval;
+  
+  /**
+   * Expert: minimum docFreq to write any skip data at all
+   */
+  final int skipMinimum;
+
+  /** Expert: The maximum number of skip levels. Smaller values result in 
+   * slightly smaller indexes, but slower skipping in big posting lists.
+   */
+  final int maxSkipLevels = 10;
+  final int totalNumDocs;
+  IndexOutput termsOut;
+
+  boolean omitTermFreqAndPositions;
+  boolean storePayloads;
+  // Starts a new term
+  long lastFreqStart;
+  long freqStart;
+  long lastProxStart;
+  long proxStart;
+  FieldInfo fieldInfo;
+  int lastPayloadLength;
+  int lastPosition;
+
+  private int pendingCount;
+
+  //private String segment;
+
+  private RAMOutputStream bytesWriter = new RAMOutputStream();
+
+  public StandardPostingsWriter(SegmentWriteState state) throws IOException {
+    this(state, DEFAULT_SKIP_INTERVAL);
+  }
+  
+  public StandardPostingsWriter(SegmentWriteState state, int skipInterval) throws IOException {
+    this.skipInterval = skipInterval;
+    this.skipMinimum = skipInterval; /* set to the same for now */
+    //this.segment = state.segmentName;
+    String fileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, StandardCodec.FREQ_EXTENSION);
+    freqOut = state.directory.createOutput(fileName);
+    boolean success = false;
+    try {
+      if (state.fieldInfos.hasProx()) {
+        // At least one field does not omit TF, so create the
+        // prox file
+        fileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, StandardCodec.PROX_EXTENSION);
+        proxOut = state.directory.createOutput(fileName);
+      } else {
+        // Every field omits TF so we will write no prox file
+        proxOut = null;
+      }
+      
+      totalNumDocs = state.numDocs;
+      
+      skipListWriter = new DefaultSkipListWriter(skipInterval, maxSkipLevels,
+          state.numDocs, freqOut, proxOut);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeSafely(true, freqOut, proxOut);
+      }
     }
+  }
 
-    private static Logger logger_ = Logger.getLogger( ReadVerbHandler.class );
-    /* We use this so that we can reuse the same row mutation context for the mutation. */
-    private static ThreadLocal<ReadVerbHandler.ReadContext> tls_ = new InheritableThreadLocal<ReadVerbHandler.ReadContext>();
+  @Override
+  public void start(IndexOutput termsOut) throws IOException {
+    this.termsOut = termsOut;
+    CodecUtil.writeHeader(termsOut, CODEC, VERSION_CURRENT);
+    termsOut.writeInt(skipInterval);                // write skipInterval
+    termsOut.writeInt(maxSkipLevels);               // write maxSkipLevels
+    termsOut.writeInt(skipMinimum);                 // write skipMinimum
+  }
+
+  @Override
+  public void startTerm() {
+    //System.out.println("StandardW: startTerm seg=" + segment + " pendingCount=" + pendingCount);
+    freqStart = freqOut.getFilePointer();
+    if (proxOut != null) {
+      proxStart = proxOut.getFilePointer();
+      // force first payload to write its length
+      lastPayloadLength = -1;
+    }
+    skipListWriter.resetSkip();
+  }
+
+  // Currently, this instance is re-used across fields, so
+  // our parent calls setField whenever the field changes
+  @Override
+  public void setField(FieldInfo fieldInfo) {
+    //System.out.println("SPW: setField");
+    this.fieldInfo = fieldInfo;
+    omitTermFreqAndPositions = fieldInfo.omitTermFreqAndPositions;
+    storePayloads = fieldInfo.storePayloads;
+    //System.out.println("  set init blockFreqStart=" + freqStart);
+    //System.out.println("  set init blockProxStart=" + proxStart);
+  }
+
+  int lastDocID;
+  int df;
+  
+  /** Adds a new doc in this term.  If this returns null
+   *  then we just skip consuming positions/payloads. */
+  @Override
+  public void startDoc(int docID, int termDocFreq) throws IOException {
+    //System.out.println("StandardW:   startDoc seg=" + segment + " docID=" + docID + " tf=" + termDocFreq);
+
+    final int delta = docID - lastDocID;
     
-    protected static ReadVerbHandler.ReadContext getCurrentReadContext()
-    {
-        return tls_.get();
+    if (docID < 0 || (df > 0 && delta <= 0)) {
+      throw new CorruptIndexException("docs out of order (" + docID + " <= " + lastDocID + " )");
     }
+
+    if ((++df % skipInterval) == 0) {
+      skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength);
+      skipListWriter.bufferSkip(df);
+    }
+
+    assert docID < totalNumDocs: "docID=" + docID + " totalNumDocs=" + totalNumDocs;
+
+    lastDocID = docID;
+    if (omitTermFreqAndPositions) {
+      freqOut.writeVInt(delta);
+    } else if (1 == termDocFreq) {
+      freqOut.writeVInt((delta<<1) | 1);
+    } else {
+      freqOut.writeVInt(delta<<1);
+      freqOut.writeVInt(termDocFreq);
+    }
+
+    lastPosition = 0;
+  }
+
+  /** Add a new position & payload */
+  @Override
+  public void addPosition(int position, BytesRef payload) throws IOException {
+    //System.out.println("StandardW:     addPos pos=" + position + " payload=" + (payload == null ? "null" : (payload.length + " bytes")) + " proxFP=" + proxOut.getFilePointer());
+    assert !omitTermFreqAndPositions: "omitTermFreqAndPositions is true";
+    assert proxOut != null;
+
+    final int delta = position - lastPosition;
     
-    protected static void setCurrentReadContext(ReadVerbHandler.ReadContext readContext)
-    {
-        tls_.set(readContext);
+    assert delta > 0 || position == 0: "position=" + position + " lastPosition=" + lastPosition;            // not quite right (if pos=0 is repeated twice we don't catch it)
+
+    lastPosition = position;
+
+    if (storePayloads) {
+      final int payloadLength = payload == null ? 0 : payload.length;
+
+      if (payloadLength != lastPayloadLength) {
+        lastPayloadLength = payloadLength;
+        proxOut.writeVInt((delta<<1)|1);
+        proxOut.writeVInt(payloadLength);
+      } else {
+        proxOut.writeVInt(delta << 1);
+      }
+
+      if (payloadLength > 0) {
+        proxOut.writeBytes(payload.bytes, payload.offset, payloadLength);
+      }
+    } else {
+      proxOut.writeVInt(delta);
+    }
+  }
+
+  @Override
+  public void finishDoc() {
+  }
+
+  /** Called when we are done adding docs to this term */
+  @Override
+  public void finishTerm(TermStats stats) throws IOException {
+    //System.out.println("StandardW.finishTerm seg=" + segment);
+    assert stats.docFreq > 0;
+
+    // TODO: wasteful we are counting this (counting # docs
+    // for this term) in two places?
+    assert stats.docFreq == df;
+
+    final boolean isFirstTerm = pendingCount == 0;
+    //System.out.println("  isFirstTerm=" + isFirstTerm);
+
+    //System.out.println("  freqFP=" + freqStart);
+    if (isFirstTerm) {
+      bytesWriter.writeVLong(freqStart);
+    } else {
+      bytesWriter.writeVLong(freqStart-lastFreqStart);
+    }
+    lastFreqStart = freqStart;
+
+    if (df >= skipMinimum) {
+      bytesWriter.writeVInt((int) (skipListWriter.writeSkip(freqOut)-freqStart));
     }
 
-    public void doVerb(Message message)
-    {
-        byte[] body = message.getMessageBody();
-        /* Obtain a Read Context from TLS */
-        ReadContext readCtx = tls_.get();
-        if ( readCtx == null )
-        {
-            readCtx = new ReadContext();
-            tls_.set(readCtx);
-        }
-        readCtx.bufIn_ = new ByteArrayInputStream(body);
-
-        try
-        {
-            if (StorageService.instance.isBootstrapMode())
-            {
-                /* Don't service reads! */
-                throw new RuntimeException("Cannot service reads while bootstrapping!");
-            }
-            ReadCommand command = ReadCommand.serializer().deserialize(new DataInputStream(readCtx.bufIn_));
-            Table table = Table.open(command.table);
-            Row row = command.getRow(table);
-            ReadResponse readResponse;
-            if (command.isDigestQuery())
-            {
-                if (logger_.isDebugEnabled())
-                    logger_.debug("digest is " + FBUtilities.bytesToHex(ColumnFamily.digest(row.cf)));
-                readResponse = new ReadResponse(ColumnFamily.digest(row.cf));
-            }
-            else
-            {
-                readResponse = new ReadResponse(row);
-            }
-            readResponse.setIsDigestQuery(command.isDigestQuery());
-            /* serialize the ReadResponseMessage. */
-            readCtx.bufOut_.reset();
-
-            ReadResponse.serializer().serialize(readResponse, readCtx.bufOut_);
-
-            byte[] bytes = new byte[readCtx.bufOut_.getLength()];
-            System.arraycopy(readCtx.bufOut_.getData(), 0, bytes, 0, bytes.length);
-
-            Message response = message.getReply(FBUtilities.getLocalAddress(), bytes);
-            if (logger_.isDebugEnabled())
-              logger_.debug("Read key " + command.key + "; sending response to " + message.getMessageId() + "@" + message.getFrom());
-            MessagingService.instance.sendOneWay(response, message.getFrom());
-
-            /* Do read repair if header of the message says so */
-            if (message.getHeader(ReadCommand.DO_REPAIR) != null)
-            {
-                List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.key);
-                /* Remove the local storage endpoint from the list. */
-                endpoints.remove(FBUtilities.getLocalAddress());
-                if (endpoints.size() > 0 && DatabaseDescriptor.getConsistencyCheck())
-                    StorageService.instance.doConsistencyCheck(row, endpoints, command);
-            }
-        }
-        catch (IOException ex)
-        {
-            throw new RuntimeException(ex);
-        }
+    if (!omitTermFreqAndPositions) {
+      //System.out.println("  proxFP=" + proxStart);
+      if (isFirstTerm) {
+        bytesWriter.writeVLong(proxStart);
+      } else {
+        bytesWriter.writeVLong(proxStart - lastProxStart);
+      }
+      lastProxStart = proxStart;
     }
+     
+    lastDocID = 0;
+    df = 0;
+    pendingCount++;
+  }
+
+  @Override
+  public void flushTermsBlock() throws IOException {
+    //System.out.println("SPW.flushBlock pendingCount=" + pendingCount);
+    termsOut.writeVInt((int) bytesWriter.getFilePointer());
+    bytesWriter.writeTo(termsOut);
+    bytesWriter.reset();
+    pendingCount = 0;
+  }
+
+  @Override
+  public void close() throws IOException {
+    IOUtils.closeSafely(false, freqOut, proxOut);
+  }
 }

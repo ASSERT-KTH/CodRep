@@ -1,4 +1,4 @@
-clusterService.submitStateUpdateTask("indices_store", new ClusterStateNonMasterUpdateTask() {
+public static final AlwaysDistanceBoundingCheck ALWAYS_INSTANCE = new AlwaysDistanceBoundingCheck();
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -19,436 +19,354 @@ clusterService.submitStateUpdateTask("indices_store", new ClusterStateNonMasterU
  * under the License.
  */
 
-package org.elasticsearch.indices.store;
+package org.elasticsearch.common.geo;
 
-import org.apache.lucene.store.StoreRateLimiting;
-import org.elasticsearch.Version;
-import org.elasticsearch.cluster.*;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.routing.IndexRoutingTable;
-import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.common.collect.Tuple;
-import org.elasticsearch.common.component.AbstractComponent;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.io.FileSystemUtils;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.settings.ImmutableSettings;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.ByteSizeUnit;
-import org.elasticsearch.common.unit.ByteSizeValue;
-import org.elasticsearch.env.NodeEnvironment;
-import org.elasticsearch.index.service.IndexService;
-import org.elasticsearch.index.shard.IndexShardState;
-import org.elasticsearch.index.shard.ShardId;
-import org.elasticsearch.index.shard.service.IndexShard;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.node.settings.NodeSettingsService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.*;
+import org.apache.lucene.util.SloppyMath;
+import org.elasticsearch.ElasticsearchIllegalArgumentException;
+import org.elasticsearch.common.unit.DistanceUnit;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.EnumSet;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Locale;
 
 /**
- *
+ * Geo distance calculation.
  */
-public class IndicesStore extends AbstractComponent implements ClusterStateListener {
-
-    public static final String INDICES_STORE_THROTTLE_TYPE = "indices.store.throttle.type";
-    public static final String INDICES_STORE_THROTTLE_MAX_BYTES_PER_SEC = "indices.store.throttle.max_bytes_per_sec";
-
-    public static final String ACTION_SHARD_EXISTS = "internal:index/shard/exists";
-
-    private static final EnumSet<IndexShardState> ACTIVE_STATES = EnumSet.of(IndexShardState.STARTED, IndexShardState.RELOCATED);
-
-    class ApplySettings implements NodeSettingsService.Listener {
+public enum GeoDistance {
+    /**
+     * Calculates distance as points on a plane. Faster, but less accurate than {@link #ARC}.
+     */
+    PLANE() {
         @Override
-        public void onRefreshSettings(Settings settings) {
-            String rateLimitingType = settings.get(INDICES_STORE_THROTTLE_TYPE, IndicesStore.this.rateLimitingType);
-            // try and parse the type
-            StoreRateLimiting.Type.fromString(rateLimitingType);
-            if (!rateLimitingType.equals(IndicesStore.this.rateLimitingType)) {
-                logger.info("updating indices.store.throttle.type from [{}] to [{}]", IndicesStore.this.rateLimitingType, rateLimitingType);
-                IndicesStore.this.rateLimitingType = rateLimitingType;
-                IndicesStore.this.rateLimiting.setType(rateLimitingType);
-            }
+        public double calculate(double sourceLatitude, double sourceLongitude, double targetLatitude, double targetLongitude, DistanceUnit unit) {
+            double px = targetLongitude - sourceLongitude;
+            double py = targetLatitude - sourceLatitude;
+            return Math.sqrt(px * px + py * py) * unit.getDistancePerDegree();
+        }
 
-            ByteSizeValue rateLimitingThrottle = settings.getAsBytesSize(INDICES_STORE_THROTTLE_MAX_BYTES_PER_SEC, IndicesStore.this.rateLimitingThrottle);
-            if (!rateLimitingThrottle.equals(IndicesStore.this.rateLimitingThrottle)) {
-                logger.info("updating indices.store.throttle.max_bytes_per_sec from [{}] to [{}], note, type is [{}]", IndicesStore.this.rateLimitingThrottle, rateLimitingThrottle, IndicesStore.this.rateLimitingType);
-                IndicesStore.this.rateLimitingThrottle = rateLimitingThrottle;
-                IndicesStore.this.rateLimiting.setMaxRate(rateLimitingThrottle);
-            }
+        @Override
+        public double normalize(double distance, DistanceUnit unit) {
+            return distance;
+        }
+
+        @Override
+        public FixedSourceDistance fixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            return new PlaneFixedSourceDistance(sourceLatitude, sourceLongitude, unit);
+        }
+    },
+
+    /**
+     * Calculates distance factor.
+     */
+    FACTOR() {
+        @Override
+        public double calculate(double sourceLatitude, double sourceLongitude, double targetLatitude, double targetLongitude, DistanceUnit unit) {
+            double longitudeDifference = targetLongitude - sourceLongitude;
+            double a = Math.toRadians(90D - sourceLatitude);
+            double c = Math.toRadians(90D - targetLatitude);
+            return (Math.cos(a) * Math.cos(c)) + (Math.sin(a) * Math.sin(c) * Math.cos(Math.toRadians(longitudeDifference)));
+        }
+
+        @Override
+        public double normalize(double distance, DistanceUnit unit) {
+            return Math.cos(distance / unit.getEarthRadius());
+        }
+
+        @Override
+        public FixedSourceDistance fixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            return new FactorFixedSourceDistance(sourceLatitude, sourceLongitude, unit);
+        }
+    },
+    /**
+     * Calculates distance as points on a globe.
+     */
+    ARC() {
+        @Override
+        public double calculate(double sourceLatitude, double sourceLongitude, double targetLatitude, double targetLongitude, DistanceUnit unit) {
+            double x1 = sourceLatitude * Math.PI / 180D;
+            double x2 = targetLatitude * Math.PI / 180D;
+            double h1 = 1D - Math.cos(x1 - x2);
+            double h2 = 1D - Math.cos((sourceLongitude - targetLongitude) * Math.PI / 180D);
+            double h = (h1 + Math.cos(x1) * Math.cos(x2) * h2) / 2;
+            double averageLatitude = (x1 + x2) / 2;
+            double diameter = GeoUtils.earthDiameter(averageLatitude);
+            return unit.fromMeters(diameter * Math.asin(Math.min(1, Math.sqrt(h))));
+        }
+
+        @Override
+        public double normalize(double distance, DistanceUnit unit) {
+            return distance;
+        }
+
+        @Override
+        public FixedSourceDistance fixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            return new ArcFixedSourceDistance(sourceLatitude, sourceLongitude, unit);
+        }
+    },
+    /**
+     * Calculates distance as points on a globe in a sloppy way. Close to the pole areas the accuracy
+     * of this function decreases.
+     */
+    SLOPPY_ARC() {
+
+        @Override
+        public double normalize(double distance, DistanceUnit unit) {
+            return distance;
+        }
+
+        @Override
+        public double calculate(double sourceLatitude, double sourceLongitude, double targetLatitude, double targetLongitude, DistanceUnit unit) {
+            return unit.fromMeters(SloppyMath.haversin(sourceLatitude, sourceLongitude, targetLatitude, targetLongitude) * 1000.0);
+        }
+
+        @Override
+        public FixedSourceDistance fixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            return new SloppyArcFixedSourceDistance(sourceLatitude, sourceLongitude, unit);
+        }
+    };
+
+    /**
+     * Default {@link GeoDistance} function. This method should be used, If no specific function has been selected.
+     * This is an alias for <code>SLOPPY_ARC</code>
+     */
+    public static final GeoDistance DEFAULT = SLOPPY_ARC; 
+    
+    public abstract double normalize(double distance, DistanceUnit unit);
+
+    public abstract double calculate(double sourceLatitude, double sourceLongitude, double targetLatitude, double targetLongitude, DistanceUnit unit);
+
+    public abstract FixedSourceDistance fixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit);
+
+    private static final double MIN_LAT = Math.toRadians(-90d);  // -PI/2
+    private static final double MAX_LAT = Math.toRadians(90d);   //  PI/2
+    private static final double MIN_LON = Math.toRadians(-180d); // -PI
+    private static final double MAX_LON = Math.toRadians(180d);  //  PI
+
+    public static DistanceBoundingCheck distanceBoundingCheck(double sourceLatitude, double sourceLongitude, double distance, DistanceUnit unit) {
+        // angular distance in radians on a great circle
+        double radDist = distance / unit.getEarthRadius();
+
+        double radLat = Math.toRadians(sourceLatitude);
+        double radLon = Math.toRadians(sourceLongitude);
+
+        double minLat = radLat - radDist;
+        double maxLat = radLat + radDist;
+
+        double minLon, maxLon;
+        if (minLat > MIN_LAT && maxLat < MAX_LAT) {
+            double deltaLon = Math.asin(Math.sin(radDist) / Math.cos(radLat));
+            minLon = radLon - deltaLon;
+            if (minLon < MIN_LON) minLon += 2d * Math.PI;
+            maxLon = radLon + deltaLon;
+            if (maxLon > MAX_LON) maxLon -= 2d * Math.PI;
+        } else {
+            // a pole is within the distance
+            minLat = Math.max(minLat, MIN_LAT);
+            maxLat = Math.min(maxLat, MAX_LAT);
+            minLon = MIN_LON;
+            maxLon = MAX_LON;
+        }
+
+        GeoPoint topLeft = new GeoPoint(Math.toDegrees(maxLat), Math.toDegrees(minLon));
+        GeoPoint bottomRight = new GeoPoint(Math.toDegrees(minLat), Math.toDegrees(maxLon));
+        if (minLon > maxLon) {
+            return new Meridian180DistanceBoundingCheck(topLeft, bottomRight);
+        }
+        return new SimpleDistanceBoundingCheck(topLeft, bottomRight);
+    }
+
+    /**
+     * Get a {@link GeoDistance} according to a given name. Valid values are
+     * 
+     * <ul>
+     *     <li><b>plane</b> for <code>GeoDistance.PLANE</code></li>
+     *     <li><b>sloppy_arc</b> for <code>GeoDistance.SLOPPY_ARC</code></li>
+     *     <li><b>factor</b> for <code>GeoDistance.FACTOR</code></li>
+     *     <li><b>arc</b> for <code>GeoDistance.ARC</code></li>
+     * </ul>
+     * 
+     * @param name name of the {@link GeoDistance}
+     * @return a {@link GeoDistance}
+     */
+    public static GeoDistance fromString(String name) {
+        name = name.toLowerCase(Locale.ROOT);
+        if ("plane".equals(name)) {
+            return PLANE;
+        } else if ("arc".equals(name)) {
+            return ARC;
+        } else if ("sloppy_arc".equals(name)) {
+            return SLOPPY_ARC;
+        } else if ("factor".equals(name)) {
+            return FACTOR;
+        }
+        throw new ElasticsearchIllegalArgumentException("No geo distance for [" + name + "]");
+    }
+
+    public static interface FixedSourceDistance {
+
+        double calculate(double targetLatitude, double targetLongitude);
+    }
+
+    public static interface DistanceBoundingCheck {
+
+        boolean isWithin(double targetLatitude, double targetLongitude);
+
+        GeoPoint topLeft();
+
+        GeoPoint bottomRight();
+    }
+
+    public static AlwaysDistanceBoundingCheck ALWAYS_INSTANCE = new AlwaysDistanceBoundingCheck();
+
+    private static class AlwaysDistanceBoundingCheck implements DistanceBoundingCheck {
+        @Override
+        public boolean isWithin(double targetLatitude, double targetLongitude) {
+            return true;
+        }
+
+        @Override
+        public GeoPoint topLeft() {
+            return null;
+        }
+
+        @Override
+        public GeoPoint bottomRight() {
+            return null;
         }
     }
 
+    public static class Meridian180DistanceBoundingCheck implements DistanceBoundingCheck {
 
-    private final NodeEnvironment nodeEnv;
+        private final GeoPoint topLeft;
+        private final GeoPoint bottomRight;
 
-    private final NodeSettingsService nodeSettingsService;
-
-    private final IndicesService indicesService;
-
-    private final ClusterService clusterService;
-    private final TransportService transportService;
-
-    private volatile String rateLimitingType;
-    private volatile ByteSizeValue rateLimitingThrottle;
-    private final StoreRateLimiting rateLimiting = new StoreRateLimiting();
-
-    private final ApplySettings applySettings = new ApplySettings();
-
-    @Inject
-    public IndicesStore(Settings settings, NodeEnvironment nodeEnv, NodeSettingsService nodeSettingsService, IndicesService indicesService,
-                        ClusterService clusterService, TransportService transportService) {
-        super(settings);
-        this.nodeEnv = nodeEnv;
-        this.nodeSettingsService = nodeSettingsService;
-        this.indicesService = indicesService;
-        this.clusterService = clusterService;
-        this.transportService = transportService;
-        transportService.registerHandler(ACTION_SHARD_EXISTS, new ShardActiveRequestHandler());
-
-        // we limit with 20MB / sec by default with a default type set to merge sice 0.90.1
-        this.rateLimitingType = componentSettings.get("throttle.type", StoreRateLimiting.Type.MERGE.name());
-        rateLimiting.setType(rateLimitingType);
-        this.rateLimitingThrottle = componentSettings.getAsBytesSize("throttle.max_bytes_per_sec", new ByteSizeValue(20, ByteSizeUnit.MB));
-        rateLimiting.setMaxRate(rateLimitingThrottle);
-
-        logger.debug("using indices.store.throttle.type [{}], with index.store.throttle.max_bytes_per_sec [{}]", rateLimitingType, rateLimitingThrottle);
-
-        nodeSettingsService.addListener(applySettings);
-        clusterService.addLast(this);
-    }
-
-    IndicesStore() {
-        super(ImmutableSettings.EMPTY);
-        nodeEnv = null;
-        nodeSettingsService = null;
-        indicesService = null;
-        this.clusterService = null;
-        this.transportService = null;
-    }
-
-    public StoreRateLimiting rateLimiting() {
-        return this.rateLimiting;
-    }
-
-    public void close() {
-        nodeSettingsService.removeListener(applySettings);
-        clusterService.remove(this);
-    }
-
-    @Override
-    public void clusterChanged(ClusterChangedEvent event) {
-        if (!event.routingTableChanged()) {
-            return;
-        }
-
-        if (event.state().blocks().disableStatePersistence()) {
-            return;
-        }
-
-        for (IndexRoutingTable indexRoutingTable : event.state().routingTable()) {
-            // Note, closed indices will not have any routing information, so won't be deleted
-            for (IndexShardRoutingTable indexShardRoutingTable : indexRoutingTable) {
-                if (shardCanBeDeleted(event.state(), indexShardRoutingTable)) {
-                    ShardId shardId = indexShardRoutingTable.shardId();
-                    IndexService indexService = indicesService.indexService(shardId.getIndex());
-                    if (indexService == null) {
-                        if (nodeEnv.hasNodeFile()) {
-                            File[] shardLocations = nodeEnv.shardLocations(shardId);
-                            if (FileSystemUtils.exists(shardLocations)) {
-                                deleteShardIfExistElseWhere(event.state(), indexShardRoutingTable);
-                            }
-                        }
-                    } else {
-                        if (!indexService.hasShard(shardId.id())) {
-                            if (indexService.store().canDeleteUnallocated(shardId)) {
-                                deleteShardIfExistElseWhere(event.state(), indexShardRoutingTable);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    boolean shardCanBeDeleted(ClusterState state, IndexShardRoutingTable indexShardRoutingTable) {
-        // a shard can be deleted if all its copies are active, and its not allocated on this node
-        if (indexShardRoutingTable.size() == 0) {
-            // should not really happen, there should always be at least 1 (primary) shard in a
-            // shard replication group, in any case, protected from deleting something by mistake
-            return false;
-        }
-
-        for (ShardRouting shardRouting : indexShardRoutingTable) {
-            // be conservative here, check on started, not even active
-            if (!shardRouting.started()) {
-                return false;
-            }
-
-            // if the allocated or relocation node id doesn't exists in the cluster state  it may be a stale node,
-            // make sure we don't do anything with this until the routing table has properly been rerouted to reflect
-            // the fact that the node does not exists
-            DiscoveryNode node = state.nodes().get(shardRouting.currentNodeId());
-            if (node == null) {
-                return false;
-            }
-            // If all nodes have been upgraded to >= 1.3.0 at some point we get back here and have the chance to
-            // run this api. (when cluster state is then updated)
-            if (node.getVersion().before(Version.V_1_3_0)) {
-                logger.debug("Skip deleting deleting shard instance [{}], a node holding a shard instance is < 1.3.0", shardRouting);
-                return false;
-            }
-            if (shardRouting.relocatingNodeId() != null) {
-                node = state.nodes().get(shardRouting.relocatingNodeId());
-                if (node == null) {
-                    return false;
-                }
-                if (node.getVersion().before(Version.V_1_3_0)) {
-                    logger.debug("Skip deleting deleting shard instance [{}], a node holding a shard instance is < 1.3.0", shardRouting);
-                    return false;
-                }
-            }
-
-            // check if shard is active on the current node or is getting relocated to the our node
-            String localNodeId = state.getNodes().localNode().id();
-            if (localNodeId.equals(shardRouting.currentNodeId()) || localNodeId.equals(shardRouting.relocatingNodeId())) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private void deleteShardIfExistElseWhere(ClusterState state, IndexShardRoutingTable indexShardRoutingTable) {
-        List<Tuple<DiscoveryNode, ShardActiveRequest>> requests = new ArrayList<>(indexShardRoutingTable.size());
-        String indexUUID = state.getMetaData().index(indexShardRoutingTable.shardId().getIndex()).getUUID();
-        ClusterName clusterName = state.getClusterName();
-        for (ShardRouting shardRouting : indexShardRoutingTable) {
-            // Node can't be null, because otherwise shardCanBeDeleted() would have returned false
-            DiscoveryNode currentNode = state.nodes().get(shardRouting.currentNodeId());
-            assert currentNode != null;
-
-            requests.add(new Tuple<>(currentNode, new ShardActiveRequest(clusterName, indexUUID, shardRouting.shardId())));
-            if (shardRouting.relocatingNodeId() != null) {
-                DiscoveryNode relocatingNode = state.nodes().get(shardRouting.relocatingNodeId());
-                assert relocatingNode != null;
-                requests.add(new Tuple<>(relocatingNode, new ShardActiveRequest(clusterName, indexUUID, shardRouting.shardId())));
-            }
-        }
-
-        ShardActiveResponseHandler responseHandler = new ShardActiveResponseHandler(indexShardRoutingTable.shardId(), state, requests.size());
-        for (Tuple<DiscoveryNode, ShardActiveRequest> request : requests) {
-            transportService.sendRequest(request.v1(), ACTION_SHARD_EXISTS, request.v2(), responseHandler);
-        }
-    }
-
-    private class ShardActiveResponseHandler implements TransportResponseHandler<ShardActiveResponse> {
-
-        private final ShardId shardId;
-        private final int expectedActiveCopies;
-        private final ClusterState clusterState;
-        private final AtomicInteger awaitingResponses;
-        private final AtomicInteger activeCopies;
-
-        public ShardActiveResponseHandler(ShardId shardId, ClusterState clusterState, int expectedActiveCopies) {
-            this.shardId = shardId;
-            this.expectedActiveCopies = expectedActiveCopies;
-            this.clusterState = clusterState;
-            this.awaitingResponses = new AtomicInteger(expectedActiveCopies);
-            this.activeCopies = new AtomicInteger();
+        public Meridian180DistanceBoundingCheck(GeoPoint topLeft, GeoPoint bottomRight) {
+            this.topLeft = topLeft;
+            this.bottomRight = bottomRight;
         }
 
         @Override
-        public ShardActiveResponse newInstance() {
-            return new ShardActiveResponse();
+        public boolean isWithin(double targetLatitude, double targetLongitude) {
+            return (targetLatitude >= bottomRight.lat() && targetLatitude <= topLeft.lat()) &&
+                    (targetLongitude >= topLeft.lon() || targetLongitude <= bottomRight.lon());
         }
 
         @Override
-        public void handleResponse(ShardActiveResponse response) {
-            if (response.shardActive) {
-                logger.trace("[{}] exists on node [{}]", shardId, response.node);
-                activeCopies.incrementAndGet();
-            }
-
-            if (awaitingResponses.decrementAndGet() == 0) {
-                allNodesResponded();
-            }
+        public GeoPoint topLeft() {
+            return topLeft;
         }
 
         @Override
-        public void handleException(TransportException exp) {
-            logger.debug("shards active request failed for {}", exp, shardId);
-            if (awaitingResponses.decrementAndGet() == 0) {
-                allNodesResponded();
-            }
+        public GeoPoint bottomRight() {
+            return bottomRight;
+        }
+    }
+
+    public static class SimpleDistanceBoundingCheck implements DistanceBoundingCheck {
+        private final GeoPoint topLeft;
+        private final GeoPoint bottomRight;
+
+        public SimpleDistanceBoundingCheck(GeoPoint topLeft, GeoPoint bottomRight) {
+            this.topLeft = topLeft;
+            this.bottomRight = bottomRight;
         }
 
         @Override
-        public String executor() {
-            return ThreadPool.Names.SAME;
+        public boolean isWithin(double targetLatitude, double targetLongitude) {
+            return (targetLatitude >= bottomRight.lat() && targetLatitude <= topLeft.lat()) &&
+                    (targetLongitude >= topLeft.lon() && targetLongitude <= bottomRight.lon());
         }
 
-        private void allNodesResponded() {
-            if (activeCopies.get() != expectedActiveCopies) {
-                logger.trace("not deleting shard {}, expected {} active copies, but only {} found active copies", shardId, expectedActiveCopies, activeCopies.get());
-                return;
-            }
+        @Override
+        public GeoPoint topLeft() {
+            return topLeft;
+        }
 
-            ClusterState latestClusterState = clusterService.state();
-            if (clusterState.getVersion() != latestClusterState.getVersion()) {
-                logger.trace("not deleting shard {}, the latest cluster state version[{}] is not equal to cluster state before shard active api call [{}]", shardId, latestClusterState.getVersion(), clusterState.getVersion());
-                return;
-            }
+        @Override
+        public GeoPoint bottomRight() {
+            return bottomRight;
+        }
+    }
 
-            clusterService.submitStateUpdateTask("indices_store", new ClusterStateUpdateTask() {
-                @Override
-                public ClusterState execute(ClusterState currentState) throws Exception {
-                    if (clusterState.getVersion() != currentState.getVersion()) {
-                        logger.trace("not deleting shard {}, the update task state version[{}] is not equal to cluster state before shard active api call [{}]", shardId, currentState.getVersion(), clusterState.getVersion());
-                        return currentState;
-                    }
+    public static class PlaneFixedSourceDistance implements FixedSourceDistance {
 
-                    IndexService indexService = indicesService.indexService(shardId.getIndex());
-                    if (indexService == null) {
-                        // not physical allocation of the index, delete it from the file system if applicable
-                        if (nodeEnv.hasNodeFile()) {
-                            File[] shardLocations = nodeEnv.shardLocations(shardId);
-                            if (FileSystemUtils.exists(shardLocations)) {
-                                logger.debug("{} deleting shard that is no longer used", shardId);
-                                FileSystemUtils.deleteRecursively(shardLocations);
-                            }
-                        }
-                    } else {
-                        if (!indexService.hasShard(shardId.id())) {
-                            if (indexService.store().canDeleteUnallocated(shardId)) {
-                                logger.debug("{} deleting shard that is no longer used", shardId);
-                                try {
-                                    indexService.store().deleteUnallocated(shardId);
-                                } catch (Exception e) {
-                                    logger.debug("{} failed to delete unallocated shard, ignoring", e, shardId);
-                                }
-                            }
-                        } else {
-                            // this state is weird, should we log?
-                            // basically, it means that the shard is not allocated on this node using the routing
-                            // but its still physically exists on an IndexService
-                            // Note, this listener should run after IndicesClusterStateService...
-                        }
-                    }
-                    return currentState;
-                }
+        private final double sourceLatitude;
+        private final double sourceLongitude;
+        private final double distancePerDegree;
 
-                @Override
-                public void onFailure(String source, Throwable t) {
-                    logger.error("{} unexpected error during deletion of unallocated shard", t, shardId);
-                }
-            });
+        public PlaneFixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            this.sourceLatitude = sourceLatitude;
+            this.sourceLongitude = sourceLongitude;
+            this.distancePerDegree = unit.getDistancePerDegree();
+        }
+
+        @Override
+        public double calculate(double targetLatitude, double targetLongitude) {
+            double px = targetLongitude - sourceLongitude;
+            double py = targetLatitude - sourceLatitude;
+            return Math.sqrt(px * px + py * py) * distancePerDegree;
+        }
+    }
+
+    public static class FactorFixedSourceDistance implements FixedSourceDistance {
+
+        private final double sourceLongitude;
+
+        private final double a;
+        private final double sinA;
+        private final double cosA;
+
+        public FactorFixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            this.sourceLongitude = sourceLongitude;
+            this.a = Math.toRadians(90D - sourceLatitude);
+            this.sinA = Math.sin(a);
+            this.cosA = Math.cos(a);
+        }
+
+        @Override
+        public double calculate(double targetLatitude, double targetLongitude) {
+            double longitudeDifference = targetLongitude - sourceLongitude;
+            double c = Math.toRadians(90D - targetLatitude);
+            return (cosA * Math.cos(c)) + (sinA * Math.sin(c) * Math.cos(Math.toRadians(longitudeDifference)));
+        }
+    }
+
+    /**
+     * Basic implementation of {@link FixedSourceDistance}. This class keeps the basic parameters for a distance
+     * functions based on a fixed source. Namely latitude, longitude and unit. 
+     */
+    public static abstract class FixedSourceDistanceBase implements FixedSourceDistance {
+        protected final double sourceLatitude;
+        protected final double sourceLongitude;
+        protected final DistanceUnit unit;
+
+        public FixedSourceDistanceBase(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            this.sourceLatitude = sourceLatitude;
+            this.sourceLongitude = sourceLongitude;
+            this.unit = unit;
+        }
+    }
+    
+    public static class ArcFixedSourceDistance extends FixedSourceDistanceBase {
+
+        public ArcFixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            super(sourceLatitude, sourceLongitude, unit);
+        }
+
+        @Override
+        public double calculate(double targetLatitude, double targetLongitude) {
+            return ARC.calculate(sourceLatitude, sourceLongitude, targetLatitude, targetLongitude, unit);
         }
 
     }
 
-    private class ShardActiveRequestHandler extends BaseTransportRequestHandler<ShardActiveRequest> {
+    public static class SloppyArcFixedSourceDistance extends FixedSourceDistanceBase {
 
-        @Override
-        public ShardActiveRequest newInstance() {
-            return new ShardActiveRequest();
+        public SloppyArcFixedSourceDistance(double sourceLatitude, double sourceLongitude, DistanceUnit unit) {
+            super(sourceLatitude, sourceLongitude, unit);
         }
 
         @Override
-        public String executor() {
-            return ThreadPool.Names.SAME;
-        }
-
-        @Override
-        public void messageReceived(ShardActiveRequest request, TransportChannel channel) throws Exception {
-            channel.sendResponse(new ShardActiveResponse(shardActive(request), clusterService.localNode()));
-        }
-
-        private boolean shardActive(ShardActiveRequest request) {
-            ClusterName thisClusterName = clusterService.state().getClusterName();
-            if (!thisClusterName.equals(request.clusterName)) {
-                logger.trace("shard exists request meant for cluster[{}], but this is cluster[{}], ignoring request", request.clusterName, thisClusterName);
-                return false;
-            }
-
-            ShardId shardId = request.shardId;
-            IndexService indexService = indicesService.indexService(shardId.index().getName());
-            if (indexService != null && indexService.indexUUID().equals(request.indexUUID)) {
-                IndexShard indexShard = indexService.shard(shardId.getId());
-                if (indexShard != null) {
-                    return ACTIVE_STATES.contains(indexShard.state());
-                }
-            }
-            return false;
-        }
-    }
-
-    private static class ShardActiveRequest extends TransportRequest {
-
-        private ClusterName clusterName;
-        private String indexUUID;
-        private ShardId shardId;
-
-        ShardActiveRequest() {
-        }
-
-        ShardActiveRequest(ClusterName clusterName, String indexUUID, ShardId shardId) {
-            this.shardId = shardId;
-            this.indexUUID = indexUUID;
-            this.clusterName = clusterName;
-        }
-
-        @Override
-        public void readFrom(StreamInput in) throws IOException {
-            super.readFrom(in);
-            clusterName = ClusterName.readClusterName(in);
-            indexUUID = in.readString();
-            shardId = ShardId.readShardId(in);
-        }
-
-        @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            super.writeTo(out);
-            clusterName.writeTo(out);
-            out.writeString(indexUUID);
-            shardId.writeTo(out);
-        }
-    }
-
-    private static class ShardActiveResponse extends TransportResponse {
-
-        private boolean shardActive;
-        private DiscoveryNode node;
-
-        ShardActiveResponse() {
-        }
-
-        ShardActiveResponse(boolean shardActive, DiscoveryNode node) {
-            this.shardActive = shardActive;
-            this.node = node;
-        }
-
-        @Override
-        public void readFrom(StreamInput in) throws IOException {
-            super.readFrom(in);
-            shardActive = in.readBoolean();
-            node = DiscoveryNode.readNode(in);
-        }
-
-        @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            super.writeTo(out);
-            out.writeBoolean(shardActive);
-            node.writeTo(out);
+        public double calculate(double targetLatitude, double targetLongitude) {
+            return SLOPPY_ARC.calculate(sourceLatitude, sourceLongitude, targetLatitude, targetLongitude, unit);
         }
     }
 }

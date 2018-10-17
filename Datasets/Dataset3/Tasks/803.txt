@@ -1,8 +1,8 @@
-context.stepCompleted();
+final String productName = productConfig.resolveName();
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2011, Red Hat, Inc., and individual contributors
+ * Copyright 2013, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,189 +22,374 @@ context.stepCompleted();
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.connector.subsystems.datasources;
+package org.jboss.as.patching.installation;
 
-import java.sql.Driver;
-import java.util.ArrayList;
+import static org.jboss.as.patching.Constants.ADD_ONS;
+import static org.jboss.as.patching.Constants.LAYERS;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-import org.jboss.as.connector.util.ConnectorServices;
-import org.jboss.as.connector.services.driver.registry.DriverRegistry;
-import org.jboss.as.controller.AbstractAddStepHandler;
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.OperationStepHandler;
-import org.jboss.as.controller.PathAddress;
-import org.jboss.as.controller.ServiceVerificationHandler;
-import org.jboss.as.controller.SimpleAttributeDefinition;
-import org.jboss.as.controller.registry.ManagementResourceRegistration;
-import org.jboss.as.controller.registry.Resource;
-import org.jboss.as.naming.service.NamingService;
-import org.jboss.as.security.service.SubjectFactoryService;
-import org.jboss.dmr.ModelNode;
-import org.jboss.dmr.Property;
-import org.jboss.jca.core.api.connectionmanager.ccm.CachedConnectionManager;
-import org.jboss.jca.core.api.management.ManagementRepository;
-import org.jboss.jca.core.spi.transaction.TransactionIntegration;
-import org.jboss.msc.service.ServiceBuilder;
-import org.jboss.msc.service.ServiceController;
-import org.jboss.msc.service.ServiceName;
-import org.jboss.msc.service.ServiceRegistry;
-import org.jboss.msc.service.ServiceTarget;
-import org.jboss.security.SubjectFactory;
-
-import static org.jboss.as.connector.logging.ConnectorMessages.MESSAGES;
-import static org.jboss.as.connector.subsystems.datasources.Constants.DATASOURCE_DRIVER;
-import static org.jboss.as.connector.subsystems.datasources.Constants.JNDINAME;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
+import org.jboss.as.patching.DirectoryStructure;
+import org.jboss.as.version.ProductConfig;
 
 /**
- * Abstract operation handler responsible for adding a DataSource.
- *
- * @author John Bailey
+ * @author Emanuel Muckenhuber
  */
-public abstract class AbstractDataSourceAdd extends AbstractAddStepHandler {
-
+class LayersFactory {
 
     /**
-     * Overrides superclass method to pass the full {@code Resource} into the runtime handling logic.
+     * Load the available layers.
      *
-     * {@inheritDoc}
+     * @param image             the installed image
+     * @param productConfig     the product config to establish the identity
+     * @param moduleRoots       the module roots
+     * @param bundleRoots       the bundle roots
+     * @return the layers
+     * @throws IOException
      */
-    @Override
-    public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-        final Resource resource = createResource(context);
-        populateModel(context, operation, resource);
-        final ModelNode model = resource.getModel();
+    static InstalledIdentity load(final InstalledImage image, final ProductConfig productConfig, final List<File> moduleRoots, final List<File> bundleRoots) throws IOException {
 
-        if (requiresRuntime(context)) {
-            context.addStep(new OperationStepHandler() {
-                public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-                    final List<ServiceController<?>> controllers = new ArrayList<ServiceController<?>>();
-                    final ServiceVerificationHandler verificationHandler = new ServiceVerificationHandler();
-                    performRuntime(context, operation, resource, model, verificationHandler, controllers);
+        // build the identity information
+        final String productVersion = productConfig.resolveVersion();
+        final String productName = productConfig.getProductName();
+        final Identity identity = new AbstractLazyIdentity() {
+            @Override
+            public String getName() {
+                return productName;
+            }
 
-                    if(requiresRuntimeVerification()) {
-                        context.addStep(verificationHandler, OperationContext.Stage.VERIFY);
-                    }
+            @Override
+            public String getVersion() {
+                return productVersion;
+            }
 
-                    context.completeStep(new OperationContext.RollbackHandler() {
-                        @Override
-                        public void handleRollback(OperationContext context, ModelNode operation) {
-                            rollbackRuntime(context, operation, model, controllers);
-                        }
-                    });
+            @Override
+            public InstalledImage getInstalledImage() {
+                return image;
+            }
+        };
+
+        // Step 1 - gather the installed layers data
+        final InstalledConfiguration conf = createInstalledConfig(image);
+        // Step 2 - process the actual module and bundle roots
+        final ProcessedLayers processedLayers = process(conf, moduleRoots, bundleRoots);
+        final InstalledConfiguration config = processedLayers.getConf();
+
+        // Step 3 - create the actual config objects
+        // Process layers
+        final InstalledIdentityImpl installedIdentity = new InstalledIdentityImpl(identity, image);
+        for (final LayerPathConfig layer : processedLayers.getLayers().values()) {
+            final String name = layer.name;
+            installedIdentity.putLayer(name, createPatchableTarget(name, layer, config.getLayerMetadataDir(name), image));
+        }
+        // Process add-ons
+        for (final LayerPathConfig addOn : processedLayers.getAddOns().values()) {
+            final String name = addOn.name;
+            installedIdentity.putAddOn(name, createPatchableTarget(name, addOn, config.getAddOnMetadataDir(name), image));
+        }
+        return installedIdentity;
+    }
+
+    /**
+     * Process the module and bundle roots and cross check with the installed information.
+     *
+     * @param conf        the installed configuration
+     * @param moduleRoots the module roots
+     * @param bundleRoots the bundle roots
+     * @return the processed layers
+     * @throws IOException
+     */
+    static ProcessedLayers process(final InstalledConfiguration conf, final List<File> moduleRoots, final List<File> bundleRoots) throws IOException {
+        final ProcessedLayers layers = new ProcessedLayers(conf);
+        // Process module roots
+        final LayerPathSetter moduleSetter = new LayerPathSetter() {
+            @Override
+            public boolean setPath(final LayerPathConfig pending, final File root) {
+                if (pending.modulePath == null) {
+                    pending.modulePath = root;
+                    return true;
                 }
-            }, OperationContext.Stage.RUNTIME);
+                return false;
+            }
+        };
+        for (final File moduleRoot : moduleRoots) {
+            processRoot(moduleRoot, layers, moduleSetter);
         }
-        context.completeStep(OperationContext.RollbackHandler.NOOP_ROLLBACK_HANDLER);
+        // Process bundle root
+        final LayerPathSetter bundleSetter = new LayerPathSetter() {
+            @Override
+            public boolean setPath(LayerPathConfig pending, File root) {
+                if (pending.bundlePath == null) {
+                    pending.bundlePath = root;
+                    return true;
+                }
+                return false;
+            }
+        };
+        for (final File bundleRoot : bundleRoots) {
+            processRoot(bundleRoot, layers, bundleSetter);
+        }
+//        if (conf.getInstalledLayers().size() != layers.getLayers().size()) {
+//            throw processingError("processed layers don't match expected %s, but was %s", conf.getInstalledLayers(), layers.getLayers().keySet());
+//        }
+//        if (conf.getInstalledAddOns().size() != layers.getAddOns().size()) {
+//            throw processingError("processed add-ons don't match expected %s, but was %s", conf.getInstalledAddOns(), layers.getAddOns().keySet());
+//        }
+        return layers;
     }
 
     /**
-     * Method is {@code final}, and throws unsupported operation exception to prevent subclasses inadvertently
-     * overridding it.
+     * Process a module or bundle root.
      *
-     * {@inheritDoc}
+     * @param root   the root
+     * @param layers the processed layers
+     * @param setter the bundle or module path setter
+     * @throws IOException
      */
-    @Override
-    protected final void performRuntime(OperationContext context, ModelNode operation, ModelNode model, ServiceVerificationHandler verificationHandler, List<ServiceController<?>> newControllers) throws OperationFailedException {
-        throw new UnsupportedOperationException();
-    }
-
-    private void performRuntime(final OperationContext context, final ModelNode operation, final Resource resource, final ModelNode model,
-                                final ServiceVerificationHandler verificationHandler, final List<ServiceController<?>> controllers) throws OperationFailedException {
-        final ModelNode address = operation.require(OP_ADDR);
-        final String dsName = PathAddress.pathAddress(address).getLastElement().getValue();
-        final String jndiName = model.get(JNDINAME.getName()).asString();
-
-        final ServiceTarget serviceTarget = context.getServiceTarget();
-
-        boolean enabled = false;
-                //!operation.hasDefined(ENABLED.getName()) || operation.get(ENABLED.getName()).asBoolean();
-
-        ModelNode node = DATASOURCE_DRIVER.resolveModelAttribute(context, model);
-
-
-        AbstractDataSourceService dataSourceService = createDataSourceService(dsName);
-
-        final ManagementResourceRegistration registration = context.getResourceRegistrationForUpdate();
-
-        final ServiceName dataSourceServiceName = AbstractDataSourceService.SERVICE_NAME_BASE.append(jndiName);
-        final ServiceBuilder<?> dataSourceServiceBuilder = serviceTarget
-                .addService(dataSourceServiceName, dataSourceService)
-                .addDependency(ConnectorServices.TRANSACTION_INTEGRATION_SERVICE, TransactionIntegration.class,
-                        dataSourceService.getTransactionIntegrationInjector())
-                .addDependency(ConnectorServices.MANAGEMENT_REPOSITORY_SERVICE, ManagementRepository.class,
-                        dataSourceService.getManagementRepositoryInjector())
-                .addDependency(SubjectFactoryService.SERVICE_NAME, SubjectFactory.class,
-                        dataSourceService.getSubjectFactoryInjector())
-                .addDependency(ConnectorServices.JDBC_DRIVER_REGISTRY_SERVICE, DriverRegistry.class,
-                        dataSourceService.getDriverRegistryInjector())
-                .addDependency(ConnectorServices.CCM_SERVICE, CachedConnectionManager.class,
-                        dataSourceService.getCcmInjector())
-                .addDependency(ConnectorServices.IDLE_REMOVER_SERVICE)
-                .addDependency(ConnectorServices.CONNECTION_VALIDATOR_SERVICE)
-                .addDependency(NamingService.SERVICE_NAME);
-
-        dataSourceServiceBuilder.addListener(new DataSourceStatisticsListener(registration, resource, dsName));
-        startConfigAndAddDependency(dataSourceServiceBuilder, dataSourceService, dsName, serviceTarget, operation, verificationHandler);
-
-        final String driverName = node.asString();
-        final ServiceName driverServiceName = ServiceName.JBOSS.append("jdbc-driver", driverName.replaceAll("\\.", "_"));
-        if (!context.isBooting()) {
-            final ServiceRegistry registry = context.getServiceRegistry(true);
-            final ServiceController<?> dataSourceController = registry.getService(driverServiceName);
-
-            if (driverServiceName != null && dataSourceController != null) {
-                dataSourceServiceBuilder.addDependency(driverServiceName, Driver.class,
-                        dataSourceService.getDriverInjector());
-            } else {
-                throw new OperationFailedException(MESSAGES.driverNotPresent(driverName));
+    static void processRoot(final File root, final ProcessedLayers layers, final LayerPathSetter setter) throws IOException {
+        final LayersConfig layersConfig = LayersConfig.getLayersConfig(root);
+        // Process layers
+        final File layersDir = new File(root, layersConfig.getLayersPath());
+        if (!layersDir.exists()) {
+            if (layersConfig.isConfigured()) {
+                // Bad config from user
+                throw processingError("No layers directory found at " + layersDir);
             }
+            // else this isn't a root that has layers and add-ons
         } else {
-            dataSourceServiceBuilder.addDependency(driverServiceName, Driver.class,
-                    dataSourceService.getDriverInjector());
-        }
-
-        dataSourceServiceBuilder.setInitialMode(ServiceController.Mode.NEVER);
-
-        controllers.add(dataSourceServiceBuilder.install());
-
-    }
-
-    static String cleanupJavaContext(String jndiName) {
-        String bindName;
-        if (jndiName.startsWith("java:/")) {
-            bindName = jndiName.substring(6);
-        } else if(jndiName.startsWith("java:")) {
-            bindName = jndiName.substring(5);
-        } else {
-            bindName = jndiName;
-        }
-        return bindName;
-    }
-
-    protected abstract void startConfigAndAddDependency(ServiceBuilder<?> dataSourceServiceBuilder,
-            AbstractDataSourceService dataSourceService, String jndiName, ServiceTarget serviceTarget, final ModelNode operation, final ServiceVerificationHandler serviceVerificationHandler)
-            throws OperationFailedException;
-
-    protected abstract void populateModel(final ModelNode operation, final ModelNode model) throws OperationFailedException;
-
-    protected abstract AbstractDataSourceService createDataSourceService(final String jndiName) throws OperationFailedException;
-
-    static void populateAddModel(final ModelNode operation, final ModelNode modelNode,
-            final String connectionPropertiesProp, final SimpleAttributeDefinition[] attributes) throws OperationFailedException {
-        if (operation.hasDefined(connectionPropertiesProp)) {
-
-            for (Property property : operation.get(connectionPropertiesProp).asPropertyList()) {
-                modelNode.get(connectionPropertiesProp, property.getName()).set(property.getValue().asString());
+            // check for a valid layer configuration
+            for (final String layer : layersConfig.getLayers()) {
+                File layerDir = new File(layersDir, layer);
+                if (!layerDir.exists()) {
+                    if (layersConfig.isConfigured()) {
+                        // Bad config from user
+                        throw processingError("Cannot find layer '%s' under directory %s", layer, layersDir);
+                    }
+                    // else this isn't a standard layers and add-ons structure
+                    return;
+                }
+                layers.addLayer(layer, layerDir, setter);
             }
         }
-        for (final SimpleAttributeDefinition attribute : attributes) {
-            attribute.validateAndSet(operation, modelNode);
+        // Finally process the add-ons
+        final File addOnsDir = new File(root, layersConfig.getAddOnsPath());
+        final File[] addOnsList = addOnsDir.listFiles();
+        if (addOnsList != null) {
+            for (final File addOn : addOnsList) {
+                layers.addAddOn(addOn.getName(), addOn, setter);
+            }
         }
+    }
 
+    /**
+     * Create the actual patchable target.
+     *
+     * @param name     the layer name
+     * @param layer    the layer path config
+     * @param metadata the metadata location for this target
+     * @param image    the installed image
+     * @return the patchable target
+     * @throws IOException
+     */
+    static AbstractLazyPatchableTarget createPatchableTarget(final String name, final LayerPathConfig layer, final File metadata, final InstalledImage image) throws IOException {
+        // patchable target
+        return new AbstractLazyPatchableTarget() {
+
+            @Override
+            public InstalledImage getInstalledImage() {
+                return image;
+            }
+
+            @Override
+            public File getModuleRoot() {
+                return layer.modulePath;
+            }
+
+            @Override
+            public File getBundleRepositoryRoot() {
+                return layer.bundlePath;
+            }
+
+            public File getPatchesMetadata() {
+                return metadata;
+            }
+
+            @Override
+            public String getName() {
+                return name;
+            }
+        };
+    }
+
+    static class LayerPathConfig {
+
+        File modulePath;
+        File bundlePath;
+
+        final String name;
+
+        LayerPathConfig(String name) {
+            this.name = name;
+        }
+    }
+
+    interface LayerPathSetter {
+
+        /**
+         * Set the path for the layer.
+         *
+         * @param pending the pending layer
+         * @param root    the root
+         * @return {@code true} if the root wasn't set, {@code false} otherwise
+         */
+        boolean setPath(LayerPathConfig pending, File root);
 
     }
 
+    /**
+     * Resolve the installed layers and add-ons.
+     *
+     * @param image the installed image
+     * @return the installed layers
+     */
+    static InstalledConfiguration createInstalledConfig(final InstalledImage image) {
+        final InstalledConfiguration conf = new InstalledConfiguration(image);
+        // Would be nice to have a installed inventory or smth like that
+        return conf;
+    }
+
+    static class ProcessedLayers {
+
+        private final InstalledConfiguration conf;
+        private final Map<String, LayerPathConfig> layers = new LinkedHashMap<String, LayerPathConfig>();
+        private final Map<String, LayerPathConfig> addOns = new LinkedHashMap<String, LayerPathConfig>();
+
+        ProcessedLayers(InstalledConfiguration conf) {
+            this.conf = conf;
+        }
+
+        InstalledConfiguration getConf() {
+            return conf;
+        }
+
+        Map<String, LayerPathConfig> getLayers() {
+            return layers;
+        }
+
+        Map<String, LayerPathConfig> getAddOns() {
+            return addOns;
+        }
+
+        void addLayer(final String name, final File root, final LayerPathSetter setter) {
+//            if (!conf.getInstalledLayers().contains(name)) {
+//                throw processingError("layer '%s' not configured ", name);
+//            }
+            LayerPathConfig pending = layers.get(name);
+            if (pending == null) {
+                pending = new LayerPathConfig(name);
+                layers.put(name, pending);
+            }
+            if (!setter.setPath(pending, root)) {
+                // Already set means duplicate
+                throw processingError("duplicate layer " + name);
+            }
+        }
+
+        void addAddOn(final String name, final File root, LayerPathSetter setter) {
+//            if (!conf.getInstalledAddOns().contains(name)) {
+//                throw processingError("add-on '%s' not configured ", name);
+//            }
+            LayerPathConfig pending = addOns.get(name);
+            if (pending == null) {
+                pending = new LayerPathConfig(name);
+                addOns.put(name, pending);
+            }
+            if (!setter.setPath(pending, root)) {
+                // Already set means duplicate
+                throw processingError("duplicate add-on " + name);
+            }
+        }
+
+    }
+
+    static class InstalledConfiguration {
+
+        final File metadata;
+        final InstalledImage installedImage;
+        final Set<String> installedLayers = new HashSet<String>();
+        final Set<String> installedAddOns = new HashSet<String>();
+
+        InstalledConfiguration(final InstalledImage installedImage) {
+            this.metadata = installedImage.getInstallationMetadata();
+            this.installedImage = installedImage;
+        }
+
+        File getLayersMetadataDir() {
+            return new File(metadata, LAYERS);
+        }
+
+        File getLayerMetadataDir(final String name) {
+            return new File(getLayersMetadataDir(), name);
+        }
+
+        File getAddOnsMetadataDir() {
+            return new File(metadata, ADD_ONS);
+        }
+
+        File getAddOnMetadataDir(final String name) {
+            return new File(getAddOnsMetadataDir(), name);
+        }
+
+        Set<String> getInstalledLayers() {
+            return installedLayers;
+        }
+
+        Set<String> getInstalledAddOns() {
+            return installedAddOns;
+        }
+    }
+
+    static IllegalStateException processingError(final String message, final Object... params) {
+        return new IllegalStateException(String.format(message, params));
+    }
+
+    /**
+     * @author Emanuel Muckenhuber
+     */
+    abstract static class AbstractLazyPatchableTarget extends LayerDirectoryStructure implements Layer, AddOn {
+
+        @Override
+        public DirectoryStructure getDirectoryStructure() {
+            return this;
+        }
+
+        @Override
+        public TargetInfo loadTargetInfo() throws IOException {
+            return LayerInfo.loadTargetInfoFromDisk(getDirectoryStructure());
+        }
+
+    }
+
+    /**
+     * @author Emanuel Muckenhuber
+     */
+    abstract static class AbstractLazyIdentity extends LayerDirectoryStructure.IdentityDirectoryStructure implements Identity {
+
+        @Override
+        public DirectoryStructure getDirectoryStructure() {
+            return this;
+        }
+
+        @Override
+        public TargetInfo loadTargetInfo() throws IOException {
+            return LayerInfo.loadTargetInfoFromDisk(getDirectoryStructure());
+        }
+
+    }
 }

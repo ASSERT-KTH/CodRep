@@ -1,4 +1,4 @@
-package org.jboss.as.test.integration.osgi.simple.bundleB;
+return getDefaultAccessTimeout();
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,25 +22,177 @@ package org.jboss.as.test.integration.osgi.simple.bundleB;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.test.smoke.osgi.bundleB;
+package org.jboss.as.ejb3.component.singleton;
 
-import javax.ejb.Local;
-import javax.ejb.LocalBean;
-import javax.ejb.Remote;
-import javax.ejb.Stateful;
+import org.jboss.as.ee.component.BasicComponentInstance;
+import org.jboss.as.ee.component.Component;
+import org.jboss.as.ejb3.component.EJBBusinessMethod;
+import org.jboss.as.ejb3.component.session.SessionBeanComponent;
+import org.jboss.as.ejb3.concurrency.AccessTimeoutDetails;
+import org.jboss.as.ejb3.concurrency.LockableComponent;
+import org.jboss.as.ejb3.timerservice.SingletonTimedObjectInvokerImpl;
+import org.jboss.as.ejb3.timerservice.spi.TimedObjectInvoker;
+import org.jboss.as.naming.ManagedReference;
+import org.jboss.as.server.CurrentServiceContainer;
+import org.jboss.invocation.Interceptor;
+import org.jboss.invocation.InterceptorFactory;
+import org.jboss.invocation.InterceptorFactoryContext;
+import org.jboss.logging.Logger;
+import org.jboss.msc.service.ServiceController;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.StopContext;
+
+import javax.ejb.LockType;
+import java.lang.reflect.Method;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * @author Thomas.Diesler@jboss.com
- * @since 02-Jul-2012
+ * {@link Component} representing a {@link javax.ejb.Singleton} EJB.
+ *
+ * @author Jaikiran Pai
  */
-@Stateful
-@LocalBean
-@Local(Echo.class)
-@Remote(RemoteEcho.class)
-public class SampleSFSB implements RemoteEcho {
+public class SingletonComponent extends SessionBeanComponent implements LockableComponent {
+
+    private static final Logger logger = Logger.getLogger(SingletonComponent.class);
+
+    private volatile SingletonComponentInstance singletonComponentInstance;
+
+    private final boolean initOnStartup;
+
+    private final Map<String, LockType> beanLevelLockType;
+
+    private final Map<EJBBusinessMethod, LockType> methodLockTypes;
+
+    private final Map<EJBBusinessMethod, AccessTimeoutDetails> methodAccessTimeouts;
+
+    private final List<ServiceName> dependsOn;
+    /**
+     * Construct a new instance.
+     *
+     * @param singletonComponentCreateService
+     *                  the component configuration
+     * @param dependsOn
+     */
+    public SingletonComponent(final SingletonComponentCreateService singletonComponentCreateService, final List<ServiceName> dependsOn) {
+        super(singletonComponentCreateService);
+        this.dependsOn = dependsOn;
+        this.initOnStartup = singletonComponentCreateService.isInitOnStartup();
+
+        this.beanLevelLockType = singletonComponentCreateService.getBeanLockType();
+        this.methodLockTypes = singletonComponentCreateService.getMethodApplicableLockTypes();
+        this.methodAccessTimeouts = singletonComponentCreateService.getMethodApplicableAccessTimeouts();
+    }
 
     @Override
-    public String echo(String msg) {
-        return msg;
+    protected BasicComponentInstance instantiateComponentInstance(AtomicReference<ManagedReference> instanceReference, Interceptor preDestroyInterceptor, Map<Method, Interceptor> methodInterceptors, final InterceptorFactoryContext interceptorContext) {
+        // synchronized from getComponentInstance
+        assert Thread.holdsLock(this);
+        // the race is on right through createInstance where everybody will wait until the component is started
+        if (this.singletonComponentInstance != null) {
+            return this.singletonComponentInstance;
+        }
+        if (dependsOn != null) {
+            for(ServiceName serviceName : dependsOn) {
+                final ServiceController<Component> service = (ServiceController<Component>) CurrentServiceContainer.getServiceContainer().getRequiredService(serviceName);
+                final Component component = service.getValue();
+                if (component instanceof SingletonComponent) {
+                    ((SingletonComponent) component).getComponentInstance();
+                }
+            }
+        }
+        final Map<Method, Interceptor> timeouts;
+        if (timeoutInterceptors != null) {
+            timeouts = new HashMap<Method, Interceptor>();
+            for (Map.Entry<Method, InterceptorFactory> entry : timeoutInterceptors.entrySet()) {
+                timeouts.put(entry.getKey(), entry.getValue().create(interceptorContext));
+            }
+        } else {
+            timeouts = Collections.emptyMap();
+        }
+
+        return new SingletonComponentInstance(this, instanceReference, preDestroyInterceptor, methodInterceptors, timeouts);
+    }
+
+    public SingletonComponentInstance getComponentInstance() {
+        if (this.singletonComponentInstance == null) {
+            synchronized (this) {
+                // no need to check here, createInstance has a wait (on start)
+                this.singletonComponentInstance = (SingletonComponentInstance) this.createInstance();
+            }
+        }
+        return this.singletonComponentInstance;
+    }
+
+    @Override
+    public void start() {
+        super.start();
+        if (this.initOnStartup) {
+            // Do not call createInstance() because we can't ever assume that the singleton instance
+            // hasn't already been created.
+            logger.debug(this.getComponentName() + " bean is a @Startup (a.k.a init-on-startup) bean, creating/getting the singleton instance");
+            this.getComponentInstance();
+        }
+    }
+
+    @Override
+    public void stop(final StopContext stopContext) {
+        this.destroySingletonInstance();
+        super.stop(stopContext);
+    }
+
+    @Override
+    public LockType getLockType(Method method) {
+        final EJBBusinessMethod ejbMethod = new EJBBusinessMethod(method);
+        final LockType lockType = this.methodLockTypes.get(ejbMethod);
+        if (lockType != null) {
+            return lockType;
+        }
+        // check bean level lock type
+        final LockType type = this.beanLevelLockType.get(method.getDeclaringClass().getName());
+        if (type != null) {
+            return type;
+        }
+        // default WRITE lock type
+        return LockType.WRITE;
+    }
+
+    @Override
+    public AccessTimeoutDetails getAccessTimeout(Method method) {
+        final EJBBusinessMethod ejbMethod = new EJBBusinessMethod(method);
+        final AccessTimeoutDetails accessTimeout = this.methodAccessTimeouts.get(ejbMethod);
+        if (accessTimeout != null) {
+            return accessTimeout;
+        }
+        // check bean level access timeout
+        final AccessTimeoutDetails beanTimeout = this.beanLevelAccessTimeout.get(method.getDeclaringClass().getName());
+        if (beanTimeout != null) {
+            return beanTimeout;
+        }
+        //TODO: this should be configurable
+        return new AccessTimeoutDetails(5, TimeUnit.MINUTES);
+    }
+
+    @Override
+    public AccessTimeoutDetails getDefaultAccessTimeout() {
+        // TODO: This has to be configurable.
+        // Currently defaults to 5 minutes
+        return new AccessTimeoutDetails(5, TimeUnit.MINUTES);
+    }
+
+    private synchronized void destroySingletonInstance() {
+        if (this.singletonComponentInstance != null) {
+            singletonComponentInstance.destroy();
+            this.singletonComponentInstance = null;
+        }
+    }
+
+    @Override
+    public TimedObjectInvoker getTimedObjectInvoker() {
+        return new SingletonTimedObjectInvokerImpl(this);
     }
 }

@@ -1,6 +1,8 @@
-solrCore.getUpdateHandler().newIndexWriter(true);
+if (si.getHasVectors()) { // open term vector files only as needed
 
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -16,1249 +18,1356 @@ solrCore.getUpdateHandler().newIndexWriter(true);
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.solr.handler;
 
-import org.apache.commons.io.IOUtils;
-import org.apache.http.client.HttpClient;
-import org.apache.lucene.index.IndexCommit;
-import org.apache.lucene.index.IndexWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldSelector;
+import org.apache.lucene.search.Similarity;
+import org.apache.lucene.store.BufferedIndexInput;
 import org.apache.lucene.store.Directory;
-import org.apache.solr.client.solrj.SolrServer;
-import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.HttpClientUtil;
-import org.apache.solr.client.solrj.impl.HttpSolrServer;
-import org.apache.solr.client.solrj.request.QueryRequest;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.util.FastInputStream;
-import org.apache.solr.util.FileUtils;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.core.CachingDirectoryFactory.CloseListener;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.core.IndexDeletionPolicyWrapper;
-import static org.apache.solr.handler.ReplicationHandler.*;
-
-import org.apache.solr.request.LocalSolrQueryRequest;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.update.CommitUpdateCommand;
-import org.apache.solr.util.RefCounted;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.zip.Adler32;
-import java.util.zip.Checksum;
-import java.util.zip.InflaterInputStream;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.BitVector;
+import org.apache.lucene.util.CloseableThreadLocal;
+import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
 
 /**
- * <p/> Provides functionality of downloading changed index files as well as config files and a timer for scheduling fetches from the
- * master. </p>
- *
- *
- * @since solr 1.4
+ * @lucene.experimental
  */
-public class SnapPuller {
-  private static final Logger LOG = LoggerFactory.getLogger(SnapPuller.class.getName());
+public class SegmentReader extends IndexReader implements Cloneable {
+  protected boolean readOnly;
 
-  private final String masterUrl;
+  private SegmentInfo si;
+  private int readBufferSize;
 
-  private final ReplicationHandler replicationHandler;
+  CloseableThreadLocal<FieldsReader> fieldsReaderLocal = new FieldsReaderLocal();
+  CloseableThreadLocal<TermVectorsReader> termVectorsLocal = new CloseableThreadLocal<TermVectorsReader>();
 
-  private final Integer pollInterval;
+  BitVector deletedDocs = null;
+  AtomicInteger deletedDocsRef = null;
+  private boolean deletedDocsDirty = false;
+  private boolean normsDirty = false;
+  private int pendingDeleteCount;
 
-  private String pollIntervalStr;
+  private boolean rollbackHasChanges = false;
+  private boolean rollbackDeletedDocsDirty = false;
+  private boolean rollbackNormsDirty = false;
+  private SegmentInfo rollbackSegmentInfo;
+  private int rollbackPendingDeleteCount;
 
-  private ScheduledExecutorService executorService;
+  // optionally used for the .nrm file shared by multiple norms
+  private IndexInput singleNormStream;
+  private AtomicInteger singleNormRef;
 
-  private volatile long executorStartTime;
+  CoreReaders core;
 
-  private volatile long replicationStartTime;
+  // Holds core readers that are shared (unchanged) when
+  // SegmentReader is cloned or reopened
+  static final class CoreReaders {
 
-  private final SolrCore solrCore;
+    // Counts how many other reader share the core objects
+    // (freqStream, proxStream, tis, etc.) of this reader;
+    // when coreRef drops to 0, these core objects may be
+    // closed.  A given instance of SegmentReader may be
+    // closed, even those it shares core objects with other
+    // SegmentReaders:
+    private final AtomicInteger ref = new AtomicInteger(1);
 
-  private volatile List<Map<String, Object>> filesToDownload;
+    final String segment;
+    final FieldInfos fieldInfos;
+    final IndexInput freqStream;
+    final IndexInput proxStream;
+    final TermInfosReader tisNoIndex;
 
-  private volatile List<Map<String, Object>> confFilesToDownload;
+    final Directory dir;
+    final Directory cfsDir;
+    final int readBufferSize;
+    final int termsIndexDivisor;
 
-  private volatile List<Map<String, Object>> filesDownloaded;
+    private final SegmentReader origInstance;
 
-  private volatile List<Map<String, Object>> confFilesDownloaded;
+    TermInfosReader tis;
+    FieldsReader fieldsReaderOrig;
+    TermVectorsReader termVectorsReaderOrig;
+    CompoundFileReader cfsReader;
+    CompoundFileReader storeCFSReader;
 
-  private volatile Map<String, Object> currentFile;
+    CoreReaders(SegmentReader origInstance, Directory dir, SegmentInfo si, int readBufferSize, int termsIndexDivisor) throws IOException {
+      segment = si.name;
+      this.readBufferSize = readBufferSize;
+      this.dir = dir;
 
-  private volatile FileFetcher fileFetcher;
+      boolean success = false;
 
-  private volatile ExecutorService fsyncService;
-
-  private volatile boolean stop = false;
-
-  private boolean useInternal = false;
-
-  private boolean useExternal = false;
-
-  /**
-   * Disable the timer task for polling
-   */
-  private AtomicBoolean pollDisabled = new AtomicBoolean(false);
-
-  // HttpClient shared by all cores (used if timeout is not specified for a core)
-  private static HttpClient client;
-  // HttpClient for this instance if connectionTimeout or readTimeout has been specified
-  private final HttpClient myHttpClient;
-
-  private static synchronized HttpClient createHttpClient(String connTimeout, String readTimeout, String httpBasicAuthUser, String httpBasicAuthPassword, boolean useCompression) {
-    if (connTimeout == null && readTimeout == null && client != null)  return client;
-    final ModifiableSolrParams httpClientParams = new ModifiableSolrParams();
-    httpClientParams.set(HttpClientUtil.PROP_CONNECTION_TIMEOUT, connTimeout != null ? connTimeout : "5000");
-    httpClientParams.set(HttpClientUtil.PROP_SO_TIMEOUT, readTimeout != null ? readTimeout : "20000");
-    httpClientParams.set(HttpClientUtil.PROP_BASIC_AUTH_USER, httpBasicAuthUser);
-    httpClientParams.set(HttpClientUtil.PROP_BASIC_AUTH_PASS, httpBasicAuthPassword);
-    httpClientParams.set(HttpClientUtil.PROP_ALLOW_COMPRESSION, useCompression);
-    // Keeping a very high number so that if you have a large number of cores
-    // no requests are kept waiting for an idle connection.
-    httpClientParams.set(HttpClientUtil.PROP_MAX_CONNECTIONS, 10000);
-    httpClientParams.set(HttpClientUtil.PROP_MAX_CONNECTIONS_PER_HOST, 10000);
-    HttpClient httpClient = HttpClientUtil.createClient(httpClientParams);
-    if (client == null && connTimeout == null && readTimeout == null) client = httpClient;
-    return httpClient;
-  }
-
-  public SnapPuller(final NamedList initArgs, final ReplicationHandler handler, final SolrCore sc) {
-    solrCore = sc;
-    final SolrParams params = SolrParams.toSolrParams(initArgs);
-    String masterUrl = (String) initArgs.get(MASTER_URL);
-    if (masterUrl == null)
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-              "'masterUrl' is required for a slave");
-    if (masterUrl.endsWith("/replication")) {
-      masterUrl = masterUrl.substring(0, masterUrl.length()-12);
-      LOG.warn("'masterUrl' must be specified without the /replication suffix");
-    }
-    this.masterUrl = masterUrl;
-    
-    this.replicationHandler = handler;
-    pollIntervalStr = (String) initArgs.get(POLL_INTERVAL);
-    pollInterval = readInterval(pollIntervalStr);
-    String compress = (String) initArgs.get(COMPRESSION);
-    useInternal = INTERNAL.equals(compress);
-    useExternal = EXTERNAL.equals(compress);
-    String connTimeout = (String) initArgs.get(HttpClientUtil.PROP_CONNECTION_TIMEOUT);
-    String readTimeout = (String) initArgs.get(HttpClientUtil.PROP_SO_TIMEOUT);
-    String httpBasicAuthUser = (String) initArgs.get(HttpClientUtil.PROP_BASIC_AUTH_USER);
-    String httpBasicAuthPassword = (String) initArgs.get(HttpClientUtil.PROP_BASIC_AUTH_PASS);
-    myHttpClient = createHttpClient(connTimeout, readTimeout, httpBasicAuthUser, httpBasicAuthPassword, useExternal);
-    if (pollInterval != null && pollInterval > 0) {
-      startExecutorService();
-    } else {
-      LOG.info(" No value set for 'pollInterval'. Timer Task not started.");
-    }
-  }
-
-  private void startExecutorService() {
-    Runnable task = new Runnable() {
-      public void run() {
-        if (pollDisabled.get()) {
-          LOG.info("Poll disabled");
-          return;
-        }
-        try {
-          executorStartTime = System.currentTimeMillis();
-          replicationHandler.doFetch(null, false);
-        } catch (Exception e) {
-          LOG.error("Exception in fetching index", e);
-        }
-      }
-    };
-    executorService = Executors.newSingleThreadScheduledExecutor();
-    long initialDelay = pollInterval - (System.currentTimeMillis() % pollInterval);
-    executorService.scheduleAtFixedRate(task, initialDelay, pollInterval, TimeUnit.MILLISECONDS);
-    LOG.info("Poll Scheduled at an interval of " + pollInterval + "ms");
-  }
-
-  /**
-   * Gets the latest commit version and generation from the master
-   */
-  @SuppressWarnings("unchecked")
-  NamedList getLatestVersion() throws IOException {
-    ModifiableSolrParams params = new ModifiableSolrParams();
-    params.set(COMMAND, CMD_INDEX_VERSION);
-    params.set(CommonParams.WT, "javabin");
-    params.set(CommonParams.QT, "/replication");
-    QueryRequest req = new QueryRequest(params);
-    SolrServer server = new HttpSolrServer(masterUrl, myHttpClient); //XXX modify to use shardhandler
-    try {
-      return server.request(req);
-    } catch (SolrServerException e) {
-      throw new IOException(e);
-    }
-  }
-
-  /**
-   * Fetches the list of files in a given index commit point and updates internal list of files to download.
-   */
-  private void fetchFileList(long gen) throws IOException {
-    ModifiableSolrParams params = new ModifiableSolrParams();
-    params.set(COMMAND,  CMD_GET_FILE_LIST);
-    params.set(GENERATION, String.valueOf(gen));
-    params.set(CommonParams.WT, "javabin");
-    params.set(CommonParams.QT, "/replication");
-    QueryRequest req = new QueryRequest(params);
-    SolrServer server = new HttpSolrServer(masterUrl, myHttpClient);  //XXX modify to use shardhandler
-
-    try {
-      NamedList response = server.request(req);
-
-      List<Map<String, Object>> files = (List<Map<String,Object>>) response.get(CMD_GET_FILE_LIST);
-      if (files != null)
-        filesToDownload = Collections.synchronizedList(files);
-      else {
-        filesToDownload = Collections.emptyList();
-        LOG.error("No files to download for index generation: "+ gen);
-      }
-
-      files = (List<Map<String,Object>>) response.get(CONF_FILES);
-      if (files != null)
-        confFilesToDownload = Collections.synchronizedList(files);
-
-    } catch (SolrServerException e) {
-      throw new IOException(e);
-    }
-  }
-
-  private boolean successfulInstall = false;
-
-  /**
-   * This command downloads all the necessary files from master to install a index commit point. Only changed files are
-   * downloaded. It also downloads the conf files (if they are modified).
-   *
-   * @param core the SolrCore
-   * @param force force a replication in all cases 
-   * @return true on success, false if slave is already in sync
-   * @throws IOException if an exception occurs
-   */
-  @SuppressWarnings("unchecked")
-  boolean fetchLatestIndex(SolrCore core, boolean force) throws IOException, InterruptedException {
-    successfulInstall = false;
-    replicationStartTime = System.currentTimeMillis();
-    try {
-      //get the current 'replicateable' index version in the master
-      NamedList response = null;
       try {
-        response = getLatestVersion();
-      } catch (Exception e) {
-        LOG.error("Master at: " + masterUrl + " is not available. Index fetch failed. Exception: " + e.getMessage());
-        return false;
-      }
-      long latestVersion = (Long) response.get(CMD_INDEX_VERSION);
-      long latestGeneration = (Long) response.get(GENERATION);
-
-      IndexCommit commit;
-      RefCounted<SolrIndexSearcher> searcherRefCounted = null;
-      try {
-        searcherRefCounted = core.getNewestSearcher(false);
-        if (searcherRefCounted == null) {
-          SolrException.log(LOG, "No open searcher found - fetch aborted");
-          return false;
+        Directory dir0 = dir;
+        if (si.getUseCompoundFile()) {
+          cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
+          dir0 = cfsReader;
         }
-        commit = searcherRefCounted.get().getIndexReader().getIndexCommit();
-      } finally {
-        if (searcherRefCounted != null)
-          searcherRefCounted.decref();
-      }
-      
-      if (latestVersion == 0L) {
-        if (force && commit.getGeneration() != 0) {
-          // since we won't get the files for an empty index,
-          // we just clear ours and commit
-          RefCounted<IndexWriter> iw = core.getUpdateHandler().getSolrCoreState().getIndexWriter(core);
-          try {
-            iw.get().deleteAll();
-          } finally {
-            iw.decref();
-          }
-          SolrQueryRequest req = new LocalSolrQueryRequest(core,
-              new ModifiableSolrParams());
-          core.getUpdateHandler().commit(new CommitUpdateCommand(req, false));
-        }
-        
-        //there is nothing to be replicated
-        successfulInstall = true;
-        return true;
-      }
-      
-      if (!force && IndexDeletionPolicyWrapper.getCommitTimestamp(commit) == latestVersion) {
-        //master and slave are already in sync just return
-        LOG.info("Slave in sync with master.");
-        successfulInstall = true;
-        return true;
-      }
-      LOG.info("Master's generation: " + latestGeneration);
-      LOG.info("Slave's generation: " + commit.getGeneration());
-      LOG.info("Starting replication process");
-      // get the list of files first
-      fetchFileList(latestGeneration);
-      // this can happen if the commit point is deleted before we fetch the file list.
-      if(filesToDownload.isEmpty()) return false;
-      LOG.info("Number of files in latest index in master: " + filesToDownload.size());
+        cfsDir = dir0;
 
-      // Create the sync service
-      fsyncService = Executors.newSingleThreadExecutor();
-      // use a synchronized list because the list is read by other threads (to show details)
-      filesDownloaded = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
-      // if the generateion of master is older than that of the slave , it means they are not compatible to be copied
-      // then a new index direcory to be created and all the files need to be copied
-      boolean isFullCopyNeeded = IndexDeletionPolicyWrapper.getCommitTimestamp(commit) >= latestVersion || force;
-      File tmpIndexDir = createTempindexDir(core);
-      if (isIndexStale())
-        isFullCopyNeeded = true;
-      LOG.info("Starting download to " + tmpIndexDir + " fullCopy=" + isFullCopyNeeded);
-      successfulInstall = false;
-      boolean deleteTmpIdxDir = true;
+        fieldInfos = new FieldInfos(cfsDir, IndexFileNames.segmentFileName(segment, IndexFileNames.FIELD_INFOS_EXTENSION));
 
-      // make sure it's the newest known index dir...
-      final File indexDir = new File(core.getNewIndexDir());
-      Directory oldDirectory = null;
-      try {
-        downloadIndexFiles(isFullCopyNeeded, tmpIndexDir, latestGeneration);
-        LOG.info("Total time taken for download : " + ((System.currentTimeMillis() - replicationStartTime) / 1000) + " secs");
-        Collection<Map<String, Object>> modifiedConfFiles = getModifiedConfFiles(confFilesToDownload);
-        if (!modifiedConfFiles.isEmpty()) {
-          downloadConfFiles(confFilesToDownload, latestGeneration);
-          if (isFullCopyNeeded) {
-            successfulInstall = modifyIndexProps(tmpIndexDir.getName());
-            deleteTmpIdxDir =  false;
-          } else {
-            successfulInstall = copyIndexFiles(tmpIndexDir, indexDir);
-          }
-          if (successfulInstall) {
-            LOG.info("Configuration files are modified, core will be reloaded");
-            logReplicationTimeAndConfFiles(modifiedConfFiles, successfulInstall);//write to a file time of replication and conf files.
-            reloadCore();
-          }
+        this.termsIndexDivisor = termsIndexDivisor;
+        TermInfosReader reader = new TermInfosReader(cfsDir, segment, fieldInfos, readBufferSize, termsIndexDivisor);
+        if (termsIndexDivisor == -1) {
+          tisNoIndex = reader;
         } else {
-          terminateAndWaitFsyncService();
-          if (isFullCopyNeeded) {
-            successfulInstall = modifyIndexProps(tmpIndexDir.getName());
-            deleteTmpIdxDir =  false;
-            RefCounted<IndexWriter> iw = core.getUpdateHandler().getSolrCoreState().getIndexWriter(core);
-            try {
-               oldDirectory = iw.get().getDirectory();
-            } finally {
-              iw.decref();
-            }
-          } else {
-            successfulInstall = copyIndexFiles(tmpIndexDir, indexDir);
-          }
-          if (successfulInstall) {
-            logReplicationTimeAndConfFiles(modifiedConfFiles, successfulInstall);
-          }
+          tis = reader;
+          tisNoIndex = null;
         }
-        
-        if (isFullCopyNeeded) {
-          // we have to do this before commit
-          core.getDirectoryFactory().addCloseListener(oldDirectory, new CloseListener(){
 
-            @Override
-            public void onClose() {
-              LOG.info("removing old index directory " + indexDir);
-              delTree(indexDir);
-            }
-            
-          });
+        // make sure that all index files have been read or are kept open
+        // so that if an index update removes them we'll still have them
+        freqStream = cfsDir.openInput(IndexFileNames.segmentFileName(segment, IndexFileNames.FREQ_EXTENSION), readBufferSize);
+
+        if (fieldInfos.hasProx()) {
+          proxStream = cfsDir.openInput(IndexFileNames.segmentFileName(segment, IndexFileNames.PROX_EXTENSION), readBufferSize);
+        } else {
+          proxStream = null;
         }
-        
-        if (successfulInstall) {
-          if (isFullCopyNeeded) {
-            // let the system know we are changing dir's and the old one
-            // may be closed
-            core.getDirectoryFactory().doneWithDirectory(oldDirectory);
-          }
-          doCommit();
-        }
-        
-        replicationStartTime = 0;
-        return successfulInstall;
-      } catch (ReplicationHandlerException e) {
-        LOG.error("User aborted Replication");
-        return false;
-      } catch (SolrException e) {
-        throw e;
-      } catch (InterruptedException e) {
-        throw new InterruptedException("Index fetch interrupted");
-      } catch (Exception e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Index fetch failed : ", e);
-      } finally {
-        if (deleteTmpIdxDir) {
-          LOG.info("removing temporary index download directory " + tmpIndexDir);
-          delTree(tmpIndexDir);
-        } 
-      }
-    } finally {
-      if (!successfulInstall) {
-        logReplicationTimeAndConfFiles(null, successfulInstall);
-      }
-      filesToDownload = filesDownloaded = confFilesDownloaded = confFilesToDownload = null;
-      replicationStartTime = 0;
-      fileFetcher = null;
-      if (fsyncService != null && !fsyncService.isShutdown()) fsyncService.shutdownNow();
-      fsyncService = null;
-      stop = false;
-      fsyncException = null;
-    }
-  }
-
-  private volatile Exception fsyncException;
-
-  /**
-   * terminate the fsync service and wait for all the tasks to complete. If it is already terminated
-   *
-   * @throws Exception
-   */
-  private void terminateAndWaitFsyncService() throws Exception {
-    if (fsyncService.isTerminated()) return;
-    fsyncService.shutdown();
-     // give a long wait say 1 hr
-    fsyncService.awaitTermination(3600, TimeUnit.SECONDS);
-    // if any fsync failed, throw that exception back
-    Exception fsyncExceptionCopy = fsyncException;
-    if (fsyncExceptionCopy != null) throw fsyncExceptionCopy;
-  }
-
-  /**
-   * Helper method to record the last replication's details so that we can show them on the statistics page across
-   * restarts.
-   */
-  private void logReplicationTimeAndConfFiles(Collection<Map<String, Object>> modifiedConfFiles, boolean successfulInstall) {
-    FileOutputStream outFile = null;
-    List<String> confFiles = new ArrayList<String>();
-    if (modifiedConfFiles != null && !modifiedConfFiles.isEmpty())
-      for (Map<String, Object> map1 : modifiedConfFiles)
-        confFiles.add((String) map1.get(NAME));
-
-    Properties props = replicationHandler.loadReplicationProperties();
-    long replicationTime = System.currentTimeMillis();
-    long replicationTimeTaken = (replicationTime - getReplicationStartTime()) / 1000;
-    try {
-      int indexCount = 1, confFilesCount = 1;
-      if (props.containsKey(TIMES_INDEX_REPLICATED)) {
-        indexCount = Integer.valueOf(props.getProperty(TIMES_INDEX_REPLICATED)) + 1;
-      }
-      StringBuffer sb = readToStringBuffer(replicationTime, props.getProperty(INDEX_REPLICATED_AT_LIST));
-      props.setProperty(INDEX_REPLICATED_AT_LIST, sb.toString());
-      props.setProperty(INDEX_REPLICATED_AT, String.valueOf(replicationTime));
-      props.setProperty(PREVIOUS_CYCLE_TIME_TAKEN, String.valueOf(replicationTimeTaken));
-      props.setProperty(TIMES_INDEX_REPLICATED, String.valueOf(indexCount));
-      if (modifiedConfFiles != null && !modifiedConfFiles.isEmpty()) {
-        props.setProperty(CONF_FILES_REPLICATED, confFiles.toString());
-        props.setProperty(CONF_FILES_REPLICATED_AT, String.valueOf(replicationTime));
-        if (props.containsKey(TIMES_CONFIG_REPLICATED)) {
-          confFilesCount = Integer.valueOf(props.getProperty(TIMES_CONFIG_REPLICATED)) + 1;
-        }
-        props.setProperty(TIMES_CONFIG_REPLICATED, String.valueOf(confFilesCount));
-      }
-
-      props.setProperty(LAST_CYCLE_BYTES_DOWNLOADED, String.valueOf(getTotalBytesDownloaded(this)));
-      if (!successfulInstall) {
-        int numFailures = 1;
-        if (props.containsKey(TIMES_FAILED)) {
-          numFailures = Integer.valueOf(props.getProperty(TIMES_FAILED)) + 1;
-        }
-        props.setProperty(TIMES_FAILED, String.valueOf(numFailures));
-        props.setProperty(REPLICATION_FAILED_AT, String.valueOf(replicationTime));
-        sb = readToStringBuffer(replicationTime, props.getProperty(REPLICATION_FAILED_AT_LIST));
-        props.setProperty(REPLICATION_FAILED_AT_LIST, sb.toString());
-      }
-      File f = new File(solrCore.getDataDir(), REPLICATION_PROPERTIES);
-      outFile = new FileOutputStream(f);
-      props.store(outFile, "Replication details");
-      outFile.close();
-    } catch (Exception e) {
-      LOG.warn("Exception while updating statistics", e);
-    }
-    finally {
-      IOUtils.closeQuietly(outFile);
-    }
-  }
-
-  static long getTotalBytesDownloaded(SnapPuller snappuller) {
-    long bytesDownloaded = 0;
-    //get size from list of files to download
-    for (Map<String, Object> file : snappuller.getFilesDownloaded()) {
-      bytesDownloaded += (Long) file.get(SIZE);
-    }
-
-    //get size from list of conf files to download
-    for (Map<String, Object> file : snappuller.getConfFilesDownloaded()) {
-      bytesDownloaded += (Long) file.get(SIZE);
-    }
-
-    //get size from current file being downloaded
-    Map<String, Object> currentFile = snappuller.getCurrentFile();
-    if (currentFile != null) {
-      if (currentFile.containsKey("bytesDownloaded")) {
-        bytesDownloaded += (Long) currentFile.get("bytesDownloaded");
-      }
-    }
-    return bytesDownloaded;
-  }
-
-  private StringBuffer readToStringBuffer(long replicationTime, String str) {
-    StringBuffer sb = new StringBuffer();
-    List<String> l = new ArrayList<String>();
-    if (str != null && str.length() != 0) {
-      String[] ss = str.split(",");
-      for (int i = 0; i < ss.length; i++) {
-        l.add(ss[i]);
-      }
-    }
-    sb.append(replicationTime);
-    if (!l.isEmpty()) {
-      for (int i = 0; i < l.size() || i < 9; i++) {
-        if (i == l.size() || i == 9) break;
-        String s = l.get(i);
-        sb.append(",").append(s);
-      }
-    }
-    return sb;
-  }
-
-  private void doCommit() throws IOException {
-    SolrQueryRequest req = new LocalSolrQueryRequest(solrCore,
-        new ModifiableSolrParams());
-    // reboot the writer on the new index and get a new searcher
-    solrCore.getUpdateHandler().newIndexWriter();
-    
-    try {
-      // first try to open an NRT searcher so that the new 
-      // IndexWriter is registered with the reader
-      Future[] waitSearcher = new Future[1];
-      solrCore.getSearcher(true, false, waitSearcher, true);
-      if (waitSearcher[0] != null) {
-        try {
-         waitSearcher[0].get();
-       } catch (InterruptedException e) {
-         SolrException.log(LOG,e);
-       } catch (ExecutionException e) {
-         SolrException.log(LOG,e);
-       }
-     }
-
-      // update our commit point to the right dir
-      solrCore.getUpdateHandler().commit(new CommitUpdateCommand(req, false));
-
-    } finally {
-      req.close();
-    }
-  }
-
-
-  /**
-   * All the files are copied to a temp dir first
-   */
-  private File createTempindexDir(SolrCore core) {
-    String tmpIdxDirName = "index." + new SimpleDateFormat(SnapShooter.DATE_FMT, Locale.ROOT).format(new Date());
-    File tmpIdxDir = new File(core.getDataDir(), tmpIdxDirName);
-    tmpIdxDir.mkdirs();
-    return tmpIdxDir;
-  }
-
-  private void reloadCore() {
-    new Thread() {
-      @Override
-      public void run() {
-        try {
-          solrCore.getCoreDescriptor().getCoreContainer().reload(solrCore.getName());
-        } catch (Exception e) {
-          LOG.error("Could not restart core ", e);
-        }
-      }
-    }.start();
-  }
-
-  private void downloadConfFiles(List<Map<String, Object>> confFilesToDownload, long latestGeneration) throws Exception {
-    LOG.info("Starting download of configuration files from master: " + confFilesToDownload);
-    confFilesDownloaded = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
-    File tmpconfDir = new File(solrCore.getResourceLoader().getConfigDir(), "conf." + getDateAsStr(new Date()));
-    try {
-      boolean status = tmpconfDir.mkdirs();
-      if (!status) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                "Failed to create temporary config folder: " + tmpconfDir.getName());
-      }
-      for (Map<String, Object> file : confFilesToDownload) {
-        String saveAs = (String) (file.get(ALIAS) == null ? file.get(NAME) : file.get(ALIAS));
-        fileFetcher = new FileFetcher(tmpconfDir, file, saveAs, true, latestGeneration);
-        currentFile = file;
-        fileFetcher.fetchFile();
-        confFilesDownloaded.add(new HashMap<String, Object>(file));
-      }
-      // this is called before copying the files to the original conf dir
-      // so that if there is an exception avoid corrupting the original files.
-      terminateAndWaitFsyncService();
-      copyTmpConfFiles2Conf(tmpconfDir);
-    } finally {
-      delTree(tmpconfDir);
-    }
-  }
-
-  /**
-   * Download the index files. If a new index is needed, download all the files.
-   *
-   * @param downloadCompleteIndex is it a fresh index copy
-   * @param tmpIdxDir               the directory to which files need to be downloadeed to
-   * @param latestGeneration         the version number
-   */
-  private void downloadIndexFiles(boolean downloadCompleteIndex, File tmpIdxDir, long latestGeneration) throws Exception {
-    String indexDir = solrCore.getIndexDir();
-    for (Map<String, Object> file : filesToDownload) {
-      File localIndexFile = new File(indexDir, (String) file.get(NAME));
-      if (!localIndexFile.exists() || downloadCompleteIndex) {
-        fileFetcher = new FileFetcher(tmpIdxDir, file, (String) file.get(NAME), false, latestGeneration);
-        currentFile = file;
-        fileFetcher.fetchFile();
-        filesDownloaded.add(new HashMap<String, Object>(file));
-      } else {
-        LOG.info("Skipping download for " + localIndexFile);
-      }
-    }
-  }
-
-  /**
-   * All the files which are common between master and slave must have same size else we assume they are
-   * not compatible (stale).
-   *
-   * @return true if the index stale and we need to download a fresh copy, false otherwise.
-   */
-  private boolean isIndexStale() {
-    for (Map<String, Object> file : filesToDownload) {
-      File localIndexFile = new File(solrCore.getIndexDir(), (String) file
-              .get(NAME));
-      if (localIndexFile.exists()
-              && localIndexFile.length() != (Long) file.get(SIZE)) {
-        // file exists and size is different, therefore we must assume
-        // corrupted index
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Copy a file by the File#renameTo() method. If it fails, it is considered a failure
-   * <p/>
-   */
-  private boolean copyAFile(File tmpIdxDir, File indexDir, String fname, List<String> copiedfiles) {
-    File indexFileInTmpDir = new File(tmpIdxDir, fname);
-    File indexFileInIndex = new File(indexDir, fname);
-    boolean success = indexFileInTmpDir.renameTo(indexFileInIndex);
-    if(!success){
-      try {
-        LOG.error("Unable to move index file from: " + indexFileInTmpDir
-              + " to: " + indexFileInIndex + " Trying to do a copy");
-        FileUtils.copyFile(indexFileInTmpDir,indexFileInIndex);
         success = true;
-      } catch (IOException e) {
-        LOG.error("Unable to copy index file from: " + indexFileInTmpDir
-              + " to: " + indexFileInIndex , e);
-      }
-    }
-
-    if (!success) {
-      for (String f : copiedfiles) {
-        File indexFile = new File(indexDir, f);
-        if (indexFile.exists())
-          indexFile.delete();
-      }
-      delTree(tmpIdxDir);
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * Copy all index files from the temp index dir to the actual index. The segments_N file is copied last.
-   */
-  private boolean copyIndexFiles(File tmpIdxDir, File indexDir) {
-    String segmentsFile = null;
-    List<String> copiedfiles = new ArrayList<String>();
-    for (Map<String, Object> f : filesDownloaded) {
-      String fname = (String) f.get(NAME);
-      // the segments file must be copied last
-      // or else if there is a failure in between the
-      // index will be corrupted
-      if (fname.startsWith("segments_")) {
-        //The segments file must be copied in the end
-        //Otherwise , if the copy fails index ends up corrupted
-        segmentsFile = fname;
-        continue;
-      }
-      if (!copyAFile(tmpIdxDir, indexDir, fname, copiedfiles)) return false;
-      copiedfiles.add(fname);
-    }
-    //copy the segments file last
-    if (segmentsFile != null) {
-      if (!copyAFile(tmpIdxDir, indexDir, segmentsFile, copiedfiles)) return false;
-    }
-    return true;
-  }
-
-  /**
-   * The conf files are copied to the tmp dir to the conf dir. A backup of the old file is maintained
-   */
-  private void copyTmpConfFiles2Conf(File tmpconfDir) {
-    File confDir = new File(solrCore.getResourceLoader().getConfigDir());
-    for (File file : tmpconfDir.listFiles()) {
-      File oldFile = new File(confDir, file.getName());
-      if (oldFile.exists()) {
-        File backupFile = new File(confDir, oldFile.getName() + "." + getDateAsStr(new Date(oldFile.lastModified())));
-        boolean status = oldFile.renameTo(backupFile);
-        if (!status) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                  "Unable to rename: " + oldFile + " to: " + backupFile);
+      } finally {
+        if (!success) {
+          decRef();
         }
       }
-      boolean status = file.renameTo(oldFile);
-      if (status) {
+
+      // Must assign this at the end -- if we hit an
+      // exception above core, we don't want to attempt to
+      // purge the FieldCache (will hit NPE because core is
+      // not assigned yet).
+      this.origInstance = origInstance;
+    }
+
+    synchronized TermVectorsReader getTermVectorsReaderOrig() {
+      return termVectorsReaderOrig;
+    }
+
+    synchronized FieldsReader getFieldsReaderOrig() {
+      return fieldsReaderOrig;
+    }
+
+    synchronized void incRef() {
+      ref.incrementAndGet();
+    }
+
+    synchronized Directory getCFSReader() {
+      return cfsReader;
+    }
+
+    synchronized TermInfosReader getTermsReader() {
+      if (tis != null) {
+        return tis;
       } else {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                "Unable to rename: " + file + " to: " + oldFile);
+        return tisNoIndex;
       }
-    }
-  }
+    }      
 
-  private String getDateAsStr(Date d) {
-    return new SimpleDateFormat(SnapShooter.DATE_FMT, Locale.ROOT).format(d);
-  }
+    synchronized boolean termsIndexIsLoaded() {
+      return tis != null;
+    }      
 
-  /**
-   * If the index is stale by any chance, load index from a different dir in the data dir.
-   */
-  private boolean modifyIndexProps(String tmpIdxDirName) {
-    LOG.info("New index installed. Updating index properties... index="+tmpIdxDirName);
-    File idxprops = new File(solrCore.getDataDir() + "index.properties");
-    Properties p = new Properties();
-    if (idxprops.exists()) {
-      InputStream is = null;
-      try {
-        is = new FileInputStream(idxprops);
-        p.load(is);
-      } catch (Exception e) {
-        LOG.error("Unable to load index.properties");
-      } finally {
-        IOUtils.closeQuietly(is);
-      }
-    }
-    p.put("index", tmpIdxDirName);
-    FileOutputStream os = null;
-    try {
-      os = new FileOutputStream(idxprops);
-      p.store(os, "index properties");
-    } catch (Exception e) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-              "Unable to write index.properties", e);
-    } finally {
-      IOUtils.closeQuietly(os);
-    }
-      return true;
-  }
-
-  private final Map<String, FileInfo> confFileInfoCache = new HashMap<String, FileInfo>();
-
-  /**
-   * The local conf files are compared with the conf files in the master. If they are same (by checksum) do not copy.
-   *
-   * @param confFilesToDownload The list of files obtained from master
-   *
-   * @return a list of configuration files which have changed on the master and need to be downloaded.
-   */
-  private Collection<Map<String, Object>> getModifiedConfFiles(List<Map<String, Object>> confFilesToDownload) {
-    if (confFilesToDownload == null || confFilesToDownload.isEmpty())
-      return Collections.EMPTY_LIST;
-    //build a map with alias/name as the key
-    Map<String, Map<String, Object>> nameVsFile = new HashMap<String, Map<String, Object>>();
-    NamedList names = new NamedList();
-    for (Map<String, Object> map : confFilesToDownload) {
-      //if alias is present that is the name the file may have in the slave
-      String name = (String) (map.get(ALIAS) == null ? map.get(NAME) : map.get(ALIAS));
-      nameVsFile.put(name, map);
-      names.add(name, null);
-    }
-    //get the details of the local conf files with the same alias/name
-    List<Map<String, Object>> localFilesInfo = replicationHandler.getConfFileInfoFromCache(names, confFileInfoCache);
-    //compare their size/checksum to see if
-    for (Map<String, Object> fileInfo : localFilesInfo) {
-      String name = (String) fileInfo.get(NAME);
-      Map<String, Object> m = nameVsFile.get(name);
-      if (m == null) continue; // the file is not even present locally (so must be downloaded)
-      if (m.get(CHECKSUM).equals(fileInfo.get(CHECKSUM))) {
-        nameVsFile.remove(name); //checksums are same so the file need not be downloaded
-      }
-    }
-    return nameVsFile.isEmpty() ? Collections.EMPTY_LIST : nameVsFile.values();
-  }
-
-  /**
-   * Delete the directory tree recursively
-   */
-  static boolean delTree(File dir) {
-    if (dir == null || !dir.exists())
-      return false;
-    boolean isSuccess = true;
-    File contents[] = dir.listFiles();
-    if (contents != null) {
-      for (File file : contents) {
-        if (file.isDirectory()) {
-          boolean success = delTree(file);
-          if (!success) {
-            LOG.warn("Unable to delete directory : " + file);
-            isSuccess = false;
+    // NOTE: only called from IndexWriter when a near
+    // real-time reader is opened, or applyDeletes is run,
+    // sharing a segment that's still being merged.  This
+    // method is not fully thread safe, and relies on the
+    // synchronization in IndexWriter
+    synchronized void loadTermsIndex(SegmentInfo si, int termsIndexDivisor) throws IOException {
+      if (tis == null) {
+        Directory dir0;
+        if (si.getUseCompoundFile()) {
+          // In some cases, we were originally opened when CFS
+          // was not used, but then we are asked to open the
+          // terms reader with index, the segment has switched
+          // to CFS
+          if (cfsReader == null) {
+            cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
           }
+          dir0 = cfsReader;
         } else {
-          boolean success = file.delete();
-          if (!success) {
-            LOG.warn("Unable to delete file : " + file);
-            isSuccess = false;
-            return false;
-          }
+          dir0 = dir;
+        }
+
+        tis = new TermInfosReader(dir0, segment, fieldInfos, readBufferSize, termsIndexDivisor);
+      }
+    }
+
+    synchronized void decRef() throws IOException {
+
+      if (ref.decrementAndGet() == 0) {
+
+        // close everything, nothing is shared anymore with other readers
+        if (tis != null) {
+          tis.close();
+          // null so if an app hangs on to us we still free most ram
+          tis = null;
+        }
+        
+        if (tisNoIndex != null) {
+          tisNoIndex.close();
+        }
+        
+        if (freqStream != null) {
+          freqStream.close();
+        }
+
+        if (proxStream != null) {
+          proxStream.close();
+        }
+
+        if (termVectorsReaderOrig != null) {
+          termVectorsReaderOrig.close();
+        }
+  
+        if (fieldsReaderOrig != null) {
+          fieldsReaderOrig.close();
+        }
+  
+        if (cfsReader != null) {
+          cfsReader.close();
+        }
+  
+        if (storeCFSReader != null) {
+          storeCFSReader.close();
+        }
+
+        // Force FieldCache to evict our entries at this
+        // point.  If the exception occurred while
+        // initializing the core readers, then
+        // origInstance will be null, and we don't want
+        // to call FieldCache.purge (it leads to NPE):
+        if (origInstance != null) {
+          FieldCache.DEFAULT.purge(origInstance);
         }
       }
     }
-    return isSuccess && dir.delete();
+
+    synchronized void openDocStores(SegmentInfo si) throws IOException {
+
+      assert si.name.equals(segment);
+
+      if (fieldsReaderOrig == null) {
+        final Directory storeDir;
+        if (si.getDocStoreOffset() != -1) {
+          if (si.getDocStoreIsCompoundFile()) {
+            assert storeCFSReader == null;
+            storeCFSReader = new CompoundFileReader(dir,
+                IndexFileNames.segmentFileName(si.getDocStoreSegment(), IndexFileNames.COMPOUND_FILE_STORE_EXTENSION),
+                                                    readBufferSize);
+            storeDir = storeCFSReader;
+            assert storeDir != null;
+          } else {
+            storeDir = dir;
+            assert storeDir != null;
+          }
+        } else if (si.getUseCompoundFile()) {
+          // In some cases, we were originally opened when CFS
+          // was not used, but then we are asked to open doc
+          // stores after the segment has switched to CFS
+          if (cfsReader == null) {
+            cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
+          }
+          storeDir = cfsReader;
+          assert storeDir != null;
+        } else {
+          storeDir = dir;
+          assert storeDir != null;
+        }
+
+        final String storesSegment;
+        if (si.getDocStoreOffset() != -1) {
+          storesSegment = si.getDocStoreSegment();
+        } else {
+          storesSegment = segment;
+        }
+
+        fieldsReaderOrig = new FieldsReader(storeDir, storesSegment, fieldInfos, readBufferSize,
+                                            si.getDocStoreOffset(), si.docCount);
+
+        // Verify two sources of "maxDoc" agree:
+        if (si.getDocStoreOffset() == -1 && fieldsReaderOrig.size() != si.docCount) {
+          throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + fieldsReaderOrig.size() + " but segmentInfo shows " + si.docCount);
+        }
+
+        if (fieldInfos.hasVectors()) { // open term vector files only as needed
+          termVectorsReaderOrig = new TermVectorsReader(storeDir, storesSegment, fieldInfos, readBufferSize, si.getDocStoreOffset(), si.docCount);
+        }
+      }
+    }
   }
 
   /**
-   * Disable periodic polling
+   * Sets the initial value 
    */
-  void disablePoll() {
-    pollDisabled.set(true);
-    LOG.info("inside disable poll, value of pollDisabled = " + pollDisabled);
-  }
-
-  /**
-   * Enable periodic polling
-   */
-  void enablePoll() {
-    pollDisabled.set(false);
-    LOG.info("inside enable poll, value of pollDisabled = " + pollDisabled);
-  }
-
-  /**
-   * Stops the ongoing pull
-   */
-  void abortPull() {
-    stop = true;
-  }
-
-  long getReplicationStartTime() {
-    return replicationStartTime;
-  }
-
-  List<Map<String, Object>> getConfFilesToDownload() {
-    //make a copy first because it can be null later
-    List<Map<String, Object>> tmp = confFilesToDownload;
-    //create a new instance. or else iterator may fail
-    return tmp == null ? Collections.EMPTY_LIST : new ArrayList<Map<String, Object>>(tmp);
-  }
-
-  List<Map<String, Object>> getConfFilesDownloaded() {
-    //make a copy first because it can be null later
-    List<Map<String, Object>> tmp = confFilesDownloaded;
-    // NOTE: it's safe to make a copy of a SynchronizedCollection(ArrayList)
-    return tmp == null ? Collections.EMPTY_LIST : new ArrayList<Map<String, Object>>(tmp);
-  }
-
-  List<Map<String, Object>> getFilesToDownload() {
-    //make a copy first because it can be null later
-    List<Map<String, Object>> tmp = filesToDownload;
-    return tmp == null ? Collections.EMPTY_LIST : new ArrayList<Map<String, Object>>(tmp);
-  }
-
-  List<Map<String, Object>> getFilesDownloaded() {
-    List<Map<String, Object>> tmp = filesDownloaded;
-    return tmp == null ? Collections.EMPTY_LIST : new ArrayList<Map<String, Object>>(tmp);
-  }
-
-  Map<String, Object> getCurrentFile() {
-    Map<String, Object> tmp = currentFile;
-    FileFetcher tmpFileFetcher = fileFetcher;
-    if (tmp == null)
-      return null;
-    tmp = new HashMap<String, Object>(tmp);
-    if (tmpFileFetcher != null)
-      tmp.put("bytesDownloaded", tmpFileFetcher.bytesDownloaded);
-    return tmp;
-  }
-
-  boolean isPollingDisabled() {
-    return pollDisabled.get();
-  }
-
-  Long getNextScheduledExecTime() {
-    Long nextTime = null;
-    if (executorStartTime > 0)
-      nextTime = executorStartTime + pollInterval;
-    return nextTime;
-  }
-
-  private static class ReplicationHandlerException extends InterruptedException {
-    public ReplicationHandlerException(String message) {
-      super(message);
-    }
-  }
-
-  /**
-   * The class acts as a client for ReplicationHandler.FileStream. It understands the protocol of wt=filestream
-   *
-   * @see org.apache.solr.handler.ReplicationHandler.FileStream
-   */
-  private class FileFetcher {
-    boolean includeChecksum = true;
-
-    private File copy2Dir;
-
-    String fileName;
-
-    String saveAs;
-
-    long size, lastmodified;
-
-    long bytesDownloaded = 0;
-
-    FileChannel fileChannel;
-    
-    private FileOutputStream fileOutputStream;
-
-    byte[] buf = new byte[1024 * 1024];
-
-    Checksum checksum;
-
-    File file;
-
-    int errorCount = 0;
-
-    private boolean isConf;
-
-    private boolean aborted = false;
-
-    private Long indexGen;
-
-    FileFetcher(File dir, Map<String, Object> fileDetails, String saveAs,
-                boolean isConf, long latestGen) throws IOException {
-      this.copy2Dir = dir;
-      this.fileName = (String) fileDetails.get(NAME);
-      this.size = (Long) fileDetails.get(SIZE);
-      this.isConf = isConf;
-      this.saveAs = saveAs;
-      if(fileDetails.get(LAST_MODIFIED) != null){
-        lastmodified = (Long)fileDetails.get(LAST_MODIFIED);
-      }
-      indexGen = latestGen;
-
-      this.file = new File(copy2Dir, saveAs);
-      
-      this.fileOutputStream = new FileOutputStream(file);
-      this.fileChannel = this.fileOutputStream.getChannel();
-
-      if (includeChecksum)
-        checksum = new Adler32();
-    }
-
-    /**
-     * The main method which downloads file
-     */
-    void fetchFile() throws Exception {
-      try {
-        while (true) {
-          final FastInputStream is = getStream();
-          int result;
-          try {
-            //fetch packets one by one in a single request
-            result = fetchPackets(is);
-            if (result == 0 || result == NO_CONTENT) {
-              // if the file is downloaded properly set the
-              //  timestamp same as that in the server
-              if (file.exists() && lastmodified > 0)
-                file.setLastModified(lastmodified);
-              return;
-            }
-            //if there is an error continue. But continue from the point where it got broken
-          } finally {
-            IOUtils.closeQuietly(is);
-          }
-        }
-      } finally {
-        cleanup();
-        //if cleanup suceeds . The file is downloaded fully. do an fsync
-        fsyncService.submit(new Runnable(){
-          public void run() {
-            try {
-              FileUtils.sync(file);
-            } catch (IOException e) {
-              fsyncException = e;
-            }
-          }
-        });
-      }
-    }
-
-    private int fetchPackets(FastInputStream fis) throws Exception {
-      byte[] intbytes = new byte[4];
-      byte[] longbytes = new byte[8];
-      try {
-        while (true) {
-          if (stop) {
-            stop = false;
-            aborted = true;
-            throw new ReplicationHandlerException("User aborted replication");
-          }
-          long checkSumServer = -1;
-          fis.readFully(intbytes);
-          //read the size of the packet
-          int packetSize = readInt(intbytes);
-          if (packetSize <= 0) {
-            LOG.warn("No content recieved for file: " + currentFile);
-            return NO_CONTENT;
-          }
-          if (buf.length < packetSize)
-            buf = new byte[packetSize];
-          if (checksum != null) {
-            //read the checksum
-            fis.readFully(longbytes);
-            checkSumServer = readLong(longbytes);
-          }
-          //then read the packet of bytes
-          fis.readFully(buf, 0, packetSize);
-          //compare the checksum as sent from the master
-          if (includeChecksum) {
-            checksum.reset();
-            checksum.update(buf, 0, packetSize);
-            long checkSumClient = checksum.getValue();
-            if (checkSumClient != checkSumServer) {
-              LOG.error("Checksum not matched between client and server for: " + currentFile);
-              //if checksum is wrong it is a problem return for retry
-              return 1;
-            }
-          }
-          //if everything is fine, write down the packet to the file
-          fileChannel.write(ByteBuffer.wrap(buf, 0, packetSize));
-          bytesDownloaded += packetSize;
-          if (bytesDownloaded >= size)
-            return 0;
-          //errorcount is always set to zero after a successful packet
-          errorCount = 0;
-        }
-      } catch (ReplicationHandlerException e) {
-        throw e;
-      } catch (Exception e) {
-        LOG.warn("Error in fetching packets ", e);
-        //for any failure , increment the error count
-        errorCount++;
-        //if it fails for the same pacaket for   MAX_RETRIES fail and come out
-        if (errorCount > MAX_RETRIES) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                  "Fetch failed for file:" + fileName, e);
-        }
-        return ERR;
-      }
-    }
-
-    /**
-     * The webcontainer flushes the data only after it fills the buffer size. So, all data has to be read as readFully()
-     * other wise it fails. So read everything as bytes and then extract an integer out of it
-     */
-    private int readInt(byte[] b) {
-      return (((b[0] & 0xff) << 24) | ((b[1] & 0xff) << 16)
-              | ((b[2] & 0xff) << 8) | (b[3] & 0xff));
-
-    }
-
-    /**
-     * Same as above but to read longs from a byte array
-     */
-    private long readLong(byte[] b) {
-      return (((long) (b[0] & 0xff)) << 56) | (((long) (b[1] & 0xff)) << 48)
-              | (((long) (b[2] & 0xff)) << 40) | (((long) (b[3] & 0xff)) << 32)
-              | (((long) (b[4] & 0xff)) << 24) | ((b[5] & 0xff) << 16)
-              | ((b[6] & 0xff) << 8) | ((b[7] & 0xff));
-
-    }
-
-    /**
-     * cleanup everything
-     */
-    private void cleanup() {
-      try {
-        //close the FileOutputStream (which also closes the Channel)
-        fileOutputStream.close();
-      } catch (Exception e) {/* noop */
-          LOG.error("Error closing the file stream: "+ this.saveAs ,e);
-      }
-      if (bytesDownloaded != size) {
-        //if the download is not complete then
-        //delete the file being downloaded
-        try {
-          file.delete();
-        } catch (Exception e) {
-          LOG.error("Error deleting file in cleanup" + e.getMessage());
-        }
-        //if the failure is due to a user abort it is returned nomally else an exception is thrown
-        if (!aborted)
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                  "Unable to download " + fileName + " completely. Downloaded "
-                          + bytesDownloaded + "!=" + size);
-      }
-    }
-
-    /**
-     * Open a new stream using HttpClient
-     */
-    FastInputStream getStream() throws IOException {
-      SolrServer s = new HttpSolrServer(masterUrl, myHttpClient, null);  //XXX use shardhandler
-      ModifiableSolrParams params = new ModifiableSolrParams();
-
-//    //the method is command=filecontent
-      params.set(COMMAND, CMD_GET_FILE);
-      params.set(GENERATION, Long.toString(indexGen));
-      params.set(CommonParams.QT, "/replication");
-      //add the version to download. This is used to reserve the download
-      if (isConf) {
-        //set cf instead of file for config file
-        params.set(CONF_FILE_SHORT, fileName);
-      } else {
-        params.set(FILE, fileName);
-      }
-      if (useInternal) {
-        params.set(COMPRESSION, "internal"); 
-      }
-      //use checksum
-      if (this.includeChecksum) {
-        params.set(CHECKSUM, true);
-      }
-      //wt=filestream this is a custom protocol
-      params.set(CommonParams.WT, FILE_STREAM);
-        // This happen if there is a failure there is a retry. the offset=<sizedownloaded> ensures that
-        // the server starts from the offset
-      if (bytesDownloaded > 0) {
-        params.set(OFFSET, Long.toString(bytesDownloaded));
-      }
-      
-
-      NamedList response;
-      InputStream is = null;
-      try {
-        QueryRequest req = new QueryRequest(params);
-        response = s.request(req);
-        is = (InputStream) response.get("stream");
-        if(useInternal) {
-          is = new InflaterInputStream(is);
-        }
-        return new FastInputStream(is);
-      } catch (Throwable t) {
-        //close stream on error
-        IOUtils.closeQuietly(is);
-        throw new IOException("Could not download file '" + fileName + "'", t);
-      }
+  private class FieldsReaderLocal extends CloseableThreadLocal<FieldsReader> {
+    @Override
+    protected FieldsReader initialValue() {
+      return (FieldsReader) core.getFieldsReaderOrig().clone();
     }
   }
   
-  NamedList getDetails() throws IOException, SolrServerException {
-    ModifiableSolrParams params = new ModifiableSolrParams();
-    params.set(COMMAND, CMD_DETAILS);
-    params.set("slave", false);
-    params.set(CommonParams.QT, "/replication");
-    SolrServer server = new HttpSolrServer(masterUrl, myHttpClient); //XXX use shardhandler
-    QueryRequest request = new QueryRequest(params);
-    return server.request(request);
-  }
+  /**
+   * Byte[] referencing is used because a new norm object needs 
+   * to be created for each clone, and the byte array is all 
+   * that is needed for sharing between cloned readers.  The 
+   * current norm referencing is for sharing between readers 
+   * whereas the byte[] referencing is for copy on write which 
+   * is independent of reader references (i.e. incRef, decRef).
+   */
 
-  static Integer readInterval(String interval) {
-    if (interval == null)
-      return null;
-    int result = 0;
-    if (interval != null) {
-      Matcher m = INTERVAL_PATTERN.matcher(interval.trim());
-      if (m.find()) {
-        String hr = m.group(1);
-        String min = m.group(2);
-        String sec = m.group(3);
-        result = 0;
-        try {
-          if (sec != null && sec.length() > 0)
-            result += Integer.parseInt(sec);
-          if (min != null && min.length() > 0)
-            result += (60 * Integer.parseInt(min));
-          if (hr != null && hr.length() > 0)
-            result += (60 * 60 * Integer.parseInt(hr));
-          result *= 1000;
-        } catch (NumberFormatException e) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                  INTERVAL_ERR_MSG);
+  final class Norm implements Cloneable {
+    private int refCount = 1;
+
+    // If this instance is a clone, the originalNorm
+    // references the Norm that has a real open IndexInput:
+    private Norm origNorm;
+
+    private IndexInput in;
+    private long normSeek;
+
+    // null until bytes is set
+    private AtomicInteger bytesRef;
+    private byte[] bytes;
+    private boolean dirty;
+    private int number;
+    private boolean rollbackDirty;
+    
+    public Norm(IndexInput in, int number, long normSeek) {
+      this.in = in;
+      this.number = number;
+      this.normSeek = normSeek;
+    }
+
+    public synchronized void incRef() {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
+      refCount++;
+    }
+
+    private void closeInput() throws IOException {
+      if (in != null) {
+        if (in != singleNormStream) {
+          // It's private to us -- just close it
+          in.close();
+        } else {
+          // We are sharing this with others -- decRef and
+          // maybe close the shared norm stream
+          if (singleNormRef.decrementAndGet() == 0) {
+            singleNormStream.close();
+            singleNormStream = null;
+          }
         }
+
+        in = null;
+      }
+    }
+
+    public synchronized void decRef() throws IOException {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
+
+      if (--refCount == 0) {
+        if (origNorm != null) {
+          origNorm.decRef();
+          origNorm = null;
+        } else {
+          closeInput();
+        }
+
+        if (bytes != null) {
+          assert bytesRef != null;
+          bytesRef.decrementAndGet();
+          bytes = null;
+          bytesRef = null;
+        } else {
+          assert bytesRef == null;
+        }
+      }
+    }
+
+    // Load bytes but do not cache them if they were not
+    // already cached
+    public synchronized void bytes(byte[] bytesOut, int offset, int len) throws IOException {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
+      if (bytes != null) {
+        // Already cached -- copy from cache:
+        assert len <= maxDoc();
+        System.arraycopy(bytes, 0, bytesOut, offset, len);
       } else {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                INTERVAL_ERR_MSG);
+        // Not cached
+        if (origNorm != null) {
+          // Ask origNorm to load
+          origNorm.bytes(bytesOut, offset, len);
+        } else {
+          // We are orig -- read ourselves from disk:
+          synchronized(in) {
+            in.seek(normSeek);
+            in.readBytes(bytesOut, offset, len, false);
+          }
+        }
+      }
+    }
+
+    // Load & cache full bytes array.  Returns bytes.
+    public synchronized byte[] bytes() throws IOException {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
+      if (bytes == null) {                     // value not yet read
+        assert bytesRef == null;
+        if (origNorm != null) {
+          // Ask origNorm to load so that for a series of
+          // reopened readers we share a single read-only
+          // byte[]
+          bytes = origNorm.bytes();
+          bytesRef = origNorm.bytesRef;
+          bytesRef.incrementAndGet();
+
+          // Once we've loaded the bytes we no longer need
+          // origNorm:
+          origNorm.decRef();
+          origNorm = null;
+
+        } else {
+          // We are the origNorm, so load the bytes for real
+          // ourself:
+          final int count = maxDoc();
+          bytes = new byte[count];
+
+          // Since we are orig, in must not be null
+          assert in != null;
+
+          // Read from disk.
+          synchronized(in) {
+            in.seek(normSeek);
+            in.readBytes(bytes, 0, count, false);
+          }
+
+          bytesRef = new AtomicInteger(1);
+          closeInput();
+        }
       }
 
+      return bytes;
     }
-    return result;
+
+    // Only for testing
+    AtomicInteger bytesRef() {
+      return bytesRef;
+    }
+
+    // Called if we intend to change a norm value.  We make a
+    // private copy of bytes if it's shared with others:
+    public synchronized byte[] copyOnWrite() throws IOException {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
+      bytes();
+      assert bytes != null;
+      assert bytesRef != null;
+      if (bytesRef.get() > 1) {
+        // I cannot be the origNorm for another norm
+        // instance if I'm being changed.  Ie, only the
+        // "head Norm" can be changed:
+        assert refCount == 1;
+        final AtomicInteger oldRef = bytesRef;
+        bytes = cloneNormBytes(bytes);
+        bytesRef = new AtomicInteger(1);
+        oldRef.decrementAndGet();
+      }
+      dirty = true;
+      return bytes;
+    }
+    
+    // Returns a copy of this Norm instance that shares
+    // IndexInput & bytes with the original one
+    @Override
+    public synchronized Object clone() {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
+        
+      Norm clone;
+      try {
+        clone = (Norm) super.clone();
+      } catch (CloneNotSupportedException cnse) {
+        // Cannot happen
+        throw new RuntimeException("unexpected CloneNotSupportedException", cnse);
+      }
+      clone.refCount = 1;
+
+      if (bytes != null) {
+        assert bytesRef != null;
+        assert origNorm == null;
+
+        // Clone holds a reference to my bytes:
+        clone.bytesRef.incrementAndGet();
+      } else {
+        assert bytesRef == null;
+        if (origNorm == null) {
+          // I become the origNorm for the clone:
+          clone.origNorm = this;
+        }
+        clone.origNorm.incRef();
+      }
+
+      // Only the origNorm will actually readBytes from in:
+      clone.in = null;
+
+      return clone;
+    }
+
+    // Flush all pending changes to the next generation
+    // separate norms file.
+    public void reWrite(SegmentInfo si) throws IOException {
+      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0): "refCount=" + refCount + " origNorm=" + origNorm;
+
+      // NOTE: norms are re-written in regular directory, not cfs
+      si.advanceNormGen(this.number);
+      final String normFileName = si.getNormFileName(this.number);
+      IndexOutput out = directory().createOutput(normFileName);
+      boolean success = false;
+      try {
+        try {
+          out.writeBytes(bytes, maxDoc());
+        } finally {
+          out.close();
+        }
+        success = true;
+      } finally {
+        if (!success) {
+          try {
+            directory().deleteFile(normFileName);
+          } catch (Throwable t) {
+            // suppress this so we keep throwing the
+            // original exception
+          }
+        }
+      }
+      this.dirty = false;
+    }
   }
 
-  public void destroy() {
-    if (executorService != null) executorService.shutdown();
+  Map<String,Norm> norms = new HashMap<String,Norm>();
+  
+  /**
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  public static SegmentReader get(boolean readOnly, SegmentInfo si, int termInfosIndexDivisor) throws CorruptIndexException, IOException {
+    return get(readOnly, si.dir, si, BufferedIndexInput.BUFFER_SIZE, true, termInfosIndexDivisor);
   }
 
-  String getMasterUrl() {
-    return masterUrl;
+  /**
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  public static SegmentReader get(boolean readOnly,
+                                  Directory dir,
+                                  SegmentInfo si,
+                                  int readBufferSize,
+                                  boolean doOpenStores,
+                                  int termInfosIndexDivisor)
+    throws CorruptIndexException, IOException {
+    SegmentReader instance = readOnly ? new ReadOnlySegmentReader() : new SegmentReader();
+    instance.readOnly = readOnly;
+    instance.si = si;
+    instance.readBufferSize = readBufferSize;
+
+    boolean success = false;
+
+    try {
+      instance.core = new CoreReaders(instance, dir, si, readBufferSize, termInfosIndexDivisor);
+      if (doOpenStores) {
+        instance.core.openDocStores(si);
+      }
+      instance.loadDeletedDocs();
+      instance.openNorms(instance.core.cfsDir, readBufferSize);
+      success = true;
+    } finally {
+
+      // With lock-less commits, it's entirely possible (and
+      // fine) to hit a FileNotFound exception above.  In
+      // this case, we want to explicitly close any subset
+      // of things that were opened so that we don't have to
+      // wait for a GC to do so.
+      if (!success) {
+        instance.doClose();
+      }
+    }
+    return instance;
   }
 
-  String getPollInterval() {
-    return pollIntervalStr;
+  void openDocStores() throws IOException {
+    core.openDocStores(si);
   }
 
-  private static final int MAX_RETRIES = 5;
+  private boolean checkDeletedCounts() throws IOException {
+    final int recomputedCount = deletedDocs.getRecomputedCount();
+     
+    assert deletedDocs.count() == recomputedCount : "deleted count=" + deletedDocs.count() + " vs recomputed count=" + recomputedCount;
 
-  private static final int NO_CONTENT = 1;
+    assert si.getDelCount() == recomputedCount : 
+    "delete count mismatch: info=" + si.getDelCount() + " vs BitVector=" + recomputedCount;
 
-  private static final int ERR = 2;
+    // Verify # deletes does not exceed maxDoc for this
+    // segment:
+    assert si.getDelCount() <= maxDoc() : 
+    "delete count mismatch: " + recomputedCount + ") exceeds max doc (" + maxDoc() + ") for segment " + si.name;
 
-  public static final String REPLICATION_PROPERTIES = "replication.properties";
+    return true;
+  }
 
-  public static final String POLL_INTERVAL = "pollInterval";
+  private void loadDeletedDocs() throws IOException {
+    // NOTE: the bitvector is stored using the regular directory, not cfs
+    if (hasDeletions(si)) {
+      deletedDocs = new BitVector(directory(), si.getDelFileName());
+      deletedDocsRef = new AtomicInteger(1);
+      assert checkDeletedCounts();
+      if (deletedDocs.size() != si.docCount) {
+        throw new CorruptIndexException("document count mismatch: deleted docs count " + deletedDocs.size() + " vs segment doc count " + si.docCount + " segment=" + si.name);
+      }
+    } else
+      assert si.getDelCount() == 0;
+  }
+  
+  /**
+   * Clones the norm bytes.  May be overridden by subclasses.  New and experimental.
+   * @param bytes Byte array to clone
+   * @return New BitVector
+   */
+  protected byte[] cloneNormBytes(byte[] bytes) {
+    byte[] cloneBytes = new byte[bytes.length];
+    System.arraycopy(bytes, 0, cloneBytes, 0, bytes.length);
+    return cloneBytes;
+  }
+  
+  /**
+   * Clones the deleteDocs BitVector.  May be overridden by subclasses. New and experimental.
+   * @param bv BitVector to clone
+   * @return New BitVector
+   */
+  protected BitVector cloneDeletedDocs(BitVector bv) {
+    return (BitVector)bv.clone();
+  }
 
-  public static final String INTERVAL_ERR_MSG = "The " + POLL_INTERVAL + " must be in this format 'HH:mm:ss'";
+  @Override
+  public final synchronized Object clone() {
+    try {
+      return clone(readOnly); // Preserve current readOnly
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
+    }
+  }
 
-  private static final Pattern INTERVAL_PATTERN = Pattern.compile("(\\d*?):(\\d*?):(\\d*)");
+  @Override
+  public final synchronized IndexReader clone(boolean openReadOnly) throws CorruptIndexException, IOException {
+    return reopenSegment(si, true, openReadOnly);
+  }
 
-  static final String INDEX_REPLICATED_AT = "indexReplicatedAt";
+  @Override
+  public synchronized IndexReader reopen()
+    throws CorruptIndexException, IOException {
+    return reopenSegment(si, false, readOnly);
+  }
 
-  static final String TIMES_INDEX_REPLICATED = "timesIndexReplicated";
+  @Override
+  public synchronized IndexReader reopen(boolean openReadOnly)
+    throws CorruptIndexException, IOException {
+    return reopenSegment(si, false, openReadOnly);
+  }
 
-  static final String CONF_FILES_REPLICATED = "confFilesReplicated";
+  synchronized SegmentReader reopenSegment(SegmentInfo si, boolean doClone, boolean openReadOnly) throws CorruptIndexException, IOException {
+    boolean deletionsUpToDate = (this.si.hasDeletions() == si.hasDeletions()) 
+                                  && (!si.hasDeletions() || this.si.getDelFileName().equals(si.getDelFileName()));
+    boolean normsUpToDate = true;
+    
+    boolean[] fieldNormsChanged = new boolean[core.fieldInfos.size()];
+    final int fieldCount = core.fieldInfos.size();
+    for (int i = 0; i < fieldCount; i++) {
+      if (!this.si.getNormFileName(i).equals(si.getNormFileName(i))) {
+        normsUpToDate = false;
+        fieldNormsChanged[i] = true;
+      }
+    }
 
-  static final String CONF_FILES_REPLICATED_AT = "confFilesReplicatedAt";
+    // if we're cloning we need to run through the reopenSegment logic
+    // also if both old and new readers aren't readonly, we clone to avoid sharing modifications
+    if (normsUpToDate && deletionsUpToDate && !doClone && openReadOnly && readOnly) {
+      return this;
+    }    
 
-  static final String TIMES_CONFIG_REPLICATED = "timesConfigReplicated";
+    // When cloning, the incoming SegmentInfos should not
+    // have any changes in it:
+    assert !doClone || (normsUpToDate && deletionsUpToDate);
 
-  static final String LAST_CYCLE_BYTES_DOWNLOADED = "lastCycleBytesDownloaded";
+    // clone reader
+    SegmentReader clone = openReadOnly ? new ReadOnlySegmentReader() : new SegmentReader();
 
-  static final String TIMES_FAILED = "timesFailed";
+    boolean success = false;
+    try {
+      core.incRef();
+      clone.core = core;
+      clone.readOnly = openReadOnly;
+      clone.si = si;
+      clone.readBufferSize = readBufferSize;
+      clone.pendingDeleteCount = pendingDeleteCount;
 
-  static final String REPLICATION_FAILED_AT = "replicationFailedAt";
+      if (!openReadOnly && hasChanges) {
+        // My pending changes transfer to the new reader
+        clone.deletedDocsDirty = deletedDocsDirty;
+        clone.normsDirty = normsDirty;
+        clone.hasChanges = hasChanges;
+        hasChanges = false;
+      }
+      
+      if (doClone) {
+        if (deletedDocs != null) {
+          deletedDocsRef.incrementAndGet();
+          clone.deletedDocs = deletedDocs;
+          clone.deletedDocsRef = deletedDocsRef;
+        }
+      } else {
+        if (!deletionsUpToDate) {
+          // load deleted docs
+          assert clone.deletedDocs == null;
+          clone.loadDeletedDocs();
+        } else if (deletedDocs != null) {
+          deletedDocsRef.incrementAndGet();
+          clone.deletedDocs = deletedDocs;
+          clone.deletedDocsRef = deletedDocsRef;
+        }
+      }
 
-  static final String PREVIOUS_CYCLE_TIME_TAKEN = "previousCycleTimeInSeconds";
+      clone.norms = new HashMap<String,Norm>();
 
-  static final String INDEX_REPLICATED_AT_LIST = "indexReplicatedAtList";
+      // Clone norms
+      for (int i = 0; i < fieldNormsChanged.length; i++) {
 
-  static final String REPLICATION_FAILED_AT_LIST = "replicationFailedAtList";
+        // Clone unchanged norms to the cloned reader
+        if (doClone || !fieldNormsChanged[i]) {
+          final String curField = core.fieldInfos.fieldInfo(i).name;
+          Norm norm = this.norms.get(curField);
+          if (norm != null)
+            clone.norms.put(curField, (Norm) norm.clone());
+        }
+      }
+
+      // If we are not cloning, then this will open anew
+      // any norms that have changed:
+      clone.openNorms(si.getUseCompoundFile() ? core.getCFSReader() : directory(), readBufferSize);
+
+      success = true;
+    } finally {
+      if (!success) {
+        // An exception occurred during reopen, we have to decRef the norms
+        // that we incRef'ed already and close singleNormsStream and FieldsReader
+        clone.decRef();
+      }
+    }
+    
+    return clone;
+  }
+
+  @Override
+  protected void doCommit(Map<String,String> commitUserData) throws IOException {
+    if (hasChanges) {
+      startCommit();
+      boolean success = false;
+      try {
+        commitChanges(commitUserData);
+        success = true;
+      } finally {
+        if (!success) {
+          rollbackCommit();
+        }
+      }
+    }
+  }
+
+  private void commitChanges(Map<String,String> commitUserData) throws IOException {
+    if (deletedDocsDirty) {               // re-write deleted
+      si.advanceDelGen();
+
+      assert deletedDocs.size() == si.docCount;
+
+      // We can write directly to the actual name (vs to a
+      // .tmp & renaming it) because the file is not live
+      // until segments file is written:
+      final String delFileName = si.getDelFileName();
+      boolean success = false;
+      try {
+        deletedDocs.write(directory(), delFileName);
+        success = true;
+      } finally {
+        if (!success) {
+          try {
+            directory().deleteFile(delFileName);
+          } catch (Throwable t) {
+            // suppress this so we keep throwing the
+            // original exception
+          }
+        }
+      }
+
+      si.setDelCount(si.getDelCount()+pendingDeleteCount);
+      pendingDeleteCount = 0;
+      assert deletedDocs.count() == si.getDelCount(): "delete count mismatch during commit: info=" + si.getDelCount() + " vs BitVector=" + deletedDocs.count();
+    } else {
+      assert pendingDeleteCount == 0;
+    }
+
+    if (normsDirty) {               // re-write norms
+      si.setNumFields(core.fieldInfos.size());
+      for (final Norm norm : norms.values()) {
+        if (norm.dirty) {
+          norm.reWrite(si);
+        }
+      }
+    }
+    deletedDocsDirty = false;
+    normsDirty = false;
+    hasChanges = false;
+  }
+
+  FieldsReader getFieldsReader() {
+    return fieldsReaderLocal.get();
+  }
+
+  @Override
+  protected void doClose() throws IOException {
+    termVectorsLocal.close();
+    fieldsReaderLocal.close();
+    
+    if (deletedDocs != null) {
+      deletedDocsRef.decrementAndGet();
+      // null so if an app hangs on to us we still free most ram
+      deletedDocs = null;
+    }
+
+    for (final Norm norm : norms.values()) {
+      norm.decRef();
+    }
+    if (core != null) {
+      core.decRef();
+    }
+  }
+
+  static boolean hasDeletions(SegmentInfo si) throws IOException {
+    // Don't call ensureOpen() here (it could affect performance)
+    return si.hasDeletions();
+  }
+
+  @Override
+  public boolean hasDeletions() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return deletedDocs != null;
+  }
+
+  static boolean usesCompoundFile(SegmentInfo si) throws IOException {
+    return si.getUseCompoundFile();
+  }
+
+  static boolean hasSeparateNorms(SegmentInfo si) throws IOException {
+    return si.hasSeparateNorms();
+  }
+
+  @Override
+  protected void doDelete(int docNum) {
+    if (deletedDocs == null) {
+      deletedDocs = new BitVector(maxDoc());
+      deletedDocsRef = new AtomicInteger(1);
+    }
+    // there is more than 1 SegmentReader with a reference to this
+    // deletedDocs BitVector so decRef the current deletedDocsRef,
+    // clone the BitVector, create a new deletedDocsRef
+    if (deletedDocsRef.get() > 1) {
+      AtomicInteger oldRef = deletedDocsRef;
+      deletedDocs = cloneDeletedDocs(deletedDocs);
+      deletedDocsRef = new AtomicInteger(1);
+      oldRef.decrementAndGet();
+    }
+    deletedDocsDirty = true;
+    if (!deletedDocs.getAndSet(docNum))
+      pendingDeleteCount++;
+  }
+
+  @Override
+  protected void doUndeleteAll() {
+    deletedDocsDirty = false;
+    if (deletedDocs != null) {
+      assert deletedDocsRef != null;
+      deletedDocsRef.decrementAndGet();
+      deletedDocs = null;
+      deletedDocsRef = null;
+      pendingDeleteCount = 0;
+      si.clearDelGen();
+      si.setDelCount(0);
+    } else {
+      assert deletedDocsRef == null;
+      assert pendingDeleteCount == 0;
+    }
+  }
+
+  List<String> files() throws IOException {
+    return new ArrayList<String>(si.files());
+  }
+
+  @Override
+  public TermEnum terms() {
+    ensureOpen();
+    return core.getTermsReader().terms();
+  }
+
+  @Override
+  public TermEnum terms(Term t) throws IOException {
+    ensureOpen();
+    return core.getTermsReader().terms(t);
+  }
+
+  FieldInfos fieldInfos() {
+    return core.fieldInfos;
+  }
+
+  @Override
+  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+    ensureOpen();
+    return getFieldsReader().doc(n, fieldSelector);
+  }
+
+  @Override
+  public synchronized boolean isDeleted(int n) {
+    return (deletedDocs != null && deletedDocs.get(n));
+  }
+
+  @Override
+  public TermDocs termDocs(Term term) throws IOException {
+    if (term == null) {
+      return new AllTermDocs(this);
+    } else {
+      return super.termDocs(term);
+    }
+  }
+
+  @Override
+  public TermDocs termDocs() throws IOException {
+    ensureOpen();
+    return new SegmentTermDocs(this);
+  }
+
+  @Override
+  public TermPositions termPositions() throws IOException {
+    ensureOpen();
+    return new SegmentTermPositions(this);
+  }
+
+  @Override
+  public int docFreq(Term t) throws IOException {
+    ensureOpen();
+    TermInfo ti = core.getTermsReader().get(t);
+    if (ti != null)
+      return ti.docFreq;
+    else
+      return 0;
+  }
+
+  @Override
+  public int numDocs() {
+    // Don't call ensureOpen() here (it could affect performance)
+    int n = maxDoc();
+    if (deletedDocs != null)
+      n -= deletedDocs.count();
+    return n;
+  }
+
+  @Override
+  public int maxDoc() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return si.docCount;
+  }
+
+  /**
+   * @see IndexReader#getFieldNames(org.apache.lucene.index.IndexReader.FieldOption)
+   */
+  @Override
+  public Collection<String> getFieldNames(IndexReader.FieldOption fieldOption) {
+    ensureOpen();
+
+    Set<String> fieldSet = new HashSet<String>();
+    for (int i = 0; i < core.fieldInfos.size(); i++) {
+      FieldInfo fi = core.fieldInfos.fieldInfo(i);
+      if (fieldOption == IndexReader.FieldOption.ALL) {
+        fieldSet.add(fi.name);
+      }
+      else if (!fi.isIndexed && fieldOption == IndexReader.FieldOption.UNINDEXED) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.omitTermFreqAndPositions && fieldOption == IndexReader.FieldOption.OMIT_TERM_FREQ_AND_POSITIONS) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.storePayloads && fieldOption == IndexReader.FieldOption.STORES_PAYLOADS) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.isIndexed && fieldOption == IndexReader.FieldOption.INDEXED) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.isIndexed && fi.storeTermVector == false && fieldOption == IndexReader.FieldOption.INDEXED_NO_TERMVECTOR) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.storeTermVector == true &&
+               fi.storePositionWithTermVector == false &&
+               fi.storeOffsetWithTermVector == false &&
+               fieldOption == IndexReader.FieldOption.TERMVECTOR) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.isIndexed && fi.storeTermVector && fieldOption == IndexReader.FieldOption.INDEXED_WITH_TERMVECTOR) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.storePositionWithTermVector && fi.storeOffsetWithTermVector == false && fieldOption == IndexReader.FieldOption.TERMVECTOR_WITH_POSITION) {
+        fieldSet.add(fi.name);
+      }
+      else if (fi.storeOffsetWithTermVector && fi.storePositionWithTermVector == false && fieldOption == IndexReader.FieldOption.TERMVECTOR_WITH_OFFSET) {
+        fieldSet.add(fi.name);
+      }
+      else if ((fi.storeOffsetWithTermVector && fi.storePositionWithTermVector) &&
+                fieldOption == IndexReader.FieldOption.TERMVECTOR_WITH_POSITION_OFFSET) {
+        fieldSet.add(fi.name);
+      }
+    }
+    return fieldSet;
+  }
+
+
+  @Override
+  public synchronized boolean hasNorms(String field) {
+    ensureOpen();
+    return norms.containsKey(field);
+  }
+
+  // can return null if norms aren't stored
+  protected synchronized byte[] getNorms(String field) throws IOException {
+    Norm norm = norms.get(field);
+    if (norm == null) return null;  // not indexed, or norms not stored
+    return norm.bytes();
+  }
+
+  // returns fake norms if norms aren't available
+  @Override
+  public synchronized byte[] norms(String field) throws IOException {
+    ensureOpen();
+    byte[] bytes = getNorms(field);
+    return bytes;
+  }
+
+  @Override
+  protected void doSetNorm(int doc, String field, byte value)
+          throws IOException {
+    Norm norm = norms.get(field);
+    if (norm == null)                             // not an indexed field
+      return;
+
+    normsDirty = true;
+    norm.copyOnWrite()[doc] = value;                    // set the value
+  }
+
+  /** Read norms into a pre-allocated array. */
+  @Override
+  public synchronized void norms(String field, byte[] bytes, int offset)
+    throws IOException {
+
+    ensureOpen();
+    Norm norm = norms.get(field);
+    if (norm == null) {
+      Arrays.fill(bytes, offset, bytes.length, Similarity.getDefault().encodeNormValue(1.0f));
+      return;
+    }
+  
+    norm.bytes(bytes, offset, maxDoc());
+  }
+
+
+  private void openNorms(Directory cfsDir, int readBufferSize) throws IOException {
+    long nextNormSeek = SegmentMerger.NORMS_HEADER.length; //skip header (header unused for now)
+    int maxDoc = maxDoc();
+    for (int i = 0; i < core.fieldInfos.size(); i++) {
+      FieldInfo fi = core.fieldInfos.fieldInfo(i);
+      if (norms.containsKey(fi.name)) {
+        // in case this SegmentReader is being re-opened, we might be able to
+        // reuse some norm instances and skip loading them here
+        continue;
+      }
+      if (fi.isIndexed && !fi.omitNorms) {
+        Directory d = directory();
+        String fileName = si.getNormFileName(fi.number);
+        if (!si.hasSeparateNorms(fi.number)) {
+          d = cfsDir;
+        }
+        
+        // singleNormFile means multiple norms share this file
+        boolean singleNormFile = IndexFileNames.matchesExtension(fileName, IndexFileNames.NORMS_EXTENSION);
+        IndexInput normInput = null;
+        long normSeek;
+
+        if (singleNormFile) {
+          normSeek = nextNormSeek;
+          if (singleNormStream == null) {
+            singleNormStream = d.openInput(fileName, readBufferSize);
+            singleNormRef = new AtomicInteger(1);
+          } else {
+            singleNormRef.incrementAndGet();
+          }
+          // All norms in the .nrm file can share a single IndexInput since
+          // they are only used in a synchronized context.
+          // If this were to change in the future, a clone could be done here.
+          normInput = singleNormStream;
+        } else {
+          normSeek = 0;
+          normInput = d.openInput(fileName);
+        }
+
+        norms.put(fi.name, new Norm(normInput, fi.number, normSeek));
+        nextNormSeek += maxDoc; // increment also if some norms are separate
+      }
+    }
+  }
+
+  boolean termsIndexLoaded() {
+    return core.termsIndexIsLoaded();
+  }
+
+  // NOTE: only called from IndexWriter when a near
+  // real-time reader is opened, or applyDeletes is run,
+  // sharing a segment that's still being merged.  This
+  // method is not thread safe, and relies on the
+  // synchronization in IndexWriter
+  void loadTermsIndex(int termsIndexDivisor) throws IOException {
+    core.loadTermsIndex(si, termsIndexDivisor);
+  }
+
+  // for testing only
+  boolean normsClosed() {
+    if (singleNormStream != null) {
+      return false;
+    }
+    for (final Norm norm : norms.values()) {
+      if (norm.refCount > 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // for testing only
+  boolean normsClosed(String field) {
+    return norms.get(field).refCount == 0;
+  }
+
+  /**
+   * Create a clone from the initial TermVectorsReader and store it in the ThreadLocal.
+   * @return TermVectorsReader
+   */
+  TermVectorsReader getTermVectorsReader() {
+    TermVectorsReader tvReader = termVectorsLocal.get();
+    if (tvReader == null) {
+      TermVectorsReader orig = core.getTermVectorsReaderOrig();
+      if (orig == null) {
+        return null;
+      } else {
+        try {
+          tvReader = (TermVectorsReader) orig.clone();
+        } catch (CloneNotSupportedException cnse) {
+          return null;
+        }
+      }
+      termVectorsLocal.set(tvReader);
+    }
+    return tvReader;
+  }
+
+  TermVectorsReader getTermVectorsReaderOrig() {
+    return core.getTermVectorsReaderOrig();
+  }
+  
+  /** Return a term frequency vector for the specified document and field. The
+   *  vector returned contains term numbers and frequencies for all terms in
+   *  the specified field of this document, if the field had storeTermVector
+   *  flag set.  If the flag was not set, the method returns null.
+   * @throws IOException
+   */
+  @Override
+  public TermFreqVector getTermFreqVector(int docNumber, String field) throws IOException {
+    // Check if this field is invalid or has no stored term vector
+    ensureOpen();
+    FieldInfo fi = core.fieldInfos.fieldInfo(field);
+    if (fi == null || !fi.storeTermVector) 
+      return null;
+    
+    TermVectorsReader termVectorsReader = getTermVectorsReader();
+    if (termVectorsReader == null)
+      return null;
+    
+    return termVectorsReader.get(docNumber, field);
+  }
+
+
+  @Override
+  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+    FieldInfo fi = core.fieldInfos.fieldInfo(field);
+    if (fi == null || !fi.storeTermVector)
+      return;
+
+    TermVectorsReader termVectorsReader = getTermVectorsReader();
+    if (termVectorsReader == null) {
+      return;
+    }
+
+
+    termVectorsReader.get(docNumber, field, mapper);
+  }
+
+
+  @Override
+  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+
+    TermVectorsReader termVectorsReader = getTermVectorsReader();
+    if (termVectorsReader == null)
+      return;
+
+    termVectorsReader.get(docNumber, mapper);
+  }
+
+  /** Return an array of term frequency vectors for the specified document.
+   *  The array contains a vector for each vectorized field in the document.
+   *  Each vector vector contains term numbers and frequencies for all terms
+   *  in a given vectorized field.
+   *  If no such fields existed, the method returns null.
+   * @throws IOException
+   */
+  @Override
+  public TermFreqVector[] getTermFreqVectors(int docNumber) throws IOException {
+    ensureOpen();
+    
+    TermVectorsReader termVectorsReader = getTermVectorsReader();
+    if (termVectorsReader == null)
+      return null;
+    
+    return termVectorsReader.get(docNumber);
+  }
+  
+  /** {@inheritDoc} */
+  @Override
+  public String toString() {
+    final StringBuilder buffer = new StringBuilder();
+    if (hasChanges) {
+      buffer.append('*');
+    }
+    buffer.append(si.toString(core.dir, pendingDeleteCount));
+    return buffer.toString();
+  }
+
+  /**
+   * Return the name of the segment this reader is reading.
+   */
+  public String getSegmentName() {
+    return core.segment;
+  }
+  
+  /**
+   * Return the SegmentInfo of the segment this reader is reading.
+   */
+  SegmentInfo getSegmentInfo() {
+    return si;
+  }
+
+  void setSegmentInfo(SegmentInfo info) {
+    si = info;
+  }
+
+  void startCommit() {
+    rollbackSegmentInfo = (SegmentInfo) si.clone();
+    rollbackHasChanges = hasChanges;
+    rollbackDeletedDocsDirty = deletedDocsDirty;
+    rollbackNormsDirty = normsDirty;
+    rollbackPendingDeleteCount = pendingDeleteCount;
+    for (Norm norm : norms.values()) {
+      norm.rollbackDirty = norm.dirty;
+    }
+  }
+
+  void rollbackCommit() {
+    si.reset(rollbackSegmentInfo);
+    hasChanges = rollbackHasChanges;
+    deletedDocsDirty = rollbackDeletedDocsDirty;
+    normsDirty = rollbackNormsDirty;
+    pendingDeleteCount = rollbackPendingDeleteCount;
+    for (Norm norm : norms.values()) {
+      norm.dirty = norm.rollbackDirty;
+    }
+  }
+
+  /** Returns the directory this index resides in. */
+  @Override
+  public Directory directory() {
+    // Don't ensureOpen here -- in certain cases, when a
+    // cloned/reopened reader needs to commit, it may call
+    // this method on the closed original reader
+    return core.dir;
+  }
+
+  // This is necessary so that cloned SegmentReaders (which
+  // share the underlying postings data) will map to the
+  // same entry in the FieldCache.  See LUCENE-1579.
+  @Override
+  public final Object getCoreCacheKey() {
+    return core.freqStream;
+  }
+
+  @Override
+  public Object getDeletesCacheKey() {
+    return deletedDocs;
+  }
+
+  @Override
+  public long getUniqueTermCount() {
+    return core.getTermsReader().size();
+  }
+
+  /**
+   * Lotsa tests did hacks like:<br/>
+   * SegmentReader reader = (SegmentReader) IndexReader.open(dir);<br/>
+   * They broke. This method serves as a hack to keep hacks working
+   * We do it with R/W access for the tests (BW compatibility)
+   * @deprecated Remove this when tests are fixed!
+   */
+  @Deprecated
+  static SegmentReader getOnlySegmentReader(Directory dir) throws IOException {
+    return getOnlySegmentReader(IndexReader.open(dir,false));
+  }
+
+  static SegmentReader getOnlySegmentReader(IndexReader reader) {
+    if (reader instanceof SegmentReader)
+      return (SegmentReader) reader;
+
+    if (reader instanceof DirectoryReader) {
+      IndexReader[] subReaders = reader.getSequentialSubReaders();
+      if (subReaders.length != 1)
+        throw new IllegalArgumentException(reader + " has " + subReaders.length + " segments instead of exactly one");
+
+      return (SegmentReader) subReaders[0];
+    }
+
+    throw new IllegalArgumentException(reader + " is not a SegmentReader or a single-segment DirectoryReader");
+  }
+
+  @Override
+  public int getTermInfosIndexDivisor() {
+    return core.termsIndexDivisor;
+  }
 }

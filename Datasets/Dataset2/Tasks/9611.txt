@@ -1,401 +1,536 @@
-return "Flow context"/*nonNLS*/;
+IWorkingCopy[] workingCopies = this.hierarchy.workingCopies;
 
-package org.eclipse.jdt.internal.compiler.flow;
+/*******************************************************************************
+ * Copyright (c) 2000, 2003 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials 
+ * are made available under the terms of the Common Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/cpl-v10.html
+ * 
+ * Contributors:
+ *     IBM Corporation - initial API and implementation
+ *******************************************************************************/
+package org.eclipse.jdt.internal.core.hierarchy;
 
-/*
- * (c) Copyright IBM Corp. 2000, 2001.
- * All Rights Reserved.
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+
+import org.eclipse.core.resources.IProject;
+import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.SubProgressMonitor;
+import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.IWorkingCopy;
+import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.compiler.CharOperation;
+import org.eclipse.jdt.core.search.IJavaSearchConstants;
+import org.eclipse.jdt.core.search.IJavaSearchScope;
+import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+import org.eclipse.jdt.internal.compiler.env.IGenericType;
+import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+import org.eclipse.jdt.internal.compiler.lookup.TagBits;
+import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+import org.eclipse.jdt.internal.compiler.util.HashtableOfObject;
+import org.eclipse.jdt.internal.compiler.util.SuffixConstants;
+import org.eclipse.jdt.internal.core.*;
+import org.eclipse.jdt.internal.core.search.IIndexSearchRequestor;
+import org.eclipse.jdt.internal.core.search.IInfoConstants;
+import org.eclipse.jdt.internal.core.search.IndexSearchAdapter;
+import org.eclipse.jdt.internal.core.search.SubTypeSearchJob;
+import org.eclipse.jdt.internal.core.search.indexing.AbstractIndexer;
+import org.eclipse.jdt.internal.core.search.indexing.IIndexConstants;
+import org.eclipse.jdt.internal.core.search.indexing.IndexManager;
+import org.eclipse.jdt.internal.core.search.matching.SuperTypeReferencePattern;
+
+public class IndexBasedHierarchyBuilder extends HierarchyBuilder implements SuffixConstants {
+	public static final int MAXTICKS = 800; // heuristic so that there still progress for deep hierachies
+	/**
+	 * A temporary cache of compilation units to handles to speed info
+	 * to handle translation - it only contains the entries
+	 * for the types in the region (in other words, it contains no supertypes outside
+	 * the region).
+	 */
+	protected Map cuToHandle;
+	/**
+	 * A map from compilation unit handles to working copies.
+	 */
+	protected Map handleToWorkingCopy;
+
+	/**
+	 * The scope this hierarchy builder should restrain results to.
+	 */
+	protected IJavaSearchScope scope;
+
+	/**
+	 * Cache used to record binaries recreated from index matches
+	 */
+	protected Map binariesFromIndexMatches;
+	
+	/**
+	 * Collection used to queue subtype index queries
+	 */
+	private static class Queue {
+		public char[][] names = new char[10][];
+		public int start = 0;
+		public int end = -1;
+		public void add(char[] name){
+			if (++this.end == this.names.length){
+				this.end -= this.start;
+				System.arraycopy(this.names, this.start, this.names = new char[this.end*2][], 0, this.end);
+				this.start = 0;
+			}
+			this.names[this.end] = name;
+		}
+		public char[] retrieve(){
+			if (this.start > this.end) return null; // none
+			
+			char[] name = this.names[this.start++];
+			if (this.start > this.end){
+				this.start = 0;
+				this.end = -1;
+			}
+			return name;
+		}
+		public String toString(){
+			StringBuffer buffer = new StringBuffer("Queue:\n"); //$NON-NLS-1$
+			for (int i = this.start; i <= this.end; i++){
+				buffer.append(names[i]).append('\n');		
+			}
+			return buffer.toString();
+		}
+	}
+public IndexBasedHierarchyBuilder(TypeHierarchy hierarchy, IJavaSearchScope scope) throws JavaModelException {
+	super(hierarchy);
+	this.cuToHandle = new HashMap(5);
+	this.binariesFromIndexMatches = new HashMap(10);
+	this.scope = scope;
+}
+/**
+ * Add the type info from the given hierarchy binary type to the given list of infos.
  */
-import java.util.*;
+private void addInfoFromBinaryIndexMatch(Openable handle, HierarchyBinaryType binaryType, ArrayList infos) throws JavaModelException {
+	infos.add(binaryType);
+	this.infoToHandle.put(binaryType, handle);
+}
+protected void addInfoFromClosedElement(Openable handle,ArrayList infos,ArrayList units,String resourcePath) throws JavaModelException {
+	HierarchyBinaryType binaryType = (HierarchyBinaryType) binariesFromIndexMatches.get(resourcePath);
+	if (binaryType != null) {
+		this.addInfoFromBinaryIndexMatch(handle, binaryType, infos);
+	} else {
+		super.addInfoFromClosedElement(handle, infos, units, resourcePath);
+	}
+}
+/**
+ * Add the type info (and its sibblings type infos) to the given list of infos.
+ */
+private void addInfosFromType(IType type, ArrayList infos) throws JavaModelException {
+	if (type.isBinary()) {
+		// add class file
+		ClassFile classFile = (ClassFile)type.getClassFile();
+		if (classFile != null) {
+			this.addInfoFromOpenClassFile(classFile, infos);
+		}
+	} else {
+		// add whole cu (if it is a working copy, it's types can be potential subtypes)
+		CompilationUnit unit = (CompilationUnit)type.getCompilationUnit();
+		if (unit != null) {
+			this.addInfoFromOpenCU(unit, infos);
+		}
+	}
+}
+public void build(boolean computeSubtypes) throws JavaModelException, CoreException {
+	JavaModelManager manager = JavaModelManager.getJavaModelManager();
+	try {
+		// optimize access to zip files while building hierarchy
+		manager.cacheZipFiles();
+				
+		if (computeSubtypes) {
+			// Note by construction there always is a focus type here
+			boolean focusIsObject = getType().getElementName().equals(new String(IIndexConstants.OBJECT));
+			int amountOfWorkForSubtypes = focusIsObject ? 5 : 80; // percentage of work needed to get possible subtypes
+			IProgressMonitor possibleSubtypesMonitor = 
+				this.hierarchy.progressMonitor == null ? 
+					null : 
+					new SubProgressMonitor(this.hierarchy.progressMonitor, amountOfWorkForSubtypes);
+			String[] allPossibleSubtypes = this.determinePossibleSubTypes(possibleSubtypesMonitor);
+			if (allPossibleSubtypes != null) {
+				IProgressMonitor buildMonitor = 
+					this.hierarchy.progressMonitor == null ? 
+						null : 
+						new SubProgressMonitor(this.hierarchy.progressMonitor, 100 - amountOfWorkForSubtypes);
+				this.hierarchy.initialize(allPossibleSubtypes.length);
+				buildFromPotentialSubtypes(allPossibleSubtypes, buildMonitor);
+			}
+		} else {
+			this.hierarchy.initialize(1);
+			this.buildSupertypes();
+		}
+	} finally {
+		manager.flushZipFiles();
+	}
+}
+private void buildForProject(JavaProject project, ArrayList infos, ArrayList units, IWorkingCopy[] workingCopies, IProgressMonitor monitor) throws JavaModelException {
+	// copy vectors into arrays
+	IGenericType[] genericTypes;
+	int infosSize = infos.size();
+	if (infosSize > 0) {
+		genericTypes = new IGenericType[infosSize];
+		infos.toArray(genericTypes);
+	} else {
+		genericTypes = new IGenericType[0];
+	}
+	ICompilationUnit[] compilationUnits;
+	int unitsSize = units.size();
+	if (unitsSize > 0) {
+		compilationUnits = new ICompilationUnit[unitsSize];
+		units.toArray(compilationUnits);
+	} else {
+		compilationUnits = new ICompilationUnit[0];
+	}
 
-import org.eclipse.jdt.internal.compiler.*;
-import org.eclipse.jdt.internal.compiler.ast.*;
-import org.eclipse.jdt.internal.compiler.codegen.*;
-import org.eclipse.jdt.internal.compiler.lookup.*;
-import org.eclipse.jdt.internal.compiler.problem.*;
-import org.eclipse.jdt.internal.compiler.util.*;
+	// resolve
+	if (infosSize > 0 || unitsSize > 0) {
+		this.searchableEnvironment = (SearchableEnvironment)project.getSearchableNameEnvironment();
+		IType focusType = this.getType();
+		this.nameLookup = project.getNameLookup();
+		boolean inProjectOfFocusType = focusType != null && focusType.getJavaProject().equals(project);
+		if (inProjectOfFocusType) {
+			org.eclipse.jdt.core.ICompilationUnit unitToLookInside = focusType.getCompilationUnit();
+			IWorkingCopy[] unitsToLookInside;
+			if (unitToLookInside != null) {
+				int wcLength = workingCopies == null ? 0 : workingCopies.length;
+				if (wcLength == 0) {
+					unitsToLookInside = new IWorkingCopy[] {unitToLookInside};
+				} else {
+					unitsToLookInside = new IWorkingCopy[wcLength+1];
+					unitsToLookInside[0] = unitToLookInside;
+					System.arraycopy(workingCopies, 0, unitsToLookInside, 1, wcLength);
+				}
+			} else {
+				unitsToLookInside = workingCopies;
+			}
+			this.nameLookup.setUnitsToLookInside(unitsToLookInside); // NB: this uses a PerThreadObject, so it is thread safe
+		}
+		try {
+			this.hierarchyResolver = 
+				new HierarchyResolver(this.searchableEnvironment, project.getOptions(true), this, new DefaultProblemFactory());
+			if (focusType != null) {
+				char[] fullyQualifiedName = focusType.getFullyQualifiedName().toCharArray();
+				ReferenceBinding focusTypeBinding = this.hierarchyResolver.setFocusType(CharOperation.splitOn('.', fullyQualifiedName));
+				if (focusTypeBinding == null 
+					|| (!inProjectOfFocusType && (focusTypeBinding.tagBits & TagBits.HierarchyHasProblems) > 0)) {
+					// focus type is not visible in this project: no need to go further
+					return;
+				}
+			}
+			this.hierarchyResolver.resolve(genericTypes, compilationUnits, monitor);
+		} finally {
+			if (inProjectOfFocusType) {
+				this.nameLookup.setUnitsToLookInside(null);
+			}
+		}
+	}
+}
+/**
+ * Configure this type hierarchy based on the given potential subtypes.
+ */
+private void buildFromPotentialSubtypes(String[] allPotentialSubTypes, IProgressMonitor monitor) {
+	IType focusType = this.getType();
+		
+	// substitute compilation units with working copies
+	HashMap wcPaths = new HashMap(); // a map from path to working copies
+	int wcLength;
+	IWorkingCopy[] workingCopies = this.getWokingCopies();
+	if (workingCopies != null && (wcLength = workingCopies.length) > 0) {
+		String[] newPaths = new String[wcLength];
+		for (int i = 0; i < wcLength; i++) {
+			IWorkingCopy workingCopy = workingCopies[i];
+			String path = workingCopy.getOriginalElement().getPath().toString();
+			wcPaths.put(path, workingCopy);
+			newPaths[i] = path;
+		}
+		int potentialSubtypesLength = allPotentialSubTypes.length;
+		System.arraycopy(allPotentialSubTypes, 0, allPotentialSubTypes = new String[potentialSubtypesLength+wcLength], 0, potentialSubtypesLength);
+		System.arraycopy(newPaths, 0, allPotentialSubTypes, potentialSubtypesLength, wcLength);
+	}
+			
+	int length = allPotentialSubTypes.length;
+
+	// inject the compilation unit of the focus type (so that types in
+	// this cu have special visibility permission (this is also usefull
+	// when the cu is a working copy)
+	Openable focusCU = (Openable)focusType.getCompilationUnit();
+	String focusPath = null;
+	if (focusCU != null) {
+		focusPath = focusCU.getPath().toString();
+		if (length > 0) {
+			System.arraycopy(allPotentialSubTypes, 0, allPotentialSubTypes = new String[length+1], 0, length);
+			allPotentialSubTypes[length] = focusPath;	
+		} else {
+			allPotentialSubTypes = new String[] {focusPath};
+		}
+		length++;
+	}
+	
+	// sort by projects
+	/*
+	 * NOTE: To workaround pb with hierarchy resolver that requests top  
+	 * level types in the process of caching an enclosing type, this needs to
+	 * be sorted in reverse alphabetical order so that top level types are cached
+	 * before their inner types.
+	 */
+	Util.sortReverseOrder(allPotentialSubTypes);
+	
+	ArrayList infos = new ArrayList();
+	ArrayList units = new ArrayList();
+
+	try {
+		// create element infos for subtypes
+		HandleFactory factory = new HandleFactory(ResourcesPlugin.getWorkspace());
+		IJavaProject currentProject = null;
+		if (monitor != null) monitor.beginTask("", length*2 /* 1 for build binding, 1 for connect hierarchy*/); //$NON-NLS-1$
+		for (int i = 0; i < length; i++) {
+			try {
+				String resourcePath = allPotentialSubTypes[i];
+				
+				// skip duplicate paths (e.g. if focus path was injected when it was already a potential subtype)
+				if (i > 0 && resourcePath.equals(allPotentialSubTypes[i-1])) continue;
+				
+				Openable handle;
+				IWorkingCopy workingCopy = (IWorkingCopy)wcPaths.get(resourcePath);
+				if (workingCopy != null) {
+					handle = (Openable)workingCopy;
+				} else {
+					handle = 
+						resourcePath.equals(focusPath) ? 
+							focusCU :
+							factory.createOpenable(resourcePath, this.scope);
+					if (handle == null) continue; // match is outside classpath
+				}
+				
+				IJavaProject project = handle.getJavaProject();
+				if (currentProject == null) {
+					currentProject = project;
+					infos = new ArrayList(5);
+					units = new ArrayList(5);
+				} else if (!currentProject.equals(project)) {
+					// build current project
+					this.buildForProject((JavaProject)currentProject, infos, units, workingCopies, monitor);
+					currentProject = project;
+					infos = new ArrayList(5);
+					units = new ArrayList(5);
+				}
+				
+				this.addInfoFromElement(handle, infos, units, resourcePath);
+			} catch (JavaModelException e) {
+				continue;
+			}
+		}
+		
+		// build last project
+		try {
+			if (currentProject == null) {
+				// case of no potential subtypes
+				currentProject = focusType.getJavaProject();
+				this.addInfosFromType(focusType, infos);
+			}
+			this.buildForProject((JavaProject)currentProject, infos, units, workingCopies, monitor);
+		} catch (JavaModelException e) {
+		}
+		
+		// Compute hierarchy of focus type if not already done (case of a type with potential subtypes that are not real subtypes)
+		if (!this.hierarchy.contains(focusType)) {
+			try {
+				currentProject = focusType.getJavaProject();
+				infos = new ArrayList();
+				units = new ArrayList();
+				this.addInfosFromType(focusType, infos);
+				this.buildForProject((JavaProject)currentProject, infos, units, workingCopies, monitor);
+			} catch (JavaModelException e) {
+			}
+		}
+		
+		// Add focus if not already in (case of a type with no explicit super type)
+		if (!this.hierarchy.contains(focusType)) {
+			this.hierarchy.addRootClass(focusType);
+		}
+	} finally {
+		if (monitor != null) monitor.done();
+	}
+}
+protected ICompilationUnit createCompilationUnitFromPath(Openable handle,String osPath) throws JavaModelException {
+	ICompilationUnit unit = super.createCompilationUnitFromPath(handle, osPath);
+	this.cuToHandle.put(unit, handle);
+	return unit;
+}
+/**
+ * Returns all of the possible subtypes of this type hierarchy.
+ * Returns null if they could not be determine.
+ */
+private String[] determinePossibleSubTypes(IProgressMonitor monitor) throws JavaModelException, CoreException {
+
+	class PathCollector implements IPathRequestor {
+		HashSet paths = new HashSet(10);
+		public void acceptPath(String path) {
+			paths.add(path);
+		}
+	}
+	PathCollector collector = new PathCollector();
+	IProject project = this.hierarchy.javaProject().getProject();
+	
+	try {
+		if (monitor != null) monitor.beginTask("", MAXTICKS); //$NON-NLS-1$
+		searchAllPossibleSubTypes(
+			project.getWorkspace(),
+			this.getType(),
+			this.scope,
+			this.binariesFromIndexMatches,
+			collector,
+			IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+			monitor);
+	} finally {
+		if (monitor != null) monitor.done();
+	}
+
+	HashSet paths = collector.paths;
+	int length = paths.size();
+	String[] result = new String[length];
+	int count = 0;
+	for (Iterator iter = paths.iterator(); iter.hasNext();) {
+		result[count++] = (String) iter.next();
+	} 
+	return result;
+}
+/**
+ * Returns a handle for the given generic type or null if not found.
+ */
+protected IType getHandle(IGenericType genericType) {
+	if (genericType instanceof HierarchyType) {
+		IType type = (IType)this.infoToHandle.get(genericType);
+		if (type == null) {
+			HierarchyType hierarchyType = (HierarchyType)genericType;
+			CompilationUnit unit = (CompilationUnit)this.cuToHandle.get(hierarchyType.originatingUnit);
+
+			// collect enclosing type names
+			ArrayList enclosingTypeNames = new ArrayList();
+			HierarchyType enclosingType = hierarchyType;
+			do {
+				enclosingTypeNames.add(enclosingType.name);
+				enclosingType = enclosingType.enclosingType;
+			} while (enclosingType != null);
+			int length = enclosingTypeNames.size();
+			char[][] simpleTypeNames = new char[length][];
+			enclosingTypeNames.toArray(simpleTypeNames);
+
+			// build handle
+			type = unit.getType(new String(simpleTypeNames[length-1]));
+			for (int i = length-2; i >= 0; i--) {
+				type = type.getType(new String(simpleTypeNames[i]));
+			}
+			this.infoToHandle.put(genericType, type);
+		}
+		return type;
+	} else
+		return super.getHandle(genericType);
+}
 
 /**
- * Reflects the context of code analysis, keeping track of enclosing
- *	try statements, exception handlers, etc...
+ * Find the set of candidate subtypes of a given type.
+ *
+ * The requestor is notified of super type references (with actual path of
+ * its occurrence) for all types which are potentially involved inside a particular
+ * hierarchy.
+ * The match locator is not used here to narrow down the results, the type hierarchy
+ * resolver is rather used to compute the whole hierarchy at once.
  */
-public class FlowContext implements TypeConstants {
-	public AstNode associatedNode;
-	public FlowContext parent;
 
-	public final static FlowContext NotContinuableContext = new FlowContext(null,null);
-public FlowContext(FlowContext parent, AstNode associatedNode) {
-	this.parent = parent;
-	this.associatedNode = associatedNode;
-}
-public Label breakLabel() {
-	return null;
-}
-public void checkExceptionHandlers(TypeBinding[] raisedExceptions, AstNode location, FlowInfo flowInfo, BlockScope scope) {
+public static void searchAllPossibleSubTypes(
+	IWorkspace workbench,
+	IType type,
+	IJavaSearchScope scope,
+	final Map binariesFromIndexMatches,
+	final IPathRequestor pathRequestor,
+	int waitingPolicy,	// WaitUntilReadyToSearch | ForceImmediateSearch | CancelIfNotReadyToSearch
+	IProgressMonitor progressMonitor)  throws JavaModelException, CoreException {
 
-	// check that all the argument exception types are handled
+	/* embed constructs inside arrays so as to pass them to (inner) collector */
+	final Queue awaitings = new Queue();
+	final HashtableOfObject foundSuperNames = new HashtableOfObject(5);
 
-	// JDK Compatible implementation - when an exception type is thrown, 
-	// all related catch blocks are marked as reachable... instead of those only
-	// until the point where it is safely handled (Smarter - see comment at the end)
+	IndexManager indexManager = ((JavaModelManager)JavaModelManager.getJavaModelManager()).getIndexManager();
 
-	int remainingCount; // counting the number of remaining unhandled exceptions
-	int raisedCount; // total number of exceptions raised
-	if ((raisedExceptions == null) || ((raisedCount = raisedExceptions.length) == 0))
-		return;
-	remainingCount = raisedCount;
-
-	// duplicate the array of raised exceptions since it will be updated
-	// (null replaces any handled exception)
-	System.arraycopy(raisedExceptions, 0, (raisedExceptions = new TypeBinding[raisedCount]), 0, raisedCount);
-	FlowContext traversedContext = this;
-	while (traversedContext != null) {
-		AstNode sub;
-		if (((sub = traversedContext.subRoutine()) != null) && sub.cannotReturn()) {
-			// traversing a non-returning subroutine means that all unhandled 
-			// exceptions will actually never get sent...
-			return;
-		}
-
-		// filter exceptions that are locally caught from the most enclosing 
-		// try statement to the outer ones.
-		if (traversedContext instanceof ExceptionHandlingFlowContext) {
-			ExceptionHandlingFlowContext exceptionContext = (ExceptionHandlingFlowContext) traversedContext;
-			ReferenceBinding[] caughtExceptions;
-			if ((caughtExceptions = exceptionContext.handledExceptions) != NoExceptions) {
-				int caughtCount = caughtExceptions.length;
-				boolean[] locallyCaught = new boolean[raisedCount]; // at most
-
-				for (int caughtIndex = 0; caughtIndex < caughtCount; caughtIndex++) {
-					ReferenceBinding caughtException = caughtExceptions[caughtIndex];
-					for (int raisedIndex = 0; raisedIndex < raisedCount; raisedIndex++) {
-						TypeBinding raisedException;
-						if ((raisedException = raisedExceptions[raisedIndex]) != null) {
-							switch (scope.compareTypes(raisedException, caughtException)) {
-								case EqualOrMoreSpecific :
-									exceptionContext.recordHandlingException(caughtException, flowInfo.unconditionalInits(), raisedException, location, locallyCaught[raisedIndex]); // was already definitely caught ?
-									if (!locallyCaught[raisedIndex]){
-										locallyCaught[raisedIndex] = true; // remember that this exception has been definitely caught
-										remainingCount--;
-									}
-									break;
-								case MoreGeneric :
-									exceptionContext.recordHandlingException(caughtException, flowInfo.unconditionalInits(), raisedException, location, false); // was not caught already per construction
-							}
-						}
+	/* use a special collector to collect paths and queue new subtype names */
+	IIndexSearchRequestor searchRequestor = new IndexSearchAdapter(){
+		public void acceptSuperTypeReference(String resourcePath, char[] qualification, char[] typeName, char[] enclosingTypeName, char classOrInterface, char[] superQualification, char[] superTypeName, char superClassOrInterface, int modifiers) {
+			pathRequestor.acceptPath(resourcePath);
+			int suffix = resourcePath.toLowerCase().indexOf(SUFFIX_STRING_class);
+			if (suffix != -1){ 
+				HierarchyBinaryType binaryType = (HierarchyBinaryType)binariesFromIndexMatches.get(resourcePath);
+				if (binaryType == null){
+					if (enclosingTypeName == IIndexConstants.ONE_ZERO) { // local or anonymous type
+						int lastSlash = resourcePath.lastIndexOf('/');
+						if (lastSlash == -1) return;
+						int lastDollar = resourcePath.lastIndexOf('$');
+						if (lastDollar == -1) return;
+						enclosingTypeName = resourcePath.substring(lastSlash+1, lastDollar).toCharArray();
+						typeName = resourcePath.substring(lastDollar+1, suffix).toCharArray();
 					}
+					binaryType = new HierarchyBinaryType(modifiers, qualification, typeName, enclosingTypeName, classOrInterface);
+					binariesFromIndexMatches.put(resourcePath, binaryType);
 				}
-				// remove locally caught exceptions from the remaining ones
-				for (int i = 0; i < raisedCount; i++) {
-					if (locallyCaught[i]) {
-						raisedExceptions[i] = null; // removed from the remaining ones.
-					}
-				}
+				binaryType.recordSuperType(superTypeName, superQualification, superClassOrInterface);
 			}
-			// method treatment for unchecked exceptions
-			if (exceptionContext.isMethodContext){
-				for (int i = 0; i < raisedCount; i++) {
-					TypeBinding raisedException;
-					if ((raisedException = raisedExceptions[i]) != null) {
-						if (scope.areTypesCompatible(raisedException, scope.getJavaLangRuntimeException())
-							|| scope.areTypesCompatible(raisedException, scope.getJavaLangError())){
-							remainingCount --;
-							raisedExceptions[i] = null;
-						}
-					}			
-				}
+			if (!foundSuperNames.containsKey(typeName)){
+				foundSuperNames.put(typeName, typeName);
+				awaitings.add(typeName);
 			}
-		}
-		if (remainingCount == 0)
-			return;
-		traversedContext = traversedContext.parent;
-	}
-
-	// if reaches this point, then there are some remaining unhandled exception types.	
-	for (int i = 0; i < raisedCount; i++) {
-		TypeBinding exception;
-		if ((exception = raisedExceptions[i]) != null) {
-			scope.problemReporter().unhandledException(exception, location, scope);
-		}
-	}
-}
-/* 
-"	- SMARTER VERSION -
-| unhandledExceptionTypes nameEnv traversedContext |
-
-someExceptionTypes isEmpty ifTrue: [^self].
-
-unhandledExceptionTypes := someExceptionTypes asOrderedCollection.
-nameEnv := scope enclosingMethod nameEnvironment.
-
-traversedContext := self.
-[traversedContext isNil] whileFalse: [| caughtExceptions sub |
-
-((sub := traversedContext subRoutine) notNil and: [sub cannotReturn])
-ifTrue: [
-" "Traversing a non-returning subroutine means that all unhandled exceptions will actually
-never get sent..." "
-^self].
-" "Filter exceptions that are locally caught from the most enclosing try statement to the outer ones." "
-(caughtExceptions := traversedContext handledExceptions) isNil
-ifFalse: [
-caughtExceptions do: [:handledExceptionAssoc | | handledException |
-handledException := handledExceptionAssoc key.
-unhandledExceptionTypes copy do: [:raisedException | | safe |
-" "Any exception recognized as being caught is removed from the exceptions list" "
-((safe := raisedException isCompatibleWith: handledException in: nameEnv)
-or: [handledException isCompatibleWith: raisedException in: nameEnv])
-ifTrue: [
-traversedContext
-recordInitializationInfo: initInfo
-onException: handledException.
-handledExceptionAssoc value: true.
-safe ifTrue: [unhandledExceptionTypes remove: raisedException]]]]].
-unhandledExceptionTypes isEmpty ifTrue: [^self].
-traversedContext := traversedContext parent].
-
-scope enclosingMethod errorInterface
-unexpectedExceptionsError: unhandledExceptionTypes
-from: invocationSite
-
-*/
-public void checkExceptionHandlers(TypeBinding raisedException, AstNode location, FlowInfo flowInfo, BlockScope scope) {
-
-	// LIGHT-VERSION OF THE EQUIVALENT WITH AN ARRAY OF EXCEPTIONS
-
-	// check that all the argument exception types are handled
-	// JDK Compatible implementation - when an exception type is thrown, 
-	// all related catch blocks are marked as reachable... instead of those only
-	// until the point where it is safely handled (Smarter - see comment at the end)
-
-
-	FlowContext traversedContext = this;
-	while (traversedContext != null) {
-		AstNode sub;
-		if (((sub = traversedContext.subRoutine()) != null) && sub.cannotReturn()) {
-			// traversing a non-returning subroutine means that all unhandled 
-			// exceptions will actually never get sent...
-			return;
-		}
-
-		// filter exceptions that are locally caught from the most enclosing 
-		// try statement to the outer ones.
-		if (traversedContext instanceof ExceptionHandlingFlowContext) {
-			ExceptionHandlingFlowContext exceptionContext = (ExceptionHandlingFlowContext) traversedContext;
-			ReferenceBinding[] caughtExceptions;
-			if ((caughtExceptions = exceptionContext.handledExceptions) != NoExceptions) {
-				boolean definitelyCaught = false;
-				for (int caughtIndex = 0, caughtCount = caughtExceptions.length; caughtIndex < caughtCount; caughtIndex++) {
-					ReferenceBinding caughtException = caughtExceptions[caughtIndex];
-					switch (scope.compareTypes(raisedException, caughtException)) {
-						case EqualOrMoreSpecific :
-							exceptionContext.recordHandlingException(
-								caughtException, 
-								flowInfo.unconditionalInits(), 
-								raisedException, 
-								location, 
-								definitelyCaught); // was it already definitely caught ?
-							definitelyCaught = true;
-							break;
-						case MoreGeneric :
-							exceptionContext.recordHandlingException(
-								caughtException, 
-								flowInfo.unconditionalInits(), 
-								raisedException, 
-								location, 
-								false); // was not caught already per construction
-					}
-				}
-				if (definitelyCaught) return;
-			}
-			// method treatment for unchecked exceptions
-			if (exceptionContext.isMethodContext){
-				if (scope.areTypesCompatible(raisedException, scope.getJavaLangRuntimeException())
-					|| scope.areTypesCompatible(raisedException, scope.getJavaLangError()))
-					return;
-				break; // not handled anywhere, thus jump to error handling
-			}
-		}
-		traversedContext = traversedContext.parent;
-	}
-
-	// if reaches this point, then there are some remaining unhandled exception types.
-	scope.problemReporter().unhandledException(raisedException, location, scope);
-}
-public Label continueLabel() {
-	return null;
-}
-public FlowContext getTargetContextForBreakLabel(char[] labelName) {
-
-	// lookup through break labels
-
-	FlowContext current = this, lastNonReturningSubRoutine = null;
-	while (current != null) {
-		if (current.isNonReturningContext()) {
-			lastNonReturningSubRoutine = current;
-		}
-		char[] currentLabelName;
-		if (((currentLabelName = current.labelName()) != null) 
-			&& CharOperation.equals(currentLabelName, labelName)) {
-			if (lastNonReturningSubRoutine == null) {
-				return current;
-			} else {
-				return lastNonReturningSubRoutine;
-			}
-		}
-		current = current.parent;
-	}
-
-	// not found
-	return null;
-}
-public FlowContext getTargetContextForContinueLabel(char[] labelName) {
-
-	// lookup through continue labels
-
-	FlowContext current = this, lastContinuable = null, lastNonReturningSubRoutine = null;
-	while (current != null) {
-		if (current.isNonReturningContext()) {
-			lastNonReturningSubRoutine = current;
-		} else {
-			if (current.isContinuable()) {
-				lastContinuable = current;
-			}
-		}
-		char[] currentLabelName;		
-		if (((currentLabelName = current.labelName()) != null) 
-			&& CharOperation.equals(currentLabelName, labelName)) {
-			if ((lastContinuable != null) && (current.associatedNode.concreteStatement() == lastContinuable.associatedNode)) {
-				if (lastNonReturningSubRoutine == null) {
-					return lastContinuable;
-				} else {
-					return lastNonReturningSubRoutine;
-				}
-			} else {
-				// label is found, but not a continuable location
-				return NotContinuableContext;
-			}
-		}
-		current = current.parent;
-	}
-
-	// not found
-	return null;
-}
-public FlowContext getTargetContextForDefaultBreak() {
-
-	// lookup through break labels
-
-	FlowContext current = this, lastNonReturningSubRoutine = null;
-	while (current != null) {
-		if (current.isNonReturningContext()) {
-			lastNonReturningSubRoutine = current;
-		}
-		if (current.isBreakable()) {
-			if (lastNonReturningSubRoutine == null) {
-				return current;
-			} else {
-				return lastNonReturningSubRoutine;
-			}
-		}
-		current = current.parent;
-	}
-
-	// not found
-	return null;
-}
-public FlowContext getTargetContextForDefaultContinue() {
-
-	// lookup through continue labels
-
-
-	FlowContext current = this, lastNonReturningSubRoutine = null;
-	while (current != null) {
-		if (current.isNonReturningContext()) {
-			lastNonReturningSubRoutine = current;
-		}
-		if (current.isContinuable()) {
-			if (lastNonReturningSubRoutine == null) {
-				return current;
-			} else {
-				return lastNonReturningSubRoutine;
-			}
-		}
-		current = current.parent;
-	}
-
-	// not found
-	return null;
-}
-public String individualToString(){
-	return "Flow context"; //$NON-NLS-1$
-}
-public FlowInfo initsOnBreak() {
-	return FlowInfo.DeadEnd;
-}
-public boolean isBreakable() {
-	return false;
-}
-public boolean isContinuable() {
-	return false;
-}
-public boolean isNonReturningContext() {
-	return false;
-}
-public boolean isSubRoutine() {
-	return false;
-}
-public char[] labelName() {
-	return null;
-}
-public void recordBreakFrom(FlowInfo flowInfo) {
-}
-public void recordContinueFrom(FlowInfo flowInfo) {
-}
-boolean recordFinalAssignment(VariableBinding variable, Reference finalReference) {
-	return true; // keep going
-}
-public void recordReturnFrom(UnconditionalFlowInfo flowInfo) {
-}
-public void recordSettingFinal(VariableBinding variable, Reference finalReference) {
-
-	// for initialization inside looping statement that effectively loops
-
-	FlowContext context = this;
-	while (context != null) {
-		if (!context.recordFinalAssignment(variable, finalReference)){
-			break; // no need to keep going
-		}
-		context = context.parent;
-	}
-}
-void removeFinalAssignmentIfAny(Reference reference) {
-}
-public AstNode subRoutine() {
-	return null;
-}
-public String toString(){
-	StringBuffer buffer = new StringBuffer();
-	FlowContext current = this;
-
-	int parentsCount = 0;
-	while ((current = current.parent) != null){ parentsCount++; }
+		}		
+	};
 	
-	FlowContext[] parents = new FlowContext[parentsCount+1];
-	current = this;
-	int index = parentsCount;
-	while (index >= 0) { 
-		parents[index--] = current;
-		current = current.parent; 
-	}
+	SuperTypeReferencePattern pattern = new SuperTypeReferencePattern(null, null, IJavaSearchConstants.EXACT_MATCH, IJavaSearchConstants.CASE_SENSITIVE);
+	SubTypeSearchJob job = new SubTypeSearchJob(
+				pattern, 
+				scope,
+				type, 
+				IInfoConstants.PathInfo, 
+				searchRequestor, 
+				indexManager);
+	
+	/* initialize entry result cache */
+	pattern.entryResults = new HashMap();
+	/* iterate all queued names */
+	int ticks = 0;
+	awaitings.add(type.getElementName().toCharArray());
+	while (awaitings.start <= awaitings.end){
+		if (progressMonitor != null && progressMonitor.isCanceled()) return;
 
-	for(int i = 0; i < parentsCount; i++){
-		for(int j = 0; j < i; j++) buffer.append('\t');
-		buffer.append(parents[i].individualToString()).append('\n');
+		char[] currentTypeName = awaitings.retrieve();
+
+		/* all subclasses of OBJECT are actually all types */
+		if (CharOperation.equals(currentTypeName, AbstractIndexer.OBJECT)){
+			currentTypeName = null;
+		}			
+		/* search all index references to a given supertype */
+		pattern.superSimpleName = currentTypeName;
+		indexManager.performConcurrentJob(
+			job, 
+			waitingPolicy, 
+			null); // don't pass a sub progress monitor as this is too costly for deep hierarchies
+		if (progressMonitor != null && ++ticks <= MAXTICKS) {
+			progressMonitor.worked(1);
+		}
+		/* in case, we search all subtypes, no need to search further */
+		if (currentTypeName == null) break;
 	}
-	buffer.append('*');
-	for(int j = 0; j < parentsCount+1; j++) buffer.append('\t');
-	buffer.append(individualToString()).append('\n');
-	return buffer.toString();
+	/* close all cached index inputs */
+	job.closeAll();
+	/* flush entry result cache */
+	pattern.entryResults = null;
 }
 }

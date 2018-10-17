@@ -1,13 +1,13 @@
-if (!getResponse.exists()) {
+private final List<RiverClusterStateListener> clusterStateListeners = new CopyOnWriteArrayList<>();
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,194 +19,155 @@ if (!getResponse.exists()) {
  * under the License.
  */
 
-package org.elasticsearch.action.mlt;
+package org.elasticsearch.river.cluster;
 
-import com.google.common.collect.Sets;
-import com.google.inject.Inject;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.index.Term;
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.TransportActions;
-import org.elasticsearch.action.get.GetRequest;
-import org.elasticsearch.action.get.GetResponse;
-import org.elasticsearch.action.get.TransportGetAction;
-import org.elasticsearch.action.search.SearchRequest;
-import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.TransportSearchAction;
-import org.elasticsearch.action.support.BaseAction;
-import org.elasticsearch.index.mapper.DocumentMapper;
-import org.elasticsearch.index.mapper.FieldMapper;
-import org.elasticsearch.index.mapper.FieldMappers;
-import org.elasticsearch.index.mapper.InternalMapper;
-import org.elasticsearch.index.query.json.BoolJsonQueryBuilder;
-import org.elasticsearch.index.query.json.MoreLikeThisFieldJsonQueryBuilder;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.transport.BaseTransportRequestHandler;
-import org.elasticsearch.transport.TransportChannel;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.transport.TransportService;
-import org.elasticsearch.util.settings.Settings;
 
-import java.util.Set;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 
-import static org.elasticsearch.client.Requests.*;
-import static org.elasticsearch.index.query.json.JsonQueryBuilders.*;
-import static org.elasticsearch.search.builder.SearchSourceBuilder.*;
+import static java.util.concurrent.Executors.newSingleThreadExecutor;
+import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadFactory;
 
 /**
- * The more like this action.
  *
- * @author kimchy (shay.banon)
  */
-public class TransportMoreLikeThisAction extends BaseAction<MoreLikeThisRequest, SearchResponse> {
+public class RiverClusterService extends AbstractLifecycleComponent<RiverClusterService> {
 
-    private final TransportSearchAction searchAction;
+    private final ClusterService clusterService;
 
-    private final TransportGetAction getAction;
+    private final PublishRiverClusterStateAction publishAction;
 
-    private final IndicesService indicesService;
+    private final List<RiverClusterStateListener> clusterStateListeners = new CopyOnWriteArrayList<RiverClusterStateListener>();
 
-    @Inject public TransportMoreLikeThisAction(Settings settings, TransportSearchAction searchAction, TransportGetAction getAction,
-                                               IndicesService indicesService, TransportService transportService) {
+    private volatile ExecutorService updateTasksExecutor;
+
+    private volatile RiverClusterState clusterState = RiverClusterState.builder().build();
+
+    @Inject
+    public RiverClusterService(Settings settings, TransportService transportService, ClusterService clusterService) {
         super(settings);
-        this.searchAction = searchAction;
-        this.getAction = getAction;
-        this.indicesService = indicesService;
+        this.clusterService = clusterService;
 
-        transportService.registerHandler(TransportActions.MORE_LIKE_THIS, new TransportHandler());
+        this.publishAction = new PublishRiverClusterStateAction(settings, transportService, clusterService, new UpdateClusterStateListener());
     }
 
-    @Override protected void doExecute(final MoreLikeThisRequest request, final ActionListener<SearchResponse> listener) {
-        GetRequest getRequest = getRequest(request.index())
-                .type(request.type())
-                .id(request.id())
-                .listenerThreaded(false);
-        getAction.execute(getRequest, new ActionListener<GetResponse>() {
-            @Override public void onResponse(GetResponse getResponse) {
-                if (getResponse.exists()) {
-                    listener.onFailure(new ElasticSearchException("document missing"));
+    @Override
+    protected void doStart() throws ElasticsearchException {
+        this.updateTasksExecutor = newSingleThreadExecutor(daemonThreadFactory(settings, "riverClusterService#updateTask"));
+    }
+
+    @Override
+    protected void doStop() throws ElasticsearchException {
+        updateTasksExecutor.shutdown();
+        try {
+            updateTasksExecutor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // ignore
+        }
+    }
+
+    @Override
+    protected void doClose() throws ElasticsearchException {
+    }
+
+    public void add(RiverClusterStateListener listener) {
+        clusterStateListeners.add(listener);
+    }
+
+    public void remove(RiverClusterStateListener listener) {
+        clusterStateListeners.remove(listener);
+    }
+
+    /**
+     * The current state.
+     */
+    public ClusterState state() {
+        return clusterService.state();
+    }
+
+    public void submitStateUpdateTask(final String source, final RiverClusterStateUpdateTask updateTask) {
+        if (!lifecycle.started()) {
+            return;
+        }
+        updateTasksExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                if (!lifecycle.started()) {
+                    logger.debug("processing [{}]: ignoring, cluster_service not started", source);
                     return;
                 }
-                final BoolJsonQueryBuilder boolBuilder = boolQuery();
+                logger.debug("processing [{}]: execute", source);
+
+                RiverClusterState previousClusterState = clusterState;
                 try {
-                    DocumentMapper docMapper = indicesService.indexServiceSafe(request.index()).mapperService().documentMapper(request.type());
-                    final Set<String> fields = Sets.newHashSet();
-                    if (request.fields() != null) {
-                        for (String field : request.fields()) {
-                            FieldMappers fieldMappers = docMapper.mappers().smartName(field);
-                            if (fieldMappers != null) {
-                                fields.add(fieldMappers.mapper().names().indexName());
-                            } else {
-                                fields.add(field);
-                            }
-                        }
-                    }
-                    docMapper.parse(request.type(), request.id(), getResponse.source(), new DocumentMapper.ParseListenerAdapter() {
-                        @Override public boolean beforeFieldAdded(FieldMapper fieldMapper, Fieldable field, Object parseContext) {
-                            if (fieldMapper instanceof InternalMapper) {
-                                return true;
-                            }
-                            String value = fieldMapper.valueAsString(field);
-                            if (value == null) {
-                                return false;
-                            }
-
-                            if (fields.isEmpty() || fields.contains(field.name())) {
-                                addMoreLikeThis(request, boolBuilder, fieldMapper, field);
-                            }
-
-                            return false;
-                        }
-                    });
-                    // exclude myself
-                    Term uidTerm = docMapper.uidMapper().term(request.type(), request.id());
-                    boolBuilder.mustNot(termQuery(uidTerm.field(), uidTerm.text()));
+                    clusterState = updateTask.execute(previousClusterState);
                 } catch (Exception e) {
-                    listener.onFailure(e);
+                    StringBuilder sb = new StringBuilder("failed to execute cluster state update, state:\nversion [").append(clusterState.version()).append("], source [").append(source).append("]\n");
+                    logger.warn(sb.toString(), e);
+                    return;
                 }
-
-                String[] searchIndices = request.searchIndices();
-                if (searchIndices == null) {
-                    searchIndices = new String[]{request.index()};
-                }
-                String[] searchTypes = request.searchTypes();
-                if (searchTypes == null) {
-                    searchTypes = new String[]{request.type()};
-                }
-
-                SearchRequest searchRequest = searchRequest(searchIndices)
-                        .types(searchTypes)
-                        .searchType(request.searchType())
-                        .source(request.searchSource())
-                        .scroll(request.searchScroll())
-                        .extraSource(searchSource()
-                                .query(boolBuilder)
-                        )
-                        .listenerThreaded(request.listenerThreaded());
-                searchAction.execute(searchRequest, new ActionListener<SearchResponse>() {
-                    @Override public void onResponse(SearchResponse response) {
-                        listener.onResponse(response);
+                if (previousClusterState != clusterState) {
+                    if (clusterService.state().nodes().localNodeMaster()) {
+                        // only the master controls the version numbers
+                        clusterState = new RiverClusterState(clusterState.version() + 1, clusterState);
+                    } else {
+                        // we got this cluster state from the master, filter out based on versions (don't call listeners)
+                        if (clusterState.version() < previousClusterState.version()) {
+                            logger.debug("got old cluster state [" + clusterState.version() + "<" + previousClusterState.version() + "] from source [" + source + "], ignoring");
+                            return;
+                        }
                     }
 
-                    @Override public void onFailure(Throwable e) {
-                        listener.onFailure(e);
+                    if (logger.isTraceEnabled()) {
+                        StringBuilder sb = new StringBuilder("cluster state updated:\nversion [").append(clusterState.version()).append("], source [").append(source).append("]\n");
+                        logger.trace(sb.toString());
+                    } else if (logger.isDebugEnabled()) {
+                        logger.debug("cluster state updated, version [{}], source [{}]", clusterState.version(), source);
                     }
-                });
 
-            }
+                    RiverClusterChangedEvent clusterChangedEvent = new RiverClusterChangedEvent(source, clusterState, previousClusterState);
 
-            @Override public void onFailure(Throwable e) {
-                listener.onFailure(e);
+                    for (RiverClusterStateListener listener : clusterStateListeners) {
+                        listener.riverClusterChanged(clusterChangedEvent);
+                    }
+
+                    // if we are the master, publish the new state to all nodes
+                    if (clusterService.state().nodes().localNodeMaster()) {
+                        publishAction.publish(clusterState);
+                    }
+
+                    logger.debug("processing [{}]: done applying updated cluster_state", source);
+                } else {
+                    logger.debug("processing [{}]: no change in cluster_state", source);
+                }
             }
         });
     }
 
-    private void addMoreLikeThis(MoreLikeThisRequest request, BoolJsonQueryBuilder boolBuilder, FieldMapper fieldMapper, Fieldable field) {
-        MoreLikeThisFieldJsonQueryBuilder mlt = moreLikeThisFieldQuery(field.name())
-                .likeText(fieldMapper.valueAsString(field))
-                .percentTermsToMatch(request.percentTermsToMatch())
-                .boostTerms(request.boostTerms())
-                .boostTermsFactor(request.boostTermsFactor())
-                .minDocFreq(request.minDocFreq())
-                .maxDocFreq(request.maxDocFreq())
-                .minWordLen(request.minWordLen())
-                .maxWordLen(request.maxWordLen())
-                .minTermFrequency(request.minTermFrequency())
-                .maxQueryTerms(request.maxQueryTerms())
-                .stopWords(request.stopWords());
-        boolBuilder.should(mlt);
-    }
+    private class UpdateClusterStateListener implements PublishRiverClusterStateAction.NewClusterStateListener {
+        @Override
+        public void onNewClusterState(final RiverClusterState clusterState) {
+            ClusterState state = clusterService.state();
+            if (state.nodes().localNodeMaster()) {
+                logger.warn("master should not receive new cluster state from [{}]", state.nodes().masterNode());
+                return;
+            }
 
-    private class TransportHandler extends BaseTransportRequestHandler<MoreLikeThisRequest> {
-
-        @Override public MoreLikeThisRequest newInstance() {
-            return new MoreLikeThisRequest();
-        }
-
-        @Override public void messageReceived(MoreLikeThisRequest request, final TransportChannel channel) throws Exception {
-            // no need to have a threaded listener since we just send back a response
-            request.listenerThreaded(false);
-            execute(request, new ActionListener<SearchResponse>() {
-                @Override public void onResponse(SearchResponse result) {
-                    try {
-                        channel.sendResponse(result);
-                    } catch (Exception e) {
-                        onFailure(e);
-                    }
-                }
-
-                @Override public void onFailure(Throwable e) {
-                    try {
-                        channel.sendResponse(e);
-                    } catch (Exception e1) {
-                        logger.warn("Failed to send response for get", e1);
-                    }
+            submitStateUpdateTask("received_state", new RiverClusterStateUpdateTask() {
+                @Override
+                public RiverClusterState execute(RiverClusterState currentState) {
+                    return clusterState;
                 }
             });
-        }
-
-        @Override public boolean spawn() {
-            return false;
         }
     }
 }

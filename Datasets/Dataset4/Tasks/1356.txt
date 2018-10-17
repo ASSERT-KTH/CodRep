@@ -1,10 +1,10 @@
-new NamedAnalyzer("_float/max", new NumericFloatAnalyzer(Integer.MAX_VALUE)), provider, null);
+import static org.elasticsearch.common.util.concurrent.EsExecutors.*;
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
+ * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
+ * regarding copyright ownership. Elastic Search licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,276 +19,226 @@ new NamedAnalyzer("_float/max", new NumericFloatAnalyzer(Integer.MAX_VALUE)), pr
  * under the License.
  */
 
-package org.elasticsearch.index.mapper.internal;
+package org.elasticsearch.cluster.service;
 
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.search.Filter;
-import org.apache.lucene.search.NumericRangeFilter;
-import org.apache.lucene.search.NumericRangeQuery;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.NumericUtils;
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.Numbers;
-import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentParser;
-import org.elasticsearch.index.analysis.NamedAnalyzer;
-import org.elasticsearch.index.analysis.NumericFloatAnalyzer;
-import org.elasticsearch.index.cache.field.data.FieldDataCache;
-import org.elasticsearch.index.codec.postingsformat.PostingsFormatProvider;
-import org.elasticsearch.index.field.data.FieldDataType;
-import org.elasticsearch.index.mapper.*;
-import org.elasticsearch.index.mapper.core.FloatFieldMapper;
-import org.elasticsearch.index.mapper.core.NumberFieldMapper;
-import org.elasticsearch.index.query.QueryParseContext;
-import org.elasticsearch.index.search.NumericRangeFieldDataFilter;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.discovery.DiscoveryService;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
 
-import java.io.IOException;
-import java.util.Map;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
-import static org.elasticsearch.common.xcontent.support.XContentMapValues.nodeFloatValue;
-import static org.elasticsearch.index.mapper.core.TypeParsers.parseNumberField;
+import static java.util.concurrent.Executors.*;
+import static org.elasticsearch.cluster.ClusterState.*;
+import static org.elasticsearch.common.unit.TimeValue.*;
+import static org.elasticsearch.common.util.concurrent.Executors.*;
 
 /**
- *
+ * @author kimchy (shay.banon)
  */
-public class BoostFieldMapper extends NumberFieldMapper<Float> implements InternalMapper, RootMapper {
+public class InternalClusterService extends AbstractLifecycleComponent<ClusterService> implements ClusterService {
 
-    public static final String CONTENT_TYPE = "_boost";
-    public static final String NAME = "_boost";
+    private final TimeValue timeoutInterval;
 
-    public static class Defaults extends NumberFieldMapper.Defaults {
-        public static final String NAME = "_boost";
-        public static final Float NULL_VALUE = null;
+    private final ThreadPool threadPool;
 
-        public static final FieldType BOOST_FIELD_TYPE = new FieldType(NumberFieldMapper.Defaults.NUMBER_FIELD_TYPE);
+    private final DiscoveryService discoveryService;
 
-        static {
-            BOOST_FIELD_TYPE.setIndexed(false);
-            BOOST_FIELD_TYPE.setStored(false);
-        }
+    private final TransportService transportService;
+
+    private volatile ExecutorService updateTasksExecutor;
+
+    private final List<ClusterStateListener> clusterStateListeners = new CopyOnWriteArrayList<ClusterStateListener>();
+
+    private final List<TimeoutHolder> clusterStateTimeoutListeners = new CopyOnWriteArrayList<TimeoutHolder>();
+
+    private volatile ScheduledFuture scheduledFuture;
+
+    private volatile ClusterState clusterState = newClusterStateBuilder().build();
+
+    @Inject public InternalClusterService(Settings settings, DiscoveryService discoveryService, TransportService transportService, ThreadPool threadPool) {
+        super(settings);
+        this.transportService = transportService;
+        this.discoveryService = discoveryService;
+        this.threadPool = threadPool;
+
+        this.timeoutInterval = componentSettings.getAsTime("timeout_interval", timeValueMillis(500));
     }
 
-    public static class Builder extends NumberFieldMapper.Builder<Builder, BoostFieldMapper> {
-
-        protected Float nullValue = Defaults.NULL_VALUE;
-
-        public Builder(String name) {
-            super(name, new FieldType(Defaults.BOOST_FIELD_TYPE));
-            builder = this;
-        }
-
-        public Builder nullValue(float nullValue) {
-            this.nullValue = nullValue;
-            return this;
-        }
-
-        @Override
-        public BoostFieldMapper build(BuilderContext context) {
-            return new BoostFieldMapper(name, buildIndexName(context),
-                    precisionStep, boost, fieldType, nullValue, provider);
-        }
-    }
-
-    public static class TypeParser implements Mapper.TypeParser {
-        @Override
-        public Mapper.Builder parse(String fieldName, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
-            String name = node.get("name") == null ? BoostFieldMapper.Defaults.NAME : node.get("name").toString();
-            BoostFieldMapper.Builder builder = MapperBuilders.boost(name);
-            parseNumberField(builder, name, node, parserContext);
-            for (Map.Entry<String, Object> entry : node.entrySet()) {
-                String propName = Strings.toUnderscoreCase(entry.getKey());
-                Object propNode = entry.getValue();
-                if (propName.equals("null_value")) {
-                    builder.nullValue(nodeFloatValue(propNode));
+    @Override protected void doStart() throws ElasticSearchException {
+        this.clusterState = newClusterStateBuilder().build();
+        this.updateTasksExecutor = newSingleThreadExecutor(daemonThreadFactory(settings, "clusterService#updateTask"));
+        scheduledFuture = threadPool.scheduleWithFixedDelay(new Runnable() {
+            @Override public void run() {
+                long timestamp = System.currentTimeMillis();
+                for (final TimeoutHolder holder : clusterStateTimeoutListeners) {
+                    if ((timestamp - holder.timestamp) > holder.timeout.millis()) {
+                        clusterStateTimeoutListeners.remove(holder);
+                        InternalClusterService.this.threadPool.execute(new Runnable() {
+                            @Override public void run() {
+                                holder.listener.onTimeout(holder.timeout);
+                            }
+                        });
+                    }
                 }
             }
-            return builder;
+        }, timeoutInterval);
+    }
+
+    @Override protected void doStop() throws ElasticSearchException {
+        scheduledFuture.cancel(false);
+        for (TimeoutHolder holder : clusterStateTimeoutListeners) {
+            holder.listener.onTimeout(holder.timeout);
+        }
+        updateTasksExecutor.shutdown();
+        try {
+            updateTasksExecutor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // ignore
         }
     }
 
-    private final Float nullValue;
-
-    public BoostFieldMapper() {
-        this(Defaults.NAME, Defaults.NAME);
+    @Override protected void doClose() throws ElasticSearchException {
     }
 
-    protected BoostFieldMapper(String name, String indexName) {
-        this(name, indexName, Defaults.PRECISION_STEP, Defaults.BOOST, new FieldType(Defaults.BOOST_FIELD_TYPE),
-                Defaults.NULL_VALUE, null);
+    public ClusterState state() {
+        return this.clusterState;
     }
 
-    protected BoostFieldMapper(String name, String indexName, int precisionStep, float boost, FieldType fieldType,
-                               Float nullValue, PostingsFormatProvider provider) {
-        super(new Names(name, indexName, indexName, name), precisionStep, null, boost, fieldType,
-                Defaults.IGNORE_MALFORMED, new NamedAnalyzer("_float/" + precisionStep, new NumericFloatAnalyzer(precisionStep)),
-                new NamedAnalyzer("_float/max", new NumericFloatAnalyzer(Integer.MAX_VALUE)), provider);
-        this.nullValue = nullValue;
+    public void add(ClusterStateListener listener) {
+        clusterStateListeners.add(listener);
     }
 
-    @Override
-    protected int maxPrecisionStep() {
-        return 32;
+    public void remove(ClusterStateListener listener) {
+        clusterStateListeners.remove(listener);
     }
 
-    @Override
-    public Float value(Field field) {
-        BytesRef value = field.binaryValue();
-        if (value == null) {
-            return null;
+    public void add(TimeValue timeout, TimeoutClusterStateListener listener) {
+        clusterStateTimeoutListeners.add(new TimeoutHolder(listener, System.currentTimeMillis(), timeout));
+    }
+
+    public void remove(TimeoutClusterStateListener listener) {
+        clusterStateTimeoutListeners.remove(new TimeoutHolder(listener, -1, null));
+    }
+
+    public void submitStateUpdateTask(final String source, final ClusterStateUpdateTask updateTask) {
+        if (!lifecycle.started()) {
+            return;
         }
-        return Numbers.bytesToFloat(value.bytes);
-    }
+        updateTasksExecutor.execute(new Runnable() {
+            @Override public void run() {
+                if (!lifecycle.started()) {
+                    return;
+                }
+                ClusterState previousClusterState = clusterState;
+                try {
+                    clusterState = updateTask.execute(previousClusterState);
+                } catch (Exception e) {
+                    StringBuilder sb = new StringBuilder("failed to execute cluster state update, state:\nversion [").append(clusterState.version()).append("], source [").append(source).append("]\n");
+                    sb.append(clusterState.nodes().prettyPrint());
+                    sb.append(clusterState.routingTable().prettyPrint());
+                    sb.append(clusterState.readOnlyRoutingNodes().prettyPrint());
+                    logger.warn(sb.toString(), e);
+                    return;
+                }
+                if (previousClusterState != clusterState) {
+                    if (clusterState.nodes().localNodeMaster()) {
+                        // only the master controls the version numbers
+                        clusterState = new ClusterState(clusterState.version() + 1, clusterState);
+                    } else {
+                        // we got this cluster state from the master, filter out based on versions (don't call listeners)
+                        if (clusterState.version() < previousClusterState.version()) {
+                            logger.debug("got old cluster state [" + clusterState.version() + "<" + previousClusterState.version() + "] from source [" + source + "], ignoring");
+                            return;
+                        }
+                    }
 
-    @Override
-    public Float valueFromString(String value) {
-        return Float.parseFloat(value);
-    }
+                    if (logger.isTraceEnabled()) {
+                        StringBuilder sb = new StringBuilder("cluster state updated:\nversion [").append(clusterState.version()).append("], source [").append(source).append("]\n");
+                        sb.append(clusterState.nodes().prettyPrint());
+                        sb.append(clusterState.routingTable().prettyPrint());
+                        sb.append(clusterState.readOnlyRoutingNodes().prettyPrint());
+                        logger.trace(sb.toString());
+                    } else if (logger.isDebugEnabled()) {
+                        logger.debug("cluster state updated, version [{}], source [{}]", clusterState.version(), source);
+                    }
 
-    @Override
-    public String indexedValue(String value) {
-        int intValue = NumericUtils.floatToSortableInt(Float.parseFloat(value));
-        BytesRef bytesRef = new BytesRef();
-        NumericUtils.intToPrefixCoded(intValue, precisionStep(), bytesRef);
-        return bytesRef.utf8ToString();
-    }
+                    ClusterChangedEvent clusterChangedEvent = new ClusterChangedEvent(source, clusterState, previousClusterState);
+                    // new cluster state, notify all listeners
+                    final DiscoveryNodes.Delta nodesDelta = clusterChangedEvent.nodesDelta();
+                    if (nodesDelta.hasChanges() && logger.isInfoEnabled()) {
+                        String summary = nodesDelta.shortSummary();
+                        if (summary.length() > 0) {
+                            logger.info("{}, reason: {}", summary, source);
+                        }
+                    }
 
-    @Override
-    public Query fuzzyQuery(String value, String minSim, int prefixLength, int maxExpansions, boolean transpositions) {
-        float iValue = Float.parseFloat(value);
-        float iSim = Float.parseFloat(minSim);
-        return NumericRangeQuery.newFloatRange(names.indexName(), precisionStep,
-                iValue - iSim,
-                iValue + iSim,
-                true, true);
-    }
+                    // TODO, do this in parallel (and wait)
+                    for (DiscoveryNode node : nodesDelta.addedNodes()) {
+                        try {
+                            transportService.connectToNode(node);
+                        } catch (Exception e) {
+                            // the fault detection will detect it as failed as well
+                            logger.warn("failed to connect to node [" + node + "]", e);
+                        }
+                    }
 
-    @Override
-    public Query fuzzyQuery(String value, double minSim, int prefixLength, int maxExpansions, boolean transpositions) {
-        float iValue = Float.parseFloat(value);
-        float iSim = (float) (minSim * dFuzzyFactor);
-        return NumericRangeQuery.newFloatRange(names.indexName(), precisionStep,
-                iValue - iSim,
-                iValue + iSim,
-                true, true);
-    }
+                    for (TimeoutHolder timeoutHolder : clusterStateTimeoutListeners) {
+                        timeoutHolder.listener.clusterChanged(clusterChangedEvent);
+                    }
+                    for (ClusterStateListener listener : clusterStateListeners) {
+                        listener.clusterChanged(clusterChangedEvent);
+                    }
 
-    @Override
-    public Query rangeQuery(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper, @Nullable QueryParseContext context) {
-        return NumericRangeQuery.newFloatRange(names.indexName(), precisionStep,
-                lowerTerm == null ? null : Float.parseFloat(lowerTerm),
-                upperTerm == null ? null : Float.parseFloat(upperTerm),
-                includeLower, includeUpper);
-    }
+                    threadPool.execute(new Runnable() {
+                        @Override public void run() {
+                            for (DiscoveryNode node : nodesDelta.removedNodes()) {
+                                transportService.disconnectFromNode(node);
+                            }
+                        }
+                    });
 
-    @Override
-    public Filter rangeFilter(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper, @Nullable QueryParseContext context) {
-        return NumericRangeFilter.newFloatRange(names.indexName(), precisionStep,
-                lowerTerm == null ? null : Float.parseFloat(lowerTerm),
-                upperTerm == null ? null : Float.parseFloat(upperTerm),
-                includeLower, includeUpper);
-    }
+                    // if we are the master, publish the new state to all nodes
+                    if (clusterState.nodes().localNodeMaster()) {
+                        discoveryService.publish(clusterState);
+                    }
 
-    @Override
-    public Filter rangeFilter(FieldDataCache fieldDataCache, String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper, @Nullable QueryParseContext context) {
-        return NumericRangeFieldDataFilter.newFloatRange(fieldDataCache, names.indexName(),
-                lowerTerm == null ? null : Float.parseFloat(lowerTerm),
-                upperTerm == null ? null : Float.parseFloat(upperTerm),
-                includeLower, includeUpper);
-    }
-
-    @Override
-    public Filter nullValueFilter() {
-        if (nullValue == null) {
-            return null;
-        }
-        return NumericRangeFilter.newFloatRange(names.indexName(), precisionStep,
-                nullValue,
-                nullValue,
-                true, true);
-    }
-
-    @Override
-    public void preParse(ParseContext context) throws IOException {
-    }
-
-    @Override
-    public void postParse(ParseContext context) throws IOException {
-    }
-
-    @Override
-    public void validate(ParseContext context) throws MapperParsingException {
-    }
-
-    @Override
-    public boolean includeInObject() {
-        return true;
-    }
-
-    @Override
-    public void parse(ParseContext context) throws IOException {
-        // we override parse since we want to handle cases where it is not indexed and not stored (the default)
-        float value = parseFloatValue(context);
-        if (!Float.isNaN(value)) {
-            context.docBoost(value);
-        }
-        super.parse(context);
-    }
-
-    @Override
-    protected Field innerParseCreateField(ParseContext context) throws IOException {
-        final float value = parseFloatValue(context);
-        if (Float.isNaN(value)) {
-            return null;
-        }
-        context.docBoost(value);
-        return new FloatFieldMapper.CustomFloatNumericField(this, value, fieldType);
-    }
-
-    private float parseFloatValue(ParseContext context) throws IOException {
-        float value;
-        if (context.parser().currentToken() == XContentParser.Token.VALUE_NULL) {
-            if (nullValue == null) {
-                return Float.NaN;
+                    if (updateTask instanceof ProcessedClusterStateUpdateTask) {
+                        ((ProcessedClusterStateUpdateTask) updateTask).clusterStateProcessed(clusterState);
+                    }
+                }
             }
-            value = nullValue;
-        } else {
-            value = context.parser().floatValue();
-        }
-        return value;
+        });
     }
 
-    @Override
-    public FieldDataType fieldDataType() {
-        return FieldDataType.DefaultTypes.FLOAT;
-    }
+    private static class TimeoutHolder {
+        final TimeoutClusterStateListener listener;
+        final long timestamp;
+        final TimeValue timeout;
 
-    @Override
-    protected String contentType() {
-        return CONTENT_TYPE;
-    }
+        private TimeoutHolder(TimeoutClusterStateListener listener, long timestamp, TimeValue timeout) {
+            this.listener = listener;
+            this.timestamp = timestamp;
+            this.timeout = timeout;
+        }
 
-    @Override
-    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        // all are defaults, don't write it at all
-        if (name().equals(Defaults.NAME) && nullValue == null) {
-            return builder;
+        @Override public int hashCode() {
+            return listener.hashCode();
         }
-        builder.startObject(contentType());
-        if (!name().equals(Defaults.NAME)) {
-            builder.field("name", name());
-        }
-        if (nullValue != null) {
-            builder.field("null_value", nullValue);
-        }
-        builder.endObject();
-        return builder;
-    }
 
-    @Override
-    public void merge(Mapper mergeWith, MergeContext mergeContext) throws MergeMappingException {
-        // do nothing here, no merging, but also no exception
+        @Override public boolean equals(Object obj) {
+            return ((TimeoutHolder) obj).listener == listener;
+        }
     }
 }

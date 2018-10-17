@@ -1,234 +1,261 @@
-return writer.newestSegment();
-
-package org.apache.lucene.index;
+RowMutation rm = new RowMutation(cfs.table.name, new Row(filter.key, returnCF.cloneMe()));
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
  */
-import junit.framework.TestCase;
-import junit.framework.TestSuite;
-import junit.textui.TestRunner;
+package org.apache.cassandra.db;
 
-
-import org.apache.lucene.analysis.SimpleAnalyzer;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.store.FSDirectory;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.search.Similarity;
-import org.apache.lucene.demo.FileDocument;
-
-import java.io.*;
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.*;
 
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/** JUnit adaptation of an older test case DocTest.
- *
- * @version $Id$
- */
-public class TestDoc extends TestCase {
+import org.apache.cassandra.db.columniterator.IColumnIterator;
+import org.apache.cassandra.db.columniterator.SimpleAbstractColumnIterator;
+import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
+import org.apache.cassandra.db.filter.NamesQueryFilter;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.marshal.CounterColumnType;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.CloseableIterator;
 
-    /** Main for running test case by itself. */
-    public static void main(String args[]) {
-        TestRunner.run (new TestSuite(TestDoc.class));
+public class CollationController
+{
+    private static Logger logger = LoggerFactory.getLogger(CollationController.class);
+
+    private final ColumnFamilyStore cfs;
+    private final boolean mutableColumns;
+    private final QueryFilter filter;
+    private final int gcBefore;
+
+    private int sstablesIterated = 0;
+
+    public CollationController(ColumnFamilyStore cfs, boolean mutableColumns, QueryFilter filter, int gcBefore)
+    {
+        this.cfs = cfs;
+        this.mutableColumns = mutableColumns;
+        this.filter = filter;
+        this.gcBefore = gcBefore;
     }
 
+    public ColumnFamily getTopLevelColumns()
+    {
+        return filter.filter instanceof NamesQueryFilter
+               && (cfs.metadata.cfType == ColumnFamilyType.Standard || filter.path.superColumnName != null)
+               && cfs.metadata.getDefaultValidator() != CounterColumnType.instance
+               ? collectTimeOrderedData()
+               : collectAllData();
+    }
 
-    private File workDir;
-    private File indexDir;
-    private LinkedList files;
-
-
-    /** Set the test case. This test case needs
-     *  a few text files created in the current working directory.
+    /**
+     * Collects data in order of recency, using the sstable maxtimestamp data.
+     * Once we have data for all requests columns that is newer than the newest remaining maxtimestamp,
+     * we stop.
      */
-    public void setUp() throws IOException {
-        workDir = new File(System.getProperty("tempDir"),"TestDoc");
-        workDir.mkdirs();
+    private ColumnFamily collectTimeOrderedData()
+    {
+        logger.debug("collectTimeOrderedData");
 
-        indexDir = new File(workDir, "testIndex");
-        indexDir.mkdirs();
+        ISortedColumns.Factory factory = mutableColumns
+                                       ? ThreadSafeSortedColumns.factory()
+                                       : TreeMapBackedSortedColumns.factory();
+        ColumnFamily container = ColumnFamily.create(cfs.metadata, factory, filter.filter.isReversed());
+        List<IColumnIterator> iterators = new ArrayList<IColumnIterator>();
+        ColumnFamilyStore.ViewFragment view = cfs.markReferenced(filter.key);
+        try
+        {
+            for (Memtable memtable : view.memtables)
+            {
+                IColumnIterator iter = filter.getMemtableColumnIterator(memtable, cfs.metadata.comparator);
+                if (iter != null)
+                {
+                    iterators.add(iter);
+                    container.delete(iter.getColumnFamily());
+                    while (iter.hasNext())
+                        container.addColumn(iter.next());
+                }
+            }
 
-        Directory directory = FSDirectory.getDirectory(indexDir, true);
-        directory.close();
+            // avoid changing the filter columns of the original filter
+            // (reduceNameFilter removes columns that are known to be irrelevant)
+            TreeSet<ByteBuffer> filterColumns = new TreeSet<ByteBuffer>(((NamesQueryFilter) filter.filter).columns);
+            QueryFilter reducedFilter = new QueryFilter(filter.key, filter.path, new NamesQueryFilter(filterColumns));
 
-        files = new LinkedList();
-        files.add(createOutput("test.txt",
-            "This is the first test file"
-        ));
+            /* add the SSTables on disk */
+            Collections.sort(view.sstables, SSTable.maxTimestampComparator);
 
-        files.add(createOutput("test2.txt",
-            "This is the second test file"
-        ));
-    }
+            // read sorted sstables
+            for (SSTableReader sstable : view.sstables)
+            {
+                long currentMaxTs = sstable.getMaxTimestamp();
+                reduceNameFilter(reducedFilter, container, currentMaxTs);
+                if (((NamesQueryFilter) reducedFilter.filter).columns.isEmpty())
+                    break;
 
-    private File createOutput(String name, String text) throws IOException {
-        FileWriter fw = null;
-        PrintWriter pw = null;
+                IColumnIterator iter = reducedFilter.getSSTableColumnIterator(sstable);
+                iterators.add(iter);
+                if (iter.getColumnFamily() != null)
+                {
+                    container.delete(iter.getColumnFamily());
+                    sstablesIterated++;
+                    while (iter.hasNext())
+                        container.addColumn(iter.next());
+                }
+            }
 
-        try {
-            File f = new File(workDir, name);
-            if (f.exists()) f.delete();
+            // we need to distinguish between "there is no data at all for this row" (BF will let us rebuild that efficiently)
+            // and "there used to be data, but it's gone now" (we should cache the empty CF so we don't need to rebuild that slower)
+            if (iterators.isEmpty())
+                return null;
 
-            fw = new FileWriter(f);
-            pw = new PrintWriter(fw);
-            pw.println(text);
-            return f;
+            // do a final collate.  toCollate is boilerplate required to provide a CloseableIterator
+            final ColumnFamily c2 = container;
+            CloseableIterator<IColumn> toCollate = new SimpleAbstractColumnIterator()
+            {
+                final Iterator<IColumn> iter = c2.iterator();
 
-        } finally {
-            if (pw != null) pw.close();
-            if (fw != null) fw.close();
+                protected IColumn computeNext()
+                {
+                    return iter.hasNext() ? iter.next() : endOfData();
+                }
+
+                public ColumnFamily getColumnFamily()
+                {
+                    return c2;
+                }
+
+                public DecoratedKey getKey()
+                {
+                    return filter.key;
+                }
+            };
+            ColumnFamily returnCF = container.cloneMeShallow();
+            filter.collateColumns(returnCF, Collections.singletonList(toCollate), cfs.metadata.comparator, gcBefore);
+
+            // "hoist up" the requested data into a more recent sstable
+            if (sstablesIterated >= cfs.getMinimumCompactionThreshold() && cfs.getCompactionStrategy() instanceof SizeTieredCompactionStrategy)
+            {
+                RowMutation rm = new RowMutation(cfs.table.name, new Row(filter.key, returnCF));
+                try
+                {
+                    rm.applyUnsafe(); // skipping commitlog is fine since we're just de-fragmenting existing data
+                }
+                catch (IOException e)
+                {
+                    // log and allow the result to be returned
+                    logger.error("Error re-writing read results", e);
+                }
+            }
+
+            // Caller is responsible for final removeDeletedCF.  This is important for cacheRow to work correctly:
+            return returnCF;
+        }
+        finally
+        {
+            for (IColumnIterator iter : iterators)
+                FileUtils.closeQuietly(iter);
+            SSTableReader.releaseReferences(view.sstables);
         }
     }
 
-
-    /** This test executes a number of merges and compares the contents of
-     *  the segments created when using compound file or not using one.
-     *
-     *  TODO: the original test used to print the segment contents to System.out
-     *        for visual validation. To have the same effect, a new method
-     *        checkSegment(String name, ...) should be created that would
-     *        assert various things about the segment.
+    /**
+     * remove columns from @param filter where we already have data in @param returnCF newer than @param sstableTimestamp
      */
-    public void testIndexAndMerge() throws Exception {
-      StringWriter sw = new StringWriter();
-      PrintWriter out = new PrintWriter(sw, true);
+    private void reduceNameFilter(QueryFilter filter, ColumnFamily returnCF, long sstableTimestamp)
+    {
+        AbstractColumnContainer container = filter.path.superColumnName == null
+                                          ? returnCF
+                                          : (SuperColumn) returnCF.getColumn(filter.path.superColumnName);
+        if (container == null)
+            return;
 
-      Directory directory = FSDirectory.getDirectory(indexDir);
-      IndexWriter writer = new IndexWriter(directory, new SimpleAnalyzer(), true);
-
-      SegmentInfo si1 = indexDoc(writer, "test.txt");
-      printSegment(out, si1);
-
-      SegmentInfo si2 = indexDoc(writer, "test2.txt");
-      printSegment(out, si2);
-      writer.close();
-      directory.close();
-
-      SegmentInfo siMerge = merge(si1, si2, "merge", false);
-      printSegment(out, siMerge);
-
-      SegmentInfo siMerge2 = merge(si1, si2, "merge2", false);
-      printSegment(out, siMerge2);
-
-      SegmentInfo siMerge3 = merge(siMerge, siMerge2, "merge3", false);
-      printSegment(out, siMerge3);
-      
-      out.close();
-      sw.close();
-      String multiFileOutput = sw.getBuffer().toString();
-      //System.out.println(multiFileOutput);
-
-      sw = new StringWriter();
-      out = new PrintWriter(sw, true);
-
-      directory = FSDirectory.getDirectory(indexDir);
-      writer = new IndexWriter(directory, new SimpleAnalyzer(), true);
-
-      si1 = indexDoc(writer, "test.txt");
-      printSegment(out, si1);
-
-      si2 = indexDoc(writer, "test2.txt");
-      printSegment(out, si2);
-      writer.close();
-      directory.close();
-
-      siMerge = merge(si1, si2, "merge", true);
-      printSegment(out, siMerge);
-
-      siMerge2 = merge(si1, si2, "merge2", true);
-      printSegment(out, siMerge2);
-
-      siMerge3 = merge(siMerge, siMerge2, "merge3", true);
-      printSegment(out, siMerge3);
-      
-      out.close();
-      sw.close();
-      String singleFileOutput = sw.getBuffer().toString();
-
-      assertEquals(multiFileOutput, singleFileOutput);
-   }
-
-
-   private SegmentInfo indexDoc(IndexWriter writer, String fileName)
-   throws Exception
-   {
-      File file = new File(workDir, fileName);
-      Document doc = FileDocument.Document(file);
-      writer.addDocument(doc);
-      writer.flush();
-      return writer.segmentInfos.info(writer.segmentInfos.size()-1);
-   }
-
-
-   private SegmentInfo merge(SegmentInfo si1, SegmentInfo si2, String merged, boolean useCompoundFile)
-   throws Exception {
-      Directory directory = FSDirectory.getDirectory(indexDir, false);
-
-      SegmentReader r1 = SegmentReader.get(si1);
-      SegmentReader r2 = SegmentReader.get(si2);
-
-      SegmentMerger merger = new SegmentMerger(directory, merged);
-
-      merger.add(r1);
-      merger.add(r2);
-      merger.merge();
-      merger.closeReaders();
-      
-      if (useCompoundFile) {
-        Vector filesToDelete = merger.createCompoundFile(merged + ".cfs");
-        for (Iterator iter = filesToDelete.iterator(); iter.hasNext();)
-          directory.deleteFile((String) iter.next());
-      }
-
-      directory.close();
-      return new SegmentInfo(merged, si1.docCount + si2.docCount, directory, useCompoundFile, true);
-   }
-
-
-   private void printSegment(PrintWriter out, SegmentInfo si)
-   throws Exception {
-      Directory directory = FSDirectory.getDirectory(indexDir, false);
-      SegmentReader reader = SegmentReader.get(si);
-
-      for (int i = 0; i < reader.numDocs(); i++)
-        out.println(reader.document(i));
-
-      TermEnum tis = reader.terms();
-      while (tis.next()) {
-        out.print(tis.term());
-        out.println(" DF=" + tis.docFreq());
-
-        TermPositions positions = reader.termPositions(tis.term());
-        try {
-          while (positions.next()) {
-            out.print(" doc=" + positions.doc());
-            out.print(" TF=" + positions.freq());
-            out.print(" pos=");
-            out.print(positions.nextPosition());
-            for (int j = 1; j < positions.freq(); j++)
-              out.print("," + positions.nextPosition());
-            out.println("");
-          }
-        } finally {
-          positions.close();
+        for (Iterator<ByteBuffer> iterator = ((NamesQueryFilter) filter.filter).columns.iterator(); iterator.hasNext(); )
+        {
+            ByteBuffer filterColumn = iterator.next();
+            IColumn column = container.getColumn(filterColumn);
+            if (column != null && column.timestamp() > sstableTimestamp)
+                iterator.remove();
         }
-      }
-      tis.close();
-      reader.close();
-      directory.close();
+    }
+
+    /**
+     * Collects data the brute-force way: gets an iterator for the filter in question
+     * from every memtable and sstable, then merges them together.
+     */
+    private ColumnFamily collectAllData()
+    {
+        logger.debug("collectAllData");
+        ISortedColumns.Factory factory = mutableColumns
+                                       ? ThreadSafeSortedColumns.factory()
+                                       : ArrayBackedSortedColumns.factory();
+        List<IColumnIterator> iterators = new ArrayList<IColumnIterator>();
+        ColumnFamily returnCF = ColumnFamily.create(cfs.metadata, factory, filter.filter.isReversed());
+
+        ColumnFamilyStore.ViewFragment view = cfs.markReferenced(filter.key);
+        try
+        {
+            for (Memtable memtable : view.memtables)
+            {
+                IColumnIterator iter = filter.getMemtableColumnIterator(memtable, cfs.metadata.comparator);
+                if (iter != null)
+                {
+                    returnCF.delete(iter.getColumnFamily());
+                    iterators.add(iter);
+                }
+            }
+
+            for (SSTableReader sstable : view.sstables)
+            {
+                IColumnIterator iter = filter.getSSTableColumnIterator(sstable);
+                iterators.add(iter);
+                if (iter.getColumnFamily() != null)
+                {
+                    returnCF.delete(iter.getColumnFamily());
+                    sstablesIterated++;
+                }
+            }
+
+            // we need to distinguish between "there is no data at all for this row" (BF will let us rebuild that efficiently)
+            // and "there used to be data, but it's gone now" (we should cache the empty CF so we don't need to rebuild that slower)
+            if (iterators.isEmpty())
+                return null;
+
+            filter.collateColumns(returnCF, iterators, cfs.metadata.comparator, gcBefore);
+
+            // Caller is responsible for final removeDeletedCF.  This is important for cacheRow to work correctly:
+            return returnCF;
+        }
+        finally
+        {
+            for (IColumnIterator iter : iterators)
+                FileUtils.closeQuietly(iter);
+            SSTableReader.releaseReferences(view.sstables);
+        }
+    }
+
+    public int getSstablesIterated()
+    {
+        return sstablesIterated;
     }
 }

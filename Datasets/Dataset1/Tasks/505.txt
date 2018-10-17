@@ -1,544 +1,436 @@
-if (reader != null) comparators[i] = comparators[i].setNextReader(reader, docBase);
+private static final Logger logger = LoggerFactory.getLogger(LeveledManifest.class);
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+package org.apache.cassandra.db.compaction;
+/*
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-package org.apache.solr.search;
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.*;
-import org.apache.solr.search.function.DocValues;
-import org.apache.solr.search.function.ValueSource;
-
+import java.io.File;
+import java.io.IOError;
 import java.io.IOException;
 import java.util.*;
 
-public class MultiCollector extends Collector {
-  final Collector[] collectors;
-  final boolean acceptsDocsOutOfOrder;
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  public static Collector wrap(List<? extends Collector> collectors) {
-    return collectors.size() == 1 ? collectors.get(0) : new MultiCollector(collectors);  
-  }
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.codehaus.jackson.JsonEncoding;
+import org.codehaus.jackson.JsonFactory;
+import org.codehaus.jackson.JsonGenerator;
+import org.codehaus.jackson.JsonNode;
+import org.codehaus.jackson.map.ObjectMapper;
 
-  public static Collector[] subCollectors(Collector collector) {
-    if (collector instanceof MultiCollector)
-      return ((MultiCollector)collector).collectors;
-    return new Collector[]{collector};
-  }
+public class LeveledManifest
+{
+    private static final Logger logger = LoggerFactory.getLogger(LeveledCompactionStrategy.class);
 
-  public MultiCollector(List<? extends Collector> collectors) {
-    this(collectors.toArray(new Collector[collectors.size()]));
-  }
+    public static final String EXTENSION = ".json";
 
-  public MultiCollector(Collector[] collectors) {
-    this.collectors = collectors;
+    /**
+     * limit the number of L0 sstables we do at once, because compaction bloom filter creation
+     * uses a pessimistic estimate of how many keys overlap (none), so we risk wasting memory
+     * or even OOMing when compacting highly overlapping sstables
+     */
+    static int MAX_COMPACTING_L0 = 32;
 
-    boolean acceptsDocsOutOfOrder = true;
-    for (Collector collector : collectors) {
-      if (collector.acceptsDocsOutOfOrder() == false) {
-        acceptsDocsOutOfOrder = false;
-        break;
-      }
-    }
-    this.acceptsDocsOutOfOrder = acceptsDocsOutOfOrder;
-  }
+    private final ColumnFamilyStore cfs;
+    private final List<SSTableReader>[] generations;
+    private final DecoratedKey[] lastCompactedKeys;
+    private final int maxSSTableSizeInMB;
+    private int levelCount;
 
-  @Override
-  public void setScorer(Scorer scorer) throws IOException {
-    for (Collector collector : collectors)
-      collector.setScorer(scorer);
-  }
+    private LeveledManifest(ColumnFamilyStore cfs, int maxSSTableSizeInMB)
+    {
+        this.cfs = cfs;
+        this.maxSSTableSizeInMB = maxSSTableSizeInMB;
 
-  @Override
-  public void collect(int doc) throws IOException {
-    for (Collector collector : collectors)
-      collector.collect(doc);
-  }
-
-  @Override
-  public void setNextReader(IndexReader reader, int docBase) throws IOException {
-    for (Collector collector : collectors)
-      collector.setNextReader(reader, docBase);
-  }
-
-  @Override
-  public boolean acceptsDocsOutOfOrder() {
-    return acceptsDocsOutOfOrder;
-  }
-}
-
-
-
-
-
-
-class SearchGroup {
-  public MutableValue groupValue;
-  int matches;
-  int topDoc;
-  // float topDocScore;  // currently unused
-  int comparatorSlot;
-
-  // currently only used when sort != sort.group
-  FieldComparator[] sortGroupComparators;
-  int[] sortGroupReversed;
-
-  /***
-  @Override
-  public int hashCode() {
-    return super.hashCode();
-  }
-
-  @Override
-  public boolean equals(Object obj) {
-    return groupValue.equalsSameType(((SearchGroup)obj).groupValue);
-  }
-  ***/
-}
-
-
-
-/** Finds the top set of groups, grouped by groupByVS when sort == group.sort */
-class TopGroupCollector extends Collector {
-  final int nGroups;
-  final HashMap<MutableValue, SearchGroup> groupMap;
-  TreeSet<SearchGroup> orderedGroups;
-  final ValueSource vs;
-  final Map context;
-  final FieldComparator[] comparators;
-  final int[] reversed;
-
-  DocValues docValues;
-  DocValues.ValueFiller filler;
-  MutableValue mval;
-  Scorer scorer;
-  int docBase;
-  int spareSlot;
-
-  int matches;
-
-  public TopGroupCollector(ValueSource groupByVS, Map vsContext, Sort sort, int nGroups) throws IOException {
-    this.vs = groupByVS;
-    this.context = vsContext;
-    this.nGroups = nGroups;
-
-    SortField[] sortFields = sort.getSort();
-    this.comparators = new FieldComparator[sortFields.length];
-    this.reversed = new int[sortFields.length];
-    for (int i = 0; i < sortFields.length; i++) {
-      SortField sortField = sortFields[i];
-      reversed[i] = sortField.getReverse() ? -1 : 1;
-      // use nGroups + 1 so we have a spare slot to use for comparing (tracked by this.spareSlot)
-      comparators[i] = sortField.getComparator(nGroups + 1, i);
-    }
-    this.spareSlot = nGroups;
-
-    this.groupMap = new HashMap<MutableValue, SearchGroup>(nGroups);
-  }
-
-  @Override
-  public void setScorer(Scorer scorer) throws IOException {
-    this.scorer = scorer;
-    for (FieldComparator fc : comparators)
-      fc.setScorer(scorer);
-  }
-
-  @Override
-  public void collect(int doc) throws IOException {
-    matches++;
-    filler.fillValue(doc);
-    SearchGroup group = groupMap.get(mval);
-    if (group == null) {
-      int num = groupMap.size();
-      if (groupMap.size() < nGroups) {
-        SearchGroup sg = new SearchGroup();
-        sg.groupValue = mval.duplicate();
-        sg.comparatorSlot = num++;
-        sg.matches = 1;
-        sg.topDoc = docBase + doc;
-        // sg.topDocScore = scorer.score();
-        for (FieldComparator fc : comparators)
-          fc.copy(sg.comparatorSlot, doc);
-        groupMap.put(sg.groupValue, sg);
-        return;
-      }
-
-      if (orderedGroups == null) {
-        buildSet();
-      }
-
-
-      for (int i = 0;; i++) {
-        final int c = reversed[i] * comparators[i].compareBottom(doc);
-        if (c < 0) {
-          // Definitely not competitive.
-          return;
-        } else if (c > 0) {
-          // Definitely competitive.
-          break;
-        } else if (i == comparators.length - 1) {
-          // Here c=0. If we're at the last comparator, this doc is not
-          // competitive, since docs are visited in doc Id order, which means
-          // this doc cannot compete with any other document in the queue.
-          return;
+        // allocate enough generations for a PB of data
+        int n = (int) Math.log10(1000 * 1000 * 1000 / maxSSTableSizeInMB);
+        generations = new List[n];
+        lastCompactedKeys = new DecoratedKey[n];
+        for (int i = 0; i < generations.length; i++)
+        {
+            generations[i] = new ArrayList<SSTableReader>();
+            lastCompactedKeys[i] = new DecoratedKey(cfs.partitioner.getMinimumToken(), null);
         }
-      }
-
-      // remove current smallest group
-      SearchGroup smallest = orderedGroups.pollLast();
-      groupMap.remove(smallest.groupValue);
-
-      // reuse the removed SearchGroup
-      smallest.groupValue.copy(mval);
-      smallest.matches = 1;
-      smallest.topDoc = docBase + doc;
-      // smallest.topDocScore = scorer.score();
-      for (FieldComparator fc : comparators)
-        fc.copy(smallest.comparatorSlot, doc);
-
-      groupMap.put(smallest.groupValue, smallest);
-      orderedGroups.add(smallest);
-
-      for (FieldComparator fc : comparators)
-        fc.setBottom(orderedGroups.last().comparatorSlot);
-
-      return;
     }
 
-    //
-    // update existing group
-    //
+    static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize)
+    {
+        LeveledManifest manifest = new LeveledManifest(cfs, maxSSTableSize);
+        load(cfs, manifest);
 
-    group.matches++; // TODO: these aren't valid if the group is every discarded then re-added.  keep track if there have been discards?
-
-    for (int i = 0;; i++) {
-      FieldComparator fc = comparators[i];
-      fc.copy(spareSlot, doc);
-
-      final int c = reversed[i] * fc.compare(group.comparatorSlot, spareSlot);
-      if (c < 0) {
-        // Definitely not competitive.
-        return;
-      } else if (c > 0) {
-        // Definitely competitive.
-        // Set remaining comparators
-        for (int j=i+1; j<comparators.length; j++)
-          comparators[j].copy(spareSlot, doc);
-        break;
-      } else if (i == comparators.length - 1) {
-        // Here c=0. If we're at the last comparator, this doc is not
-        // competitive, since docs are visited in doc Id order, which means
-        // this doc cannot compete with any other document in the queue.
-        return;
-      }
-    }
-
-    // remove before updating the group since lookup is done via comparators
-    // TODO: optimize this
-    if (orderedGroups != null)
-      orderedGroups.remove(group);
-
-    group.topDoc = docBase + doc;
-    // group.topDocScore = scorer.score();
-    int tmp = spareSlot; spareSlot = group.comparatorSlot; group.comparatorSlot=tmp;  // swap slots
-
-    // re-add the changed group
-    if (orderedGroups != null)
-      orderedGroups.add(group);
-  }
-
-  void buildSet() {
-    Comparator<SearchGroup> comparator = new Comparator<SearchGroup>() {
-      public int compare(SearchGroup o1, SearchGroup o2) {
-        for (int i = 0;; i++) {
-          FieldComparator fc = comparators[i];
-          int c = reversed[i] * fc.compare(o1.comparatorSlot, o2.comparatorSlot);
-          if (c != 0) {
-            return c;
-          } else if (i == comparators.length - 1) {
-            return o1.topDoc - o2.topDoc;
-          }
+        // ensure all SSTables are in the manifest
+        for (SSTableReader ssTableReader : cfs.getSSTables())
+        {
+            if (manifest.levelOf(ssTableReader) < 0)
+                manifest.add(ssTableReader);
         }
-      }
-    };
 
-    orderedGroups = new TreeSet<SearchGroup>(comparator);
-    orderedGroups.addAll(groupMap.values());
-    if (orderedGroups.size() == 0) return;
-    for (FieldComparator fc : comparators)
-      fc.setBottom(orderedGroups.last().comparatorSlot);
-  }
-
-  @Override
-  public void setNextReader(IndexReader reader, int docBase) throws IOException {
-    this.docBase = docBase;
-    docValues = vs.getValues(context, reader);
-    filler = docValues.getValueFiller();
-    mval = filler.getValue();
-    for (FieldComparator fc : comparators)
-      fc.setNextReader(reader, docBase);
-  }
-
-  @Override
-  public boolean acceptsDocsOutOfOrder() {
-    return false;
-  }
-
-  public int getMatches() {
-    return matches;
-  }
-}
-
-
-/**
- * This class allows a different sort within a group than what is used between groups.
- * Sorting between groups is done by the sort value of the first (highest ranking)
- * document in that group.
- */
-class TopGroupSortCollector extends TopGroupCollector {
-
-  IndexReader reader;
-  Sort groupSort;
-
-  public TopGroupSortCollector(ValueSource groupByVS, Map vsContext, Sort sort, Sort groupSort, int nGroups) throws IOException {
-    super(groupByVS, vsContext, sort, nGroups);
-    this.groupSort = groupSort;
-  }
-
-  void constructComparators(FieldComparator[] comparators, int[] reversed, SortField[] sortFields, int size) throws IOException {
-    for (int i = 0; i < sortFields.length; i++) {
-      SortField sortField = sortFields[i];
-      reversed[i] = sortField.getReverse() ? -1 : 1;
-      comparators[i] = sortField.getComparator(size, i);
-      if (scorer != null) comparators[i].setScorer(scorer);
-      if (reader != null) comparators[i].setNextReader(reader, docBase);
+        return manifest;
     }
-  }
 
-  @Override
-  public void setScorer(Scorer scorer) throws IOException {
-    super.setScorer(scorer);
-    for (SearchGroup searchGroup : groupMap.values()) {
-      for (FieldComparator fc : searchGroup.sortGroupComparators) {
-        fc.setScorer(scorer);
-      }
-    }
-  }
+    private static void load(ColumnFamilyStore cfs, LeveledManifest manifest)
+    {
+        File manifestFile = tryGetManifest(cfs);
+        if (manifestFile == null)
+            return;
 
-  @Override
-  public void collect(int doc) throws IOException {
-    matches++;
-    filler.fillValue(doc);
-    SearchGroup group = groupMap.get(mval);
-    if (group == null) {
-      int num = groupMap.size();
-      if (groupMap.size() < nGroups) {
-        SearchGroup sg = new SearchGroup();
-        SortField[] sortGroupFields = groupSort.getSort();
-        sg.sortGroupComparators = new FieldComparator[sortGroupFields.length];
-        sg.sortGroupReversed = new int[sortGroupFields.length];
-        constructComparators(sg.sortGroupComparators, sg.sortGroupReversed, sortGroupFields, 1);
-
-        sg.groupValue = mval.duplicate();
-        sg.comparatorSlot = num++;
-        sg.matches = 1;
-        sg.topDoc = docBase + doc;
-        // sg.topDocScore = scorer.score();
-        for (FieldComparator fc : comparators)
-          fc.copy(sg.comparatorSlot, doc);
-        for (FieldComparator fc : sg.sortGroupComparators) {
-          fc.copy(0, doc);
-          fc.setBottom(0);
+        ObjectMapper m = new ObjectMapper();
+        try
+        {
+            JsonNode rootNode = m.readValue(manifestFile, JsonNode.class);
+            JsonNode generations = rootNode.get("generations");
+            assert generations.isArray();
+            for (JsonNode generation : generations)
+            {
+                int level = generation.get("generation").getIntValue();
+                JsonNode generationValues = generation.get("members");
+                for (JsonNode generationValue : generationValues)
+                {
+                    for (SSTableReader ssTableReader : cfs.getSSTables())
+                    {
+                        if (ssTableReader.descriptor.generation == generationValue.getIntValue())
+                        {
+                            logger.debug("Loading {} at L{}", ssTableReader, level);
+                            manifest.add(ssTableReader, level);
+                        }
+                    }
+                }
+            }
         }
-        groupMap.put(sg.groupValue, sg);
-        return;
-      }
-
-      if (orderedGroups == null) {
-        buildSet();
-      }
-
-      SearchGroup leastSignificantGroup = orderedGroups.last();
-      for (int i = 0;; i++) {
-        final int c = leastSignificantGroup.sortGroupReversed[i] * leastSignificantGroup.sortGroupComparators[i].compareBottom(doc);
-        if (c < 0) {
-          // Definitely not competitive.
-          return;
-        } else if (c > 0) {
-          // Definitely competitive.
-          break;
-        } else if (i == leastSignificantGroup.sortGroupComparators.length - 1) {
-          // Here c=0. If we're at the last comparator, this doc is not
-          // competitive, since docs are visited in doc Id order, which means
-          // this doc cannot compete with any other document in the queue.
-          return;
+        catch (Exception e)
+        {
+            // TODO try to recover -old first
+            logger.error("Manifest present but corrupt. Cassandra will compact levels from scratch", e);
         }
-      }
-
-      // remove current smallest group
-      SearchGroup smallest = orderedGroups.pollLast();
-      groupMap.remove(smallest.groupValue);
-
-      // reuse the removed SearchGroup
-      smallest.groupValue.copy(mval);
-      smallest.matches = 1;
-      smallest.topDoc = docBase + doc;
-      // smallest.topDocScore = scorer.score();
-      for (FieldComparator fc : comparators)
-        fc.copy(smallest.comparatorSlot, doc);
-      for (FieldComparator fc : smallest.sortGroupComparators) {
-        fc.copy(0, doc);
-        fc.setBottom(0);
-      }
-
-      groupMap.put(smallest.groupValue, smallest);
-      orderedGroups.add(smallest);
-
-      for (FieldComparator fc : comparators)
-        fc.setBottom(orderedGroups.last().comparatorSlot);
-      for (FieldComparator fc : smallest.sortGroupComparators)
-        fc.setBottom(0);
-
-      return;
     }
 
-    //
-    // update existing group
-    //
+    public synchronized void add(SSTableReader reader)
+    {
+        logDistribution();
+        logger.debug("Adding {} to L0", reader);
+        add(reader, 0);
+        serialize();
+    }
 
-    group.matches++; // TODO: these aren't valid if the group is every discarded then re-added.  keep track if there have been discards?
-
-    for (int i = 0;; i++) {
-      FieldComparator fc = group.sortGroupComparators[i];
-
-      final int c = group.sortGroupReversed[i] * fc.compareBottom(doc);
-      if (c < 0) {
-        // Definitely not competitive.
-        return;
-      } else if (c > 0) {
-        // Definitely competitive.
-        // Set remaining comparators
-        for (int j = 0; j < group.sortGroupComparators.length; j++) {
-          group.sortGroupComparators[j].copy(0, doc);
-          group.sortGroupComparators[j].setBottom(0);
+    /**
+     * if the number of SSTables in the current compacted set *by itself* exeeds the target level's
+     * (regardless of the level's current contents), find an empty level instead
+     */
+    private int skipLevels(int newLevel, Iterable<SSTableReader> added)
+    {
+        while (maxBytesForLevel(newLevel) < SSTableReader.getTotalBytes(added)
+            && generations[(newLevel + 1)].isEmpty())
+        {
+            newLevel++;
         }
-        for (FieldComparator comparator : comparators) comparator.copy(spareSlot, doc);
-        break;
-      } else if (i == group.sortGroupComparators.length - 1) {
-        // Here c=0. If we're at the last comparator, this doc is not
-        // competitive, since docs are visited in doc Id order, which means
-        // this doc cannot compete with any other document in the queue.
-        return;
-      }
+        return newLevel;
     }
 
-    // remove before updating the group since lookup is done via comparators
-    // TODO: optimize this
-    if (orderedGroups != null)
-      orderedGroups.remove(group);
+    public synchronized void promote(Iterable<SSTableReader> removed, Iterable<SSTableReader> added)
+    {
+        logDistribution();
+        if (logger.isDebugEnabled())
+            logger.debug((Iterables.isEmpty(added) ? "Removing [" : "Replacing [") + toString(removed) + "]");
 
-    group.topDoc = docBase + doc;
-    // group.topDocScore = scorer.score();
-    int tmp = spareSlot; spareSlot = group.comparatorSlot; group.comparatorSlot=tmp;  // swap slots
+        // the level for the added sstables is the max of the removed ones,
+        // plus one if the removed were all on the same level
+        int minimumLevel = Integer.MAX_VALUE;
+        int maximumLevel = 0;
+        for (SSTableReader sstable : removed)
+        {
+            int thisLevel = levelOf(sstable);
+            maximumLevel = Math.max(maximumLevel, thisLevel);
+            minimumLevel = Math.min(minimumLevel, thisLevel);
+            remove(sstable);
+        }
 
-    // re-add the changed group
-    if (orderedGroups != null)
-      orderedGroups.add(group);
-  }
+        // it's valid to do a remove w/o an add (e.g. on truncate)
+        if (!added.iterator().hasNext())
+            return;
 
-  @Override
-  public void setNextReader(IndexReader reader, int docBase) throws IOException {
-    super.setNextReader(reader, docBase);
-    this.reader = reader;
-    for (SearchGroup searchGroup : groupMap.values()) {
-      for (FieldComparator fc : searchGroup.sortGroupComparators) {
-        fc.setNextReader(reader, docBase);
-      }
-    }
-  }
+        int newLevel = minimumLevel == maximumLevel ? maximumLevel + 1 : maximumLevel;
+        newLevel = skipLevels(newLevel, added);
+        assert newLevel > 0;
+        if (logger.isDebugEnabled())
+            logger.debug("Adding [{}] at L{}", toString(added), newLevel);
 
-}
+        lastCompactedKeys[minimumLevel] = SSTable.sstableOrdering.max(added).last;
+        for (SSTableReader ssTableReader : added)
+            add(ssTableReader, newLevel);
 
-
-class Phase2GroupCollector extends Collector {
-  final HashMap<MutableValue, SearchGroupDocs> groupMap;
-  final ValueSource vs;
-  final Map context;
-
-  DocValues docValues;
-  DocValues.ValueFiller filler;
-  MutableValue mval;
-  Scorer scorer;
-  int docBase;
-
-  // TODO: may want to decouple from the phase1 collector
-  public Phase2GroupCollector(TopGroupCollector topGroups, ValueSource groupByVS, Map vsContext, Sort sort, int docsPerGroup, boolean getScores) throws IOException {
-    boolean getSortFields = false;
-
-    groupMap = new HashMap<MutableValue, SearchGroupDocs>(topGroups.groupMap.size());
-    for (SearchGroup group : topGroups.groupMap.values()) {
-      SearchGroupDocs groupDocs = new SearchGroupDocs();
-      groupDocs.groupValue = group.groupValue;
-      groupDocs.collector = TopFieldCollector.create(sort, docsPerGroup, getSortFields, getScores, getScores, true);
-      groupMap.put(groupDocs.groupValue, groupDocs);
+        serialize();
     }
 
-    this.vs = groupByVS;
-    this.context = vsContext;
-  }
+    private String toString(Iterable<SSTableReader> sstables)
+    {
+        StringBuilder builder = new StringBuilder();
+        for (SSTableReader sstable : sstables)
+        {
+            builder.append(sstable.descriptor.cfname)
+                   .append('-')
+                   .append(sstable.descriptor.generation)
+                   .append("(L")
+                   .append(levelOf(sstable))
+                   .append("), ");
+        }
+        return builder.toString();
+    }
 
-  @Override
-  public void setScorer(Scorer scorer) throws IOException {
-    this.scorer = scorer;
-    for (SearchGroupDocs group : groupMap.values())
-      group.collector.setScorer(scorer);
-  }
+    private double maxBytesForLevel (int level)
+    {
+        return level == 0
+               ? 4 * maxSSTableSizeInMB * 1024 * 1024
+               : Math.pow(10, level) * maxSSTableSizeInMB * 1024 * 1024;
+    }
 
-  @Override
-  public void collect(int doc) throws IOException {
-    filler.fillValue(doc);
-    SearchGroupDocs group = groupMap.get(mval);
-    if (group == null) return;
-    group.matches++;
-    group.collector.collect(doc);
-  }
+    public synchronized Collection<SSTableReader> getCompactionCandidates()
+    {
+        // LevelDB gives each level a score of how much data it contains vs its ideal amount, and
+        // compacts the level with the highest score. But this falls apart spectacularly once you
+        // get behind.  Consider this set of levels:
+        // L0: 988 [ideal: 4]
+        // L1: 117 [ideal: 10]
+        // L2: 12  [ideal: 100]
+        //
+        // The problem is that L0 has a much higher score (almost 250) than L1 (11), so what we'll
+        // do is compact a batch of MAX_COMPACTING_L0 sstables with all 117 L1 sstables, and put the
+        // result (say, 120 sstables) in L1. Then we'll compact the next batch of MAX_COMPACTING_L0,
+        // and so forth.  So we spend most of our i/o rewriting the L1 data with each batch.
+        //
+        // If we could just do *all* L0 a single time with L1, that would be ideal.  But we can't
+        // -- see the javadoc for MAX_COMPACTING_L0.
+        //
+        // LevelDB's way around this is to simply block writes if L0 compaction falls behind.
+        // We don't have that luxury.
+        //
+        // So instead, we force compacting higher levels first.  This may not minimize the number
+        // of reads done as quickly in the short term, but it minimizes the i/o needed to compact
+        // optimially which gives us a long term win.
+        for (int i = generations.length - 1; i >= 0; i--)
+        {
+            List<SSTableReader> sstables = generations[i];
+            if (sstables.isEmpty())
+                continue; // mostly this just avoids polluting the debug log with zero scores
+            double score = SSTableReader.getTotalBytes(sstables) / maxBytesForLevel(i);
+            logger.debug("Compaction score for level {} is {}", i, score);
 
-  @Override
-  public void setNextReader(IndexReader reader, int docBase) throws IOException {
-    this.docBase = docBase;
-    docValues = vs.getValues(context, reader);
-    filler = docValues.getValueFiller();
-    mval = filler.getValue();
-    for (SearchGroupDocs group : groupMap.values())
-      group.collector.setNextReader(reader, docBase);
-  }
+            // L0 gets a special case that if we don't have anything more important to do,
+            // we'll go ahead and compact even just one sstable
+            if (score > 1.001 || i == 0)
+            {
+                Collection<SSTableReader> candidates = getCandidatesFor(i);
+                if (logger.isDebugEnabled())
+                    logger.debug("Compaction candidates for L{} are {}", i, toString(candidates));
+                return candidates;
+            }
+        }
 
-  @Override
-  public boolean acceptsDocsOutOfOrder() {
-    return false;
-  }
-}
+        return Collections.emptyList();
+    }
 
-// TODO: merge with SearchGroup or not?
-// ad: don't need to build a new hashmap
-// disad: blows up the size of SearchGroup if we need many of them, and couples implementations
-class SearchGroupDocs {
-  public MutableValue groupValue;
-  int matches;
-  TopFieldCollector collector;
+    public int getLevelSize(int i)
+    {
+
+        return generations.length > i ? generations[i].size() : 0;
+    }
+
+    private void logDistribution()
+    {
+        for (int i = 0; i < generations.length; i++)
+        {
+            if (!generations[i].isEmpty())
+            {
+                logger.debug("L{} contains {} SSTables ({} bytes) in {}",
+                             new Object[] {i, generations[i].size(), SSTableReader.getTotalBytes(generations[i]), this});
+            }
+        }
+    }
+
+    private int levelOf(SSTableReader sstable)
+    {
+        for (int level = 0; level < generations.length; level++)
+        {
+            if (generations[level].contains(sstable))
+                return level;
+        }
+        return -1;
+    }
+
+    private void remove(SSTableReader reader)
+    {
+        int level = levelOf(reader);
+        assert level >= 0 : reader + " not present in manifest";
+        generations[level].remove(reader);
+    }
+
+    private void add(SSTableReader sstable, int level)
+    {
+        generations[level].add(sstable);
+    }
+
+    private static List<SSTableReader> overlapping(SSTableReader sstable, Iterable<SSTableReader> candidates)
+    {
+        List<SSTableReader> overlapped = new ArrayList<SSTableReader>();
+        overlapped.add(sstable);
+
+        Range promotedRange = new Range(sstable.first.token, sstable.last.token);
+        for (SSTableReader candidate : candidates)
+        {
+            Range candidateRange = new Range(candidate.first.token, candidate.last.token);
+            if (candidateRange.intersects(promotedRange))
+                overlapped.add(candidate);
+        }
+        return overlapped;
+    }
+
+    private Collection<SSTableReader> getCandidatesFor(int level)
+    {
+        assert !generations[level].isEmpty();
+        logger.debug("Choosing candidates for L{}", level);
+
+        if (level == 0)
+        {
+            // because L0 files may overlap each other, we treat compactions there specially:
+            // a L0 compaction also checks other L0 files for overlap.
+            Set<SSTableReader> candidates = new HashSet<SSTableReader>();
+            // pick the oldest sstable from L0, and any that overlap with it
+            List<SSTableReader> ageSortedSSTables = new ArrayList<SSTableReader>(generations[0]);
+            Collections.sort(ageSortedSSTables, SSTable.maxTimestampComparator);
+            List<SSTableReader> L0 = overlapping(ageSortedSSTables.get(0), generations[0]);
+            L0 = L0.size() > MAX_COMPACTING_L0 ? L0.subList(0, MAX_COMPACTING_L0) : L0;
+            // add the overlapping ones from L1
+            for (SSTableReader sstable : L0)
+                candidates.addAll(overlapping(sstable, generations[1]));
+            return candidates;
+        }
+
+        // for non-L0 compactions, pick up where we left off last time
+        Collections.sort(generations[level], SSTable.sstableComparator);
+        for (SSTableReader sstable : generations[level])
+        {
+            // the first sstable that is > than the marked
+            if (sstable.first.compareTo(lastCompactedKeys[level]) > 0)
+                return overlapping(sstable, generations[(level + 1)]);
+        }
+        // or if there was no last time, start with the first sstable
+        return overlapping(generations[level].get(0), generations[(level + 1)]);
+    }
+
+    public synchronized void serialize()
+    {
+        File manifestFile = tryGetManifest(cfs);
+        if (manifestFile == null)
+            manifestFile = new File(new File(DatabaseDescriptor.getAllDataFileLocations()[0], cfs.table.name), cfs.columnFamily + ".json");
+        File oldFile = new File(manifestFile.getPath().replace(EXTENSION, "-old.json"));
+        File tmpFile = new File(manifestFile.getPath().replace(EXTENSION, "-tmp.json"));
+
+        JsonFactory f = new JsonFactory();
+        try
+        {
+            JsonGenerator g = f.createJsonGenerator(tmpFile, JsonEncoding.UTF8);
+            g.useDefaultPrettyPrinter();
+            g.writeStartObject();
+            g.writeArrayFieldStart("generations");
+            for (int level = 0; level < generations.length; level++)
+            {
+                g.writeStartObject();
+                g.writeNumberField("generation", level);
+                g.writeArrayFieldStart("members");
+                for (SSTableReader ssTableReader : generations[level])
+                    g.writeNumber(ssTableReader.descriptor.generation);
+                g.writeEndArray(); // members
+
+                g.writeEndObject(); // generation
+            }
+            g.writeEndArray(); // for field generations
+            g.writeEndObject(); // write global object
+            g.close();
+
+            if (oldFile.exists() && manifestFile.exists())
+                FileUtils.deleteWithConfirm(oldFile);
+            if (manifestFile.exists())
+                FileUtils.renameWithConfirm(manifestFile, oldFile);
+            assert tmpFile.exists();
+            FileUtils.renameWithConfirm(tmpFile, manifestFile);
+            logger.debug("Saved manifest {}", manifestFile);
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+    }
+
+    public static File tryGetManifest(ColumnFamilyStore cfs)
+    {
+        for (String dir : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            File manifestFile = new File(new File(dir, cfs.table.name), cfs.columnFamily + EXTENSION);
+            if (manifestFile.exists())
+            {
+                logger.debug("Found manifest at {}", manifestFile);
+                return manifestFile;
+            }
+        }
+        logger.debug("No level manifest found");
+        return null;
+    }
+
+    @Override
+    public String toString()
+    {
+        return "Manifest@" + hashCode();
+    }
+
+    public int getLevelCount()
+    {
+        for (int i = generations.length - 1; i >= 0; i--)
+        {
+            if (generations[i].size() > 0)
+                return i;
+        }
+        return 0;
+    }
+
+    public List<SSTableReader> getLevel(int i)
+    {
+        return generations[i];
+    }
+
+    public int getEstimatedTasks()
+    {
+        int n = 0;
+        for (int i = generations.length - 1; i >= 0; i--)
+        {
+            List<SSTableReader> sstables = generations[i];
+            n += Math.max(0L, SSTableReader.getTotalBytes(sstables) - maxBytesForLevel(i)) / (maxSSTableSizeInMB * 1024 * 1024);
+        }
+        return n;
+    }
 }

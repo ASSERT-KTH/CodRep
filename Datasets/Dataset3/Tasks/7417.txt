@@ -1,8 +1,8 @@
-private static final AttachmentKey<Boolean> WRITTEN_KEY = AttachmentKey.create(Boolean.class);
+import org.jboss.as.server.client.impl.StandaloneClientProtocol;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2012, Red Hat, Inc., and individual contributors
+ * Copyright 2010, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,352 +22,223 @@ private static final AttachmentKey<Boolean> WRITTEN_KEY = AttachmentKey.create(B
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.logging;
+package org.jboss.as.host.controller.mgmt;
 
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
 
-import org.jboss.as.controller.AbstractWriteAttributeHandler;
-import org.jboss.as.controller.AttributeDefinition;
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationContext.AttachmentKey;
-import org.jboss.as.controller.OperationContext.ResultAction;
-import org.jboss.as.controller.OperationContext.ResultHandler;
-import org.jboss.as.controller.OperationContext.RollbackHandler;
-import org.jboss.as.controller.OperationContext.Stage;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.OperationStepHandler;
-import org.jboss.as.controller.PathAddress;
-import org.jboss.as.controller.registry.Resource;
-import org.jboss.as.logging.logmanager.ConfigurationPersistence;
-import org.jboss.as.server.ServerEnvironment;
-import org.jboss.dmr.ModelNode;
-import org.jboss.logmanager.LogContext;
-import org.jboss.logmanager.config.LogContextConfiguration;
-import org.wildfly.security.manager.WildFlySecurityManager;
+import javax.net.ServerSocketFactory;
+import org.jboss.as.protocol.ByteDataInput;
+import org.jboss.as.protocol.ByteDataOutput;
+import org.jboss.as.protocol.Connection;
+import org.jboss.as.protocol.ConnectionHandler;
+import org.jboss.as.protocol.mgmt.ManagementOperationHandler;
+import org.jboss.as.protocol.mgmt.ManagementProtocol;
+import org.jboss.as.protocol.mgmt.ManagementRequestHeader;
+import org.jboss.as.protocol.mgmt.ManagementResponseHeader;
+import org.jboss.as.protocol.MessageHandler;
+import org.jboss.as.protocol.ProtocolServer;
+import org.jboss.as.protocol.SimpleByteDataInput;
+import org.jboss.as.protocol.SimpleByteDataOutput;
+import static org.jboss.as.protocol.StreamUtils.safeClose;
+import org.jboss.as.server.services.net.NetworkInterfaceBinding;
+import org.jboss.as.standalone.client.impl.StandaloneClientProtocol;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
 
 /**
- * @author <a href="mailto:jperkins@redhat.com">James R. Perkins</a>
+ * Service responsible for accepting remote communication to host controller processes.  This will wait on a {@link java.net.ServerSocket}
+ * for requests and will and the requesting socket over to a {@link org.jboss.as.protocol.mgmt.ManagementOperationHandler} to
+ * process the request.
+ *
+ * @author John E. Bailey
  */
-final class LoggingOperations {
+public class ManagementCommunicationService implements Service<ManagementCommunicationService>, ConnectionHandler {
+    public static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("host", "controller", "management", "communication");
+
+    private final InjectedValue<NetworkInterfaceBinding> interfaceBindingValue = new InjectedValue<NetworkInterfaceBinding>();
+    private final InjectedValue<Integer> portValue = new InjectedValue<Integer>();
+    private final InjectedValue<ExecutorService> executorServiceValue = new InjectedValue<ExecutorService>();
+    private final InjectedValue<ThreadFactory> threadFactoryValue = new InjectedValue<ThreadFactory>();
+    private final ConcurrentMap<Byte, ManagementOperationHandler> handlers = new ConcurrentHashMap<Byte, ManagementOperationHandler>();
+    private ProtocolServer server;
 
     /**
-     * Get the address name from the operation.
+     * Starts the service.  Will start a socket listener to listen for management operation requests.
      *
-     * @param operation the operation to extract the address name from
-     *
-     * @return the name
+     * @param context The start context
+     * @throws StartException If any errors occur
      */
-    public static String getAddressName(final ModelNode operation) {
-        return getAddress(operation).getLastElement().getValue();
-    }
+    public synchronized void start(StartContext context) throws StartException {
+        final ExecutorService executorService = executorServiceValue.getValue();
+        final ThreadFactory threadFactory = threadFactoryValue.getValue();
+        final NetworkInterfaceBinding interfaceBinding = interfaceBindingValue.getValue();
+        final Integer port = portValue.getValue();
+        try {
+            final ProtocolServer.Configuration config = new ProtocolServer.Configuration();
+            config.setBindAddress(new InetSocketAddress(interfaceBinding.getAddress(), port));
+            config.setThreadFactory(threadFactory);
+            config.setReadExecutor(executorService);
+            config.setSocketFactory(ServerSocketFactory.getDefault());
+            config.setBacklog(50);
+            config.setConnectionHandler(this);
 
-    /**
-     * Get the address from the operation.
-     *
-     * @param operation the operation to extract the address from
-     *
-     * @return the address
-     */
-    public static PathAddress getAddress(final ModelNode operation) {
-        return PathAddress.pathAddress(operation.require(OP_ADDR));
-    }
-
-    /**
-     * Adds a {@link Stage#RUNTIME runtime} step to the context that will commit or rollback any logging changes. Also
-     * if not a logging profile writes the {@code logging.properties} file.
-     *
-     * @param context                  the context to add the step to
-     * @param configurationPersistence the configuration to commit
-     */
-    static void addCommitStep(final OperationContext context, final ConfigurationPersistence configurationPersistence) {
-        context.addStep(new CommitOperationStepHandler(configurationPersistence), Stage.RUNTIME);
-    }
-
-    private static final class CommitOperationStepHandler implements OperationStepHandler {
-        private static AttachmentKey<Boolean> WRITTEN_KEY = AttachmentKey.create(Boolean.class);
-        private final ConfigurationPersistence configurationPersistence;
-        private final boolean persistConfig;
-
-        @SuppressWarnings("deprecation")
-        CommitOperationStepHandler(final ConfigurationPersistence configurationPersistence) {
-            this.configurationPersistence = configurationPersistence;
-            persistConfig = Boolean.parseBoolean(WildFlySecurityManager.getPropertyPrivileged(ServerEnvironment.JBOSS_PERSIST_SERVER_CONFIG, Boolean.toString(true)));
+            server = new ProtocolServer(config);
+            server.start();
+        } catch (Exception e) {
+            throw new StartException("Failed to start server socket", e);
         }
+    }
 
-        @Override
-        public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-            configurationPersistence.prepare();
-            context.completeStep(new ResultHandler() {
-                @Override
-                public void handleResult(final ResultAction resultAction, final OperationContext context, final ModelNode operation) {
-                    if (resultAction == ResultAction.KEEP) {
-                        configurationPersistence.commit();
-                        if (!LoggingProfileOperations.isLoggingProfileAddress(getAddress(operation))) {
-                            // Write once
-                            if (context.getAttachment(WRITTEN_KEY) == null) {
-                                context.attachIfAbsent(WRITTEN_KEY, Boolean.TRUE);
-                                if (persistConfig) {
-                                    configurationPersistence.writeConfiguration(context);
-                                }
-                            }
-                        }
-                    } else if (resultAction == ResultAction.ROLLBACK) {
-                        configurationPersistence.rollback();
-                    }
+    /**
+     * Stops the service.  Will shutdown the socket listener and will no longer accept requests.
+     *
+     * @param context The stop context
+     */
+    public synchronized void stop(StopContext context) {
+        if (server != null) {
+            server.stop();
+        }
+    }
+
+    /** {@inheritDoc} */
+    public ManagementCommunicationService getValue() throws IllegalStateException {
+        return this;
+    }
+
+    /**
+     * Get the interface binding injector.
+     *
+     * @return The injector
+     */
+    public Injector<NetworkInterfaceBinding> getInterfaceInjector() {
+        return interfaceBindingValue;
+    }
+
+    /**
+     * Get the executor service injector.
+     *
+     * @return The injector
+     */
+    public Injector<ExecutorService> getExecutorServiceInjector() {
+        return executorServiceValue;
+    }
+
+    /**
+     * Get the management port injector.
+     *
+     * @return The injector
+     */
+    public Injector<Integer> getPortInjector() {
+        return portValue;
+    }
+
+    public Injector<ThreadFactory> getThreadFactoryInjector() {
+        return threadFactoryValue;
+    }
+
+    void addHandler(ManagementOperationHandler handler) {
+        if (handlers.putIfAbsent(handler.getIdentifier(), handler) != null) {
+            // TODO: Handle
+        }
+    }
+
+    void removeHandler(ManagementOperationHandler handler) {
+        if (!handlers.remove(handler.getIdentifier(), handler)) {
+            // TODO: Handle
+        }
+    }
+
+    public MessageHandler handleConnected(Connection connection) throws IOException {
+        return new ManagementHeaderMessageHandler();
+    }
+
+    private class ManagementHeaderMessageHandler implements MessageHandler {
+        public void handleMessage(Connection connection, InputStream dataStream) throws IOException {
+            final int workingVersion;
+            final ManagementRequestHeader requestHeader;
+            final ManagementOperationHandler handler;
+            ByteDataInput input = null;
+            try {
+                input = new SimpleByteDataInput(dataStream);
+
+                // Start by reading the request header
+                requestHeader = new ManagementRequestHeader(input);
+
+                // Work with the lowest protocol version
+                workingVersion = Math.min(ManagementProtocol.VERSION, requestHeader.getVersion());
+
+                byte handlerId = requestHeader.getOperationHandlerId();
+                if (handlerId == -1) {
+                    throw new IOException("Management request failed.  Invalid handler id");
                 }
-            });
-        }
-    }
-
-    public static class ReadFilterOperationStepHandler implements OperationStepHandler {
-
-        public static final ReadFilterOperationStepHandler INSTANCE = new ReadFilterOperationStepHandler();
-
-        private ReadFilterOperationStepHandler() {
-
-        }
-
-        @Override
-        public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-            final ModelNode model = context.readResource(PathAddress.EMPTY_ADDRESS).getModel();
-            final ModelNode filter = CommonAttributes.FILTER_SPEC.resolveModelAttribute(context, model);
-            if (filter.isDefined()) {
-                context.getResult().set(Filters.filterSpecToFilter(filter.asString()));
-            }
-            context.stepCompleted();
-        }
-    }
-
-    /**
-     * The base logging OSH.
-     */
-    private abstract static class LoggingOperationStepHandler implements OperationStepHandler {
-
-        @Override
-        public final void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-            // Get the address and the name of the logger or handler
-            final PathAddress address = getAddress(operation);
-            final String name = getAddressName(operation);
-            final ConfigurationPersistence configurationPersistence;
-            final boolean isLoggingProfile = LoggingProfileOperations.isLoggingProfileAddress(address);
-            if (isLoggingProfile) {
-                final LogContext logContext = LoggingProfileContextSelector.getInstance().getOrCreate(LoggingProfileOperations.getLoggingProfileName(address));
-                configurationPersistence = ConfigurationPersistence.getOrCreateConfigurationPersistence(logContext);
-            } else {
-                configurationPersistence = ConfigurationPersistence.getOrCreateConfigurationPersistence();
-            }
-            final LogContextConfiguration logContextConfiguration = configurationPersistence.getLogContextConfiguration();
-
-            execute(context, operation, name, logContextConfiguration);
-            // This should only check that it's a server for the commit step. The logging.properties may need to be written
-            // in ADMIN_ONLY mode
-            if (context.getProcessType().isServer()) {
-                addCommitStep(context, configurationPersistence);
-                // Add rollback handler in case rollback is invoked before a commit step is invoked
-                context.completeStep(new RollbackHandler() {
-                    @Override
-                    public void handleRollback(final OperationContext context, final ModelNode operation) {
-                        configurationPersistence.rollback();
+                handler = handlers.get(handlerId);
+                if (handler == null) {
+                    String msg = null;
+                    if (handlerId == StandaloneClientProtocol.SERVER_CONTROLLER_REQUEST) {
+                        msg = "Management request failed.  A request from a client " +
+                                 "wishing to communicate with a standalone server " +
+                                 "was received by this host controller. Server " +
+                                 "managers do not support the standalone client protocol";
                     }
-                });
-            } else {
-                context.stepCompleted();
-            }
-        }
-
-        public abstract void execute(OperationContext context, ModelNode operation, String name, LogContextConfiguration logContextConfiguration) throws OperationFailedException;
-
-        /**
-         * Executes additional processing for this step.
-         *
-         * @param context                 the operation context
-         * @param operation               the operation being executed
-         * @param logContextConfiguration the logging context configuration
-         * @param name                    the name of the logger
-         * @param model                   the model to update
-         *
-         * @throws OperationFailedException if a processing error occurs
-         */
-        public abstract void performRuntime(OperationContext context, ModelNode operation, LogContextConfiguration logContextConfiguration, String name, ModelNode model) throws OperationFailedException;
-    }
-
-
-    /**
-     * A base step handler for logging operations.
-     */
-    abstract static class LoggingAddOperationStepHandler extends LoggingOperationStepHandler {
-
-        @Override
-        public final void execute(final OperationContext context, final ModelNode operation, final String name, final LogContextConfiguration logContextConfiguration) throws OperationFailedException {
-            final Resource resource = context.createResource(PathAddress.EMPTY_ADDRESS);
-            final ModelNode model = resource.getModel();
-            updateModel(operation, model);
-            if (context.isNormalServer()) {
-                context.addStep(new OperationStepHandler() {
-                    @Override
-                    public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-                        performRuntime(context, operation, logContextConfiguration, name, model);
-                        context.stepCompleted();
+                    else {
+                        msg = "Management request failed.  No handler found for id " + handlerId;
                     }
-                }, Stage.RUNTIME);
+                    throw new IOException(msg);
+                }
+                connection.setMessageHandler(handler);
+            } catch (IOException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw new IOException("Failed to read request header", t);
+            } finally {
+                safeClose(input);
+                safeClose(dataStream);
+            }
+
+            OutputStream dataOutput = null;
+            ByteDataOutput output = null;
+            try {
+                dataOutput = connection.writeMessage();
+                output = new SimpleByteDataOutput(dataOutput);
+
+                // Now write the response header
+                final ManagementResponseHeader responseHeader = new ManagementResponseHeader(workingVersion, requestHeader.getRequestId());
+                responseHeader.write(output);
+
+                output.close();
+                dataOutput.close();
+            } catch (IOException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw new IOException("Failed to write management response headers", t);
+            } finally {
+                safeClose(output);
+                safeClose(dataOutput);
             }
         }
 
-        /**
-         * Updates the model based on the operation.
-         *
-         * @param operation the operation being executed
-         * @param model     the model to update
-         *
-         * @throws OperationFailedException if a processing error occurs
-         */
-        public abstract void updateModel(ModelNode operation, ModelNode model) throws OperationFailedException;
-
-    }
-
-
-    /**
-     * A base update step handler for logging operations.
-     */
-    abstract static class LoggingUpdateOperationStepHandler extends LoggingOperationStepHandler {
-
-        @Override
-        public final void execute(final OperationContext context, final ModelNode operation, final String name, final LogContextConfiguration logContextConfiguration) throws OperationFailedException {
-            final Resource resource = context.readResourceForUpdate(PathAddress.EMPTY_ADDRESS);
-            final ModelNode model = resource.getModel();
-            updateModel(operation, model);
-            if (context.isNormalServer()) {
-                context.addStep(new OperationStepHandler() {
-                    @Override
-                    public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-                        performRuntime(context, operation, logContextConfiguration, name, model);
-                        context.stepCompleted();
-                    }
-                }, Stage.RUNTIME);
-            }
+        public void handleShutdown(final Connection connection) throws IOException {
+            connection.shutdownWrites();
         }
 
-        /**
-         * Updates the model based on the operation.
-         *
-         * @param operation the operation being executed
-         * @param model     the model to update
-         *
-         * @throws OperationFailedException if a processing error occurs
-         */
-        public abstract void updateModel(ModelNode operation, ModelNode model) throws OperationFailedException;
-
-    }
-
-
-    /**
-     * A base remove step handler for logging operations.
-     */
-    abstract static class LoggingRemoveOperationStepHandler extends LoggingOperationStepHandler {
-
-        @Override
-        public final void execute(final OperationContext context, final ModelNode operation, final String name, final LogContextConfiguration logContextConfiguration) throws OperationFailedException {
-
-            final ModelNode model = Resource.Tools.readModel(context.readResource(PathAddress.EMPTY_ADDRESS));
-
-            performRemove(context, operation, logContextConfiguration, name, model);
-            if (context.isNormalServer()) {
-                context.addStep(new OperationStepHandler() {
-                    @Override
-                    public void execute(final OperationContext context, final ModelNode operation) throws OperationFailedException {
-                        performRuntime(context, operation, logContextConfiguration, name, model);
-                        context.stepCompleted();
-                    }
-                }, Stage.RUNTIME);
-            }
+        public void handleFailure(final Connection connection, final IOException e) throws IOException {
+            connection.close();
         }
 
-        /**
-         * Performs the actual remove from the configuration.
-         *
-         * @param context                 the operation context
-         * @param operation               the operation being executed
-         * @param logContextConfiguration the logging context configuration
-         * @param name                    the name of the logger
-         * @param model                   the model to update
-         *
-         * @throws OperationFailedException if the remove fails
-         */
-        protected abstract void performRemove(OperationContext context, ModelNode operation, LogContextConfiguration logContextConfiguration, String name, ModelNode model) throws OperationFailedException;
-
-    }
-
-
-    /**
-     * A default log handler write attribute step handler.
-     */
-    abstract static class LoggingWriteAttributeHandler extends AbstractWriteAttributeHandler<ConfigurationPersistence> {
-        private final AttributeDefinition[] attributes;
-
-        protected LoggingWriteAttributeHandler(final AttributeDefinition[] attributes) {
-            super(attributes);
-            this.attributes = attributes;
-        }
-
-        @Override
-        protected final boolean applyUpdateToRuntime(final OperationContext context, final ModelNode operation, final String attributeName, final ModelNode resolvedValue, final ModelNode currentValue, final HandbackHolder<ConfigurationPersistence> handbackHolder) throws OperationFailedException {
-            final String name = getAddressName(operation);
-            final PathAddress address = getAddress(operation);
-            final ConfigurationPersistence configurationPersistence;
-            final boolean isLoggingProfile = LoggingProfileOperations.isLoggingProfileAddress(address);
-            if (isLoggingProfile) {
-                final LogContext logContext = LoggingProfileContextSelector.getInstance().getOrCreate(LoggingProfileOperations.getLoggingProfileName(address));
-                configurationPersistence = ConfigurationPersistence.getOrCreateConfigurationPersistence(logContext);
-            } else {
-                configurationPersistence = ConfigurationPersistence.getOrCreateConfigurationPersistence();
-            }
-            final LogContextConfiguration logContextConfiguration = configurationPersistence.getLogContextConfiguration();
-            handbackHolder.setHandback(configurationPersistence);
-            final boolean restartRequired = applyUpdate(context, attributeName, name, resolvedValue, logContextConfiguration);
-            addCommitStep(context, configurationPersistence);
-            return restartRequired;
-        }
-
-        /**
-         * Applies the update to the runtime.
-         *
-         * @param context                 the operation context
-         * @param attributeName           the name of the attribute being written
-         * @param addressName             the name of the handler or logger
-         * @param value                   the value to set the attribute to
-         * @param logContextConfiguration the log context configuration
-         *
-         * @return {@code true} if a restart is required, otherwise {@code false}
-         *
-         * @throws OperationFailedException if an error occurs
-         */
-        protected abstract boolean applyUpdate(final OperationContext context, final String attributeName, final String addressName, final ModelNode value, final LogContextConfiguration logContextConfiguration) throws OperationFailedException;
-
-        @Override
-        protected void revertUpdateToRuntime(final OperationContext context, final ModelNode operation, final String attributeName, final ModelNode valueToRestore, final ModelNode valueToRevert, final ConfigurationPersistence configurationPersistence) throws OperationFailedException {
-            final LogContextConfiguration logContextConfiguration = configurationPersistence.getLogContextConfiguration();
-            // First forget the configuration
-            logContextConfiguration.forget();
-        }
-
-        @Override
-        protected void validateUpdatedModel(final OperationContext context, final Resource model) throws OperationFailedException {
-            super.validateUpdatedModel(context, model);
-            final ModelNode submodel = model.getModel();
-            if (submodel.hasDefined(CommonAttributes.FILTER.getName())) {
-                final String filterSpec = Filters.filterToFilterSpec(CommonAttributes.FILTER.resolveModelAttribute(context, submodel));
-                submodel.remove(CommonAttributes.FILTER.getName());
-                submodel.get(CommonAttributes.FILTER_SPEC.getName()).set(filterSpec);
-            }
-        }
-
-        /**
-         * Returns a collection of attributes used for the write attribute.
-         *
-         * @return a collection of attributes
-         */
-        public final AttributeDefinition[] getAttributes() {
-            return attributes;
+        public void handleFinished(final Connection connection) throws IOException {
+            // nothing
         }
     }
 }

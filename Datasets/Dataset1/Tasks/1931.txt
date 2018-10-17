@@ -1,6 +1,6 @@
-return (Class<? extends ListResourceBundle>) b.loadClass(bundleName);
+out.readFully(compressed, 0, chunkSize);
 
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,195 +18,193 @@ return (Class<? extends ListResourceBundle>) b.loadClass(bundleName);
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.aries.util.nls;
+package org.apache.cassandra.io.compress;
 
+import java.io.File;
 import java.io.IOException;
-import java.net.URL;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import java.text.MessageFormat;
-import java.util.ListResourceBundle;
-import java.util.Locale;
-import java.util.MissingResourceException;
-import java.util.PropertyResourceBundle;
-import java.util.ResourceBundle;
+import java.util.zip.CRC32;
+import java.util.zip.Checksum;
 
-import org.osgi.framework.Bundle;
-import org.osgi.framework.FrameworkUtil;
+import org.apache.cassandra.io.util.FileMark;
+import org.apache.cassandra.io.util.SequentialWriter;
 
-/**
- * This is a helper class for loading messages for logging and exception messages. It supports translating the message into the
- * default Locale. It works out the calling Bundle and uses it to load any resources. If the resource bundle is of type
- * java.properties then it tries to find the bundle first via the bundle getResources method, then via the getEntry method. If it
- * is of type java.class then it'll use the bundle to load the class.
- */
-public final class MessageUtil
+import org.xerial.snappy.Snappy;
+
+public class CompressedSequentialWriter extends SequentialWriter
 {
-  /** The resource bundle used to translate messages */
-  private ResourceBundle messages;
-  private static final StackFinder finder;
+    public static final int CHUNK_LENGTH = 65536;
 
-  /** 
-   * One of the static methods needs to obtain the caller, so we cheat and use a SecurityManager to get the 
-   * classes on the stack.
-   */
-  private static class StackFinder extends SecurityManager
-  {
-    @Override
-    public Class<?>[] getClassContext()
+    public static SequentialWriter open(String dataFilePath, String indexFilePath, boolean skipIOCache) throws IOException
     {
-      return super.getClassContext();
-    }
-  }
-  
-  static 
-  {
-    finder = AccessController.doPrivileged(new PrivilegedAction<StackFinder>() {
-      public StackFinder run()
-      {
-        return new StackFinder();
-      }
-    });
-  }
-
-  private MessageUtil(ResourceBundle b)
-  {
-    messages = b;
-  }
-
-  /**
-   * This method translates the message and puts the inserts into the message before returning it.
-   * If the message key does not exist then the key itself is returned.
-   * 
-   * @param key     the message key.
-   * @param inserts the inserts into the resolved message.
-   * @return the message in the correct language, or the key if the message does not exist.
-   */
-  public String getMessage(String key, Object ... inserts)
-  {
-    String message;
-
-    try {
-      message = messages.getString(key);
-
-      if (inserts != null && inserts.length > 0) {
-        message = MessageFormat.format(message, inserts);
-      }
-    } catch (MissingResourceException e) {
-      message = key;
+        return new CompressedSequentialWriter(new File(dataFilePath), indexFilePath, skipIOCache);
     }
 
-    return message;
-  }
+    // holds offset in the file where current chunk should be written
+    // changed only by flush() method where data buffer gets compressed and stored to the file
+    private long chunkOffset = 0;
 
-  /**
-   * Loads the MessageUtil using the given context. It resolves the Class to an OSGi bundle.
-   * 
-   * @param context  the bundle this class is in will be used to resolve the base name.
-   * @param baseName the resource bundle base name
-   * @return the message util instance.
-   * @throws MissingResourceException If the resource bundle cannot be located
-   */
-  public static MessageUtil createMessageUtil(Class<?> context, String baseName)
-  {
-    return createMessageUtil(FrameworkUtil.getBundle(context), baseName);
-  }
+    // index file writer (random I/O)
+    private final CompressionMetadata.Writer metadataWriter;
 
-  /**
-   * This method uses the Bundle associated with the caller of this method.
-   * 
-   * @param baseName the resource bundle base name
-   * @return the message util instance.
-   * @throws MissingResourceException If the resource bundle cannot be located
-   */
-  public static MessageUtil createMessageUtil(String baseName)
-  {
-    Class<?>[] stack = finder.getClassContext();
+    // used to store compressed data
+    private final byte[] compressed;
 
-    for (Class<?> clazz : stack) {
-      if (clazz != MessageUtil.class) {
-        return createMessageUtil(clazz, baseName);
-      }
+    // holds a number of already written chunks
+    private int chunkCount = 0;
+
+    private final Checksum checksum = new CRC32();
+
+    public CompressedSequentialWriter(File file, String indexFilePath, boolean skipIOCache) throws IOException
+    {
+        super(file, CHUNK_LENGTH, skipIOCache);
+
+        // buffer for compression should be the same size as buffer itself
+        compressed = new byte[Snappy.maxCompressedLength(buffer.length)];
+
+        /* Index File (-CompressionInfo.db component) and it's header */
+        metadataWriter = new CompressionMetadata.Writer(indexFilePath);
+        metadataWriter.writeHeader(Snappy.class.getSimpleName(), CHUNK_LENGTH);
     }
 
-    throw new MissingResourceException(org.apache.aries.util.internal.MessageUtil.getMessage("UTIL0014E", baseName), baseName, null);
-  }
+    @Override
+    public void sync() throws IOException
+    {
+        throw new UnsupportedOperationException();
+    }
 
-  /**
-   * This method loads the resource bundle backing the MessageUtil from the provided Bundle.
-   * 
-   * @param b        the bundle to load the resource bundle from
-   * @param baseName the resource bundle base name
-   * @return the message util instance.
-   * @throws MissingResourceException If the resource bundle cannot be located
-   */
-  public static MessageUtil createMessageUtil(final Bundle b, String baseName)
-  {
-    ResourceBundle rb;
-    
-    if (b == null) {
-      // if the bundle is null we are probably outside of OSGi, so just use non-OSGi resolve rules.
-      rb = ResourceBundle.getBundle(baseName);
-    } else {
-      rb = ResourceBundle.getBundle(baseName, new ResourceBundle.Control() {
-  
-        @Override
-        public ResourceBundle newBundle(String baseName, Locale locale, String format,
-            ClassLoader loader, boolean reload) throws IllegalAccessException,
-            InstantiationException, IOException
+    @Override
+    public void flush() throws IOException
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected void flushData() throws IOException
+    {
+        seekToChunkStart();
+
+        // compressing data with buffer re-use
+        int compressedLength = Snappy.rawCompress(buffer, 0, validBufferBytes, compressed, 0);
+
+        // update checksum
+        checksum.update(buffer, 0, validBufferBytes);
+
+        // write an offset of the newly written chunk to the index file
+        metadataWriter.writeLong(chunkOffset);
+        chunkCount++;
+
+        assert compressedLength <= compressed.length;
+
+        // write data itself
+        out.write(compressed, 0, compressedLength);
+        // write corresponding checksum
+        out.writeInt((int) checksum.getValue());
+
+        // reset checksum object to the blank state for re-use
+        checksum.reset();
+
+        // next chunk should be written right after current + length of the checksum (int)
+        chunkOffset += compressedLength + 4;
+    }
+
+    @Override
+    public FileMark mark()
+    {
+        return new CompressedFileWriterMark(chunkOffset, current, validBufferBytes, chunkCount + 1);
+    }
+
+    @Override
+    public synchronized void resetAndTruncate(FileMark mark) throws IOException
+    {
+        assert mark instanceof CompressedFileWriterMark;
+
+        CompressedFileWriterMark realMark = ((CompressedFileWriterMark) mark);
+
+        // reset position
+        current = realMark.uncDataOffset;
+
+        if (realMark.chunkOffset == chunkOffset) // current buffer
         {
-          ResourceBundle result;
-  
-          final String bundleName = toBundleName(baseName, locale);
-  
-          if (FORMAT_PROPERTIES.contains(format)) {
-            final String resourceName = toResourceName(bundleName, "properties");
-            
-            URL url = AccessController.doPrivileged(new PrivilegedAction<URL>() {
-              public URL run()
-              {
-                URL url = b.getResource(resourceName);
-                
-                if (url == null) {
-                  url = b.getEntry(resourceName);
-                }
-                return url;
-              }
-            });
-            
-            if (url != null) {
-              result = new PropertyResourceBundle(url.openStream());
-            } else {
-              result = null;
-            }
-          } else if (FORMAT_CLASS.contains(format)) {
-            @SuppressWarnings("unchecked")
-            Class<? extends ListResourceBundle> clazz = AccessController.doPrivileged(new PrivilegedAction<Class<? extends ListResourceBundle>>() {
-              public Class<? extends ListResourceBundle> run()
-              {
-                try {
-                  return b.loadClass(bundleName);
-                } catch (ClassNotFoundException e) {
-                  return null;
-                }
-              }
-            });
-            
-            if (clazz != null) {
-              result = clazz.newInstance();
-            } else {
-              result = null;
-            }
-          } else {
-            throw new IllegalArgumentException(org.apache.aries.util.internal.MessageUtil.getMessage("UTIL0013E", format));
-          }
-  
-          return result;
+            // just reset a buffer offset and return
+            validBufferBytes = realMark.bufferOffset;
+            return;
         }
-    
-      });
+
+        // synchronize current buffer with disk
+        // because we don't want any data loss
+        syncInternal();
+
+        // setting marker as a current offset
+        chunkOffset = realMark.chunkOffset;
+
+        // compressed chunk size (- 4 bytes reserved for checksum)
+        int chunkSize = (int) (metadataWriter.chunkOffsetBy(realMark.nextChunkIndex) - chunkOffset - 4);
+
+        out.seek(chunkOffset);
+        out.read(compressed, 0, chunkSize);
+
+        // decompress data chunk and store its length
+        int validBytes = Snappy.rawUncompress(compressed, 0, chunkSize, buffer, 0);
+
+        checksum.update(buffer, 0, validBytes);
+
+        if (out.readInt() != (int) checksum.getValue())
+            throw new CorruptedBlockException(getPath(), chunkOffset, chunkSize);
+
+        checksum.reset();
+
+        // reset buffer
+        validBufferBytes = realMark.bufferOffset;
+        bufferOffset = current - validBufferBytes;
+        chunkCount = realMark.nextChunkIndex - 1;
+
+        // truncate data and index file
+        truncate(chunkOffset);
+        metadataWriter.resetAndTruncate(realMark.nextChunkIndex);
     }
-    
-    return new MessageUtil(rb);
-  }
+
+    /**
+     * Seek to the offset where next compressed data chunk should be stored.
+     *
+     * @throws IOException on any I/O error.
+     */
+    private void seekToChunkStart() throws IOException
+    {
+        if (out.getFilePointer() != chunkOffset)
+            out.seek(chunkOffset);
+    }
+
+    @Override
+    public void close() throws IOException
+    {
+        if (buffer == null)
+            return; // already closed
+
+        super.close();
+
+        metadataWriter.finalizeHeader(current, chunkCount);
+        metadataWriter.close();
+    }
+
+    /**
+     * Class to hold a mark to the position of the file
+     */
+    protected static class CompressedFileWriterMark implements FileMark
+    {
+        // chunk offset in the compressed file
+        long chunkOffset;
+        // uncompressed data offset (real data offset)
+        long uncDataOffset;
+
+        int bufferOffset;
+        int nextChunkIndex;
+
+        public CompressedFileWriterMark(long chunkOffset, long uncDataOffset, int bufferOffset, int nextChunkIndex)
+        {
+            this.chunkOffset = chunkOffset;
+            this.uncDataOffset = uncDataOffset;
+            this.bufferOffset = bufferOffset;
+            this.nextChunkIndex = nextChunkIndex;
+        }
+    }
 }

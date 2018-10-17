@@ -1,319 +1,375 @@
-void consolidate () {
+import org.elasticsearch.util.guice.inject.Inject;
 
 /*
- * Copyright 2010 Google Inc.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not
- * use this file except in compliance with the License. You may obtain a copy of
- * the License at
- * 
- * http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations under
- * the License.
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
-package java.io;
+package org.elasticsearch.discovery.jgroups;
 
-import com.google.gwt.storage.client.Storage;
+import com.google.inject.Inject;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.discovery.Discovery;
+import org.elasticsearch.discovery.DiscoveryException;
+import org.elasticsearch.discovery.InitialStateDiscoveryListener;
+import org.elasticsearch.env.Environment;
+import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.util.component.AbstractLifecycleComponent;
+import org.elasticsearch.util.io.NetworkUtils;
+import org.elasticsearch.util.io.stream.BytesStreamInput;
+import org.elasticsearch.util.io.stream.BytesStreamOutput;
+import org.elasticsearch.util.settings.Settings;
+import org.jgroups.*;
 
-/** Saves binary data to the local storage; currently using hex encoding. The string is prefixed with "hex:"
- * @author haustein */
-public class RandomAccessFile /* implements DataOutput, DataInput, Closeable */{
-	
-/*
- * public final FileDescriptor getFD() throws IOException { } public final FileChannel getChannel() { }
+import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.URL;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.elasticsearch.util.gcommon.collect.Maps.*;
+import static org.elasticsearch.util.gcommon.collect.Sets.*;
+import static org.elasticsearch.cluster.ClusterState.*;
+import static org.elasticsearch.cluster.node.DiscoveryNode.*;
+
+/**
+ * @author kimchy (Shay Banon)
  */
-	final String name;
-	final boolean writeable;
-	boolean dirty;
-	String data;
-	int newDataPos;
-	StringBuilder newData;
-	int pos;
-	int len;
-	
-	DataInputStream dis = new DataInputStream(new RafInputStream());
-	DataOutputStream dos = new DataOutputStream(new RafOutputStream());
+public class JgroupsDiscovery extends AbstractLifecycleComponent<Discovery> implements Discovery, Receiver {
 
-	public RandomAccessFile (String name, String mode) throws FileNotFoundException {
-		this(new File(name), mode);
-	}
+    static {
+        System.setProperty("jgroups.logging.log_factory_class", JgroupsCustomLogFactory.class.getName());
+    }
 
-	public RandomAccessFile (File file, String mode) throws FileNotFoundException {
-		name = file.getCanonicalPath();
+    private final ClusterName clusterName;
 
-		mode = mode.toLowerCase();
-		if (!mode.equals("r") && !mode.equals("rw")) {
-			throw new IllegalArgumentException("mode: '" + mode + "'");
-		}
-		writeable = mode.equals("rw");
-		if (file.exists()) {
-			data = atob(File.LocalStorage.getItem(name));
-			len = data.length();
-		} else if (writeable) {
-			data = "";
-			dirty = true;
-			try {
-				flush();
-			} catch (IOException e) {
-				throw new FileNotFoundException("" + e);
-			}
-		} else {
-			throw new FileNotFoundException(name);
-		}
-	}
+    private final TransportService transportService;
 
-	static native String btoa (String s) /*-{
-														return $wnd.btoa(s);
-														}-*/;
+    private final ClusterService clusterService;
 
-	static native String atob (String s) /*-{
-														return $wnd.atob(s);
-														}-*/;
+    private final Channel channel;
 
-	public int read () throws IOException {
-		return dis.read();
-	}
+    private volatile boolean addressSet = false;
 
-	public int read (byte b[], int off, int len) throws IOException {
-		return dis.read(b, off, len);
-	}
+    private DiscoveryNode localNode;
 
-	public int read (byte b[]) throws IOException {
-		return dis.read(b);
-	}
+    private volatile boolean firstMaster = false;
 
-	public final void readFully (byte b[]) throws IOException {
-		dis.readFully(b);
-	}
+    private final AtomicBoolean initialStateSent = new AtomicBoolean();
 
-	public final void readFully (byte b[], int off, int len) throws IOException {
-		dis.readFully(b, off, len);
-	}
+    private final CopyOnWriteArrayList<InitialStateDiscoveryListener> initialStateListeners = new CopyOnWriteArrayList<InitialStateDiscoveryListener>();
 
-	public int skipBytes (int n) throws IOException {
-		return dis.skipBytes(n);
-	}
+    @Inject public JgroupsDiscovery(Settings settings, Environment environment, ClusterName clusterName,
+                                    TransportService transportService, ClusterService clusterService) {
+        super(settings);
+        this.clusterName = clusterName;
+        this.transportService = transportService;
+        this.clusterService = clusterService;
 
-	public void write (int b) throws IOException {
-		dos.write(b);
-	};
+        String config = componentSettings.get("config", "udp");
+        String actualConfig = config;
+        if (!config.endsWith(".xml")) {
+            actualConfig = "jgroups/" + config + ".xml";
+        }
+        URL configUrl = environment.resolveConfig(actualConfig);
+        logger.debug("Using configuration [{}]", configUrl);
 
-	public void write (byte b[]) throws IOException {
-		dos.write(b);
-	}
+        Map<String, String> sysPropsSet = newHashMap();
+        try {
+            // prepare system properties to configure jgroups based on the settings
+            for (Map.Entry<String, String> entry : settings.getAsMap().entrySet()) {
+                if (entry.getKey().startsWith("discovery.jgroups")) {
+                    String jgroupsKey = entry.getKey().substring("discovery.".length());
+                    if (System.getProperty(jgroupsKey) == null) {
+                        sysPropsSet.put(jgroupsKey, entry.getValue());
+                        System.setProperty(jgroupsKey, entry.getValue());
+                    }
+                }
+            }
 
-	public void write (byte b[], int off, int len) throws IOException {
-		dos.write(b, off, len);
-	}
+            if (System.getProperty("jgroups.bind_addr") == null) {
+                // automatically set the bind address based on ElasticSearch default bindings...
+                try {
+                    InetAddress bindAddress = NetworkUtils.resolveBindHostAddress(null, settings, NetworkUtils.LOCAL);
+                    if ((bindAddress instanceof Inet4Address && NetworkUtils.isIPv4()) || (bindAddress instanceof Inet6Address && !NetworkUtils.isIPv4())) {
+                        sysPropsSet.put("jgroups.bind_addr", bindAddress.getHostAddress());
+                        System.setProperty("jgroups.bind_addr", bindAddress.getHostAddress());
+                    }
+                } catch (IOException e) {
+                    // ignore this
+                }
+            }
 
-	public long getFilePointer () throws IOException {
-		return pos;
-	}
+            channel = new JChannel(configUrl);
+        } catch (ChannelException e) {
+            throw new DiscoveryException("Failed to create jgroups channel with config [" + configUrl + "]", e);
+        } finally {
+            for (String keyToRemove : sysPropsSet.keySet()) {
+                System.getProperties().remove(keyToRemove);
+            }
+        }
+    }
 
-	public void seek (long pos) throws IOException {
-		if (pos < 0) {
-			throw new IllegalArgumentException();
-		}
-		this.pos = (int)pos;
-	}
+    @Override public void addListener(InitialStateDiscoveryListener listener) {
+        initialStateListeners.add(listener);
+    }
 
-	public long length () throws IOException {
-		return len;
-	}
+    @Override public void removeListener(InitialStateDiscoveryListener listener) {
+        initialStateListeners.remove(listener);
+    }
 
-	public void setLength (long newLength) throws IOException {
-		if (len != newLength) {
-			consolidate();
-			if (data.length() > newLength) {
-				data = data.substring(0, (int)newLength);
-				len = (int)newLength;
-			} else {
-// System.out.println("padding " + (newLength - len) + " zeros in setLength to " + newLength);
-				while (len < newLength) {
-					write(0);
-				}
-			}
-		}
-	}
+    @Override protected void doStart() throws ElasticSearchException {
+        try {
+            channel.connect(clusterName.value());
+            channel.setReceiver(this);
+            logger.debug("Connected to cluster [{}], address [{}]", channel.getClusterName(), channel.getAddress());
+            this.localNode = new DiscoveryNode(settings.get("name"), channel.getAddress().toString(), transportService.boundAddress().publishAddress(), buildCommonNodesAttributes(settings));
 
-	public void close () throws IOException {
-		if (data != null) {
-			flush();
-			data = null;
-		}
-	}
+            if (isMaster()) {
+                firstMaster = true;
+                clusterService.submitStateUpdateTask("jgroups-disco-initial_connect(master)", new ProcessedClusterStateUpdateTask() {
+                    @Override public ClusterState execute(ClusterState currentState) {
+                        DiscoveryNodes.Builder builder = new DiscoveryNodes.Builder()
+                                .localNodeId(localNode.id())
+                                .masterNodeId(localNode.id())
+                                        // put our local node
+                                .put(localNode);
+                        return newClusterStateBuilder().state(currentState).nodes(builder).build();
+                    }
 
-	private void consolidate () {
-		if (newData == null) {
-			return;
-		}
+                    @Override public void clusterStateProcessed(ClusterState clusterState) {
+                        sendInitialStateEventIfNeeded();
+                    }
+                });
+                addressSet = true;
+            } else {
+                clusterService.submitStateUpdateTask("jgroups-disco-initialconnect", new ClusterStateUpdateTask() {
+                    @Override public ClusterState execute(ClusterState currentState) {
+                        DiscoveryNodes.Builder builder = new DiscoveryNodes.Builder()
+                                .localNodeId(localNode.id())
+                                .put(localNode);
+                        return newClusterStateBuilder().state(currentState).nodes(builder).build();
+                    }
+                });
+                try {
+                    channel.send(new Message(channel.getView().getCreator(), channel.getAddress(), nodeMessagePayload()));
+                    addressSet = true;
+                    logger.debug("Sent (initial) node information to master [{}], node [{}]", channel.getView().getCreator(), localNode);
+                } catch (Exception e) {
+                    logger.warn("Can't send address to master [" + channel.getView().getCreator() + "] will try again later...", e);
+                }
+            }
+        } catch (ChannelException e) {
+            throw new DiscoveryException("Can't connect to group [" + clusterName + "]", e);
+        }
+    }
 
-// System.out.println("consolidate(); ndp: " + newDataPos + " nd-len: " + newData.length());
+    @Override protected void doStop() throws ElasticSearchException {
+        initialStateSent.set(false);
+        if (channel.isConnected()) {
+            channel.disconnect();
+        }
+    }
 
-		if (data.length() < newDataPos) {
-			StringBuilder filler = new StringBuilder();
-			while (data.length() + filler.length() < newDataPos) {
-				filler.append('\0');
-			}
-// System.out.println("padding " + (filler.length()) + " zeros in consolidate ");
+    @Override protected void doClose() throws ElasticSearchException {
+        if (channel.isOpen()) {
+            channel.close();
+        }
+    }
 
-			data += filler.toString();
-		}
+    public String nodeDescription() {
+        return channel.getClusterName() + "/" + channel.getAddress();
+    }
 
-		int p2 = newDataPos + newData.length();
-		data = data.substring(0, newDataPos) + newData.toString() + (p2 < data.length() ? data.substring(p2) : "");
-		newData = null;
-	}
+    @Override public boolean firstMaster() {
+        return firstMaster;
+    }
 
-	void flush () throws IOException {
-		if (!dirty) {
-			return;
-		}
-		consolidate();
-		File.LocalStorage.setItem(name, btoa(data));
-		dirty = false;
-	}
+    @Override public void publish(ClusterState clusterState) {
+        if (!isMaster()) {
+            throw new ElasticSearchIllegalStateException("Shouldn't publish state when not master");
+        }
+        try {
+            channel.send(new Message(null, null, ClusterState.Builder.toBytes(clusterState)));
+        } catch (Exception e) {
+            logger.error("Failed to send cluster state to nodes", e);
+        }
+    }
 
-	public final boolean readBoolean () throws IOException {
-		return dis.readBoolean();
-	}
+    @Override public void receive(Message msg) {
+        if (msg.getSrc().equals(channel.getAddress())) {
+            return; // my own message, ignore.
+        }
 
-	public final byte readByte () throws IOException {
-		return dis.readByte();
-	}
+        // message from the master, the cluster state has changed.
+        if (msg.getSrc().equals(channel.getView().getCreator())) {
+            try {
+                byte[] buffer = msg.getBuffer();
+                final ClusterState clusterState = ClusterState.Builder.fromBytes(buffer, settings, localNode);
+                // ignore cluster state messages that do not include "me", not in the game yet...
+                if (clusterState.nodes().localNode() != null) {
+                    clusterService.submitStateUpdateTask("jgroups-disco-receive(from master)", new ProcessedClusterStateUpdateTask() {
+                        @Override public ClusterState execute(ClusterState currentState) {
+                            return clusterState;
+                        }
 
-	public final int readUnsignedByte () throws IOException {
-		return dis.readUnsignedByte();
-	}
+                        @Override public void clusterStateProcessed(ClusterState clusterState) {
+                            sendInitialStateEventIfNeeded();
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                logger.error("Received corrupted cluster state.", e);
+            }
 
-	public final short readShort () throws IOException {
-		return dis.readShort();
-	}
+            return;
+        }
 
-	public final int readUnsignedShort () throws IOException {
-		return dis.readUnsignedShort();
-	}
+        // direct message from a member indicating it has joined the jgroups cluster and provides us its node information
+        if (isMaster()) {
+            try {
+                BytesStreamInput is = new BytesStreamInput(msg.getBuffer());
+                final DiscoveryNode newNode = DiscoveryNode.readNode(is);
+                is.close();
 
-	public final char readChar () throws IOException {
-		return dis.readChar();
-	}
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Received node information from [{}], node [{}]", msg.getSrc(), newNode);
+                }
 
-	public final int readInt () throws IOException {
-		return dis.readInt();
-	}
+                if (!transportService.addressSupported(newNode.address().getClass())) {
+                    // TODO, what should we do now? Maybe inform that node that its crap?
+                    logger.warn("Received a wrong address type from [" + msg.getSrc() + "], ignoring... (received_address[" + newNode.address() + ")");
+                } else {
+                    clusterService.submitStateUpdateTask("jgroups-disco-receive(from node[" + newNode + "])", new ClusterStateUpdateTask() {
+                        @Override public ClusterState execute(ClusterState currentState) {
+                            if (currentState.nodes().nodeExists(newNode.id())) {
+                                // no change, the node already exists in the cluster
+                                logger.warn("Received an address [{}] for an existing node [{}]", newNode.address(), newNode);
+                                return currentState;
+                            }
+                            return newClusterStateBuilder().state(currentState).nodes(currentState.nodes().newNode(newNode)).build();
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                logger.warn("Can't read address from cluster member [" + msg.getSrc() + "] message [" + msg.getClass().getName() + "/" + msg + "]", e);
+            }
 
-	public final long readLong () throws IOException {
-		return dis.readLong();
-	}
+            return;
+        }
 
-	public final float readFloat () throws IOException {
-		return dis.readFloat();
-	}
+        logger.error("A message between two members that neither of them is the master is not allowed.");
+    }
 
-	public final double readDouble () throws IOException {
-		return dis.readDouble();
-	}
+    private boolean isMaster() {
+        return channel.getAddress().equals(channel.getView().getCreator());
+    }
 
-	public final String readLine () throws IOException {
-		return dis.readLine();
-	}
+    @Override public byte[] getState() {
+        return new byte[0];
+    }
 
-	public final String readUTF () throws IOException {
-		return dis.readUTF();
-	}
+    @Override public void setState(byte[] state) {
+    }
 
-	public final void writeBoolean (boolean v) throws IOException {
-		dos.writeBoolean(v);
-	}
+    @Override public void viewAccepted(final View newView) {
+        if (!addressSet) {
+            try {
+                channel.send(new Message(newView.getCreator(), channel.getAddress(), nodeMessagePayload()));
+                logger.debug("Sent (view) node information to master [{}], node [{}]", newView.getCreator(), localNode);
+                addressSet = true;
+            } catch (Exception e) {
+                logger.warn("Can't send address to master [" + newView.getCreator() + "] will try again later...", e);
+            }
+        }
+        // I am the master
+        if (channel.getAddress().equals(newView.getCreator())) {
+            final Set<String> newMembers = newHashSet();
+            for (Address address : newView.getMembers()) {
+                newMembers.add(address.toString());
+            }
 
-	public final void writeByte (int v) throws IOException {
-		dos.writeByte(v);
-	}
+            clusterService.submitStateUpdateTask("jgroups-disco-view", new ClusterStateUpdateTask() {
+                @Override public ClusterState execute(ClusterState currentState) {
+                    DiscoveryNodes newNodes = currentState.nodes().removeDeadMembers(newMembers, newView.getCreator().toString());
+                    DiscoveryNodes.Delta delta = newNodes.delta(currentState.nodes());
+                    if (delta.added()) {
+                        logger.warn("No new nodes should be created when a new discovery view is accepted");
+                    }
+                    // we want to send a new cluster state any how on view change (that's why its commented)
+                    // for cases where we have client node joining (and it needs the cluster state)
+//                    if (!delta.removed()) {
+//                        // no nodes were removed, return the current state
+//                        return currentState;
+//                    }
+                    return newClusterStateBuilder().state(currentState).nodes(newNodes).build();
+                }
+            });
+        } else {
+            // check whether I have been removed due to temporary disconnect
+            final String me = channel.getAddress().toString();
+            boolean foundMe = false;
+            for (DiscoveryNode node : clusterService.state().nodes()) {
+                if (node.id().equals(me)) {
+                    foundMe = true;
+                    break;
+                }
+            }
 
-	public final void writeShort (int v) throws IOException {
-		dos.writeShort(v);
-	}
+            if (!foundMe) {
+                logger.warn("Disconnected from cluster, resending to master [{}], node [{}]", newView.getCreator(), localNode);
+                try {
+                    channel.send(new Message(newView.getCreator(), channel.getAddress(), nodeMessagePayload()));
+                    addressSet = true;
+                } catch (Exception e) {
+                    addressSet = false;
+                    logger.warn("Can't send address to master [" + newView.getCreator() + "] will try again later...", e);
+                }
+            }
+        }
+    }
 
-	public final void writeChar (int v) throws IOException {
-		dos.writeChar(v);
-	}
+    private byte[] nodeMessagePayload() throws IOException {
+        BytesStreamOutput os = BytesStreamOutput.Cached.cached();
+        localNode.writeTo(os);
+        return os.copiedByteArray();
+    }
 
-	public final void writeInt (int v) throws IOException {
-		dos.writeInt(v);
-	}
+    private void sendInitialStateEventIfNeeded() {
+        if (initialStateSent.compareAndSet(false, true)) {
+            for (InitialStateDiscoveryListener listener : initialStateListeners) {
+                listener.initialStateProcessed();
+            }
+        }
+    }
 
-	public final void writeLong (long v) throws IOException {
-		dos.writeLong(v);
-	}
 
-	public final void writeFloat (float v) throws IOException {
-		dos.writeFloat(v);
-	}
+    @Override public void suspect(Address suspectedMember) {
+    }
 
-	public final void writeDouble (double v) throws IOException {
-		dos.writeDouble(v);
-	}
-
-	public final void writeBytes (String s) throws IOException {
-		dos.writeBytes(s);
-	}
-
-	public final void writeChars (String s) throws IOException {
-		dos.writeChars(s);
-	}
-
-	public final void writeUTF (String str) throws IOException {
-		dos.writeUTF(str);
-	}
-
-// public final FileChannel getChannel() throws IOException { }
-
-	class RafInputStream extends InputStream {
-		@Override
-		public int read () throws IOException {
-			if (pos >= len) {
-				return -1;
-			} else {
-				consolidate();
-				return data.charAt(pos++);
-// int p2 = (pos << 1);
-// int result = Character.digit(data.charAt(p2), 16) * 16 +
-// Character.digit(data.charAt(p2 + 1), 16);
-// pos++;
-// return result;
-			}
-		}
-	}
-
-	class RafOutputStream extends OutputStream {
-
-		public void write (int b) throws IOException {
-			if (!writeable) {
-				throw new IOException("not writeable");
-			}
-
-			if (newData == null) {
-				newDataPos = pos;
-				newData = new StringBuilder();
-// System.out.println("no buf; newDataPos: " + pos);
-			} else if (newDataPos + newData.length() != pos) {
-				consolidate();
-				newDataPos = pos;
-				newData = new StringBuilder();
-// System.out.println("pos mismatch; newDataPos: " + pos);
-			}
-
-			newData.append((char)(b & 255));
-// newData.append("" + Character.forDigit((b >> 4) & 15, 16) +
-// Character.forDigit(b & 15, 16));
-			pos++;
-			len = Math.max(pos, len);
-			dirty = true;
-		}
-	}
+    @Override public void block() {
+        logger.warn("Blocked...");
+    }
 }

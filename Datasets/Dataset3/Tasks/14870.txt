@@ -1,8 +1,8 @@
-return new HashMap<String, String>();
+import org.jboss.as.ejb3.component.interceptors.AbstractEJBInterceptor;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2012, Red Hat, Inc., and individual contributors
+ * Copyright (c) 2011, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -21,150 +21,213 @@ return new HashMap<String, String>();
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
+package org.jboss.as.ejb3.component.entity.interceptors;
 
-package org.jboss.as.controller;
-
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
-import java.util.ResourceBundle;
-import javax.xml.stream.XMLStreamException;
-import javax.xml.stream.XMLStreamWriter;
-
-import org.jboss.as.controller.descriptions.ModelDescriptionConstants;
-import org.jboss.as.controller.descriptions.ResourceDescriptionResolver;
-import org.jboss.as.controller.operations.validation.ModelTypeValidator;
-import org.jboss.as.controller.operations.validation.ParameterValidator;
-import org.jboss.as.controller.registry.AttributeAccess;
-import org.jboss.dmr.ModelNode;
-import org.jboss.dmr.ModelType;
-import org.jboss.dmr.Property;
+import javax.ejb.EJBException;
+import javax.transaction.Status;
+import javax.transaction.Synchronization;
+import javax.transaction.TransactionSynchronizationRegistry;
+import org.jboss.as.ee.component.Component;
+import org.jboss.as.ee.component.ComponentInstance;
+import org.jboss.as.ee.component.ComponentInstanceInterceptorFactory;
+import org.jboss.as.ejb3.component.AbstractEJBInterceptor;
+import org.jboss.as.ejb3.component.entity.EntityBeanComponent;
+import org.jboss.as.ejb3.component.entity.EntityBeanComponentInstance;
+import org.jboss.as.ejb3.tx.OwnableReentrantLock;
+import org.jboss.invocation.Interceptor;
+import org.jboss.invocation.InterceptorContext;
+import org.jboss.invocation.InterceptorFactory;
+import org.jboss.invocation.InterceptorFactoryContext;
+import org.jboss.logging.Logger;
 
 /**
- * Represents simple key=value map equivalent of java.util.Map<String,String>()
+ * {@link org.jboss.invocation.Interceptor} which manages {@link javax.transaction.Synchronization} semantics on an entity bean.
+ * <p/>
+ * For now we are using a completely synchronized approach to entity concurrency. There is at most 1 entity active for a given primary
+ * key at any time, and access is synchronized within a transaction.
  *
- * @author Jason T. Greene
- * @author <a href="mailto:tomaz.cerar@redhat.com">Tomaz Cerar</a>
+ * @author <a href="mailto:cdewolf@redhat.com">Carlo de Wolf</a>
+ * @author Jaikiran Pai
+ * @author Stuart Douglas
  */
-//todo maybe replace with SimpleMapAttributeDefinition?
-public final class PropertiesAttributeDefinition extends MapAttributeDefinition {
+public class EntityBeanSynchronizationInterceptor extends AbstractEJBInterceptor {
+    private static final Logger log = Logger.getLogger(EntityBeanSynchronizationInterceptor.class);
+
+    private final Object threadLock = new Object();
+    private final OwnableReentrantLock lock = new OwnableReentrantLock();
+
+    @Override
+    public Object processInvocation(InterceptorContext context) throws Exception {
+        final EntityBeanComponent component = getComponent(context, EntityBeanComponent.class);
+        final EntityBeanComponentInstance instance = (EntityBeanComponentInstance) context.getPrivateData(ComponentInstance.class);
+
+        //we do not synchronize for instances that are not associated with an identity
+        if (instance.getPrimaryKey() == null) {
+            return context.proceed();
+        }
+
+        final TransactionSynchronizationRegistry transactionSynchronizationRegistry = component.getTransactionSynchronizationRegistry();
+        if (log.isTraceEnabled()) {
+            log.trace("Trying to acquire lock: " + lock + " for entity bean " + instance + " during invocation: " + context);
+        }
+        // we obtain a lock in this synchronization interceptor because the lock needs to be tied to the synchronization
+        // so that it can released on the tx synchronization callbacks
+        lock.pushOwner(getLockOwner(transactionSynchronizationRegistry));
+        try {
+            lock.lock();
+            synchronized (lock) {
+                if (log.isTraceEnabled()) {
+                    log.trace("Acquired lock: " + lock + " for entity bean instance: " + instance + " during invocation: " + context);
+                }
+
+                Object currentTransactionKey = null;
+                try {
+                    // get the key to current transaction associated with this thread
+                    currentTransactionKey = transactionSynchronizationRegistry.getTransactionKey();
+                    if (!instance.isSynchronizeRegistered()) {
+                        component.getCache().reference(instance);
+                        // if this entity instance is already associated with a different transaction, then it's an error
+
+                        // if the thread is currently associated with a tx, then register a tx synchronization
+                        if (currentTransactionKey != null) {
+                            // register a tx synchronization for this entity instance
+                            final Synchronization entitySynchronization = new EntityBeanSynchronization(instance);
+                            transactionSynchronizationRegistry.registerInterposedSynchronization(entitySynchronization);
+                            if (log.isTraceEnabled()) {
+                                log.trace("Registered tx synchronization: " + entitySynchronization + " for tx: " + currentTransactionKey +
+                                        " associated with entity component instance: " + instance);
+                            }
+                        }
+                        instance.setSynchronizationRegistered(true);
+                    }
+                    // proceed with the invocation
+                    return context.proceed();
+
+                } finally {
+                    // if the current call did *not* register a tx SessionSynchronization, then we have to explicitly mark the
+                    // entity instance as "no longer in use". If it registered a tx EntityBeanSynchronization, then releasing the lock is
+                    // taken care off by a tx synchronization callbacks.
+                    if (currentTransactionKey == null) {
+                        instance.store();
+                        releaseInstance(instance, true);
+                    }
+                }
+            }
+        } finally {
+            lock.popOwner();
+        }
+    }
+
     /**
-     * @param name
-     * @param xmlName
-     * @param allowNull
-     * @deprecated use {@link Builder}
+     * Releases the passed {@link EntityBeanComponentInstance} i.e. marks it as no longer in use. After releasing the
+     * instance, this method releases the lock, held by this thread, on the stateful component instance.
+     *
+     * @param instance The stateful component instance
+     * @param success
      */
-    @Deprecated
-    public PropertiesAttributeDefinition(final String name, final String xmlName, boolean allowNull) {
-        super(name, xmlName, allowNull, 0, Integer.MAX_VALUE, new ModelTypeValidator(ModelType.STRING));
-    }
-
-    private PropertiesAttributeDefinition(final String name, final String xmlName, final boolean allowNull, boolean allowExpression,
-                                          final int minSize, final int maxSize, final ParameterCorrector corrector, final ParameterValidator elementValidator,
-                                          final String[] alternatives, final String[] requires, final AttributeMarshaller attributeMarshaller, final boolean resourceOnly, final DeprecationData deprecated, final AttributeAccess.Flag... flags) {
-        super(name, xmlName, allowNull, allowExpression, minSize, maxSize, corrector, elementValidator, alternatives, requires, attributeMarshaller, resourceOnly, deprecated, flags);
-    }
-
-    @Override
-    protected void addValueTypeDescription(ModelNode node, ResourceBundle bundle) {
-        setValueType(node);
-    }
-
-    @Override
-    protected void addAttributeValueTypeDescription(ModelNode node, ResourceDescriptionResolver resolver, Locale locale, ResourceBundle bundle) {
-        setValueType(node);
-    }
-
-    @Override
-    protected void addOperationParameterValueTypeDescription(ModelNode node, String operationName, ResourceDescriptionResolver resolver, Locale locale, ResourceBundle bundle) {
-        setValueType(node);
-    }
-
-    void setValueType(ModelNode node) {
-        node.get(ModelDescriptionConstants.VALUE_TYPE).set(ModelType.STRING);
-        if (isAllowExpression()) {
-            node.get(ModelDescriptionConstants.EXPRESSIONS_ALLOWED).set(new ModelNode(true));
+    private void releaseInstance(final EntityBeanComponentInstance instance, final boolean success) {
+        try {
+            instance.getComponent().getCache().release(instance, success);
+        } finally {
+            instance.setSynchronizationRegistered(false);
+            // release the lock on the SFSB instance
+            this.releaseLock();
         }
     }
 
-    public Map<String, String> unwrap(final OperationContext context, final ModelNode model) throws OperationFailedException {
-        if (!model.hasDefined(getName())) {
-            return null;
+    /**
+     * Releases the lock, held by this thread, on the stateful component instance.
+     */
+    private void releaseLock() {
+        lock.unlock();
+        if (log.isTraceEnabled()) {
+            log.trace("Released lock: " + lock);
         }
-        ModelNode modelProps = model.get(getName());
-        Map<String, String> props = new HashMap<String, String>();
-        for (Property p : modelProps.asPropertyList()) {
-            props.put(p.getName(), context.resolveExpressions(p.getValue()).asString());
-        }
-        return props;
     }
 
-    private static class PropertiesAttributeMarshaller extends AttributeMarshaller {
-        private final boolean wrapElement;
-        private final String wrapperElement;
+    private class EntityBeanSynchronization implements Synchronization {
 
-        protected PropertiesAttributeMarshaller(final boolean wrapElement, String wrapperElement) {
-            this.wrapElement = wrapElement;
-            this.wrapperElement = wrapperElement;
+        private final EntityBeanComponentInstance componentInstance;
+
+        EntityBeanSynchronization(EntityBeanComponentInstance componentInstance) {
+            this.componentInstance = componentInstance;
         }
 
         @Override
-        public boolean isMarshallable(AttributeDefinition attribute, ModelNode resourceModel, boolean marshallDefault) {
-            return resourceModel.isDefined() && resourceModel.hasDefined(attribute.getName());
+        public void beforeCompletion() {
+            synchronized (threadLock) {
+                //invoke the EJB store method within the transaction
+                try {
+                    componentInstance.store();
+                } catch (Throwable t) {
+                    lock.pushOwner(getLockOwner(componentInstance.getComponent().getTransactionSynchronizationRegistry()));
+                    try {
+                        handleThrowableInTxSync(componentInstance, t);
+                    } finally {
+                        lock.popOwner();
+                    }
+                }
+            }
         }
 
         @Override
-        public void marshallAsElement(AttributeDefinition attribute, ModelNode resourceModel, boolean marshallDefault, XMLStreamWriter writer) throws XMLStreamException {
-            resourceModel = resourceModel.get(attribute.getName());
-            if (wrapElement) {
-                writer.writeStartElement(wrapperElement == null ? attribute.getName() : wrapperElement);
+        public void afterCompletion(int status) {
+            synchronized (threadLock) {
+                // tx has completed, so mark the SFSB instance as no longer in use
+                lock.pushOwner(getLockOwner(componentInstance.getComponent().getTransactionSynchronizationRegistry()));
+                try {
+                    releaseInstance(componentInstance, status == Status.STATUS_COMMITTED);
+                } finally {
+                    lock.popOwner();
+                }
             }
-            for (ModelNode property : resourceModel.asList()) {
-                writer.writeEmptyElement(attribute.getXmlName());
-                writer.writeAttribute(org.jboss.as.controller.parsing.Attribute.NAME.getLocalName(), property.asProperty().getName());
-                writer.writeAttribute(org.jboss.as.controller.parsing.Attribute.VALUE.getLocalName(), property.asProperty().getValue().asString());
+        }
+
+        /**
+         * Handles the exception that occurred during a {@link EntityBeanComponentInstance transaction synchronization} callback
+         * invocations.
+         * <p/>
+         * This method discards the <code>EntityBeanComponentInstance</code> and resets the {@link #transactionKey} before
+         * releasing the {@link #lock} held by this thread, for the <code>statefulSessionComponentInstance</code>
+         *
+         * @param instance The Entity component instance involved in the transaction
+         * @param t        The {@link Throwable throwable}
+         * @return
+         */
+        private Error handleThrowableInTxSync(final EntityBeanComponentInstance instance, final Throwable t) {
+            log.error("Discarding entity component instance: " + instance + " due to exception", t);
+            try {
+                // discard the Entity instance
+                instance.discard();
+            } finally {
+                // release the lock associated with the SFSB instance
+                EntityBeanSynchronizationInterceptor.this.releaseLock();
             }
-            if (wrapElement) {
-                writer.writeEndElement();
-            }
+            // throw back an appropriate exception
+            if (t instanceof RuntimeException)
+                throw (RuntimeException) t;
+            if (t instanceof Error)
+                throw (Error) t;
+            throw (EJBException) new EJBException().initCause(t);
         }
     }
 
-    public static class Builder extends AbstractAttributeDefinitionBuilder<Builder, PropertiesAttributeDefinition> {
-        private boolean wrapXmlElement = true;
-        private String wrapperElement = null;
-
-        public Builder(final String name, boolean allowNull) {
-            super(name, ModelType.OBJECT, allowNull);
-        }
-
-        public Builder(final PropertiesAttributeDefinition basis) {
-            super(basis);
-        }
-
-        public Builder(final MapAttributeDefinition basis) {
-            super(basis);
-        }
-
-        public Builder setWrapXmlElement(boolean wrap) {
-            this.wrapXmlElement = wrap;
-            return this;
-        }
-
-        public Builder setWrapperElement(String name) {
-            this.wrapperElement = name;
-            return this;
-        }
-
+    public static final InterceptorFactory FACTORY = new ComponentInstanceInterceptorFactory() {
         @Override
-        public PropertiesAttributeDefinition build() {
-            if (validator == null) {
-                validator = new ModelTypeValidator(ModelType.STRING, allowNull, allowExpression);
-            }
-            if (attributeMarshaller == null) {
-                attributeMarshaller = new PropertiesAttributeMarshaller(wrapXmlElement, wrapperElement);
-            }
-            return new PropertiesAttributeDefinition(name, xmlName, allowNull, allowExpression, minSize, maxSize, corrector, validator, alternatives, requires, attributeMarshaller, resourceOnly, deprecated, flags);
+        protected Interceptor create(final Component component, final InterceptorFactoryContext context) {
+            return new EntityBeanSynchronizationInterceptor();
         }
+    };
+
+    /**
+     * Use either the active transaction or the current thread as the lock owner
+     *
+     * @param transactionSynchronizationRegistry
+     *         The synronization registry
+     * @return The lock owner
+     */
+    private Object getLockOwner(final TransactionSynchronizationRegistry transactionSynchronizationRegistry) {
+        Object owner = transactionSynchronizationRegistry.getTransactionKey();
+        return owner != null ? owner : Thread.currentThread();
     }
 }

@@ -1,4 +1,4 @@
-return optimizeQuery(fixNegativeQueryIfNeeded(query));
+int currentNumberOfOperations = translog.estimatedNumberOfOperations();
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,151 +19,162 @@ return optimizeQuery(fixNegativeQueryIfNeeded(query));
  * under the License.
  */
 
-package org.elasticsearch.index.query.json;
+package org.elasticsearch.index.translog;
 
-import com.google.inject.Inject;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.queryParser.ParseException;
-import org.apache.lucene.queryParser.QueryParser;
-import org.apache.lucene.search.FuzzyQuery;
-import org.apache.lucene.search.Query;
-import org.codehaus.jackson.JsonParser;
-import org.codehaus.jackson.JsonToken;
-import org.elasticsearch.index.AbstractIndexComponent;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.analysis.AnalysisService;
-import org.elasticsearch.index.query.QueryParsingException;
-import org.elasticsearch.index.query.support.MapperQueryParser;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.index.engine.Engine;
+import org.elasticsearch.index.engine.EngineClosedException;
+import org.elasticsearch.index.engine.FlushNotAllowedEngineException;
 import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.util.settings.Settings;
+import org.elasticsearch.index.settings.IndexSettingsService;
+import org.elasticsearch.index.shard.AbstractIndexShardComponent;
+import org.elasticsearch.index.shard.IndexShardState;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.shard.service.IndexShard;
+import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.IOException;
+import java.util.concurrent.ScheduledFuture;
 
-import static org.elasticsearch.index.query.support.QueryParsers.*;
+import static org.elasticsearch.common.unit.TimeValue.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class FieldJsonQueryParser extends AbstractIndexComponent implements JsonQueryParser {
+public class TranslogService extends AbstractIndexShardComponent {
 
-    public static final String NAME = "field";
+    private final ThreadPool threadPool;
 
-    private final AnalysisService analysisService;
+    private final IndexSettingsService indexSettingsService;
 
-    @Inject public FieldJsonQueryParser(Index index, @IndexSettings Settings settings, AnalysisService analysisService) {
-        super(index, settings);
-        this.analysisService = analysisService;
+    private final IndexShard indexShard;
+
+    private final Translog translog;
+
+    private int flushThresholdOperations;
+
+    private ByteSizeValue flushThresholdSize;
+
+    private TimeValue flushThresholdPeriod;
+
+    private boolean disableFlush;
+
+    private final TimeValue interval;
+
+    private ScheduledFuture future;
+
+    private final ApplySettings applySettings = new ApplySettings();
+
+    @Inject public TranslogService(ShardId shardId, @IndexSettings Settings indexSettings, IndexSettingsService indexSettingsService, ThreadPool threadPool, IndexShard indexShard, Translog translog) {
+        super(shardId, indexSettings);
+        this.threadPool = threadPool;
+        this.indexSettingsService = indexSettingsService;
+        this.indexShard = indexShard;
+        this.translog = translog;
+
+        this.flushThresholdOperations = componentSettings.getAsInt("flush_threshold_ops", componentSettings.getAsInt("flush_threshold", 5000));
+        this.flushThresholdSize = componentSettings.getAsBytesSize("flush_threshold_size", new ByteSizeValue(200, ByteSizeUnit.MB));
+        this.flushThresholdPeriod = componentSettings.getAsTime("flush_threshold_period", TimeValue.timeValueMinutes(30));
+        this.interval = componentSettings.getAsTime("interval", timeValueMillis(5000));
+        this.disableFlush = componentSettings.getAsBoolean("disable_flush", false);
+
+        logger.debug("interval [{}], flush_threshold_ops [{}], flush_threshold_size [{}], flush_threshold_period [{}]", interval, flushThresholdOperations, flushThresholdSize, flushThresholdPeriod);
+
+        this.future = threadPool.schedule(interval, ThreadPool.Names.SAME, new TranslogBasedFlush());
+
+        indexSettingsService.addListener(applySettings);
     }
 
-    @Override public String name() {
-        return NAME;
+
+    public void close() {
+        indexSettingsService.removeListener(applySettings);
+        this.future.cancel(true);
     }
 
-    @Override public Query parse(JsonQueryParseContext parseContext) throws IOException, QueryParsingException {
-        JsonParser jp = parseContext.jp();
+    class ApplySettings implements IndexSettingsService.Listener {
+        @Override public void onRefreshSettings(Settings settings) {
+            int flushThresholdOperations = settings.getAsInt("index.translog.flush_threshold_ops", TranslogService.this.flushThresholdOperations);
+            if (flushThresholdOperations != TranslogService.this.flushThresholdOperations) {
+                logger.info("updating flush_threshold_ops from [{}] to [{}]", TranslogService.this.flushThresholdOperations, flushThresholdOperations);
+                TranslogService.this.flushThresholdOperations = flushThresholdOperations;
+            }
+            ByteSizeValue flushThresholdSize = settings.getAsBytesSize("index.translog.flush_threshold_size", TranslogService.this.flushThresholdSize);
+            if (!flushThresholdSize.equals(TranslogService.this.flushThresholdSize)) {
+                logger.info("updating flush_threshold_size from [{}] to [{}]", TranslogService.this.flushThresholdSize, flushThresholdSize);
+                TranslogService.this.flushThresholdSize = flushThresholdSize;
+            }
+            TimeValue flushThresholdPeriod = settings.getAsTime("index.translog.flush_threshold_period", TranslogService.this.flushThresholdPeriod);
+            if (!flushThresholdPeriod.equals(TranslogService.this.flushThresholdPeriod)) {
+                logger.info("updating flush_threshold_period from [{}] to [{}]", TranslogService.this.flushThresholdPeriod, flushThresholdPeriod);
+                TranslogService.this.flushThresholdPeriod = flushThresholdPeriod;
+            }
+            boolean disableFlush = settings.getAsBoolean("index.translog.disable_flush", TranslogService.this.disableFlush);
+            if (disableFlush != TranslogService.this.disableFlush) {
+                logger.info("updating disable_flush from [{}] to [{}]", TranslogService.this.disableFlush, disableFlush);
+                TranslogService.this.disableFlush = disableFlush;
+            }
+        }
+    }
 
-        JsonToken token = jp.nextToken();
-        assert token == JsonToken.FIELD_NAME;
-        String fieldName = jp.getCurrentName();
+    private class TranslogBasedFlush implements Runnable {
 
-        String queryString = null;
-        float boost = 1.0f;
-        MapperQueryParser.Operator defaultOperator = QueryParser.Operator.OR;
-        boolean lowercaseExpandedTerms = true;
-        boolean enablePositionIncrements = true;
-        int phraseSlop = 0;
-        float fuzzyMinSim = FuzzyQuery.defaultMinSimilarity;
-        int fuzzyPrefixLength = FuzzyQuery.defaultPrefixLength;
-        boolean escape = false;
-        Analyzer analyzer = null;
-        token = jp.nextToken();
-        if (token == JsonToken.START_OBJECT) {
-            String currentFieldName = null;
-            while ((token = jp.nextToken()) != JsonToken.END_OBJECT) {
-                if (token == JsonToken.FIELD_NAME) {
-                    currentFieldName = jp.getCurrentName();
-                } else {
-                    if ("query".equals(currentFieldName)) {
-                        queryString = jp.getText();
-                    } else if ("boost".equals(currentFieldName)) {
-                        boost = jp.getFloatValue();
-                    } else if ("enablePositionIncrements".equals(currentFieldName)) {
-                        if (token == JsonToken.VALUE_TRUE) {
-                            enablePositionIncrements = true;
-                        } else if (token == JsonToken.VALUE_FALSE) {
-                            enablePositionIncrements = false;
-                        } else {
-                            enablePositionIncrements = jp.getIntValue() != 0;
+        private volatile long lastFlushTime = System.currentTimeMillis();
+
+        @Override public void run() {
+            if (indexShard.state() == IndexShardState.CLOSED) {
+                return;
+            }
+            if (disableFlush) {
+                return;
+            }
+
+            int currentNumberOfOperations = translog.numberOfOperations();
+            if (currentNumberOfOperations > flushThresholdOperations) {
+                logger.trace("flushing translog, operations [{}], breached [{}]", currentNumberOfOperations, flushThresholdOperations);
+                asyncFlushAndReschedule();
+                return;
+            }
+
+            long sizeInBytes = translog.translogSizeInBytes();
+            if (sizeInBytes > flushThresholdSize.bytes()) {
+                logger.trace("flushing translog, size [{}], breached [{}]", new ByteSizeValue(sizeInBytes), flushThresholdSize);
+                asyncFlushAndReschedule();
+                return;
+            }
+
+            if ((System.currentTimeMillis() - lastFlushTime) > flushThresholdPeriod.millis()) {
+                logger.trace("flushing translog, last_flush_time [{}], breached [{}]", lastFlushTime, flushThresholdPeriod);
+                asyncFlushAndReschedule();
+                return;
+            }
+
+            future = threadPool.schedule(interval, ThreadPool.Names.SAME, this);
+        }
+
+        private void asyncFlushAndReschedule() {
+            threadPool.executor(ThreadPool.Names.MANAGEMENT).execute(new Runnable() {
+                @Override public void run() {
+                    try {
+                        if (indexShard.state() == IndexShardState.STARTED) {
+                            indexShard.flush(new Engine.Flush());
                         }
-                    } else if ("lowercaseExpandedTerms".equals(currentFieldName)) {
-                        if (token == JsonToken.VALUE_TRUE) {
-                            lowercaseExpandedTerms = true;
-                        } else if (token == JsonToken.VALUE_FALSE) {
-                            lowercaseExpandedTerms = false;
-                        } else {
-                            lowercaseExpandedTerms = jp.getIntValue() != 0;
-                        }
-                    } else if ("phraseSlop".equals(currentFieldName)) {
-                        phraseSlop = jp.getIntValue();
-                    } else if ("analyzer".equals(currentFieldName)) {
-                        analyzer = analysisService.analyzer(jp.getText());
-                    } else if ("defaultOperator".equals(currentFieldName)) {
-                        String op = jp.getText();
-                        if ("or".equalsIgnoreCase(op)) {
-                            defaultOperator = QueryParser.Operator.OR;
-                        } else if ("and".equalsIgnoreCase(op)) {
-                            defaultOperator = QueryParser.Operator.AND;
-                        } else {
-                            throw new QueryParsingException(index, "Query default operator [" + op + "] is not allowed");
-                        }
-                    } else if ("fuzzyMinSim".equals(currentFieldName)) {
-                        fuzzyMinSim = jp.getFloatValue();
-                    } else if ("fuzzyPrefixLength".equals(currentFieldName)) {
-                        fuzzyPrefixLength = jp.getIntValue();
-                    } else if ("escape".equals(currentFieldName)) {
-                        if (token == JsonToken.VALUE_TRUE) {
-                            escape = true;
-                        } else if (token == JsonToken.VALUE_FALSE) {
-                            escape = false;
-                        } else {
-                            escape = jp.getIntValue() != 0;
-                        }
+                    } catch (EngineClosedException e) {
+                        // we are being closed, ignore
+                    } catch (FlushNotAllowedEngineException e) {
+                        // ignore this exception, we are not allowed to perform flush
+                    } catch (Exception e) {
+                        logger.warn("failed to flush shard on translog threshold", e);
+                    }
+                    lastFlushTime = System.currentTimeMillis();
+
+                    if (indexShard.state() != IndexShardState.CLOSED) {
+                        future = threadPool.schedule(interval, ThreadPool.Names.SAME, TranslogBasedFlush.this);
                     }
                 }
-            }
-            jp.nextToken();
-        } else {
-            queryString = jp.getText();
-            // move to the next token
-            jp.nextToken();
-        }
-
-        if (analyzer == null) {
-            analyzer = parseContext.mapperService().searchAnalyzer();
-        }
-
-        if (queryString == null) {
-            throw new QueryParsingException(index, "No value specified for term query");
-        }
-
-        MapperQueryParser queryParser = new MapperQueryParser(fieldName, analyzer, parseContext.mapperService(), parseContext.filterCache());
-        queryParser.setEnablePositionIncrements(enablePositionIncrements);
-        queryParser.setLowercaseExpandedTerms(lowercaseExpandedTerms);
-        queryParser.setPhraseSlop(phraseSlop);
-        queryParser.setDefaultOperator(defaultOperator);
-        queryParser.setFuzzyMinSim(fuzzyMinSim);
-        queryParser.setFuzzyPrefixLength(fuzzyPrefixLength);
-
-        if (escape) {
-            queryString = QueryParser.escape(queryString);
-        }
-
-        try {
-            Query query = queryParser.parse(queryString);
-            query.setBoost(boost);
-            return fixNegativeQueryIfNeeded(query);
-        } catch (ParseException e) {
-            throw new QueryParsingException(index, "Failed to parse query [" + queryString + "]", e);
+            });
         }
     }
 }

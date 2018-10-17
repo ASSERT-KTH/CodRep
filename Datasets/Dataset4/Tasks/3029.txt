@@ -1,153 +1,191 @@
-cam.position.mul(30);
+final List<Listener> listeners = new ArrayList<>();
 
-/*******************************************************************************
- * Copyright 2011 See AUTHORS file.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
+/*
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- ******************************************************************************/
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.tests;
+package org.elasticsearch.index.fielddata;
 
-import com.badlogic.gdx.Gdx;
-import com.badlogic.gdx.InputAdapter;
-import com.badlogic.gdx.graphics.Camera;
-import com.badlogic.gdx.graphics.GL10;
-import com.badlogic.gdx.graphics.OrthographicCamera;
-import com.badlogic.gdx.graphics.Texture;
-import com.badlogic.gdx.graphics.g2d.Sprite;
-import com.badlogic.gdx.graphics.g2d.SpriteBatch;
-import com.badlogic.gdx.math.Intersector;
-import com.badlogic.gdx.math.Matrix4;
-import com.badlogic.gdx.math.Plane;
-import com.badlogic.gdx.math.Vector3;
-import com.badlogic.gdx.math.collision.Ray;
-import com.badlogic.gdx.tests.utils.GdxTest;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.RemovalListener;
+import com.google.common.cache.RemovalNotification;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.SegmentReader;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.lucene.SegmentReaderUtils;
+import org.elasticsearch.index.mapper.FieldMapper;
+import org.elasticsearch.index.service.IndexService;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.shard.ShardUtils;
+import org.elasticsearch.index.shard.service.IndexShard;
+import org.elasticsearch.indices.fielddata.cache.IndicesFieldDataCacheListener;
 
-public class IsoCamTest extends GdxTest {
-	private static final int TARGET_WIDTH = 480;
-	private static final float UNIT_TO_PIXEL = TARGET_WIDTH * 0.15f;
-	Texture texture;
-	OrthographicCamera cam;
-	SpriteBatch batch;
-	final Sprite[][] sprites = new Sprite[10][10];
-	final Matrix4 matrix = new Matrix4();
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
 
-	@Override
-	public void create () {
-		texture = new Texture(Gdx.files.internal("data/badlogicsmall.jpg"));
-		float unitsOnX = (float)Math.sqrt(2) * TARGET_WIDTH / (UNIT_TO_PIXEL);
-		float pixelsOnX = Gdx.graphics.getWidth() / unitsOnX;
-		float unitsOnY = Gdx.graphics.getHeight() / pixelsOnX;
-		cam = new OrthographicCamera(unitsOnX, unitsOnY, 25);
-		cam.position.scl(30);
-		cam.near = 1;
-		cam.far = 1000;
-		matrix.setToRotation(new Vector3(1, 0, 0), 90);
+/**
+ * A simple field data cache abstraction on the *index* level.
+ */
+public interface IndexFieldDataCache {
 
-		for (int z = 0; z < 10; z++) {
-			for (int x = 0; x < 10; x++) {
-				sprites[x][z] = new Sprite(texture);
-				sprites[x][z].setPosition(x, z);
-				sprites[x][z].setSize(1, 1);
-			}
-		}
+    <FD extends AtomicFieldData, IFD extends IndexFieldData<FD>> FD load(AtomicReaderContext context, IFD indexFieldData) throws Exception;
 
-		batch = new SpriteBatch();
+    /**
+     * Clears all the field data stored cached in on this index.
+     */
+    void clear();
 
-		Gdx.input.setInputProcessor(new IsoCamController(cam));
-	}
+    /**
+     * Clears all the field data stored cached in on this index for the specified field name.
+     */
+    void clear(String fieldName);
 
-	@Override
-	public void dispose () {
-		texture.dispose();
-		batch.dispose();
-	}
+    void clear(Object coreCacheKey);
 
-	@Override
-	public void render () {
-		Gdx.gl.glClear(GL10.GL_COLOR_BUFFER_BIT);
-		cam.update();
+    interface Listener {
 
-		batch.setProjectionMatrix(cam.combined);
-		batch.setTransformMatrix(matrix);
-		batch.begin();
-		for (int z = 0; z < 10; z++) {
-			for (int x = 0; x < 10; x++) {
-				sprites[x][z].draw(batch);
-			}
-		}
-		batch.end();
+        void onLoad(FieldMapper.Names fieldNames, FieldDataType fieldDataType, AtomicFieldData fieldData);
 
-		checkTileTouched();
-	}
+        void onUnload(FieldMapper.Names fieldNames, FieldDataType fieldDataType, boolean wasEvicted, long sizeInBytes, @Nullable AtomicFieldData fieldData);
+    }
 
-	final Plane xzPlane = new Plane(new Vector3(0, 1, 0), 0);
-	final Vector3 intersection = new Vector3();
-	Sprite lastSelectedTile = null;
+    /**
+     * The resident field data cache is a *per field* cache that keeps all the values in memory.
+     */
+    static abstract class FieldBased implements IndexFieldDataCache, SegmentReader.CoreClosedListener, RemovalListener<FieldBased.Key, AtomicFieldData> {
+        @Nullable
+        private final IndexService indexService;
+        private final FieldMapper.Names fieldNames;
+        private final FieldDataType fieldDataType;
+        private final Cache<Key, AtomicFieldData> cache;
+        private final IndicesFieldDataCacheListener indicesFieldDataCacheListener;
 
-	private void checkTileTouched () {
-		if (Gdx.input.justTouched()) {
-			Ray pickRay = cam.getPickRay(Gdx.input.getX(), Gdx.input.getY());
-			Intersector.intersectRayPlane(pickRay, xzPlane, intersection);
-			System.out.println(intersection);
-			int x = (int)intersection.x;
-			int z = (int)intersection.z;
-			if (x >= 0 && x < 10 && z >= 0 && z < 10) {
-				if (lastSelectedTile != null) lastSelectedTile.setColor(1, 1, 1, 1);
-				Sprite sprite = sprites[x][z];
-				sprite.setColor(1, 0, 0, 1);
-				lastSelectedTile = sprite;
-			}
-		}
-	}
+        protected FieldBased(@Nullable IndexService indexService, FieldMapper.Names fieldNames, FieldDataType fieldDataType, CacheBuilder cache, IndicesFieldDataCacheListener indicesFieldDataCacheListener) {
+            this.indexService = indexService;
+            this.fieldNames = fieldNames;
+            this.fieldDataType = fieldDataType;
+            this.indicesFieldDataCacheListener = indicesFieldDataCacheListener;
+            cache.removalListener(this);
+            //noinspection unchecked
+            this.cache = cache.build();
+        }
 
-	public class IsoCamController extends InputAdapter {
-		final Plane xzPlane = new Plane(new Vector3(0, 1, 0), 0);
-		final Vector3 intersection = new Vector3();
-		final Vector3 curr = new Vector3();
-		final Vector3 last = new Vector3(-1, -1, -1);
-		final Vector3 delta = new Vector3();
-		final Camera camera;
+        @Override
+        public void onRemoval(RemovalNotification<Key, AtomicFieldData> notification) {
+            Key key = notification.getKey();
+            assert key != null && key.listeners != null;
 
-		public IsoCamController (Camera camera) {
-			this.camera = camera;
-		}
+            AtomicFieldData value = notification.getValue();
+            long sizeInBytes = key.sizeInBytes;
+            if (sizeInBytes == -1 && value != null) {
+                sizeInBytes = value.getMemorySizeInBytes();
+            }
+            for (Listener listener : key.listeners) {
+                listener.onUnload(fieldNames, fieldDataType, notification.wasEvicted(), sizeInBytes, value);
+            }
+        }
 
-		@Override
-		public boolean touchDragged (int x, int y, int pointer) {
-			Ray pickRay = camera.getPickRay(x, y);
-			Intersector.intersectRayPlane(pickRay, xzPlane, curr);
+        @Override
+        public <FD extends AtomicFieldData, IFD extends IndexFieldData<FD>> FD load(final AtomicReaderContext context, final IFD indexFieldData) throws Exception {
+            final Key key = new Key(context.reader().getCoreCacheKey());
+            //noinspection unchecked
+            return (FD) cache.get(key, new Callable<AtomicFieldData>() {
+                @Override
+                public AtomicFieldData call() throws Exception {
+                    SegmentReaderUtils.registerCoreListener(context.reader(), FieldBased.this);
+                    AtomicFieldData fieldData = indexFieldData.loadDirect(context);
+                    key.sizeInBytes = fieldData.getMemorySizeInBytes();
+                    key.listeners.add(indicesFieldDataCacheListener);
 
-			if (!(last.x == -1 && last.y == -1 && last.z == -1)) {
-				pickRay = camera.getPickRay(last.x, last.y);
-				Intersector.intersectRayPlane(pickRay, xzPlane, delta);
-				delta.sub(curr);
-				camera.position.add(delta.x, 0, delta.z);
-			}
-			last.set(x, y, 0);
-			return false;
-		}
+                    if (indexService != null) {
+                        ShardId shardId = ShardUtils.extractShardId(context.reader());
+                        if (shardId != null) {
+                            IndexShard shard = indexService.shard(shardId.id());
+                            if (shard != null) {
+                                key.listeners.add(shard.fieldData());
+                            }
+                        }
+                    }
+                    for (Listener listener : key.listeners) {
+                        listener.onLoad(fieldNames, fieldDataType, fieldData);
+                    }
+                    return fieldData;
+                }
+            });
+        }
 
-		@Override
-		public boolean touchUp (int x, int y, int pointer, int button) {
-			last.set(-1, -1, -1);
-			return false;
-		}
-	}
+        @Override
+        public void clear() {
+            cache.invalidateAll();
+        }
 
-	@Override
-	public boolean needsGL20 () {
-		return false;
-	}
+        @Override
+        public void clear(String fieldName) {
+            cache.invalidateAll();
+        }
 
+        @Override
+        public void clear(Object coreCacheKey) {
+            cache.invalidate(new Key(coreCacheKey));
+        }
+
+        @Override
+        public void onClose(Object coreCacheKey) {
+            cache.invalidate(new Key(coreCacheKey));
+        }
+
+        static class Key {
+            final Object readerKey;
+            final List<Listener> listeners = new ArrayList<>(); // optional stats listener
+            long sizeInBytes = -1; // optional size in bytes (we keep it here in case the values are soft references)
+
+            Key(Object readerKey) {
+                this.readerKey = readerKey;
+            }
+
+            @Override
+            public boolean equals(Object o) {
+                if (this == o) return true;
+                Key key = (Key) o;
+                if (!readerKey.equals(key.readerKey)) return false;
+                return true;
+            }
+
+            @Override
+            public int hashCode() {
+                return readerKey.hashCode();
+            }
+        }
+    }
+
+    static class Resident extends FieldBased {
+
+        public Resident(@Nullable IndexService indexService, FieldMapper.Names fieldNames, FieldDataType fieldDataType, IndicesFieldDataCacheListener indicesFieldDataCacheListener) {
+            super(indexService, fieldNames, fieldDataType, CacheBuilder.newBuilder(), indicesFieldDataCacheListener);
+        }
+    }
+
+    static class Soft extends FieldBased {
+
+        public Soft(@Nullable IndexService indexService, FieldMapper.Names fieldNames, FieldDataType fieldDataType, IndicesFieldDataCacheListener indicesFieldDataCacheListener) {
+            super(indexService, fieldNames, fieldDataType, CacheBuilder.newBuilder().softValues(), indicesFieldDataCacheListener);
+        }
+    }
 }

@@ -1,259 +1,218 @@
-private final static String customDesktopLib = null; //"D:\\Data\\code\\android\\libs\\libgdx\\extensions\\gdx-bullet\\jni\\vs\\gdxBullet\\x64\\Debug\\gdxBullet.dll";
+return this.ordinals;
 
-/*******************************************************************************
- * Copyright 2011 See AUTHORS file.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- ******************************************************************************/
+/*
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.tests.bullet;
+package org.elasticsearch.index.fielddata.ordinals;
 
-import com.badlogic.gdx.Application.ApplicationType;
-import com.badlogic.gdx.Gdx;
-import com.badlogic.gdx.Input.Keys;
-import com.badlogic.gdx.graphics.Color;
-import com.badlogic.gdx.graphics.GL20;
-import com.badlogic.gdx.graphics.PerspectiveCamera;
-import com.badlogic.gdx.graphics.VertexAttributes.Usage;
-import com.badlogic.gdx.graphics.g3d.Environment;
-import com.badlogic.gdx.graphics.g3d.Material;
-import com.badlogic.gdx.graphics.g3d.Model;
-import com.badlogic.gdx.graphics.g3d.ModelBatch;
-import com.badlogic.gdx.graphics.g3d.attributes.ColorAttribute;
-import com.badlogic.gdx.graphics.g3d.attributes.FloatAttribute;
-import com.badlogic.gdx.graphics.g3d.environment.DirectionalLight;
-import com.badlogic.gdx.graphics.g3d.environment.DirectionalShadowLight;
-import com.badlogic.gdx.graphics.g3d.loader.ObjLoader;
-import com.badlogic.gdx.graphics.g3d.utils.DepthShaderProvider;
-import com.badlogic.gdx.graphics.g3d.utils.ModelBuilder;
-import com.badlogic.gdx.math.Vector3;
-import com.badlogic.gdx.math.collision.Ray;
-import com.badlogic.gdx.physics.bullet.Bullet;
-import com.badlogic.gdx.physics.bullet.dynamics.btRigidBody;
-import com.badlogic.gdx.physics.bullet.linearmath.LinearMath;
-import com.badlogic.gdx.physics.bullet.linearmath.btIDebugDraw.DebugDrawModes;
-import com.badlogic.gdx.utils.Array;
-import com.badlogic.gdx.utils.Disposable;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.LongsRef;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.packed.AppendingLongBuffer;
+import org.apache.lucene.util.packed.MonotonicAppendingLongBuffer;
+import org.apache.lucene.util.packed.PackedInts;
+import org.elasticsearch.index.fielddata.ordinals.Ordinals.Docs.Iter;
 
-/** @author xoppa */
-public class BaseBulletTest extends BulletTest {
-	// Set this to the path of the lib to use it on desktop instead of default lib.
-	private final static String customDesktopLib = null;//"C:\\Xoppa\\code\\libgdx\\extensions\\gdx-bullet\\jni\\vs\\gdxBullet\\Debug\\gdxBullet.dll";
+/**
+ * {@link Ordinals} implementation which is efficient at storing field data ordinals for multi-valued or sparse fields.
+ */
+public class MultiOrdinals implements Ordinals {
 
-	private static boolean initialized = false;
-	
-	public static boolean shadows = true;
-	
-	public static void init () {
-		if (initialized) return;
-		// Need to initialize bullet before using it.
-		if (Gdx.app.getType() == ApplicationType.Desktop && customDesktopLib != null) {
-			System.load(customDesktopLib);
-		} else
-			Bullet.init();
-		Gdx.app.log("Bullet", "Version = " + LinearMath.btGetVersion());
-		initialized = true;
-	}
+    private static final int OFFSETS_PAGE_SIZE = 1024;
+    private static final int OFFSET_INIT_PAGE_COUNT = 16;
 
-	public Environment environment;
-	public DirectionalLight light;
-	public ModelBatch shadowBatch;
+    /**
+     * Return true if this impl is going to be smaller than {@link SinglePackedOrdinals} by at least 20%.
+     */
+    public static boolean significantlySmallerThanSinglePackedOrdinals(int maxDoc, int numDocsWithValue, long numOrds) {
+        final int bitsPerOrd = PackedInts.bitsRequired(numOrds);
+        // Compute the worst-case number of bits per value for offsets in the worst case, eg. if no docs have a value at the
+        // beginning of the block and all docs have one at the end of the block
+        final float avgValuesPerDoc = (float) numDocsWithValue / maxDoc;
+        final int maxDelta = (int) Math.ceil(OFFSETS_PAGE_SIZE * (1 - avgValuesPerDoc) * avgValuesPerDoc);
+        final int bitsPerOffset = PackedInts.bitsRequired(maxDelta) + 1; // +1 because of the sign
+        final long expectedMultiSizeInBytes = (long) numDocsWithValue * bitsPerOrd + (long) maxDoc * bitsPerOffset;
+        final long expectedSingleSizeInBytes = (long) maxDoc * bitsPerOrd;
+        return expectedMultiSizeInBytes < 0.8f * expectedSingleSizeInBytes;
+    }
 
-	public BulletWorld world;
-	public ObjLoader objLoader = new ObjLoader();
-	public ModelBuilder modelBuilder = new ModelBuilder();
-	public ModelBatch modelBatch;
-	public Array<Disposable> disposables = new Array<Disposable>();
-	private int debugMode = DebugDrawModes.DBG_NoDebug;
-	
-	protected final static Vector3 tmpV1 = new Vector3(), tmpV2 = new Vector3();
+    private final boolean multiValued;
+    private final long numOrds;
+    private final MonotonicAppendingLongBuffer endOffsets;
+    private final AppendingLongBuffer ords;
 
-	public BulletWorld createWorld () {
-		return new BulletWorld();
-	}
+    public MultiOrdinals(OrdinalsBuilder builder) {
+        multiValued = builder.getNumMultiValuesDocs() > 0;
+        numOrds = builder.getNumOrds();
+        endOffsets = new MonotonicAppendingLongBuffer();
+        ords = new AppendingLongBuffer(OFFSET_INIT_PAGE_COUNT, OFFSETS_PAGE_SIZE);
+        long lastEndOffset = 0;
+        for (int i = 0; i < builder.maxDoc(); ++i) {
+            final LongsRef docOrds = builder.docOrds(i);
+            final long endOffset = lastEndOffset + docOrds.length;
+            endOffsets.add(endOffset);
+            for (int j = 0; j < docOrds.length; ++j) {
+                ords.add(docOrds.longs[docOrds.offset + j] - 1);
+            }
+            lastEndOffset = endOffset;
+        }
+        assert endOffsets.size() == builder.maxDoc();
+        assert ords.size() == builder.getTotalNumOrds() : ords.size() + " != " + builder.getTotalNumOrds();
+    }
 
-	@Override
-	public void create () {
-		init();
-		environment = new Environment();
-		environment.set(new ColorAttribute(ColorAttribute.AmbientLight, 0.3f, 0.3f, 0.3f, 1.f));
-		light = shadows ? new DirectionalShadowLight(1024, 1024, 20f, 20f, 1f, 300f) : new DirectionalLight();
-		light.set(0.8f, 0.8f, 0.8f, -0.5f, -1f, 0.7f);
-		environment.add(light);
-		if (shadows)
-			environment.shadowMap = (DirectionalShadowLight)light;
-		shadowBatch = new ModelBatch(new DepthShaderProvider());
+    @Override
+    public boolean hasSingleArrayBackingStorage() {
+        return false;
+    }
 
-		modelBatch = new ModelBatch();
+    @Override
+    public Object getBackingStorage() {
+        return null;
+    }
 
-		world = createWorld();
-		world.performanceCounter = performanceCounter;
+    @Override
+    public long getMemorySizeInBytes() {
+        return endOffsets.ramBytesUsed() + ords.ramBytesUsed();
+    }
 
-		final float width = Gdx.graphics.getWidth();
-		final float height = Gdx.graphics.getHeight();
-		if (width > height)
-			camera = new PerspectiveCamera(67f, 3f * width / height, 3f);
-		else
-			camera = new PerspectiveCamera(67f, 3f, 3f * height / width);
-		camera.position.set(10f, 10f, 10f);
-		camera.lookAt(0, 0, 0);
-		camera.update();
+    @Override
+    public boolean isMultiValued() {
+        return multiValued;
+    }
 
-		// Create some simple models
-		final Model groundModel = modelBuilder.createRect(
-			20f,
-			0f,
-			-20f,
-			-20f,
-			0f,
-			-20f,
-			-20f,
-			0f,
-			20f,
-			20f,
-			0f,
-			20f,
-			0,
-			1,
-			0,
-			new Material(ColorAttribute.createDiffuse(Color.WHITE), ColorAttribute.createSpecular(Color.WHITE), FloatAttribute
-				.createShininess(16f)), Usage.Position | Usage.Normal);
-		disposables.add(groundModel);
-		final Model boxModel = modelBuilder.createBox(1f, 1f, 1f, new Material(ColorAttribute.createDiffuse(Color.WHITE),
-			ColorAttribute.createSpecular(Color.WHITE), FloatAttribute.createShininess(64f)), Usage.Position | Usage.Normal);
-		disposables.add(boxModel);
+    @Override
+    public int getNumDocs() {
+        return (int) endOffsets.size();
+    }
 
-		// Add the constructors
-		world.addConstructor("ground", new BulletConstructor(groundModel, 0f)); // mass = 0: static body
-		world.addConstructor("box", new BulletConstructor(boxModel, 1f)); // mass = 1kg: dynamic body
-		world.addConstructor("staticbox", new BulletConstructor(boxModel, 0f)); // mass = 0: static body
-	}
+    @Override
+    public long getNumOrds() {
+        return numOrds;
+    }
 
-	@Override
-	public void dispose () {
-		world.dispose();
-		world = null;
+    @Override
+    public long getMaxOrd() {
+        return numOrds + 1;
+    }
 
-		for (Disposable disposable : disposables)
-			disposable.dispose();
-		disposables.clear();
+    @Override
+    public Ordinals.Docs ordinals() {
+        return new MultiDocs(this);
+    }
 
-		modelBatch.dispose();
-		modelBatch = null;
+    static class MultiDocs implements Ordinals.Docs {
 
-		shadowBatch.dispose();
-		shadowBatch = null;
+        private final MultiOrdinals ordinals;
+        private final MonotonicAppendingLongBuffer endOffsets;
+        private final AppendingLongBuffer ords;
+        private final LongsRef longsScratch;
+        private final MultiIter iter;
 
-		if (shadows)
-			((DirectionalShadowLight)light).dispose();
-		light = null;
+        MultiDocs(MultiOrdinals ordinals) {
+            this.ordinals = ordinals;
+            this.endOffsets = ordinals.endOffsets;
+            this.ords = ordinals.ords;
+            this.longsScratch = new LongsRef(16);
+            this.iter = new MultiIter(ords);
+        }
 
-		super.dispose();
-	}
+        @Override
+        public Ordinals ordinals() {
+            return null;
+        }
 
-	@Override
-	public void render () {
-		render(true);
-	}
+        @Override
+        public int getNumDocs() {
+            return ordinals.getNumDocs();
+        }
 
-	public void render (boolean update) {
-		fpsCounter.put(Gdx.graphics.getFramesPerSecond());
+        @Override
+        public long getNumOrds() {
+            return ordinals.getNumOrds();
+        }
 
-		if (update) update();
+        @Override
+        public long getMaxOrd() {
+            return ordinals.getMaxOrd();
+        }
 
-		beginRender(true);
+        @Override
+        public boolean isMultiValued() {
+            return ordinals.isMultiValued();
+        }
 
-		renderWorld();
+        @Override
+        public long getOrd(int docId) {
+            final long startOffset = docId > 0 ? endOffsets.get(docId - 1) : 0;
+            final long endOffset = endOffsets.get(docId);
+            if (startOffset == endOffset) {
+                return 0L; // ord for missing values
+            } else {
+                return 1L + ords.get(startOffset);
+            }
+        }
 
-		Gdx.gl.glDisable(GL20.GL_DEPTH_TEST);
-		if (debugMode != DebugDrawModes.DBG_NoDebug) world.setDebugMode(debugMode);
-		Gdx.gl.glEnable(GL20.GL_DEPTH_TEST);
+        @Override
+        public LongsRef getOrds(int docId) {
+            final long startOffset = docId > 0 ? endOffsets.get(docId - 1) : 0;
+            final long endOffset = endOffsets.get(docId);
+            final int numValues = (int) (endOffset - startOffset);
+            if (longsScratch.length < numValues) {
+                longsScratch.longs = new long[ArrayUtil.oversize(numValues, RamUsageEstimator.NUM_BYTES_LONG)];
+            }
+            for (int i = 0; i < numValues; ++i) {
+                longsScratch.longs[i] = 1L + ords.get(startOffset + i);
+            }
+            longsScratch.offset = 0;
+            longsScratch.length = numValues;
+            return longsScratch;
+        }
 
-		performance.setLength(0);
-		performance.append("FPS: ").append(fpsCounter.value).append(", Bullet: ")
-			.append((int)(performanceCounter.load.value * 100f)).append("%");
-	}
+        @Override
+        public Iter getIter(int docId) {
+            final long startOffset = docId > 0 ? endOffsets.get(docId - 1) : 0;
+            final long endOffset = endOffsets.get(docId);
+            iter.offset = startOffset;
+            iter.endOffset = endOffset;
+            return iter;
+        }
 
-	protected void beginRender (boolean lighting) {
-		Gdx.gl.glViewport(0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight());
-		Gdx.gl.glClearColor(0, 0, 0, 0);
-		Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT | GL20.GL_DEPTH_BUFFER_BIT);
-		camera.update();
-	}
+    }
 
-	protected void renderWorld () {
-		if (shadows) {
-			((DirectionalShadowLight)light).begin(Vector3.Zero, camera.direction);
-			shadowBatch.begin(((DirectionalShadowLight)light).getCamera());
-			world.render(shadowBatch, null);
-			shadowBatch.end();
-			((DirectionalShadowLight)light).end();
-		}
+    static class MultiIter implements Iter {
 
-		modelBatch.begin(camera);
-		world.render(modelBatch, environment);
-		modelBatch.end();
-	}
+        final AppendingLongBuffer ordinals;
+        long offset, endOffset;
 
-	public void update () {
-		world.update();
-	}
+        MultiIter(AppendingLongBuffer ordinals) {
+            this.ordinals = ordinals;
+        }
 
-	public BulletEntity shoot (final float x, final float y) {
-		return shoot(x, y, 30f);
-	}
+        @Override
+        public long next() {
+            if (offset >= endOffset) {
+                return 0L;
+            } else {
+                return 1L + ordinals.get(offset++);
+            }
+        }
 
-	public BulletEntity shoot (final float x, final float y, final float impulse) {
-		return shoot("box", x, y, impulse);
-	}
+    }
 
-	public BulletEntity shoot (final String what, final float x, final float y, final float impulse) {
-		// Shoot a box
-		Ray ray = camera.getPickRay(x, y);
-		BulletEntity entity = world.add(what, ray.origin.x, ray.origin.y, ray.origin.z);
-		entity.setColor(0.5f + 0.5f * (float)Math.random(), 0.5f + 0.5f * (float)Math.random(), 0.5f + 0.5f * (float)Math.random(),
-			1f);
-		((btRigidBody)entity.body).applyCentralImpulse(ray.direction.scl(impulse));
-		return entity;
-	}
-
-	public void setDebugMode (final int mode) {
-		world.setDebugMode(debugMode = mode);
-	}
-
-	public void toggleDebugMode () {
-		if (world.getDebugMode() == DebugDrawModes.DBG_NoDebug)
-			setDebugMode(DebugDrawModes.DBG_DrawWireframe);
-		else if (world.renderMeshes)
-			world.renderMeshes = false;
-		else {
-			world.renderMeshes = true;
-			setDebugMode(DebugDrawModes.DBG_NoDebug);
-		}
-	}
-
-	@Override
-	public boolean longPress (float x, float y) {
-		toggleDebugMode();
-		return true;
-	}
-
-	@Override
-	public boolean keyUp (int keycode) {
-		if (keycode == Keys.ENTER) {
-			toggleDebugMode();
-			return true;
-		}
-		return super.keyUp(keycode);
-	}
 }

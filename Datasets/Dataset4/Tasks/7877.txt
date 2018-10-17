@@ -1,4 +1,4 @@
-public File nodeLocation() {
+import static org.elasticsearch.rest.RestStatus.*;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,92 +19,221 @@ public File nodeLocation() {
  * under the License.
  */
 
-package org.elasticsearch.env;
+package org.elasticsearch.rest.action.search;
 
-import org.apache.lucene.store.Lock;
-import org.apache.lucene.store.NativeFSLockFactory;
-import org.elasticsearch.ElasticSearchIllegalStateException;
-import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.search.SearchOperationThreading;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.Client;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.index.query.xcontent.QueryBuilders;
+import org.elasticsearch.index.query.xcontent.QueryStringQueryBuilder;
+import org.elasticsearch.rest.*;
+import org.elasticsearch.rest.action.support.RestActions;
+import org.elasticsearch.search.Scroll;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.sort.SortOrder;
 
-import java.io.File;
 import java.io.IOException;
+import java.util.regex.Pattern;
 
-import static org.elasticsearch.common.settings.ImmutableSettings.Builder.*;
+import static org.elasticsearch.common.unit.TimeValue.*;
+import static org.elasticsearch.rest.RestRequest.Method.*;
+import static org.elasticsearch.rest.RestResponse.Status.*;
+import static org.elasticsearch.rest.action.support.RestXContentBuilder.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class NodeEnvironment extends AbstractComponent {
+public class RestSearchAction extends BaseRestHandler {
 
-    private final File nodeFile;
+    private final static Pattern fieldsPattern;
 
-    private final Lock lock;
+    private final static Pattern indicesBoostPattern;
 
-    public NodeEnvironment(File nodeFile) {
-        super(EMPTY_SETTINGS);
-        this.nodeFile = nodeFile;
-        this.lock = null;
+    static {
+        fieldsPattern = Pattern.compile(",");
+        indicesBoostPattern = Pattern.compile(",");
     }
 
-    @Inject public NodeEnvironment(Settings settings, Environment environment) throws IOException {
-        super(settings);
+    @Inject public RestSearchAction(Settings settings, Client client, RestController controller) {
+        super(settings, client);
+        controller.registerHandler(GET, "/_search", this);
+        controller.registerHandler(POST, "/_search", this);
+        controller.registerHandler(GET, "/{index}/_search", this);
+        controller.registerHandler(POST, "/{index}/_search", this);
+        controller.registerHandler(GET, "/{index}/{type}/_search", this);
+        controller.registerHandler(POST, "/{index}/{type}/_search", this);
+    }
 
-        if (!settings.getAsBoolean("node.data", true) || settings.getAsBoolean("node.client", false) ||
-                !settings.getAsBoolean("node.master", true)) {
-            nodeFile = null;
-            lock = null;
+    @Override public void handleRequest(final RestRequest request, final RestChannel channel) {
+        SearchRequest searchRequest;
+        try {
+            searchRequest = parseSearchRequest(request);
+            searchRequest.listenerThreaded(false);
+            SearchOperationThreading operationThreading = SearchOperationThreading.fromString(request.param("operation_threading"), SearchOperationThreading.SINGLE_THREAD);
+            if (operationThreading == SearchOperationThreading.NO_THREADS) {
+                // since we don't spawn, don't allow no_threads, but change it to a single thread
+                operationThreading = SearchOperationThreading.SINGLE_THREAD;
+            }
+            searchRequest.operationThreading(operationThreading);
+        } catch (Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("failed to parse search request parameters", e);
+            }
+            try {
+                XContentBuilder builder = restContentBuilder(request);
+                channel.sendResponse(new XContentRestResponse(request, BAD_REQUEST, builder.startObject().field("error", e.getMessage()).endObject()));
+            } catch (IOException e1) {
+                logger.error("Failed to send failure response", e1);
+            }
             return;
         }
-
-        Lock lock = null;
-        File dir = null;
-        for (int i = 0; i < 100; i++) {
-            dir = new File(new File(environment.workWithClusterFile(), "nodes"), Integer.toString(i));
-            if (!dir.exists()) {
-                dir.mkdirs();
-            }
-            try {
-                NativeFSLockFactory lockFactory = new NativeFSLockFactory(dir);
-                Lock tmpLock = lockFactory.makeLock("node.lock");
-                boolean obtained = tmpLock.obtain();
-                if (obtained) {
-                    lock = tmpLock;
-                    break;
+        client.search(searchRequest, new ActionListener<SearchResponse>() {
+            @Override public void onResponse(SearchResponse response) {
+                try {
+                    XContentBuilder builder = restContentBuilder(request);
+                    builder.startObject();
+                    response.toXContent(builder, request);
+                    builder.endObject();
+                    channel.sendResponse(new XContentRestResponse(request, OK, builder));
+                } catch (Exception e) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("failed to execute search (building response)", e);
+                    }
+                    onFailure(e);
                 }
-            } catch (IOException e) {
-                // ignore
+            }
+
+            @Override public void onFailure(Throwable e) {
+                try {
+                    channel.sendResponse(new XContentThrowableRestResponse(request, e));
+                } catch (IOException e1) {
+                    logger.error("Failed to send failure response", e1);
+                }
+            }
+        });
+    }
+
+    private SearchRequest parseSearchRequest(RestRequest request) {
+        String[] indices = RestActions.splitIndices(request.param("index"));
+        SearchRequest searchRequest = new SearchRequest(indices);
+        // get the content, and put it in the body
+        if (request.hasContent()) {
+            searchRequest.source(request.contentByteArray(), request.contentByteArrayOffset(), request.contentLength(), request.contentUnsafe());
+        } else {
+            String source = request.param("source");
+            if (source != null) {
+                searchRequest.source(source);
             }
         }
-        if (lock == null) {
-            throw new IOException("Failed to obtain node lock");
+        // add extra source based on the request parameters
+        searchRequest.extraSource(parseSearchSource(request));
+
+        searchRequest.searchType(request.param("search_type"));
+
+        String scroll = request.param("scroll");
+        if (scroll != null) {
+            searchRequest.scroll(new Scroll(parseTimeValue(scroll, null)));
         }
-        this.lock = lock;
-        this.nodeFile = dir;
-        if (logger.isDebugEnabled()) {
-            logger.debug("using node location [{}]", dir);
-        }
+
+        searchRequest.timeout(request.paramAsTime("timeout", null));
+        searchRequest.types(RestActions.splitTypes(request.param("type")));
+        searchRequest.queryHint(request.param("query_hint"));
+        searchRequest.routing(request.param("routing"));
+
+        return searchRequest;
     }
 
-    public boolean hasNodeFile() {
-        return nodeFile != null && lock != null;
-    }
-
-    public File nodeFile() {
-        if (nodeFile == null || lock == null) {
-            throw new ElasticSearchIllegalStateException("node is not configured to store local location");
+    private SearchSourceBuilder parseSearchSource(RestRequest request) {
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        String queryString = request.param("q");
+        if (queryString != null) {
+            QueryStringQueryBuilder queryBuilder = QueryBuilders.queryString(queryString);
+            queryBuilder.defaultField(request.param("df"));
+            queryBuilder.analyzer(request.param("analyzer"));
+            String defaultOperator = request.param("default_operator");
+            if (defaultOperator != null) {
+                if ("OR".equals(defaultOperator)) {
+                    queryBuilder.defaultOperator(QueryStringQueryBuilder.Operator.OR);
+                } else if ("AND".equals(defaultOperator)) {
+                    queryBuilder.defaultOperator(QueryStringQueryBuilder.Operator.AND);
+                } else {
+                    throw new ElasticSearchIllegalArgumentException("Unsupported defaultOperator [" + defaultOperator + "], can either be [OR] or [AND]");
+                }
+            }
+            searchSourceBuilder.query(queryBuilder);
         }
-        return nodeFile;
-    }
 
-    public void close() {
-        if (lock != null) {
-            try {
-                lock.release();
-            } catch (IOException e) {
-                // ignore
+        int from = request.paramAsInt("from", -1);
+        if (from != -1) {
+            searchSourceBuilder.from(from);
+        }
+        int size = request.paramAsInt("size", -1);
+        if (size != -1) {
+            searchSourceBuilder.size(size);
+        }
+
+
+        searchSourceBuilder.queryParserName(request.param("query_parser_name"));
+        searchSourceBuilder.explain(request.paramAsBoolean("explain", null));
+        searchSourceBuilder.version(request.paramAsBoolean("version", null));
+
+        String sField = request.param("fields");
+        if (sField != null) {
+            if (sField.length() == 0) {
+                searchSourceBuilder.noFields();
+            } else {
+                String[] sFields = fieldsPattern.split(sField);
+                if (sFields != null) {
+                    for (String field : sFields) {
+                        searchSourceBuilder.field(field);
+                    }
+                }
             }
         }
+
+        String sSorts = request.param("sort");
+        if (sSorts != null) {
+            String[] sorts = fieldsPattern.split(sSorts);
+            for (String sort : sorts) {
+                int delimiter = sort.lastIndexOf(":");
+                if (delimiter != -1) {
+                    String sortField = sort.substring(0, delimiter);
+                    String reverse = sort.substring(delimiter + 1);
+                    if ("asc".equals(reverse)) {
+                        searchSourceBuilder.sort(sortField, SortOrder.ASC);
+                    } else if ("desc".equals(reverse)) {
+                        searchSourceBuilder.sort(sortField, SortOrder.DESC);
+                    }
+                } else {
+                    searchSourceBuilder.sort(sort);
+                }
+            }
+        }
+
+        String sIndicesBoost = request.param("indices_boost");
+        if (sIndicesBoost != null) {
+            String[] indicesBoost = indicesBoostPattern.split(sIndicesBoost);
+            for (String indexBoost : indicesBoost) {
+                int divisor = indexBoost.indexOf(',');
+                if (divisor == -1) {
+                    throw new ElasticSearchIllegalArgumentException("Illegal index boost [" + indexBoost + "], no ','");
+                }
+                String indexName = indexBoost.substring(0, divisor);
+                String sBoost = indexBoost.substring(divisor + 1);
+                try {
+                    searchSourceBuilder.indexBoost(indexName, Float.parseFloat(sBoost));
+                } catch (NumberFormatException e) {
+                    throw new ElasticSearchIllegalArgumentException("Illegal index boost [" + indexBoost + "], boost not a float number");
+                }
+            }
+        }
+
+        return searchSourceBuilder;
     }
 }

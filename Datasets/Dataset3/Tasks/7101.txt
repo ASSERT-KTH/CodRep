@@ -1,8 +1,8 @@
-protected volatile int maxActiveAllowed = -1;
+import org.wildfly.security.manager.action.GetAccessControlContextAction;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2008, Red Hat Middleware LLC, and individual contributors
+ * Copyright 2013, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -21,247 +21,104 @@ protected volatile int maxActiveAllowed = -1;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.jboss.as.undertow.session;
+package org.wildfly.clustering.web.infinispan.session;
 
-import java.util.AbstractMap;
+import java.security.AccessController;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
-import io.undertow.server.session.Session;
-import org.jboss.metadata.web.jboss.JBossWebMetaData;
-import org.jboss.metadata.web.spec.SessionConfigMetaData;
-
+import org.jboss.as.clustering.concurrent.Scheduler;
+import org.jboss.as.clustering.infinispan.invoker.Remover;
+import org.jboss.threads.JBossThreadFactory;
+import org.wildfly.clustering.web.Batch;
+import org.wildfly.clustering.web.Batcher;
+import org.wildfly.clustering.web.infinispan.InfinispanWebLogger;
+import org.wildfly.clustering.web.session.ImmutableSession;
+import org.wildfly.security.manager.GetAccessControlContextAction;
 
 /**
+ * Session expiration scheduler that eagerly expires sessions as soon as they are eligible.
+ * If/When Infinispan implements expiration notifications (ISPN-694), this will be obsolete.
  * @author Paul Ferraro
  */
-public abstract class AbstractSessionManager implements SessionManager {
-    /** Maximum of active sessions allowed. -1 is unlimited. */
-    protected int maxActiveAllowed = -1;
-    /** Has this component been started yet? */
-    protected volatile boolean started = false;
-    /** Are we allowing backgroundProcess() to execute? We use an object so stop() can lock on it to wait for */
-//    protected AtomicBoolean backgroundProcessAllowed = new AtomicBoolean();
-    private final ReplicationStatistics stats = new ReplicationStatistics();
-    /** Number of sessions created by this manager */
-    protected final AtomicInteger createdCounter = new AtomicInteger();
-    /** number of sessions rejected because the number active sessions exceeds maxActive */
-    protected final AtomicInteger rejectedCounter = new AtomicInteger();
-    /** Number of active sessions */
-    protected final AtomicInteger localActiveCounter = new AtomicInteger();
-    /** Maximum number of concurrently locally active sessions */
-    protected final AtomicInteger maxLocalActiveCounter = new AtomicInteger();
-    /** Maximum number of active sessions seen so far */
-    protected final AtomicInteger maxActiveCounter = new AtomicInteger();
-    /** Number of sessions that have been active locally that are now expired. */
-    protected final AtomicInteger expiredCounter = new AtomicInteger();
-    /** Number of ms since last call to reset() */
-    protected long timeSinceLastReset = 0;
-    /** Cumulative time spent in backgroundProcess */
-    protected final AtomicLong processingTime = new AtomicLong();
-    /** Maximum time in ms a now expired session has been alive */
-    protected final AtomicInteger maxAliveTime = new AtomicInteger();
-    /** Average time in ms a now expired session has been alive */
-    protected final AtomicInteger averageAliveTime = new AtomicInteger();
-    /** Number of times our session id generator has generated an id that matches an existing session. */
-    protected final AtomicInteger duplicates = new AtomicInteger();
+public class SessionExpirationScheduler implements Scheduler<ImmutableSession> {
 
-    /**
-     * The default maximum inactive interval for Sessions created by this Manager.
-     */
-    protected volatile int maxInactiveTime = 30 * 60;
+    final Map<String, Future<?>> expirationFutures = new ConcurrentHashMap<>();
+    final Batcher batcher;
+    final Remover<String> remover;
+    private final ScheduledExecutorService executor;
 
-    protected volatile int maxActive = 0;
+    public SessionExpirationScheduler(Batcher batcher, Remover<String> remover) {
+        this(batcher, remover, createScheduledExecutor(createThreadFactory()));
+    }
 
+    private static ThreadFactory createThreadFactory() {
+        return new JBossThreadFactory(new ThreadGroup(SessionExpirationScheduler.class.getSimpleName()), Boolean.FALSE, null, "%G - %t", null, null, AccessController.doPrivileged(GetAccessControlContextAction.getInstance()));
+    }
 
-    protected final Map<String, Session> sessions = new ConcurrentHashMap<String, Session>();
+    private static ScheduledExecutorService createScheduledExecutor(ThreadFactory factory) {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, factory);
+        executor.setRemoveOnCancelPolicy(true);
+        return executor;
+    }
 
-    protected AbstractSessionManager(JBossWebMetaData metaData) {
-        //this.processExpiresFrequency = 1;
+    public SessionExpirationScheduler(Batcher batcher, Remover<String> remover, ScheduledExecutorService executor) {
+        this.batcher = batcher;
+        this.remover = remover;
+        this.executor = executor;
+    }
 
-        Integer maxActiveSessions = metaData.getMaxActiveSessions();
-        if (maxActiveSessions != null) {
-            this.setMaxActiveAllowed(maxActiveSessions.intValue());
-        }
-        SessionConfigMetaData config = metaData.getSessionConfig();
-        if (config != null) {
-            // Convert session timeout (minutes) to max inactive interval (seconds)
-            maxInactiveTime = config.getSessionTimeout() * 60;
+    @Override
+    public void cancel(ImmutableSession session) {
+        Future<?> future = this.expirationFutures.remove(session.getId());
+        if (future != null) {
+            future.cancel(false);
         }
     }
 
-    public synchronized void start()  {
-        this.started = true;
-    }
-
-    public void stop() {
-        // Validate and update our current component state
-        if (!this.started) return;
-
-        this.started = false;
-
-        // Block for any ongoing backgroundProcess, then disable
-        synchronized (this) {
-            resetStats();
+    @Override
+    public void schedule(ImmutableSession session) {
+        long timeout = session.getMetaData().getMaxInactiveInterval(TimeUnit.MILLISECONDS);
+        if (timeout > 0) {
+            String id = session.getId();
+            InfinispanWebLogger.ROOT_LOGGER.tracef("Session %s will expire in %d ms", id, timeout);
+            this.expirationFutures.put(id, this.executor.schedule(new ExpirationTask(id), timeout, TimeUnit.MILLISECONDS));
         }
     }
 
-    public void processExpires() {
-        synchronized (this) {
-            if (this.started) {
-                long start = System.currentTimeMillis();
+    @Override
+    public void close() {
+        this.executor.shutdown();
+    }
 
-                processExpirationPassivation();
+    private class ExpirationTask implements Runnable {
+        private final String id;
 
-                processingTime.addAndGet(System.currentTimeMillis() - start);
+        public ExpirationTask(String id) {
+            this.id = id;
+        }
+
+        @Override
+        public void run() {
+            SessionExpirationScheduler.this.expirationFutures.remove(this.id);
+            InfinispanWebLogger.ROOT_LOGGER.tracef("Expiring session %s", this.id);
+            Batch batch = SessionExpirationScheduler.this.batcher.startBatch();
+            boolean success = false;
+            try {
+                SessionExpirationScheduler.this.remover.remove(this.id);
+                success = true;
+            } finally {
+                if (success) {
+                    batch.close();
+                } else {
+                    batch.discard();
+                }
             }
         }
     }
-
-    protected abstract void processExpirationPassivation();
-
-    public int getRejectedSessions() {
-        return this.rejectedCounter.get();
-    }
-
-    public void setRejectedSessions(int rejectedSessions) {
-        this.rejectedCounter.set(rejectedSessions);
-    }
-
-
-    public ReplicationStatistics getReplicationStatistics() {
-        return this.stats;
-    }
-
-    public void resetStats() {
-        stats.resetStats();
-        maxActiveCounter.set(localActiveCounter.get());
-        rejectedCounter.set(0);
-        createdCounter.set(0);
-        expiredCounter.set(0);
-        processingTime.set(0);
-        maxAliveTime.set(0);
-        averageAliveTime.set(0);
-        duplicates.set(0);
-        timeSinceLastReset = System.currentTimeMillis();
-    }
-
-    public long getTimeSinceLastReset() {
-        return this.timeSinceLastReset;
-    }
-
-    public long getActiveSessionCount() {
-        return calcActiveSessions();
-    }
-
-    public long getLocalActiveSessionCount() {
-        return this.localActiveCounter.get();
-    }
-
-    public long getRejectedSessionCount() {
-        return this.rejectedCounter.get();
-    }
-
-    public long getCreatedSessionCount() {
-        return this.createdCounter.get();
-    }
-
-    public long getExpiredSessionCount() {
-        return this.expiredCounter.get();
-    }
-
-    public long getMaxActiveSessionCount() {
-        return this.maxActiveCounter.get();
-    }
-
-    public long getMaxLocalActiveSessionCount() {
-        return this.maxLocalActiveCounter.get();
-    }
-
-    public int getMaxActiveAllowed() {
-        return this.maxActiveAllowed;
-    }
-
-    public void setMaxActiveAllowed(int max) {
-        this.maxActiveAllowed = max;
-    }
-
-    public int getMaxActiveSessions() {
-        return this.maxActive;
-    }
-
-    public Map.Entry<String, String> parse(String sessionId) {
-        String realId = sessionId;
-        String jvmRoute = null;
-        int index = sessionId.indexOf('.', 0);
-        if (index > 0) {
-            realId = sessionId.substring(0, index);
-            if (index < sessionId.length() - 1) {
-                jvmRoute = sessionId.substring(index + 1);
-            }
-        }
-        return new AbstractMap.SimpleImmutableEntry<String, String>(realId, jvmRoute);
-    }
-
-    public String createSessionId(String realId, String jvmRoute) {
-        return (jvmRoute != null) ? realId + "." + jvmRoute : realId;
-    }
-
-    /**
-     * Updates statistics to reflect that a session with a given "alive time" has been expired.
-     *
-     * @param sessionAliveTime number of ms from when the session was created to when it was expired.
-     */
-    protected void sessionExpired(int sessionAliveTime) {
-        int current = maxAliveTime.get();
-        while (sessionAliveTime > current) {
-            if (maxAliveTime.compareAndSet(current, sessionAliveTime))
-                break;
-            else
-                current = maxAliveTime.get();
-        }
-
-        expiredCounter.incrementAndGet();
-        int newAverage;
-        do {
-            int expCount = expiredCounter.get();
-            current = averageAliveTime.get();
-            newAverage = ((current * (expCount - 1)) + sessionAliveTime) / expCount;
-        } while (averageAliveTime.compareAndSet(current, newAverage) == false);
-    }
-
-    /**
-     * Calculates the number of active sessions, and updates the max # of local active sessions and max # of sessions.
-     * <p>
-     * Call this method when a new session is added or when an accurate count of active sessions is needed.
-     * </p>
-     *
-     * @return the size of the sessions map + the size of the unloaded sessions map - the count of passivated sessions
-     */
-    protected int calcActiveSessions() {
-        localActiveCounter.set(sessions.size());
-        int active = localActiveCounter.get();
-        int maxLocal = maxLocalActiveCounter.get();
-        while (active > maxLocal) {
-            if (!maxLocalActiveCounter.compareAndSet(maxLocal, active)) {
-                maxLocal = maxLocalActiveCounter.get();
-            }
-        }
-
-        int count = getTotalActiveSessions();
-        int max = maxActiveCounter.get();
-        while (count > max) {
-            if (!maxActiveCounter.compareAndSet(max, count)) {
-                max = maxActiveCounter.get();
-                // Something changed, so reset our count
-                count = getTotalActiveSessions();
-            }
-        }
-        return count;
-    }
-
-    /** Get the total number of active sessions */
-    protected abstract int getTotalActiveSessions();
 }

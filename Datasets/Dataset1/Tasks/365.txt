@@ -1,13 +1,13 @@
-if (++length >= maxFieldLength) {
-
-package org.apache.lucene.index;
+mbs.registerMBean(this, new ObjectName("org.apache.cassandra.net:type=MessagingService"));
 
 /**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,398 +18,572 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.search.Similarity;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexOutput;
+package org.apache.cassandra.net;
 
+import java.io.IOError;
 import java.io.IOException;
-import java.io.PrintStream;
-import java.io.Reader;
-import java.io.StringReader;
-import java.util.Arrays;
-import java.util.Enumeration;
-import java.util.Hashtable;
+import java.lang.management.ManagementFactory;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.ServerSocketChannel;
+import java.security.MessageDigest;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
-final class DocumentWriter {
-  private Analyzer analyzer;
-  private Directory directory;
-  private Similarity similarity;
-  private FieldInfos fieldInfos;
-  private int maxFieldLength;
-  private int termIndexInterval = IndexWriter.DEFAULT_TERM_INDEX_INTERVAL;
-  private PrintStream infoStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  /** This ctor used by test code only.
-   *
-   * @param directory The directory to write the document information to
-   * @param analyzer The analyzer to use for the document
-   * @param similarity The Similarity function
-   * @param maxFieldLength The maximum number of tokens a field may have
-   */ 
-  DocumentWriter(Directory directory, Analyzer analyzer,
-                 Similarity similarity, int maxFieldLength) {
-    this.directory = directory;
-    this.analyzer = analyzer;
-    this.similarity = similarity;
-    this.maxFieldLength = maxFieldLength;
-  }
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.io.SerializerType;
+import org.apache.cassandra.net.sink.SinkManager;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.streaming.FileStreamTask;
+import org.apache.cassandra.streaming.StreamHeader;
+import org.apache.cassandra.utils.ExpiringMap;
+import org.apache.cassandra.utils.GuidGenerator;
+import org.apache.cassandra.utils.SimpleCondition;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
-  DocumentWriter(Directory directory, Analyzer analyzer, IndexWriter writer) {
-    this.directory = directory;
-    this.analyzer = analyzer;
-    this.similarity = writer.getSimilarity();
-    this.maxFieldLength = writer.getMaxFieldLength();
-    this.termIndexInterval = writer.getTermIndexInterval();
-  }
+public class MessagingService implements MessagingServiceMBean
+{
+    private static int version_ = 1;
+    //TODO: make this parameter dynamic somehow.  Not sure if config is appropriate.
+    private static SerializerType serializerType_ = SerializerType.BINARY;
 
-  final void addDocument(String segment, Document doc)
-          throws IOException {
-    // write field names
-    fieldInfos = new FieldInfos();
-    fieldInfos.add(doc);
-    fieldInfos.write(directory, segment + ".fnm");
+    /** we preface every message with this number so the recipient can validate the sender is sane */
+    public static final int PROTOCOL_MAGIC = 0xCA552DFA;
 
-    // write field values
-    FieldsWriter fieldsWriter =
-            new FieldsWriter(directory, segment, fieldInfos);
-    try {
-      fieldsWriter.addDocument(doc);
-    } finally {
-      fieldsWriter.close();
+    /* This records all the results mapped by message Id */
+    private static ExpiringMap<String, IAsyncCallback> callbackMap_;
+    private static ExpiringMap<String, IAsyncResult> taskCompletionMap_;
+    
+    /* Lookup table for registering message handlers based on the verb. */
+    private static Map<StorageService.Verb, IVerbHandler> verbHandlers_;
+
+    /* Thread pool to handle messaging write activities */
+    private static ExecutorService streamExecutor_;
+    
+    private static NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool> connectionManagers_ = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
+    
+    private static Logger logger_ = LoggerFactory.getLogger(MessagingService.class);
+    private static int LOG_DROPPED_INTERVAL_IN_MS = 1000;
+
+    public static final MessagingService instance = new MessagingService();
+
+    private SocketThread socketThread;
+    private SimpleCondition listenGate;
+    private static AtomicInteger droppedMessages = new AtomicInteger();
+
+    public Object clone() throws CloneNotSupportedException
+    {
+        //Prevents the singleton from being cloned
+        throw new CloneNotSupportedException();
     }
 
-    // invert doc into postingTable
-    postingTable.clear();			  // clear postingTable
-    fieldLengths = new int[fieldInfos.size()];    // init fieldLengths
-    fieldPositions = new int[fieldInfos.size()];  // init fieldPositions
-    fieldOffsets = new int[fieldInfos.size()];    // init fieldOffsets
+    protected MessagingService()
+    {
+        listenGate = new SimpleCondition();
+        verbHandlers_ = new EnumMap<StorageService.Verb, IVerbHandler>(StorageService.Verb.class);
+        /*
+         * Leave callbacks in the cachetable long enough that any related messages will arrive
+         * before the callback is evicted from the table. The concurrency level is set at 128
+         * which is the sum of the threads in the pool that adds shit into the table and the 
+         * pool that retrives the callback from here.
+        */
+        callbackMap_ = new ExpiringMap<String, IAsyncCallback>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()));
+        taskCompletionMap_ = new ExpiringMap<String, IAsyncResult>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()));
 
-    fieldBoosts = new float[fieldInfos.size()];	  // init fieldBoosts
-    Arrays.fill(fieldBoosts, doc.getBoost());
+        streamExecutor_ = new JMXEnabledThreadPoolExecutor("MESSAGE-STREAMING-POOL");
+        TimerTask logDropped = new TimerTask()
+        {
+            public void run()
+            {
+                logDroppedMessages();
+            }
+        };
+        Timer timer = new Timer("DroppedMessagesLogger");
+        timer.schedule(logDropped, LOG_DROPPED_INTERVAL_IN_MS, LOG_DROPPED_INTERVAL_IN_MS);
 
-    invertDocument(doc);
-
-    // sort postingTable into an array
-    Posting[] postings = sortPostingTable();
-
-    /*
-    for (int i = 0; i < postings.length; i++) {
-      Posting posting = postings[i];
-      System.out.print(posting.term);
-      System.out.print(" freq=" + posting.freq);
-      System.out.print(" pos=");
-      System.out.print(posting.positions[0]);
-      for (int j = 1; j < posting.freq; j++)
-	System.out.print("," + posting.positions[j]);
-      System.out.println("");
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        try
+        {
+            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.concurrent:type=MESSAGING-SERVICE-POOL"));
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
     }
+
+    public byte[] hash(String type, byte data[])
+    {
+        byte result[];
+        try
+        {
+            MessageDigest messageDigest = MessageDigest.getInstance(type);
+            result = messageDigest.digest(data);
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+        return result;
+    }
+
+    /** called from gossiper when it notices a node is not responding. */
+    public void convict(InetAddress ep)
+    {
+        logger_.debug("Resetting pool for " + ep);
+        getConnectionPool(ep).reset();
+    }
+
+    /**
+     * Listen on the specified port.
+     * @param localEp InetAddress whose port to listen on.
+     */
+    public void listen(InetAddress localEp) throws IOException
+    {        
+        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        final ServerSocket ss = serverChannel.socket();
+        ss.setReuseAddress(true);
+        ss.bind(new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort()));
+        socketThread = new SocketThread(ss, "ACCEPT-" + localEp);
+        socketThread.start();
+        listenGate.signalAll();
+    }
+
+    public void waitUntilListening()
+    {
+        try
+        {
+            listenGate.await();
+        }
+        catch (InterruptedException ie)
+        {
+            logger_.debug("await interrupted");
+        }
+    }
+
+    public static OutboundTcpConnectionPool getConnectionPool(InetAddress to)
+    {
+        OutboundTcpConnectionPool cp = connectionManagers_.get(to);
+        if (cp == null)
+        {
+            connectionManagers_.putIfAbsent(to, new OutboundTcpConnectionPool(to));
+            cp = connectionManagers_.get(to);
+        }
+        return cp;
+    }
+
+    public static OutboundTcpConnection getConnection(InetAddress to, Message msg)
+    {
+        return getConnectionPool(to).getConnection(msg);
+    }
+        
+    /**
+     * Register a verb and the corresponding verb handler with the
+     * Messaging Service.
+     * @param verb
+     * @param verbHandler handler for the specified verb
+     */
+    public void registerVerbHandlers(StorageService.Verb verb, IVerbHandler verbHandler)
+    {
+    	assert !verbHandlers_.containsKey(verb);
+    	verbHandlers_.put(verb, verbHandler);
+    }
+        
+    /**
+     * This method returns the verb handler associated with the registered
+     * verb. If no handler has been registered then null is returned.
+     * @param type for which the verb handler is sought
+     * @return a reference to IVerbHandler which is the handler for the specified verb
+     */
+    public IVerbHandler getVerbHandler(StorageService.Verb type)
+    {
+        return verbHandlers_.get(type);
+    }
+
+    /**
+     * Send a message to a given endpoint.
+     * @param message message to be sent.
+     * @param to endpoint to which the message needs to be sent
+     * @return an reference to an IAsyncResult which can be queried for the
+     * response
+     */
+    public String sendRR(Message message, InetAddress[] to, IAsyncCallback cb)
+    {
+        String messageId = message.getMessageId();
+        addCallback(cb, messageId);
+        for (InetAddress endpoint : to)
+        {
+            sendOneWay(message, endpoint);
+        }
+        return messageId;
+    }
+
+    public void addCallback(IAsyncCallback cb, String messageId)
+    {
+        callbackMap_.put(messageId, cb);
+    }
+
+    /**
+     * Send a message to a given endpoint. This method specifies a callback
+     * which is invoked with the actual response.
+     * @param message message to be sent.
+     * @param to endpoint to which the message needs to be sent
+     * @param cb callback interface which is used to pass the responses or
+     *           suggest that a timeout occurred to the invoker of the send().
+     *           suggest that a timeout occurred to the invoker of the send().
+     * @return an reference to message id used to match with the result
+     */
+    public String sendRR(Message message, InetAddress to, IAsyncCallback cb)
+    {        
+        String messageId = message.getMessageId();
+        addCallback(cb, messageId);
+        sendOneWay(message, to);
+        return messageId;
+    }
+
+    /**
+     * Send a message to a given endpoint. The ith element in the <code>messages</code>
+     * array is sent to the ith element in the <code>to</code> array.This method assumes
+     * there is a one-one mapping between the <code>messages</code> array and
+     * the <code>to</code> array. Otherwise an  IllegalArgumentException will be thrown.
+     * This method also informs the MessagingService to wait for at least
+     * <code>howManyResults</code> responses to determine success of failure.
+     * @param messages messages to be sent.
+     * @param to endpoints to which the message needs to be sent
+     * @param cb callback interface which is used to pass the responses or
+     *           suggest that a timeout occured to the invoker of the send().
+     * @return an reference to message id used to match with the result
+     */
+    public String sendRR(Message[] messages, InetAddress[] to, IAsyncCallback cb)
+    {
+        if ( messages.length != to.length )
+        {
+            throw new IllegalArgumentException("Number of messages and the number of endpoints need to be same.");
+        }
+        String groupId = GuidGenerator.guid();
+        addCallback(cb, groupId);
+        for ( int i = 0; i < messages.length; ++i )
+        {
+            messages[i].setMessageId(groupId);
+            sendOneWay(messages[i], to[i]);
+        }
+        return groupId;
+    } 
+    
+    /**
+     * Send a message to a given endpoint. This method adheres to the fire and forget
+     * style messaging.
+     * @param message messages to be sent.
+     * @param to endpoint to which the message needs to be sent
+     */
+    public void sendOneWay(Message message, InetAddress to)
+    {
+        // do local deliveries
+        if ( message.getFrom().equals(to) )
+        {
+            MessagingService.receive(message);
+            return;
+        }
+
+        // message sinks are a testing hook
+        Message processedMessage = SinkManager.processClientMessageSink(message, to);
+        if (processedMessage == null)
+        {
+            return;
+        }
+
+        // get pooled connection (really, connection queue)
+        OutboundTcpConnection connection = getConnection(to, message);
+
+        // pack message with header in a bytebuffer
+        byte[] data;
+        try
+        {
+            DataOutputBuffer buffer = new DataOutputBuffer();
+            Message.serializer().serialize(message, buffer);
+            data = buffer.getData();
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+        assert data.length > 0;
+        ByteBuffer buffer = packIt(data , false);
+
+        // write it
+        connection.write(buffer);
+    }
+    
+    public IAsyncResult sendRR(Message message, InetAddress to)
+    {
+        IAsyncResult iar = new AsyncResult();
+        taskCompletionMap_.put(message.getMessageId(), iar);
+        sendOneWay(message, to);
+        return iar;
+    }
+    
+    /**
+     * Stream a file from source to destination. This is highly optimized
+     * to not hold any of the contents of the file in memory.
+     * @param header Header contains file to stream and other metadata.
+     * @param to endpoint to which we need to stream the file.
     */
 
-    // write postings
-    writePostings(postings, segment);
+    public void stream(StreamHeader header, InetAddress to)
+    {
+        /* Streaming asynchronously on streamExector_ threads. */
+        streamExecutor_.execute(new FileStreamTask(header, to));
+    }
+    
+    /** blocks until the processing pools are empty and done. */
+    public static void waitFor() throws InterruptedException
+    {
+        while (!streamExecutor_.isTerminated())
+            streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
+    }
 
-    // write norms of indexed fields
-    writeNorms(segment);
+    public static void shutdown()
+    {
+        logger_.info("Shutting down MessageService...");
 
-  }
-
-  // Keys are Terms, values are Postings.
-  // Used to buffer a document before it is written to the index.
-  private final Hashtable postingTable = new Hashtable();
-  private int[] fieldLengths;
-  private int[] fieldPositions;
-  private int[] fieldOffsets;
-  private float[] fieldBoosts;
-
-  // Tokenizes the fields of a document into Postings.
-  private final void invertDocument(Document doc)
-          throws IOException {
-    Enumeration fields = doc.fields();
-    while (fields.hasMoreElements()) {
-      Fieldable field = (Fieldable) fields.nextElement();
-      String fieldName = field.name();
-      int fieldNumber = fieldInfos.fieldNumber(fieldName);
-
-      int length = fieldLengths[fieldNumber];     // length of field
-      int position = fieldPositions[fieldNumber]; // position in field
-      if (length>0) position+=analyzer.getPositionIncrementGap(fieldName);
-      int offset = fieldOffsets[fieldNumber];       // offset field
-
-      if (field.isIndexed()) {
-        if (!field.isTokenized()) {		  // un-tokenized field
-          String stringValue = field.stringValue();
-          if(field.isStoreOffsetWithTermVector())
-            addPosition(fieldName, stringValue, position++, new TermVectorOffsetInfo(offset, offset + stringValue.length()));
-          else
-            addPosition(fieldName, stringValue, position++, null);
-          offset += stringValue.length();
-          length++;
-        } else 
+        try
         {
-          Reader reader;			  // find or make Reader
-          if (field.readerValue() != null)
-            reader = field.readerValue();
-          else if (field.stringValue() != null)
-            reader = new StringReader(field.stringValue());
-          else
-            throw new IllegalArgumentException
-                    ("field must have either String or Reader value");
+            instance.socketThread.close();
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
 
-          // Tokenize field and add to postingTable
-          TokenStream stream = analyzer.tokenStream(fieldName, reader);
-          try {
-            Token lastToken = null;
-            for (Token t = stream.next(); t != null; t = stream.next()) {
-              position += (t.getPositionIncrement() - 1);
-              
-              if(field.isStoreOffsetWithTermVector())
-                addPosition(fieldName, t.termText(), position++, new TermVectorOffsetInfo(offset + t.startOffset(), offset + t.endOffset()));
-              else
-                addPosition(fieldName, t.termText(), position++, null);
-              
-              lastToken = t;
-              if (++length > maxFieldLength) {
-                if (infoStream != null)
-                  infoStream.println("maxFieldLength " +maxFieldLength+ " reached, ignoring following tokens");
-                break;
-              }
+        streamExecutor_.shutdownNow();
+
+        /* shut down the cachetables */
+        taskCompletionMap_.shutdown();
+        callbackMap_.shutdown();
+
+        logger_.info("Shutdown complete (no further commands will be processed)");
+    }
+
+    public static void receive(Message message)
+    {
+        message = SinkManager.processServerMessageSink(message, null);
+
+        Runnable runnable = new MessageDeliveryTask(message);
+        ExecutorService stage = StageManager.getStage(message.getMessageType());
+        assert stage != null;
+        stage.execute(runnable);
+    }
+
+    public static IAsyncCallback getRegisteredCallback(String key)
+    {
+        return callbackMap_.get(key);
+    }
+    
+    public static void removeRegisteredCallback(String key)
+    {
+        callbackMap_.remove(key);
+    }
+    
+    public static IAsyncResult getAsyncResult(String key)
+    {
+        return taskCompletionMap_.remove(key);
+    }
+
+    public static long getRegisteredCallbackAge(String key)
+    {
+        return callbackMap_.getAge(key);
+    }
+
+    public static long getAsyncResultAge(String key)
+    {
+        return taskCompletionMap_.getAge(key);
+    }
+
+    public static void validateMagic(int magic) throws IOException
+    {
+        if (magic != PROTOCOL_MAGIC)
+            throw new IOException("invalid protocol header");
+    }
+
+    public static int getBits(int x, int p, int n)
+    {
+        return x >>> (p + 1) - n & ~(-1 << n);
+    }
+        
+    public static ByteBuffer packIt(byte[] bytes, boolean compress)
+    {
+        /*
+             Setting up the protocol header. This is 4 bytes long
+             represented as an integer. The first 2 bits indicate
+             the serializer type. The 3rd bit indicates if compression
+             is turned on or off. It is turned off by default. The 4th
+             bit indicates if we are in streaming mode. It is turned off
+             by default. The 5th-8th bits are reserved for future use.
+             The next 8 bits indicate a version number. Remaining 15 bits 
+             are not used currently.            
+        */
+        int header = 0;
+        // Setting up the serializer bit
+        header |= serializerType_.ordinal();
+        // set compression bit.
+        if (compress)
+            header |= 4;
+        // Setting up the version bit
+        header |= (version_ << 8);
+
+        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
+        buffer.putInt(PROTOCOL_MAGIC);
+        buffer.putInt(header);
+        buffer.putInt(bytes.length);
+        buffer.put(bytes);
+        buffer.flip();
+        return buffer;
+    }
+        
+    public static ByteBuffer constructStreamHeader(StreamHeader streamHeader, boolean compress)
+    {
+        /* 
+        Setting up the protocol header. This is 4 bytes long
+        represented as an integer. The first 2 bits indicate
+        the serializer type. The 3rd bit indicates if compression
+        is turned on or off. It is turned off by default. The 4th
+        bit indicates if we are in streaming mode. It is turned off
+        by default. The following 4 bits are reserved for future use. 
+        The next 8 bits indicate a version number. Remaining 15 bits 
+        are not used currently.            
+        */
+        int header = 0;
+        // Setting up the serializer bit
+        header |= serializerType_.ordinal();
+        // set compression bit.
+        if ( compress )
+            header |= 4;
+        // set streaming bit
+        header |= 8;
+        // Setting up the version bit
+        header |= (version_ << 8);
+        /* Finished the protocol header setup */
+
+        /* Adding the StreamHeader which contains the session Id along
+         * with the pendingfile info for the stream.
+         * | Session Id | Pending File Size | Pending File | Bool more files |
+         * | No. of Pending files | Pending Files ... |
+         */
+        byte[] bytes;
+        try
+        {
+            DataOutputBuffer buffer = new DataOutputBuffer();
+            StreamHeader.serializer().serialize(streamHeader, buffer);
+            bytes = buffer.getData();
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+        assert bytes.length > 0;
+
+        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
+        buffer.putInt(PROTOCOL_MAGIC);
+        buffer.putInt(header);
+        buffer.putInt(bytes.length);
+        buffer.put(bytes);
+        buffer.flip();
+        return buffer;
+    }
+
+    public static int incrementDroppedMessages()
+    {
+        return droppedMessages.incrementAndGet();
+    }
+               
+    private static void logDroppedMessages()
+    {
+        if (droppedMessages.get() > 0)
+            logger_.warn("Dropped " + droppedMessages + " messages in the last " + LOG_DROPPED_INTERVAL_IN_MS + "ms");
+        droppedMessages.set(0);
+    }
+
+    private class SocketThread extends Thread
+    {
+        private final ServerSocket server;
+        
+        SocketThread(ServerSocket server, String name)
+        {
+            super(name);
+            this.server = server;
+        }
+
+        public void run()
+        {
+            while (true)
+            {
+                try
+                {
+                    Socket socket = server.accept();
+                    new IncomingTcpConnection(socket).start();
+                }
+                catch (AsynchronousCloseException e)
+                {
+                    // this happens when another thread calls close().
+                    logger_.info("MessagingService shutting down server thread.");
+                    break;
+                }
+                catch (IOException e)
+                {
+                    throw new RuntimeException(e);
+                }
             }
-            
-            if(lastToken != null)
-              offset += lastToken.endOffset() + 1;
-            
-          } finally {
-            stream.close();
-          }
         }
-
-        fieldLengths[fieldNumber] = length;	  // save field length
-        fieldPositions[fieldNumber] = position;	  // save field position
-        fieldBoosts[fieldNumber] *= field.getBoost();
-        fieldOffsets[fieldNumber] = offset;
-      }
-    }
-  }
-
-  private final Term termBuffer = new Term("", ""); // avoid consing
-
-  private final void addPosition(String field, String text, int position, TermVectorOffsetInfo offset) {
-    termBuffer.set(field, text);
-    //System.out.println("Offset: " + offset);
-    Posting ti = (Posting) postingTable.get(termBuffer);
-    if (ti != null) {				  // word seen before
-      int freq = ti.freq;
-      if (ti.positions.length == freq) {	  // positions array is full
-        int[] newPositions = new int[freq * 2];	  // double size
-        int[] positions = ti.positions;
-        for (int i = 0; i < freq; i++)		  // copy old positions to new
-          newPositions[i] = positions[i];
-        ti.positions = newPositions;
-      }
-      ti.positions[freq] = position;		  // add new position
-
-      if (offset != null) {
-        if (ti.offsets.length == freq){
-          TermVectorOffsetInfo [] newOffsets = new TermVectorOffsetInfo[freq*2];
-          TermVectorOffsetInfo [] offsets = ti.offsets;
-          for (int i = 0; i < freq; i++)
-          {
-            newOffsets[i] = offsets[i];
-          }
-          ti.offsets = newOffsets;
+        
+        void close() throws IOException
+        {
+            server.close();
         }
-        ti.offsets[freq] = offset;
-      }
-      ti.freq = freq + 1;			  // update frequency
-    } else {					  // word not seen before
-      Term term = new Term(field, text, false);
-      postingTable.put(term, new Posting(term, position, offset));
-    }
-  }
-
-  private final Posting[] sortPostingTable() {
-    // copy postingTable into an array
-    Posting[] array = new Posting[postingTable.size()];
-    Enumeration postings = postingTable.elements();
-    for (int i = 0; postings.hasMoreElements(); i++)
-      array[i] = (Posting) postings.nextElement();
-
-    // sort the array
-    quickSort(array, 0, array.length - 1);
-
-    return array;
-  }
-
-  private static final void quickSort(Posting[] postings, int lo, int hi) {
-    if (lo >= hi)
-      return;
-
-    int mid = (lo + hi) / 2;
-
-    if (postings[lo].term.compareTo(postings[mid].term) > 0) {
-      Posting tmp = postings[lo];
-      postings[lo] = postings[mid];
-      postings[mid] = tmp;
     }
 
-    if (postings[mid].term.compareTo(postings[hi].term) > 0) {
-      Posting tmp = postings[mid];
-      postings[mid] = postings[hi];
-      postings[hi] = tmp;
-
-      if (postings[lo].term.compareTo(postings[mid].term) > 0) {
-        Posting tmp2 = postings[lo];
-        postings[lo] = postings[mid];
-        postings[mid] = tmp2;
-      }
+    public Map<String, Integer> getCommandPendingTasks()
+    {
+        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
+            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getPendingMessages());
+        return pendingTasks;
     }
 
-    int left = lo + 1;
-    int right = hi - 1;
-
-    if (left >= right)
-      return;
-
-    Term partition = postings[mid].term;
-
-    for (; ;) {
-      while (postings[right].term.compareTo(partition) > 0)
-        --right;
-
-      while (left < right && postings[left].term.compareTo(partition) <= 0)
-        ++left;
-
-      if (left < right) {
-        Posting tmp = postings[left];
-        postings[left] = postings[right];
-        postings[right] = tmp;
-        --right;
-      } else {
-        break;
-      }
+    public Map<String, Long> getCommandCompletedTasks()
+    {
+        Map<String, Long> completedTasks = new HashMap<String, Long>();
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
+            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getCompletedMesssages());
+        return completedTasks;
     }
 
-    quickSort(postings, lo, left);
-    quickSort(postings, left + 1, hi);
-  }
-
-  private final void writePostings(Posting[] postings, String segment)
-          throws IOException {
-    IndexOutput freq = null, prox = null;
-    TermInfosWriter tis = null;
-    TermVectorsWriter termVectorWriter = null;
-    try {
-      //open files for inverse index storage
-      freq = directory.createOutput(segment + ".frq");
-      prox = directory.createOutput(segment + ".prx");
-      tis = new TermInfosWriter(directory, segment, fieldInfos,
-                                termIndexInterval);
-      TermInfo ti = new TermInfo();
-      String currentField = null;
-
-      for (int i = 0; i < postings.length; i++) {
-        Posting posting = postings[i];
-
-        // add an entry to the dictionary with pointers to prox and freq files
-        ti.set(1, freq.getFilePointer(), prox.getFilePointer(), -1);
-        tis.add(posting.term, ti);
-
-        // add an entry to the freq file
-        int postingFreq = posting.freq;
-        if (postingFreq == 1)				  // optimize freq=1
-          freq.writeVInt(1);			  // set low bit of doc num.
-        else {
-          freq.writeVInt(0);			  // the document number
-          freq.writeVInt(postingFreq);			  // frequency in doc
-        }
-
-        int lastPosition = 0;			  // write positions
-        int[] positions = posting.positions;
-        for (int j = 0; j < postingFreq; j++) {		  // use delta-encoding
-          int position = positions[j];
-          prox.writeVInt(position - lastPosition);
-          lastPosition = position;
-        }
-        // check to see if we switched to a new field
-        String termField = posting.term.field();
-        if (currentField != termField) {
-          // changing field - see if there is something to save
-          currentField = termField;
-          FieldInfo fi = fieldInfos.fieldInfo(currentField);
-          if (fi.storeTermVector) {
-            if (termVectorWriter == null) {
-              termVectorWriter =
-                new TermVectorsWriter(directory, segment, fieldInfos);
-              termVectorWriter.openDocument();
-            }
-            termVectorWriter.openField(currentField);
-
-          } else if (termVectorWriter != null) {
-            termVectorWriter.closeField();
-          }
-        }
-        if (termVectorWriter != null && termVectorWriter.isFieldOpen()) {
-            termVectorWriter.addTerm(posting.term.text(), postingFreq, posting.positions, posting.offsets);
-        }
-      }
-      if (termVectorWriter != null)
-        termVectorWriter.closeDocument();
-    } finally {
-      // make an effort to close all streams we can but remember and re-throw
-      // the first exception encountered in this process
-      IOException keep = null;
-      if (freq != null) try { freq.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (prox != null) try { prox.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (tis  != null) try {  tis.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (termVectorWriter  != null) try {  termVectorWriter.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (keep != null) throw (IOException) keep.fillInStackTrace();
+    public Map<String, Integer> getResponsePendingTasks()
+    {
+        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
+            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getPendingMessages());
+        return pendingTasks;
     }
-  }
 
-  private final void writeNorms(String segment) throws IOException { 
-    for(int n = 0; n < fieldInfos.size(); n++){
-      FieldInfo fi = fieldInfos.fieldInfo(n);
-      if(fi.isIndexed && !fi.omitNorms){
-        float norm = fieldBoosts[n] * similarity.lengthNorm(fi.name, fieldLengths[n]);
-        IndexOutput norms = directory.createOutput(segment + ".f" + n);
-        try {
-          norms.writeByte(Similarity.encodeNorm(norm));
-        } finally {
-          norms.close();
-        }
-      }
+    public Map<String, Long> getResponseCompletedTasks()
+    {
+        Map<String, Long> completedTasks = new HashMap<String, Long>();
+        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
+            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getCompletedMesssages());
+        return completedTasks;
     }
-  }
-  
-  /** If non-null, a message will be printed to this if maxFieldLength is reached.
-   */
-  void setInfoStream(PrintStream infoStream) {
-    this.infoStream = infoStream;
-  }
-
-}
-
-final class Posting {				  // info about a Term in a doc
-  Term term;					  // the Term
-  int freq;					  // its frequency in doc
-  int[] positions;				  // positions it occurs at
-  TermVectorOffsetInfo [] offsets;
-
-  Posting(Term t, int position, TermVectorOffsetInfo offset) {
-    term = t;
-    freq = 1;
-    positions = new int[1];
-    positions[0] = position;
-    if(offset != null){
-    offsets = new TermVectorOffsetInfo[1];
-    offsets[0] = offset;
-    }
-    else
-      offsets = null;
-  }
 }

@@ -1,8 +1,8 @@
-List<ModelNode> operations = xmlToModelOperations(xml, Namespace.RESOURCEADAPTERS_1_0.getUriString(), new ResourceAdapterSubsystemParser());
+Resource resource = ctx.readResourceFromRoot(address);
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2010, Red Hat, Inc., and individual contributors
+ * Copyright 2011, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -21,108 +21,150 @@ List<ModelNode> operations = xmlToModelOperations(xml, Namespace.RESOURCEADAPTER
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.jboss.as.test.smoke.deployment.rar.tests.multiobjectpartialactivation;
 
-import java.io.IOException;
-import java.util.List;
+package org.jboss.as.controller;
 
-import javax.annotation.Resource;
+import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
 
-import org.jboss.arquillian.container.test.api.Deployment;
-import org.jboss.arquillian.junit.Arquillian;
-import org.jboss.as.arquillian.api.ServerSetup;
-import org.jboss.as.arquillian.container.ManagementClient;
-import org.jboss.as.connector.subsystems.resourceadapters.Namespace;
-import org.jboss.as.connector.subsystems.resourceadapters.ResourceAdapterSubsystemParser;
-import org.jboss.as.test.integration.management.base.AbstractMgmtServerSetupTask;
-import org.jboss.as.test.integration.management.base.AbstractMgmtTestBase;
-import org.jboss.as.test.integration.management.base.ContainerResourceMgmtTestBase;
-import org.jboss.as.test.integration.management.util.MgmtOperationException;
-import org.jboss.as.test.shared.FileUtils;
-import org.jboss.as.test.smoke.deployment.rar.MultipleAdminObject1;
-import org.jboss.as.test.smoke.deployment.rar.MultipleConnectionFactory1;
+import java.util.NoSuchElementException;
+
+import org.jboss.as.controller.operations.common.Util;
+import org.jboss.as.controller.operations.validation.ParameterValidator;
+import org.jboss.as.controller.registry.Resource;
 import org.jboss.dmr.ModelNode;
-import org.jboss.shrinkwrap.api.ShrinkWrap;
-import org.jboss.shrinkwrap.api.asset.StringAsset;
-import org.jboss.shrinkwrap.api.spec.JavaArchive;
-import org.jboss.shrinkwrap.api.spec.ResourceAdapterArchive;
-import org.jboss.staxmapper.XMLElementReader;
-import org.jboss.staxmapper.XMLElementWriter;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-
-import static org.junit.Assert.assertNotNull;
-
+import org.jboss.msc.service.ServiceController;
+import org.jboss.msc.service.ServiceName;
 
 /**
- * @author <a href="vrastsel@redhat.com">Vladimir Rastseluev</a>
- *         JBQA-5739 multiple object activation (partial)
+ * Simple {@link org.jboss.as.controller.AbstractWriteAttributeHandler} that, if allowed,
+ * restarts a parent resource when a change is made. Otherwise the server is put into a forced reload.
+ *
+ * @author Jason T. Greene.
  */
-@RunWith(Arquillian.class)
-@ServerSetup(MultipleObjectPartialActivationTestCase.MultipleObjectPartialActivationTestCaseSetup.class)
-public class MultipleObjectPartialActivationTestCase extends ContainerResourceMgmtTestBase {
+public abstract class RestartParentWriteAttributeHandler extends AbstractWriteAttributeHandler<ModelNode> {
+    private final String parentKeyName;
 
-    static class MultipleObjectPartialActivationTestCaseSetup extends AbstractMgmtServerSetupTask {
+    public RestartParentWriteAttributeHandler(String parentKeyName) {
+        this.parentKeyName = parentKeyName;
+    }
 
-        @Override
-        public void doSetup(final ManagementClient managementClient) throws Exception{
-                String xml = FileUtils.readFile(MultipleObjectPartialActivationTestCase.class, "multiple_part.xml");
-                List<ModelNode> operations = xmlToModelOperations(xml, Namespace.CURRENT.getUriString(), new ResourceAdapterSubsystemParser());
-                executeOperation(operationListToCompositeOperation(operations));
+    public RestartParentWriteAttributeHandler(String parentKeyName, ParameterValidator validator) {
+        super(validator);
+        this.parentKeyName = parentKeyName;
+
+    }
+
+    public RestartParentWriteAttributeHandler(String parentKeyName, AttributeDefinition... definitions) {
+        super(definitions);
+        this.parentKeyName = parentKeyName;
+    }
+
+    public RestartParentWriteAttributeHandler(String parentKeyName, ParameterValidator unresolvedValidator, ParameterValidator resolvedValidator) {
+        super(unresolvedValidator, resolvedValidator);
+        this.parentKeyName = parentKeyName;
+    }
+
+    @Override
+    protected boolean applyUpdateToRuntime(OperationContext context, ModelNode operation, String attributeName, ModelNode resolvedValue, ModelNode currentValue, HandbackHolder<ModelNode> handbackHolder) throws OperationFailedException {
+
+        PathAddress address = getParentAddress(PathAddress.pathAddress(operation.require(OP_ADDR)));
+        ServiceName serviceName = getParentServiceName(address);
+        ServiceController<?> service = serviceName != null ?
+                             context.getServiceRegistry(false).getService(serviceName) : null;
+
+        // No parent service, nothing to do
+        if (service == null) {
+            return false;
         }
 
-        @Override
-        public void tearDown(final ManagementClient managementClient, final String containerId) throws IOException, MgmtOperationException {
+        boolean restartServices = isResourceServiceRestartAllowed(context, service);
 
-            final ModelNode address = new ModelNode();
-            address.add("subsystem", "resource-adapters");
-            address.add("resource-adapter", "archive_multi_partial.rar");
-            address.protect();
-            remove(address);
+        if (restartServices) {
+            ModelNode parentModel = getModel(context, address);
+            if (parentModel != null && context.markResourceRestarted(address, this)) {
+                removeServices(context, serviceName, parentModel);
+                final ServiceVerificationHandler verificationHandler = new ServiceVerificationHandler();
+                recreateParentService(context, address, parentModel, verificationHandler);
+                context.addStep(verificationHandler, OperationContext.Stage.VERIFY);
+                handbackHolder.setHandback(parentModel);
+            }
         }
+
+        // Fall back to server wide reload
+        return !restartServices;
     }
 
     /**
-     * Define the deployment
+     * Gets whether a restart of the parent resource's services is allowed. This default implementation
+     * checks whether {@link OperationContext#isResourceServiceRestartAllowed() the context allows resource service restarts};
+     * subclasses could also check the state of the {@code service}.
      *
-     * @return The deployment archive
+     * @param context the operation context
+     * @param service the parent service
+     * @return {@code true} if a restart is allowed; {@code false}
      */
-    @Deployment
-    public static ResourceAdapterArchive createDeployment() throws Exception {
-        String deploymentName = "archive_multi_partial.rar";
-
-        ResourceAdapterArchive raa =
-                ShrinkWrap.create(ResourceAdapterArchive.class, deploymentName);
-        JavaArchive ja = ShrinkWrap.create(JavaArchive.class, "multiple.jar");
-        ja.addPackage(MultipleConnectionFactory1.class.getPackage()).
-                addClasses(MultipleObjectPartialActivationTestCase.class, AbstractMgmtTestBase.class, MgmtOperationException.class, XMLElementReader.class, XMLElementWriter.class, MultipleObjectPartialActivationTestCaseSetup.class, AbstractMgmtServerSetupTask.class );
-
-        ja.addPackage(AbstractMgmtTestBase.class.getPackage());
-        raa.addAsLibrary(ja);
-
-        raa.addAsManifestResource(MultipleObjectPartialActivationTestCase.class.getPackage(), "ra.xml", "ra.xml")
-                .addAsManifestResource(new StringAsset("Dependencies: org.jboss.as.controller-client,org.jboss.dmr,org.jboss.as.cli\n"), "MANIFEST.MF");
-
-        //org.apache.httpcomponents,
-        return raa;
+    protected boolean isResourceServiceRestartAllowed(final OperationContext context, final ServiceController<?> service) {
+        return context.isResourceServiceRestartAllowed();
     }
 
-    @Resource(mappedName = "java:jboss/name1")
-    private MultipleConnectionFactory1 connectionFactory1;
-
-
-    @Resource(mappedName = "java:jboss/Name3")
-    private MultipleAdminObject1 adminObject1;
-
-
     /**
-     * Test configuration
+     * Removes services. This default implementation simply
+     * {@link OperationContext#removeService(ServiceController) instructs the context to remove the parentService}.
+     * Subclasses could use the provided {@code parentModel} to identify and remove other services.
      *
-     * @throws Throwable Thrown if case of an error
+     * @param context the operation context
+     * @param parentService the name of the parent service
+     * @param parentModel the model associated with the parent resource, including nodes for any child resources
+     *
+     * @throws OperationFailedException if there is a problem removing the services
      */
-    @Test
-    public void testConfiguration() throws Throwable {
-        assertNotNull("CF1 not found", connectionFactory1);
-        assertNotNull("AO1 not found", adminObject1);
+    protected void removeServices(final OperationContext context, final ServiceName parentService, final ModelNode parentModel) throws OperationFailedException {
+        context.removeService(parentService);
+    }
+
+    protected abstract void recreateParentService(OperationContext context, PathAddress parentAddress, ModelNode parentModel, ServiceVerificationHandler verificationHandler) throws OperationFailedException;
+
+    protected abstract ServiceName getParentServiceName(PathAddress parentAddress);
+
+
+    protected PathAddress getParentAddress(PathAddress address) {
+        return Util.getParentAddressByKey(address, parentKeyName);
+    }
+
+
+    @Override
+    protected void revertUpdateToRuntime(OperationContext context, ModelNode operation, String attributeName, ModelNode valueToRestore, ModelNode resolvedValue, ModelNode invalidatedParentModel) throws OperationFailedException {
+
+        if (invalidatedParentModel == null) {
+            // We didn't restart services, so no need to revert
+            return;
+        }
+
+        PathAddress address = getParentAddress(PathAddress.pathAddress(operation.require(OP_ADDR)));
+        ServiceName serviceName = getParentServiceName(address);
+
+        ModelNode parentModel = getOriginalModel(context, address);
+        if (parentModel != null && context.revertResourceRestarted(address, this)) {
+            removeServices(context, serviceName, invalidatedParentModel);
+            recreateParentService(context, address, parentModel, null);
+        }
+    }
+
+    private ModelNode getModel(OperationContext ctx, PathAddress address) {
+        try {
+            Resource resource = ctx.getRootResource().navigate(address);
+            return Resource.Tools.readModel(resource);
+        } catch (NoSuchElementException e) {
+            return null;
+        }
+    }
+
+    private ModelNode getOriginalModel(OperationContext ctx, PathAddress address) {
+        try {
+            Resource resource = ctx.getOriginalRootResource().navigate(address);
+            return Resource.Tools.readModel(resource);
+        } catch (NoSuchElementException e) {
+            return null;
+        }
     }
 }

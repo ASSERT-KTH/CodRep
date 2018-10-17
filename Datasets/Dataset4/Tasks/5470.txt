@@ -1,4 +1,4 @@
-request.index(metaData.concreteSingleIndex(request.index(), request.indicesOptions()));
+private static final String DEFAULT_BREAKER_LIMIT = "60%";
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,236 +18,107 @@ request.index(metaData.concreteSingleIndex(request.index(), request.indicesOptio
  * specific language governing permissions and limitations
  * under the License.
  */
+package org.elasticsearch.indices.fielddata.breaker;
 
-package org.elasticsearch.action.index;
-
-import org.elasticsearch.ExceptionsHelper;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.RoutingMissingException;
-import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
-import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
-import org.elasticsearch.action.admin.indices.create.TransportCreateIndexAction;
-import org.elasticsearch.action.support.ActionFilters;
-import org.elasticsearch.action.support.AutoCreateIndex;
-import org.elasticsearch.action.support.replication.TransportShardReplicationOperationAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.action.index.MappingUpdatedAction;
-import org.elasticsearch.cluster.action.shard.ShardStateAction;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
-import org.elasticsearch.cluster.metadata.IndexMetaData;
-import org.elasticsearch.cluster.metadata.MappingMetaData;
-import org.elasticsearch.cluster.metadata.MetaData;
-import org.elasticsearch.cluster.routing.ShardIterator;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.common.breaker.MemoryCircuitBreaker;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.engine.Engine;
-import org.elasticsearch.index.mapper.SourceToParse;
-import org.elasticsearch.index.service.IndexService;
-import org.elasticsearch.index.shard.service.IndexShard;
-import org.elasticsearch.indices.IndexAlreadyExistsException;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.node.settings.NodeSettingsService;
 
 /**
- * Performs the index operation.
- * <p/>
- * <p>Allows for the following settings:
- * <ul>
- * <li><b>autoCreateIndex</b>: When set to <tt>true</tt>, will automatically create an index if one does not exists.
- * Defaults to <tt>true</tt>.
- * <li><b>allowIdGeneration</b>: If the id is set not, should it be generated. Defaults to <tt>true</tt>.
- * </ul>
+ * The InternalCircuitBreakerService handles providing
+ * {@link org.elasticsearch.common.breaker.MemoryCircuitBreaker}s
+ * that can be used to keep track of memory usage across the node, preventing
+ * actions that could cause an {@link OutOfMemoryError} on the node.
  */
-public class TransportIndexAction extends TransportShardReplicationOperationAction<IndexRequest, IndexRequest, IndexResponse> {
+public class InternalCircuitBreakerService extends AbstractLifecycleComponent<InternalCircuitBreakerService> implements CircuitBreakerService {
 
-    private final AutoCreateIndex autoCreateIndex;
+    public static final String CIRCUIT_BREAKER_MAX_BYTES_SETTING = "indices.fielddata.breaker.limit";
+    public static final String CIRCUIT_BREAKER_OVERHEAD_SETTING = "indices.fielddata.breaker.overhead";
 
-    private final boolean allowIdGeneration;
+    public static final double DEFAULT_OVERHEAD_CONSTANT = 1.03;
+    private static final String DEFAULT_BREAKER_LIMIT = "80%";
 
-    private final TransportCreateIndexAction createIndexAction;
-
-    private final MappingUpdatedAction mappingUpdatedAction;
+    private volatile MemoryCircuitBreaker breaker;
+    private volatile long maxBytes;
+    private volatile double overhead;
 
     @Inject
-    public TransportIndexAction(Settings settings, TransportService transportService, ClusterService clusterService,
-                                IndicesService indicesService, ThreadPool threadPool, ShardStateAction shardStateAction,
-                                TransportCreateIndexAction createIndexAction, MappingUpdatedAction mappingUpdatedAction, ActionFilters actionFilters) {
-        super(settings, IndexAction.NAME, transportService, clusterService, indicesService, threadPool, shardStateAction, actionFilters);
-        this.createIndexAction = createIndexAction;
-        this.mappingUpdatedAction = mappingUpdatedAction;
-        this.autoCreateIndex = new AutoCreateIndex(settings);
-        this.allowIdGeneration = settings.getAsBoolean("action.allow_id_generation", true);
+    public InternalCircuitBreakerService(Settings settings, NodeSettingsService nodeSettingsService) {
+        super(settings);
+        this.maxBytes = settings.getAsMemory(CIRCUIT_BREAKER_MAX_BYTES_SETTING, DEFAULT_BREAKER_LIMIT).bytes();
+        this.overhead = settings.getAsDouble(CIRCUIT_BREAKER_OVERHEAD_SETTING, DEFAULT_OVERHEAD_CONSTANT);
+
+        this.breaker = new MemoryCircuitBreaker(new ByteSizeValue(maxBytes), overhead, null, logger);
+
+        nodeSettingsService.addListener(new ApplySettings());
     }
 
-    @Override
-    protected void doExecute(final IndexRequest request, final ActionListener<IndexResponse> listener) {
-        // if we don't have a master, we don't have metadata, that's fine, let it find a master using create index API
-        if (autoCreateIndex.shouldAutoCreate(request.index(), clusterService.state())) {
-            request.beforeLocalFork(); // we fork on another thread...
-            createIndexAction.execute(new CreateIndexRequest(request.index()).cause("auto(index api)").masterNodeTimeout(request.timeout()), new ActionListener<CreateIndexResponse>() {
-                @Override
-                public void onResponse(CreateIndexResponse result) {
-                    innerExecute(request, listener);
-                }
+    class ApplySettings implements NodeSettingsService.Listener {
+        @Override
+        public void onRefreshSettings(Settings settings) {
+            // clear breaker now that settings have changed
+            long newMaxByteSizeValue = settings.getAsMemory(CIRCUIT_BREAKER_MAX_BYTES_SETTING, Long.toString(maxBytes)).bytes();
+            boolean breakerResetNeeded = false;
 
-                @Override
-                public void onFailure(Throwable e) {
-                    if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
-                        // we have the index, do it
-                        try {
-                            innerExecute(request, listener);
-                        } catch (Throwable e1) {
-                            listener.onFailure(e1);
-                        }
-                    } else {
-                        listener.onFailure(e);
-                    }
-                }
-            });
-        } else {
-            innerExecute(request, listener);
-        }
-    }
+            if (newMaxByteSizeValue != maxBytes) {
+                logger.info("updating [{}] from [{}]({}) to [{}]({})", CIRCUIT_BREAKER_MAX_BYTES_SETTING,
+                        InternalCircuitBreakerService.this.maxBytes, new ByteSizeValue(InternalCircuitBreakerService.this.maxBytes),
+                        newMaxByteSizeValue, new ByteSizeValue(newMaxByteSizeValue));
+                maxBytes = newMaxByteSizeValue;
+                breakerResetNeeded = true;
+            }
 
-    @Override
-    protected boolean resolveRequest(ClusterState state, IndexRequest request, ActionListener<IndexResponse> indexResponseActionListener) {
-        MetaData metaData = clusterService.state().metaData();
-        String aliasOrIndex = request.index();
-        request.index(metaData.concreteSingleIndex(request.index()));
-        MappingMetaData mappingMd = null;
-        if (metaData.hasIndex(request.index())) {
-            mappingMd = metaData.index(request.index()).mappingOrDefault(request.type());
-        }
-        request.process(metaData, aliasOrIndex, mappingMd, allowIdGeneration);
-        return true;
-    }
+            double newOverhead = settings.getAsDouble(CIRCUIT_BREAKER_OVERHEAD_SETTING, overhead);
+            if (newOverhead != overhead) {
+                logger.info("updating [{}] from [{}] to [{}]", CIRCUIT_BREAKER_OVERHEAD_SETTING,
+                        overhead, newOverhead);
+                overhead = newOverhead;
+                breakerResetNeeded = true;
+            }
 
-    private void innerExecute(final IndexRequest request, final ActionListener<IndexResponse> listener) {
-        super.doExecute(request, listener);
-    }
-
-    @Override
-    protected boolean checkWriteConsistency() {
-        return true;
-    }
-
-    @Override
-    protected IndexRequest newRequestInstance() {
-        return new IndexRequest();
-    }
-
-    @Override
-    protected IndexRequest newReplicaRequestInstance() {
-        return new IndexRequest();
-    }
-
-    @Override
-    protected IndexResponse newResponseInstance() {
-        return new IndexResponse();
-    }
-
-    @Override
-    protected String executor() {
-        return ThreadPool.Names.INDEX;
-    }
-
-    @Override
-    protected ClusterBlockException checkGlobalBlock(ClusterState state, IndexRequest request) {
-        return state.blocks().globalBlockedException(ClusterBlockLevel.WRITE);
-    }
-
-    @Override
-    protected ClusterBlockException checkRequestBlock(ClusterState state, IndexRequest request) {
-        return state.blocks().indexBlockedException(ClusterBlockLevel.WRITE, request.index());
-    }
-
-    @Override
-    protected ShardIterator shards(ClusterState clusterState, IndexRequest request) {
-        return clusterService.operationRouting()
-                .indexShards(clusterService.state(), request.index(), request.type(), request.id(), request.routing());
-    }
-
-    @Override
-    protected PrimaryResponse<IndexResponse, IndexRequest> shardOperationOnPrimary(ClusterState clusterState, PrimaryOperationRequest shardRequest) {
-        final IndexRequest request = shardRequest.request;
-
-        // validate, if routing is required, that we got routing
-        IndexMetaData indexMetaData = clusterState.metaData().index(request.index());
-        MappingMetaData mappingMd = indexMetaData.mappingOrDefault(request.type());
-        if (mappingMd != null && mappingMd.routing().required()) {
-            if (request.routing() == null) {
-                throw new RoutingMissingException(request.index(), request.type(), request.id());
+            if (breakerResetNeeded) {
+                resetBreaker();
             }
         }
+    }
 
-        IndexService indexService = indicesService.indexServiceSafe(shardRequest.request.index());
-        IndexShard indexShard = indexService.shardSafe(shardRequest.shardId);
-        SourceToParse sourceToParse = SourceToParse.source(SourceToParse.Origin.PRIMARY, request.source()).type(request.type()).id(request.id())
-                .routing(request.routing()).parent(request.parent()).timestamp(request.timestamp()).ttl(request.ttl());
-        long version;
-        boolean created;
-        Engine.IndexingOperation op;
-        if (request.opType() == IndexRequest.OpType.INDEX) {
-            Engine.Index index = indexShard.prepareIndex(sourceToParse, request.version(), request.versionType(), Engine.Operation.Origin.PRIMARY, request.canHaveDuplicates());
-            if (index.parsedDoc().mappingsModified()) {
-                mappingUpdatedAction.updateMappingOnMaster(request.index(), index.docMapper(), indexService.indexUUID());
-            }
-            indexShard.index(index);
-            version = index.version();
-            op = index;
-            created = index.created();
-        } else {
-            Engine.Create create = indexShard.prepareCreate(sourceToParse,
-                    request.version(), request.versionType(), Engine.Operation.Origin.PRIMARY, request.canHaveDuplicates(), request.autoGeneratedId());
-            if (create.parsedDoc().mappingsModified()) {
-                mappingUpdatedAction.updateMappingOnMaster(request.index(), create.docMapper(), indexService.indexUUID());
-            }
-            indexShard.create(create);
-            version = create.version();
-            op = create;
-            created = true;
-        }
-        if (request.refresh()) {
-            try {
-                indexShard.refresh(new Engine.Refresh("refresh_flag_index").force(false));
-            } catch (Throwable e) {
-                // ignore
-            }
-        }
+    /**
+     * @return a {@link org.elasticsearch.common.breaker.MemoryCircuitBreaker} that can be used for aggregating memory usage
+     */
+    public MemoryCircuitBreaker getBreaker() {
+        return this.breaker;
+    }
 
-        // update the version on the request, so it will be used for the replicas
-        request.version(version);
-        request.versionType(request.versionType().versionTypeForReplicationAndRecovery());
-
-        assert request.versionType().validateVersionForWrites(request.version());
-
-        IndexResponse response = new IndexResponse(request.index(), request.type(), request.id(), version, created);
-        return new PrimaryResponse<>(shardRequest.request, response, op);
+    /**
+     * Reset the breaker, creating a new one and initializing its used value
+     * to the actual field data usage, or the existing estimated usage if the
+     * actual value is not available. Will not trip the breaker even if the
+     * used value is higher than the limit for the breaker.
+     */
+    public synchronized void resetBreaker() {
+        final MemoryCircuitBreaker oldBreaker = this.breaker;
+        // discard old breaker by creating a new one and pre-populating from the current breaker
+        this.breaker = new MemoryCircuitBreaker(new ByteSizeValue(maxBytes), overhead, oldBreaker, logger);
     }
 
     @Override
-    protected void shardOperationOnReplica(ReplicaOperationRequest shardRequest) {
-        IndexShard indexShard = indicesService.indexServiceSafe(shardRequest.request.index()).shardSafe(shardRequest.shardId);
-        IndexRequest request = shardRequest.request;
-        SourceToParse sourceToParse = SourceToParse.source(SourceToParse.Origin.REPLICA, request.source()).type(request.type()).id(request.id())
-                .routing(request.routing()).parent(request.parent()).timestamp(request.timestamp()).ttl(request.ttl());
-        if (request.opType() == IndexRequest.OpType.INDEX) {
-            Engine.Index index = indexShard.prepareIndex(sourceToParse, request.version(), request.versionType(), Engine.Operation.Origin.REPLICA, request.canHaveDuplicates());
-            indexShard.index(index);
-        } else {
-            Engine.Create create = indexShard.prepareCreate(sourceToParse,
-                    request.version(), request.versionType(), Engine.Operation.Origin.REPLICA, request.canHaveDuplicates(), request.autoGeneratedId());
-            indexShard.create(create);
-        }
-        if (request.refresh()) {
-            try {
-                indexShard.refresh(new Engine.Refresh("refresh_flag_index").force(false));
-            } catch (Exception e) {
-                // ignore
-            }
-        }
+    public FieldDataBreakerStats stats() {
+        return new FieldDataBreakerStats(breaker.getMaximum(), breaker.getUsed(), breaker.getOverhead());
+    }
+
+    @Override
+    protected void doStart() throws ElasticsearchException {
+    }
+
+    @Override
+    protected void doStop() throws ElasticsearchException {
+    }
+
+    @Override
+    protected void doClose() throws ElasticsearchException {
     }
 }

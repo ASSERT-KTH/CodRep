@@ -1,8 +1,8 @@
-indexWriter.shutdown();
+import org.apache.lucene.search.IndexSearcher; // javadocs
 
-package org.apache.lucene.demo.facet;
+package org.apache.lucene.search;
 
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,121 +19,200 @@ package org.apache.lucene.demo.facet;
  * limitations under the License.
  */
 
+import java.io.Closeable;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 
-import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.facet.FacetField;
-import org.apache.lucene.facet.FacetResult;
-import org.apache.lucene.facet.Facets;
-import org.apache.lucene.facet.FacetsCollector;
-import org.apache.lucene.facet.FacetsConfig;
-import org.apache.lucene.facet.taxonomy.FastTaxonomyFacetCounts;
-import org.apache.lucene.facet.taxonomy.TaxonomyReader;
-import org.apache.lucene.facet.taxonomy.directory.DirectoryTaxonomyReader;
-import org.apache.lucene.facet.taxonomy.directory.DirectoryTaxonomyWriter;
-import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.NRTManager; // javadocs
 import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.RAMDirectory;
 
-/** Demonstrates indexing categories into different indexed fields. */
-public class MultiCategoryListsFacetsExample {
+/** Utility class to safely share {@link IndexSearcher} instances
+ *  across multiple threads, while periodically reopening.
+ *  This class ensures each IndexSearcher instance is not
+ *  closed until it is no longer needed.
+ *
+ *  <p>Use {@link #acquire} to obtain the current searcher, and
+ *  {@link #release} to release it, like this:
+ *
+ *  <pre>
+ *    IndexSearcher s = manager.acquire();
+ *    try {
+ *      // Do searching, doc retrieval, etc. with s
+ *    } finally {
+ *      manager.release(s);
+ *    }
+ *    // Do not use s after this!
+ *    s = null;
+ *  </pre>
+ *
+ *  <p>In addition you should periodically call {@link
+ *  #maybeReopen}.  While it's possible to call this just
+ *  before running each query, this is discouraged since it
+ *  penalizes the unlucky queries that do the reopen.  It's
+ *  better to  use a separate background thread, that
+ *  periodically calls maybeReopen.  Finally, be sure to
+ *  call {@link #close} once you are done.
+ *
+ *  <p><b>NOTE</b>: if you have an {@link IndexWriter}, it's
+ *  better to use {@link NRTManager} since that class pulls
+ *  near-real-time readers from the IndexWriter.
+ *
+ *  @lucene.experimental
+ */
 
-  private final Directory indexDir = new RAMDirectory();
-  private final Directory taxoDir = new RAMDirectory();
-  private final FacetsConfig config = new FacetsConfig();
+public class SearcherManager implements Closeable {
 
-  /** Creates a new instance and populates the catetory list params mapping. */
-  public MultiCategoryListsFacetsExample() {
-    config.setIndexFieldName("Author", "author");
-    config.setIndexFieldName("Publish Date", "pubdate");
-    config.setHierarchical("Publish Date", true);
+  // Current searcher
+  private volatile IndexSearcher currentSearcher;
+  private final SearcherWarmer warmer;
+  private final Semaphore reopening = new Semaphore(1);
+  private final ExecutorService es;
+
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer) throws IOException {
+    this(dir, warmer, null);
   }
 
-  /** Build the example index. */
-  private void index() throws IOException {
-    IndexWriter indexWriter = new IndexWriter(indexDir, new IndexWriterConfig(FacetExamples.EXAMPLES_VER, 
-        new WhitespaceAnalyzer(FacetExamples.EXAMPLES_VER)));
-
-    // Writes facet ords to a separate directory from the main index
-    DirectoryTaxonomyWriter taxoWriter = new DirectoryTaxonomyWriter(taxoDir);
-
-    Document doc = new Document();
-    doc.add(new FacetField("Author", "Bob"));
-    doc.add(new FacetField("Publish Date", "2010", "10", "15"));
-    indexWriter.addDocument(config.build(taxoWriter, doc));
-
-    doc = new Document();
-    doc.add(new FacetField("Author", "Lisa"));
-    doc.add(new FacetField("Publish Date", "2010", "10", "20"));
-    indexWriter.addDocument(config.build(taxoWriter, doc));
-
-    doc = new Document();
-    doc.add(new FacetField("Author", "Lisa"));
-    doc.add(new FacetField("Publish Date", "2012", "1", "1"));
-    indexWriter.addDocument(config.build(taxoWriter, doc));
-
-    doc = new Document();
-    doc.add(new FacetField("Author", "Susan"));
-    doc.add(new FacetField("Publish Date", "2012", "1", "7"));
-    indexWriter.addDocument(config.build(taxoWriter, doc));
-
-    doc = new Document();
-    doc.add(new FacetField("Author", "Frank"));
-    doc.add(new FacetField("Publish Date", "1999", "5", "5"));
-    indexWriter.addDocument(config.build(taxoWriter, doc));
-    
-    indexWriter.close();
-    taxoWriter.close();
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   * @param es optional ExecutorService so different segments can
+   *        be searched concurrently (see {@link
+   *        IndexSearcher#IndexSearcher(IndexReader,ExecutorService)}.  Pass null
+   *        to search segments sequentially.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer, ExecutorService es) throws IOException {
+    this.es = es;
+    currentSearcher = new IndexSearcher(IndexReader.open(dir), this.es);
+    this.warmer = warmer;
   }
 
-  /** User runs a query and counts facets. */
-  private List<FacetResult> search() throws IOException {
-    DirectoryReader indexReader = DirectoryReader.open(indexDir);
-    IndexSearcher searcher = new IndexSearcher(indexReader);
-    TaxonomyReader taxoReader = new DirectoryTaxonomyReader(taxoDir);
+  /** You must call this, periodically, to perform a
+   *  reopen.  This calls {@link IndexReader#reopen} on the
+   *  underlying reader, and if that returns a new reader,
+   *  it's warmed (if you provided a {@link SearcherWarmer}
+   *  and then swapped into production.
+   *
+   *  <p><b>Threads</b>: it's fine for more than one thread to
+   *  call this at once.  Only the first thread will attempt
+   *  the reopen; subsequent threads will see that another
+   *  thread is already handling reopen and will return
+   *  immediately.  Note that this means if another thread
+   *  is already reopening then subsequent threads will
+   *  return right away without waiting for the reader
+   *  reopen to complete.</p>
+   *
+   *  <p>This method returns true if a new reader was in
+   *  fact opened.</p>
+   */
+  public boolean maybeReopen()
+    throws  IOException {
 
-    FacetsCollector fc = new FacetsCollector();
+    if (currentSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
 
-    // MatchAllDocsQuery is for "browsing" (counts facets
-    // for all non-deleted docs in the index); normally
-    // you'd use a "normal" query:
-    FacetsCollector.search(searcher, new MatchAllDocsQuery(), 10, fc);
-
-    // Retrieve results
-    List<FacetResult> results = new ArrayList<>();
-
-    // Count both "Publish Date" and "Author" dimensions
-    Facets author = new FastTaxonomyFacetCounts("author", taxoReader, config, fc);
-    results.add(author.getTopChildren(10, "Author"));
-
-    Facets pubDate = new FastTaxonomyFacetCounts("pubdate", taxoReader, config, fc);
-    results.add(pubDate.getTopChildren(10, "Publish Date"));
-    
-    indexReader.close();
-    taxoReader.close();
-    
-    return results;
+    // Ensure only 1 thread does reopen at once; other
+    // threads just return immediately:
+    if (reopening.tryAcquire()) {
+      try {
+        IndexReader newReader = currentSearcher.getIndexReader().reopen();
+        if (newReader != currentSearcher.getIndexReader()) {
+          IndexSearcher newSearcher = new IndexSearcher(newReader, es);
+          boolean success = false;
+          try {
+            if (warmer != null) {
+              warmer.warm(newSearcher);
+            }
+            swapSearcher(newSearcher);
+            success = true;
+          } finally {
+            if (!success) {
+              release(newSearcher);
+            }
+          }
+          return true;
+        } else {
+          return false;
+        }
+      } finally {
+        reopening.release();
+      }
+    } else {
+      return false;
+    }
   }
 
-  /** Runs the search example. */
-  public List<FacetResult> runSearch() throws IOException {
-    index();
-    return search();
+  /** Obtain the current IndexSearcher.  You must match
+   *  every call to acquire with one call to {@link #release};
+   *  it's best to do so in a finally clause. */
+  public IndexSearcher acquire() {
+    IndexSearcher searcher;
+    do {
+      if ((searcher = currentSearcher) == null) {
+        throw new AlreadyClosedException("this SearcherManager is closed");
+      }
+    } while (!searcher.getIndexReader().tryIncRef());
+    return searcher;
+  }    
+
+  /** Release the searcher previously obtained with {@link
+   *  #acquire}.
+   *
+   *  <p><b>NOTE</b>: it's safe to call this after {@link
+   *  #close}. */
+  public void release(IndexSearcher searcher)
+    throws IOException {
+    searcher.getIndexReader().decRef();
   }
-  
-  /** Runs the search example and prints the results. */
-  public static void main(String[] args) throws Exception {
-    System.out.println("Facet counting over multiple category lists example:");
-    System.out.println("-----------------------");
-    List<FacetResult> results = new MultiCategoryListsFacetsExample().runSearch();
-    System.out.println("Author: " + results.get(0));
-    System.out.println("Publish Date: " + results.get(1));
+
+  // Replaces old searcher with new one - needs to be synced to make close() work
+  private synchronized void swapSearcher(IndexSearcher newSearcher)
+    throws IOException {
+    IndexSearcher oldSearcher = currentSearcher;
+    if (oldSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
+    currentSearcher = newSearcher;
+    release(oldSearcher);
+  }
+
+  /** Close this SearcherManager to future searching.  Any
+   *  searches still in process in other threads won't be
+   *  affected, and they should still call {@link #release}
+   *  after they are done. */
+  // Not in Java 5: @Override
+  public synchronized void close() throws IOException {
+    if (currentSearcher != null) {
+      // make sure we can call this more than once
+      // closeable javadoc says:
+      //   if this is already closed then invoking this method has no effect.
+      swapSearcher(null);
+    }
   }
 }

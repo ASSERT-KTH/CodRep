@@ -1,228 +1,490 @@
-{"1.5", "1.6", "1.7"};
+syncStrategy = new SyncStrategy(cc);
 
-/*
-
-   Derby - Class org.apache.derby.client.am.Configuration
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to You under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
-*/
-
-package org.apache.derby.client.am;
+package org.apache.solr.cloud;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.security.AccessController;
-import java.security.PrivilegedExceptionAction;
+import java.util.Map;
 
-import org.apache.derby.iapi.services.info.ProductGenusNames;
-import org.apache.derby.iapi.services.info.ProductVersionHolder;
-import org.apache.derby.shared.common.reference.SQLState;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.cloud.ClusterState;
+import org.apache.solr.common.cloud.Replica;
+import org.apache.solr.common.cloud.Slice;
+import org.apache.solr.common.cloud.SolrZkClient;
+import org.apache.solr.common.cloud.ZkCmdExecutor;
+import org.apache.solr.common.cloud.ZkCoreNodeProps;
+import org.apache.solr.common.cloud.ZkNodeProps;
+import org.apache.solr.common.cloud.ZkStateReader;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.update.UpdateLog;
+import org.apache.solr.util.RefCounted;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.KeeperException.NoNodeException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class Configuration {
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-
-    public static int traceFileSuffixIndex__ = 0;
-
-    public static int traceLevel__ = org.apache.derby.jdbc.ClientBaseDataSource.TRACE_ALL;
-
-    public static String traceFile__ = null;
-
-    public static String traceDirectory__ = null;
-
-    public static boolean traceFileAppend__ = false;
-    public static final String jreLevel;// = "1.3.0"; // default level if unable to read
-    public static final int jreLevelMajor;// = 1;
-    public static final int jreLevelMinor;// = 3;
-
-    private Configuration() {
+public abstract class ElectionContext {
+  static Logger log = LoggerFactory.getLogger(ElectionContext.class);
+  final String electionPath;
+  final ZkNodeProps leaderProps;
+  final String id;
+  final String leaderPath;
+  String leaderSeqPath;
+  private SolrZkClient zkClient;
+  
+  public ElectionContext(final String coreNodeName,
+      final String electionPath, final String leaderPath, final ZkNodeProps leaderProps, final SolrZkClient zkClient) {
+    this.id = coreNodeName;
+    this.electionPath = electionPath;
+    this.leaderPath = leaderPath;
+    this.leaderProps = leaderProps;
+    this.zkClient = zkClient;
+  }
+  
+  public void close() {}
+  
+  public void cancelElection() throws InterruptedException, KeeperException {
+    try {
+      zkClient.delete(leaderSeqPath, -1, true);
+    } catch (NoNodeException e) {
+      // fine
+      log.warn("cancelElection did not find election node to remove");
     }
+  }
 
-    public static boolean traceSuspended__;
+  abstract void runLeaderProcess(boolean weAreReplacement, int pauseTime) throws KeeperException, InterruptedException, IOException;
 
-    public static boolean[] enableConnectivityToTargetServer__;
-    public static boolean jvmSupportsMicrosClock__ = false;
+  public void checkIfIamLeaderFired() {}
 
-    // -------------------------- versioning -------------------------------------
+  public void joinedElectionFired() {}
+}
 
-    private static ProductVersionHolder dncProductVersionHolder__;
+class ShardLeaderElectionContextBase extends ElectionContext {
+  private static Logger log = LoggerFactory.getLogger(ShardLeaderElectionContextBase.class);
+  protected final SolrZkClient zkClient;
+  protected String shardId;
+  protected String collection;
+  protected LeaderElector leaderElector;
 
-    public static ProductVersionHolder getProductVersionHolder() {
-        return dncProductVersionHolder__;
+  public ShardLeaderElectionContextBase(LeaderElector leaderElector, final String shardId,
+      final String collection, final String coreNodeName, ZkNodeProps props, ZkStateReader zkStateReader) {
+    super(coreNodeName, ZkStateReader.COLLECTIONS_ZKNODE + "/" + collection + "/leader_elect/"
+        + shardId, ZkStateReader.getShardLeadersPath(collection, shardId),
+        props, zkStateReader.getZkClient());
+    this.leaderElector = leaderElector;
+    this.zkClient = zkStateReader.getZkClient();
+    this.shardId = shardId;
+    this.collection = collection;
+    
+    try {
+      new ZkCmdExecutor(zkStateReader.getZkClient().getZkClientTimeout()).ensureExists(ZkStateReader.COLLECTIONS_ZKNODE + "/" + collection, zkClient);
+    } catch (KeeperException e) {
+      throw new SolrException(ErrorCode.SERVER_ERROR, e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new SolrException(ErrorCode.SERVER_ERROR, e);
     }
+  }
 
+  @Override
+  void runLeaderProcess(boolean weAreReplacement, int pauseBeforeStart) throws KeeperException,
+      InterruptedException, IOException {
+    
+    zkClient.makePath(leaderPath, ZkStateReader.toJSON(leaderProps),
+        CreateMode.EPHEMERAL, true);
+    assert shardId != null;
+    ZkNodeProps m = ZkNodeProps.fromKeyVals(Overseer.QUEUE_OPERATION, ZkStateReader.LEADER_PROP,
+        ZkStateReader.SHARD_ID_PROP, shardId, ZkStateReader.COLLECTION_PROP,
+        collection, ZkStateReader.BASE_URL_PROP, leaderProps.getProperties()
+            .get(ZkStateReader.BASE_URL_PROP), ZkStateReader.CORE_NAME_PROP,
+        leaderProps.getProperties().get(ZkStateReader.CORE_NAME_PROP),
+        ZkStateReader.STATE_PROP, ZkStateReader.ACTIVE);
+    Overseer.getInQueue(zkClient).offer(ZkStateReader.toJSON(m));
+    
+  }
 
-    // for DatabaseMetaData.getDriverName()
-    public final static String dncDriverName = "Apache Derby Network Client JDBC Driver";
+}
 
+// add core container and stop passing core around...
+final class ShardLeaderElectionContext extends ShardLeaderElectionContextBase {
+  private static Logger log = LoggerFactory.getLogger(ShardLeaderElectionContext.class);
+  
+  private final ZkController zkController;
+  private final CoreContainer cc;
+  private final SyncStrategy syncStrategy;
 
-    // Hard-wired for JDBC
-    //
-    // Currently ASCII hex value of "SYSLVL01".
-    public final static byte[] dncPackageConsistencyToken =
-            {0x53, 0x59, 0x53, 0x4c, 0x56, 0x4c, 0x30, 0x31};
-
-    // We will not set package VERSION in the initial release.
-    // If we have to change the package version in the future then we can.
-    public static final String dncPackageVersion = null;
-
-    // for Driver.jdbcCompliant()
-    public final static boolean jdbcCompliant = true;
-
-    // for Driver.getCompatibileJREVersions()
-    public final static String[] dncCompatibleJREVersions =
-            {"1.4", "1.5", "1.6"};
-
-    //---------------------- database URL protocols ------------------------------
-
-    // For DatabaseMetaData.getURL()
-    public final static String jdbcDerbyNETProtocol = "jdbc:derby://";
-
-    // -------------------------- metrics ----------------------
-    // Not currently used by production builds.
-    // We can't really use this stuff with tracing enabled, the results are not accurate.
-
-    // -------------------------- compiled in properties -------------------------
-
-    public final static boolean enableNetConnectionPooling = true;
-
-    final static boolean rangeCheckCrossConverters = true;
-
-    // Define different levels of bug checking, for now turn all bits on.
-    final static int bugCheckLevel = 0xff;
-
-    // --------------------------- connection defaults ---------------------------
-
-    // This is the DERBY default and maps to DERBY's "Cursor Stability".
-    public final static int defaultIsolation = java.sql.Connection.TRANSACTION_READ_COMMITTED;
-
-    // ---------------------------- statement defaults----------------------------
-
-    public static final int defaultFetchSize = 64;
-
-    // Prepare attribute constants
-    public static final String cursorAttribute_SensitiveStatic = "SENSITIVE STATIC SCROLL ";
-    public static final String cursorAttribute_SensitiveStaticRowset = cursorAttribute_SensitiveStatic;
-    public static final String cursorAttribute_SensitiveDynamic = "SENSITIVE DYNAMIC SCROLL ";
-    public static final String cursorAttribute_SensitiveDynamicRowset = "SENSITIVE DYNAMIC SCROLL WITH ROWSET POSITIONING ";
-    public static final String cursorAttribute_Insensitive = "INSENSITIVE SCROLL ";
-    public static final String cursorAttribute_InsensitiveRowset = cursorAttribute_Insensitive;
-
-    // uncomment the following when we want to use multi-row fetch to support sensitive static and
-    // insensitve cursors whenever the server has support for it.
-    //public static final String cursorAttribute_SensitiveStaticRowset = "SENSITIVE STATIC SCROLL WITH ROWSET POSITIONING ";
-    //public static final String cursorAttribute_InsensitiveRowset = "INSENSITIVE SCROLL WITH ROWSET POSITIONING ";
-
-    public static final String cursorAttribute_ForUpdate = "FOR UPDATE ";
-    public static final String cursorAttribute_ForReadOnly = "FOR READ ONLY ";
-
-    public static final String cursorAttribute_WithHold = "WITH HOLD ";
-
-    // -----------------------Load resource bundles for the driver asap-----------
-
-    private static final String packageNameForDNC = "org.apache.derby.client"; // NOTUSED
-
-    public static SqlException exceptionsOnLoadResources = null; // used by ClientDriver to accumulate load exceptions
-
-    static {
-        try {
-            loadProductVersionHolder();
-        } catch (SqlException e) {
-            exceptionsOnLoadResources = e;
-        }
-        String _jreLevel;
-        try {
-            _jreLevel = System.getProperty("java.version");
-        } catch (SecurityException e) {
-            _jreLevel = "1.3.0";
-        } // ignore it, assume 1.3.0
-        jreLevel = _jreLevel;
-        java.util.StringTokenizer st = new java.util.StringTokenizer(jreLevel, ".");
-        int jreState = 0;
-        int _jreLevelMajor = 1;
-        int _jreLevelMinor = 3;
-        while (st.hasMoreTokens()) {
-            int i;
-            try {
-                i = java.lang.Integer.parseInt(st.nextToken()); // get int value
-            } catch (NumberFormatException e) {
-                i = 0;
-            }
-            switch (jreState++) {
-            case 0:
-                _jreLevelMajor = i; // state 0, this is the major version
-                break;
-            case 1:
-                _jreLevelMinor = i; // state 1, this is the minor version
-                break;
-            default:
-                break; // state >1, ignore
-            }
-        }
-        jreLevelMajor = _jreLevelMajor;
-        jreLevelMinor = _jreLevelMinor;
-    }
-
-    /**
-     * load product version information and accumulate exceptions
-     */
-    private static void loadProductVersionHolder() throws SqlException {
-        try {
-            dncProductVersionHolder__ = buildProductVersionHolder();
-        } catch (java.security.PrivilegedActionException e) {
-            throw new SqlException(null, 
-                    new ClientMessageId (SQLState.ERROR_PRIVILEGED_ACTION),
-                    e.getException());                    
-        } catch (java.io.IOException ioe) {
-            throw SqlException.javaException(null, ioe);
-        }
-    }
-
-
-    // Create ProductVersionHolder in security block for Java 2 security.
-    private static ProductVersionHolder buildProductVersionHolder() throws
-            java.security.PrivilegedActionException, IOException {
-        ProductVersionHolder myPVH = null;
-        myPVH = AccessController.doPrivileged(
-                new PrivilegedExceptionAction<ProductVersionHolder>() {
-
-                    public ProductVersionHolder run() throws IOException {
-                        InputStream versionStream = getClass().getResourceAsStream(ProductGenusNames.DNC_INFO);
-
-                        return ProductVersionHolder.getProductVersionHolderFromMyEnv(versionStream);
-                    }
-                });
-
-        return myPVH;
+  private volatile boolean isClosed = false;
+  
+  public ShardLeaderElectionContext(LeaderElector leaderElector, 
+      final String shardId, final String collection,
+      final String coreNodeName, ZkNodeProps props, ZkController zkController, CoreContainer cc) {
+    super(leaderElector, shardId, collection, coreNodeName, props,
+        zkController.getZkStateReader());
+    this.zkController = zkController;
+    this.cc = cc;
+    syncStrategy = new SyncStrategy(cc.getUpdateShardHandler());
+  }
+  
+  @Override
+  public void close() {
+    this.isClosed  = true;
+    syncStrategy.close();
+  }
+  
+  /* 
+   * weAreReplacement: has someone else been the leader already?
+   */
+  @Override
+  void runLeaderProcess(boolean weAreReplacement, int pauseBeforeStart) throws KeeperException,
+      InterruptedException, IOException {
+    log.info("Running the leader process for shard " + shardId);
+    
+    String coreName = leaderProps.getStr(ZkStateReader.CORE_NAME_PROP);
+    
+    // clear the leader in clusterstate
+    ZkNodeProps m = new ZkNodeProps(Overseer.QUEUE_OPERATION, ZkStateReader.LEADER_PROP,
+        ZkStateReader.SHARD_ID_PROP, shardId, ZkStateReader.COLLECTION_PROP,
+        collection);
+    Overseer.getInQueue(zkClient).offer(ZkStateReader.toJSON(m));
+    
+    int leaderVoteWait = cc.getZkController().getLeaderVoteWait();
+    if (!weAreReplacement) {
+      waitForReplicasToComeUp(weAreReplacement, leaderVoteWait);
     }
     
-    /**
-     * Check to see if the jvm version is such that JDBC 4.0 is supported
-     */
-    
-    public static boolean supportsJDBC40() {
-        // use reflection to identify whether we support JDBC40
+    SolrCore core = null;
+    try {
+      
+      core = cc.getCore(coreName);
+      
+      if (core == null) {
+        cancelElection();
+        throw new SolrException(ErrorCode.SERVER_ERROR,
+            "Fatal Error, SolrCore not found:" + coreName + " in "
+                + cc.getCoreNames());
+      }
+      
+      // should I be leader?
+      if (weAreReplacement && !shouldIBeLeader(leaderProps, core, weAreReplacement)) {
+        rejoinLeaderElection(leaderSeqPath, core);
+        return;
+      }
+      
+      log.info("I may be the new leader - try and sync");
+ 
+      
+      // we are going to attempt to be the leader
+      // first cancel any current recovery
+      core.getUpdateHandler().getSolrCoreState().cancelRecovery();
+      
+      if (weAreReplacement) {
+        // wait a moment for any floating updates to finish
         try {
-            Class.forName("java.sql.SQLXML");
-            return true;
+          Thread.sleep(2500);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, e);
+        }
+      }
+      
+      boolean success = false;
+      try {
+        success = syncStrategy.sync(zkController, core, leaderProps, weAreReplacement);
+      } catch (Exception e) {
+        SolrException.log(log, "Exception while trying to sync", e);
+        success = false;
+      }
+      
+      UpdateLog ulog = core.getUpdateHandler().getUpdateLog();
+
+      if (!success) {
+        boolean hasRecentUpdates = false;
+        if (ulog != null) {
+          // TODO: we could optimize this if necessary
+          UpdateLog.RecentUpdates recentUpdates = ulog.getRecentUpdates();
+          try {
+            hasRecentUpdates = !recentUpdates.getVersions(1).isEmpty();
+          } finally {
+            recentUpdates.close();
+          }
+        }
+
+        if (!hasRecentUpdates) {
+          // we failed sync, but we have no versions - we can't sync in that case
+          // - we were active
+          // before, so become leader anyway
+          log.info("We failed sync, but we have no versions - we can't sync in that case - we were active before, so become leader anyway");
+          success = true;
+        }
+      }
+      
+      // solrcloud_debug
+      if (log.isDebugEnabled()) {
+        try {
+          RefCounted<SolrIndexSearcher> searchHolder = core
+              .getNewestSearcher(false);
+          SolrIndexSearcher searcher = searchHolder.get();
+          try {
+            log.debug(core.getCoreDescriptor().getCoreContainer()
+                .getZkController().getNodeName()
+                + " synched "
+                + searcher.search(new MatchAllDocsQuery(), 1).totalHits);
+          } finally {
+            searchHolder.decref();
+          }
         } catch (Exception e) {
-            return false;
+          throw new SolrException(ErrorCode.SERVER_ERROR, null, e);
         }
+      }
+      if (!success) {
+        rejoinLeaderElection(leaderSeqPath, core);
+        return;
+      }
+
+      log.info("I am the new leader: "
+          + ZkCoreNodeProps.getCoreUrl(leaderProps) + " " + shardId);
+      core.getCoreDescriptor().getCloudDescriptor().setLeader(true);
+    } finally {
+      if (core != null) {
+        core.close();
+      }
     }
+    boolean success = false;
+    try {
+      super.runLeaderProcess(weAreReplacement, 0);
+      success = true;
+    } catch (Exception e) {
+      SolrException.log(log, "There was a problem trying to register as the leader", e);
+  
+      try {
+        core = cc.getCore(coreName);
+        if (core == null) {
+          throw new SolrException(ErrorCode.SERVER_ERROR,
+              "Fatal Error, SolrCore not found:" + coreName + " in "
+                  + cc.getCoreNames());
+        }
+        
+        core.getCoreDescriptor().getCloudDescriptor().setLeader(false);
+        
+        // we could not publish ourselves as leader - rejoin election
+        rejoinLeaderElection(leaderSeqPath, core);
+      } finally {
+        try {
+          if (!success) {
+            cancelElection();
+          }
+        } finally {
+          if (core != null) {
+            core.close();
+          }
+        }
+        
+      }
+    }
+    
+  }
+  
+  private boolean areAnyOtherReplicasActive(ZkController zkController,
+      ZkNodeProps leaderProps, String collection, String shardId) {
+    ClusterState clusterState = zkController.getZkStateReader()
+        .getClusterState();
+    Map<String,Slice> slices = clusterState.getSlicesMap(collection);
+    Slice slice = slices.get(shardId);
+    if (!slice.getState().equals(Slice.ACTIVE)) {
+      //Return false if the Slice is not active yet.
+      return false;
+    }
+    Map<String,Replica> replicasMap = slice.getReplicasMap();
+    for (Map.Entry<String,Replica> shard : replicasMap.entrySet()) {
+      String state = shard.getValue().getStr(ZkStateReader.STATE_PROP);
+      // System.out.println("state:"
+      // + state
+      // + shard.getValue().get(ZkStateReader.NODE_NAME_PROP)
+      // + " live: "
+      // + clusterState.liveNodesContain(shard.getValue().get(
+      // ZkStateReader.NODE_NAME_PROP)));
+      if (state.equals(ZkStateReader.ACTIVE)
+          && clusterState.liveNodesContain(shard.getValue().getStr(
+              ZkStateReader.NODE_NAME_PROP))
+          && !new ZkCoreNodeProps(shard.getValue()).getCoreUrl().equals(
+              new ZkCoreNodeProps(leaderProps).getCoreUrl())) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
 
+  private void waitForReplicasToComeUp(boolean weAreReplacement,
+      int timeout) throws InterruptedException {
+    long timeoutAt = System.currentTimeMillis() + timeout;
+    final String shardsElectZkPath = electionPath + LeaderElector.ELECTION_NODE;
+    
+    Slice slices = zkController.getClusterState().getSlice(collection, shardId);
+    int cnt = 0;
+    while (true && !isClosed && !cc.isShutDown()) {
+      // wait for everyone to be up
+      if (slices != null) {
+        int found = 0;
+        try {
+          found = zkClient.getChildren(shardsElectZkPath, null, true).size();
+        } catch (KeeperException e) {
+          SolrException.log(log,
+              "Error checking for the number of election participants", e);
+        }
+        
+        // on startup and after connection timeout, wait for all known shards
+        if (found >= slices.getReplicasMap().size()) {
+          log.info("Enough replicas found to continue.");
+          return;
+        } else {
+          if (cnt % 40 == 0) {
+            log.info("Waiting until we see more replicas up for shard " + shardId + ": total="
+              + slices.getReplicasMap().size() + " found=" + found
+              + " timeoutin=" + (timeoutAt - System.currentTimeMillis()));
+          }
+        }
+        
+        if (System.currentTimeMillis() > timeoutAt) {
+          log.info("Was waiting for replicas to come up, but they are taking too long - assuming they won't come back till later");
+          return;
+        }
+      } else {
+        log.warn("Shard not found: " + shardId + " for collection " + collection);
 
+        return;
+
+      }
+      
+      Thread.sleep(500);
+      slices = zkController.getClusterState().getSlice(collection, shardId);
+      // System.out.println("###### waitForReplicasToComeUp  : slices=" + slices + " all=" + zkController.getClusterState().getCollectionStates() );
+      cnt++;
+    }
+  }
+
+  private void rejoinLeaderElection(String leaderSeqPath, SolrCore core)
+      throws InterruptedException, KeeperException, IOException {
+    // remove our ephemeral and re join the election
+    if (cc.isShutDown()) {
+      log.info("Not rejoining election because CoreContainer is shutdown");
+      return;
+    }
+    
+    log.info("There may be a better leader candidate than us - going back into recovery");
+    
+    cancelElection();
+    
+    core.getUpdateHandler().getSolrCoreState().doRecovery(cc, core.getCoreDescriptor());
+    
+    leaderElector.joinElection(this, true);
+  }
+
+  private boolean shouldIBeLeader(ZkNodeProps leaderProps, SolrCore core, boolean weAreReplacement) {
+    log.info("Checking if I should try and be the leader.");
+    
+    if (isClosed) {
+      log.info("Bailing on leader process because we have been closed");
+      return false;
+    }
+    
+    if (!weAreReplacement) {
+      // we are the first node starting in the shard - there is a configurable wait
+      // to make sure others participate in sync and leader election, we can be leader
+      return true;
+    }
+    
+    if (core.getCoreDescriptor().getCloudDescriptor().getLastPublished()
+        .equals(ZkStateReader.ACTIVE)) {
+      log.info("My last published State was Active, it's okay to be the leader.");
+      return true;
+    }
+    log.info("My last published State was "
+        + core.getCoreDescriptor().getCloudDescriptor().getLastPublished()
+        + ", I won't be the leader.");
+    // TODO: and if no one is a good candidate?
+    
+    return false;
+  }
+  
+}
+
+final class OverseerElectionContext extends ElectionContext {
+  
+  private final SolrZkClient zkClient;
+  private Overseer overseer;
+  public static final String PATH = "/overseer_elect";
+
+  public OverseerElectionContext(SolrZkClient zkClient, Overseer overseer, final String zkNodeName) {
+    super(zkNodeName,PATH , PATH+"/leader", null, zkClient);
+    this.overseer = overseer;
+    this.zkClient = zkClient;
+    try {
+      new ZkCmdExecutor(zkClient.getZkClientTimeout()).ensureExists("/overseer_elect", zkClient);
+    } catch (KeeperException e) {
+      throw new SolrException(ErrorCode.SERVER_ERROR, e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new SolrException(ErrorCode.SERVER_ERROR, e);
+    }
+  }
+
+  @Override
+  void runLeaderProcess(boolean weAreReplacement, int pauseBeforeStart) throws KeeperException,
+      InterruptedException {
+    log.info("I am going to be the leader {}", id);
+    final String id = leaderSeqPath
+        .substring(leaderSeqPath.lastIndexOf("/") + 1);
+    ZkNodeProps myProps = new ZkNodeProps("id", id);
+
+    zkClient.makePath(leaderPath, ZkStateReader.toJSON(myProps),
+        CreateMode.EPHEMERAL, true);
+    if(pauseBeforeStart >0){
+      try {
+        Thread.sleep(pauseBeforeStart);
+      } catch (InterruptedException e) {
+        log.warn("Wait interrupted ", e);
+      }
+    }
+    
+    overseer.start(id);
+  }
+  
+  public void cancelElection() throws InterruptedException, KeeperException {
+    super.cancelElection();
+    overseer.close();
+  }
+  
+  @Override
+  public void joinedElectionFired() {
+    overseer.close();
+  }
+  
+  @Override
+  public void checkIfIamLeaderFired() {
+    // leader changed - close the overseer
+    overseer.close();
+  }
 
 }

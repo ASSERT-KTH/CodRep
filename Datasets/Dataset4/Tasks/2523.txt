@@ -1,4 +1,4 @@
-InternalOrder order, BucketCountThresholds bucketCountThresholds,
+entries.close();
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,154 +18,131 @@ InternalOrder order, BucketCountThresholds bucketCountThresholds,
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.search.aggregations.bucket.terms;
 
+package org.elasticsearch.search.facet.histogram;
+
+import com.carrotsearch.hppc.LongObjectOpenHashMap;
 import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.BytesRefBuilder;
-import org.elasticsearch.common.lease.Releasables;
-import org.elasticsearch.common.util.BytesRefHash;
-import org.elasticsearch.index.fielddata.SortedBinaryDocValues;
-import org.elasticsearch.search.aggregations.Aggregator;
-import org.elasticsearch.search.aggregations.AggregatorFactories;
-import org.elasticsearch.search.aggregations.InternalAggregation;
-import org.elasticsearch.search.aggregations.bucket.terms.support.BucketPriorityQueue;
-import org.elasticsearch.search.aggregations.bucket.terms.support.IncludeExclude;
-import org.elasticsearch.search.aggregations.support.AggregationContext;
-import org.elasticsearch.search.aggregations.support.ValuesSource;
+import org.elasticsearch.common.recycler.Recycler;
+import org.elasticsearch.index.fielddata.DoubleValues;
+import org.elasticsearch.index.fielddata.IndexNumericFieldData;
+import org.elasticsearch.search.facet.DoubleFacetAggregatorBase;
+import org.elasticsearch.search.facet.FacetExecutor;
+import org.elasticsearch.search.facet.InternalFacet;
+import org.elasticsearch.search.internal.SearchContext;
 
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * An aggregator of string values.
+ * A histogram facet collector that uses different fields for the key and the value.
  */
-public class StringTermsAggregator extends AbstractStringTermsAggregator {
+public class ValueHistogramFacetExecutor extends FacetExecutor {
 
-    private final ValuesSource valuesSource;
-    protected final BytesRefHash bucketOrds;
-    private final IncludeExclude includeExclude;
-    private SortedBinaryDocValues values;
-    private final BytesRefBuilder previous;
+    private final IndexNumericFieldData keyIndexFieldData;
+    private final IndexNumericFieldData valueIndexFieldData;
+    private final HistogramFacet.ComparatorType comparatorType;
+    private final long interval;
 
-    public StringTermsAggregator(String name, AggregatorFactories factories, ValuesSource valuesSource, long estimatedBucketCount,
-            Terms.Order order, BucketCountThresholds bucketCountThresholds,
-                                 IncludeExclude includeExclude, AggregationContext aggregationContext, Aggregator parent, SubAggCollectionMode collectionMode, boolean showTermDocCountError) {
+    final Recycler.V<LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry>> entries;
 
-        super(name, factories, estimatedBucketCount, aggregationContext, parent, order, bucketCountThresholds, collectionMode, showTermDocCountError);
-        this.valuesSource = valuesSource;
-        this.includeExclude = includeExclude;
-        bucketOrds = new BytesRefHash(estimatedBucketCount, aggregationContext.bigArrays());
-        previous = new BytesRefBuilder();
+    public ValueHistogramFacetExecutor(IndexNumericFieldData keyIndexFieldData, IndexNumericFieldData valueIndexFieldData, long interval, HistogramFacet.ComparatorType comparatorType, SearchContext context) {
+        this.comparatorType = comparatorType;
+        this.keyIndexFieldData = keyIndexFieldData;
+        this.valueIndexFieldData = valueIndexFieldData;
+        this.interval = interval;
+        this.entries = context.cacheRecycler().longObjectMap(-1);
     }
 
     @Override
-    public boolean shouldCollect() {
-        return true;
+    public Collector collector() {
+        return new Collector();
     }
 
     @Override
-    public void setNextReader(AtomicReaderContext reader) {
-        values = valuesSource.bytesValues();
+    public InternalFacet buildFacet(String facetName) {
+        List<InternalFullHistogramFacet.FullEntry> entries1 = new ArrayList<>(entries.v().size());
+        final boolean [] states = entries.v().allocated;
+        final Object[] values = entries.v().values;
+
+        for (int i = 0; i < states.length; i++) {
+            if (states[i]) {
+                InternalFullHistogramFacet.FullEntry value = (InternalFullHistogramFacet.FullEntry) values[i];
+                entries1.add(value);
+            }
+        }
+        entries.release();
+        return new InternalFullHistogramFacet(facetName, comparatorType, entries1);
     }
 
-    @Override
-    public void collect(int doc, long owningBucketOrdinal) throws IOException {
-        assert owningBucketOrdinal == 0;
-        values.setDocument(doc);
-        final int valuesCount = values.count();
+    class Collector extends FacetExecutor.Collector {
 
-        // SortedBinaryDocValues don't guarantee uniqueness so we need to take care of dups
-        previous.clear();
-        for (int i = 0; i < valuesCount; ++i) {
-            final BytesRef bytes = values.valueAt(i);
-            if (includeExclude != null && !includeExclude.accept(bytes)) {
-                continue;
-            }
-            if (previous.get().equals(bytes)) {
-                continue;
-            }
-            long bucketOrdinal = bucketOrds.add(bytes);
-            if (bucketOrdinal < 0) { // already seen
-                bucketOrdinal = - 1 - bucketOrdinal;
-                collectExistingBucket(doc, bucketOrdinal);
-            } else {
-                collectBucket(doc, bucketOrdinal);
-            }
-            previous.copyBytes(bytes);
+        private final HistogramProc histoProc;
+        private DoubleValues keyValues;
+
+        public Collector() {
+            this.histoProc = new HistogramProc(interval, entries.v());
+        }
+
+        @Override
+        public void setNextReader(AtomicReaderContext context) throws IOException {
+            keyValues = keyIndexFieldData.load(context).getDoubleValues();
+            histoProc.valueValues = valueIndexFieldData.load(context).getDoubleValues();
+        }
+
+        @Override
+        public void collect(int doc) throws IOException {
+            histoProc.onDoc(doc, keyValues);
+        }
+
+        @Override
+        public void postCollection() {
         }
     }
 
-    @Override
-    public InternalAggregation buildAggregation(long owningBucketOrdinal) {
-        assert owningBucketOrdinal == 0;
+    public final static class HistogramProc extends DoubleFacetAggregatorBase {
 
-        if (bucketCountThresholds.getMinDocCount() == 0 && (order != InternalOrder.COUNT_DESC || bucketOrds.size() < bucketCountThresholds.getRequiredSize())) {
-            // we need to fill-in the blanks
-            for (AtomicReaderContext ctx : context.searchContext().searcher().getTopReaderContext().leaves()) {
-                context.setNextReader(ctx);
-                final SortedBinaryDocValues values = valuesSource.bytesValues();
-                // brute force
-                for (int docId = 0; docId < ctx.reader().maxDoc(); ++docId) {
-                    values.setDocument(docId);
-                    final int valueCount = values.count();
-                    for (int i = 0; i < valueCount; ++i) {
-                        final BytesRef term = values.valueAt(i);
-                        if (includeExclude == null || includeExclude.accept(term)) {
-                            bucketOrds.add(term);
-                        }
-                    }
+        final long interval;
+        final LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry> entries;
+
+        DoubleValues valueValues;
+
+        final ValueAggregator valueAggregator = new ValueAggregator();
+
+        public HistogramProc(long interval, LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry> entries) {
+            this.interval = interval;
+            this.entries = entries;
+        }
+
+        @Override
+        public void onValue(int docId, double value) {
+            long bucket = FullHistogramFacetExecutor.bucket(value, interval);
+            InternalFullHistogramFacet.FullEntry entry = entries.get(bucket);
+            if (entry == null) {
+                entry = new InternalFullHistogramFacet.FullEntry(bucket, 0, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 0, 0);
+                entries.put(bucket, entry);
+            }
+            entry.count++;
+            valueAggregator.entry = entry;
+            valueAggregator.onDoc(docId, valueValues);
+        }
+
+        public final static class ValueAggregator extends DoubleFacetAggregatorBase {
+
+            InternalFullHistogramFacet.FullEntry entry;
+
+            @Override
+            public void onValue(int docId, double value) {
+                entry.totalCount++;
+                entry.total += value;
+                if (value < entry.min) {
+                    entry.min = value;
+                }
+                if (value > entry.max) {
+                    entry.max = value;
                 }
             }
         }
-
-        final int size = (int) Math.min(bucketOrds.size(), bucketCountThresholds.getShardSize());
-
-        BucketPriorityQueue ordered = new BucketPriorityQueue(size, order.comparator(this));
-        StringTerms.Bucket spare = null;
-        for (int i = 0; i < bucketOrds.size(); i++) {
-            if (spare == null) {
-                spare = new StringTerms.Bucket(new BytesRef(), 0, null, showTermDocCountError, 0);
-            }
-            bucketOrds.get(i, spare.termBytes);
-            spare.docCount = bucketDocCount(i);
-            spare.bucketOrd = i;
-            if (bucketCountThresholds.getShardMinDocCount() <= spare.docCount) {
-                spare = (StringTerms.Bucket) ordered.insertWithOverflow(spare);
-            }
-        }
-
-        // Get the top buckets
-        final InternalTerms.Bucket[] list = new InternalTerms.Bucket[ordered.size()];
-        long survivingBucketOrds[] = new long[ordered.size()];
-        for (int i = ordered.size() - 1; i >= 0; --i) {
-            final StringTerms.Bucket bucket = (StringTerms.Bucket) ordered.pop();
-            survivingBucketOrds[i] = bucket.bucketOrd;
-            list[i] = bucket;
-        }
-        // replay any deferred collections
-        runDeferredCollections(survivingBucketOrds);
-        
-        // Now build the aggs
-        for (int i = 0; i < list.length; i++) {
-          final StringTerms.Bucket bucket = (StringTerms.Bucket)list[i];
-          bucket.termBytes = BytesRef.deepCopyOf(bucket.termBytes);
-          bucket.aggregations = bucketAggregations(bucket.bucketOrd);
-          bucket.docCountError = 0;
-        }
-        
-        return new StringTerms(name, order, bucketCountThresholds.getRequiredSize(), bucketCountThresholds.getShardSize(), bucketCountThresholds.getMinDocCount(), Arrays.asList(list), showTermDocCountError, 0);
     }
-
-    @Override
-    public InternalAggregation buildEmptyAggregation() {
-        return new StringTerms(name, order, bucketCountThresholds.getRequiredSize(), bucketCountThresholds.getShardSize(), bucketCountThresholds.getMinDocCount(), Collections.<InternalTerms.Bucket>emptyList(), showTermDocCountError, 0);
-    }
-
-    @Override
-    public void doClose() {
-        Releasables.close(bucketOrds);
-    }
-
 }

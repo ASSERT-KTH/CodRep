@@ -1,4 +1,4 @@
-request.index(metaData.concreteSingleIndex(request.index()));
+RoutingAllocation.Result routingResult = allocationService.reroute(currentState, request.commands, true);
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -19,276 +19,111 @@ request.index(metaData.concreteSingleIndex(request.index()));
  * under the License.
  */
 
-package org.elasticsearch.action.update;
+package org.elasticsearch.action.admin.cluster.reroute;
 
-import com.google.common.collect.ImmutableList;
 import org.elasticsearch.ElasticsearchException;
-import org.elasticsearch.ElasticsearchIllegalStateException;
-import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.RoutingMissingException;
-import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
-import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
-import org.elasticsearch.action.admin.indices.create.TransportCreateIndexAction;
-import org.elasticsearch.action.delete.DeleteRequest;
-import org.elasticsearch.action.delete.DeleteResponse;
-import org.elasticsearch.action.delete.TransportDeleteAction;
-import org.elasticsearch.action.index.IndexRequest;
-import org.elasticsearch.action.index.IndexResponse;
-import org.elasticsearch.action.index.TransportIndexAction;
-import org.elasticsearch.action.support.AutoCreateIndex;
-import org.elasticsearch.action.support.TransportActions;
-import org.elasticsearch.action.support.single.instance.TransportInstanceSingleOperationAction;
+import org.elasticsearch.action.support.master.TransportMasterNodeOperationAction;
+import org.elasticsearch.cluster.AckedClusterStateUpdateTask;
 import org.elasticsearch.cluster.ClusterService;
 import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
-import org.elasticsearch.cluster.metadata.MetaData;
-import org.elasticsearch.cluster.routing.PlainShardIterator;
-import org.elasticsearch.cluster.routing.ShardIterator;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.collect.Tuple;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.allocation.AllocationService;
+import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.XContentHelper;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.index.engine.DocumentAlreadyExistsException;
-import org.elasticsearch.index.engine.VersionConflictEngineException;
-import org.elasticsearch.indices.IndexAlreadyExistsException;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
 
-import java.util.Map;
-
 /**
  */
-public class TransportUpdateAction extends TransportInstanceSingleOperationAction<UpdateRequest, UpdateResponse> {
+public class TransportClusterRerouteAction extends TransportMasterNodeOperationAction<ClusterRerouteRequest, ClusterRerouteResponse> {
 
-    private final TransportDeleteAction deleteAction;
-    private final TransportIndexAction indexAction;
-    private final AutoCreateIndex autoCreateIndex;
-    private final TransportCreateIndexAction createIndexAction;
-    private final UpdateHelper updateHelper;
+    private final AllocationService allocationService;
 
     @Inject
-    public TransportUpdateAction(Settings settings, ThreadPool threadPool, ClusterService clusterService, TransportService transportService,
-                                 TransportIndexAction indexAction, TransportDeleteAction deleteAction, TransportCreateIndexAction createIndexAction,
-                                 UpdateHelper updateHelper) {
-        super(settings, threadPool, clusterService, transportService);
-        this.indexAction = indexAction;
-        this.deleteAction = deleteAction;
-        this.createIndexAction = createIndexAction;
-        this.updateHelper = updateHelper;
-        this.autoCreateIndex = new AutoCreateIndex(settings);
-    }
-
-    @Override
-    protected String transportAction() {
-        return UpdateAction.NAME;
+    public TransportClusterRerouteAction(Settings settings, TransportService transportService, ClusterService clusterService, ThreadPool threadPool,
+                                         AllocationService allocationService) {
+        super(settings, transportService, clusterService, threadPool);
+        this.allocationService = allocationService;
     }
 
     @Override
     protected String executor() {
-        return ThreadPool.Names.INDEX;
+        // we go async right away
+        return ThreadPool.Names.SAME;
     }
 
     @Override
-    protected UpdateRequest newRequest() {
-        return new UpdateRequest();
+    protected String transportAction() {
+        return ClusterRerouteAction.NAME;
     }
 
     @Override
-    protected UpdateResponse newResponse() {
-        return new UpdateResponse();
+    protected ClusterRerouteRequest newRequest() {
+        return new ClusterRerouteRequest();
     }
 
     @Override
-    protected ClusterBlockException checkGlobalBlock(ClusterState state, UpdateRequest request) {
-        return state.blocks().globalBlockedException(ClusterBlockLevel.WRITE);
+    protected ClusterRerouteResponse newResponse() {
+        return new ClusterRerouteResponse();
     }
 
     @Override
-    protected ClusterBlockException checkRequestBlock(ClusterState state, UpdateRequest request) {
-        return state.blocks().indexBlockedException(ClusterBlockLevel.WRITE, request.index());
-    }
+    protected void masterOperation(final ClusterRerouteRequest request, final ClusterState state, final ActionListener<ClusterRerouteResponse> listener) throws ElasticsearchException {
+        clusterService.submitStateUpdateTask("cluster_reroute (api)", Priority.URGENT, new AckedClusterStateUpdateTask() {
 
-    @Override
-    protected boolean retryOnFailure(Throwable e) {
-        return TransportActions.isShardNotAvailableException(e);
-    }
+            private volatile ClusterState clusterStateToSend;
 
-    @Override
-    protected boolean resolveRequest(ClusterState state, UpdateRequest request, ActionListener<UpdateResponse> listener) {
-        MetaData metaData = clusterService.state().metaData();
-        String aliasOrIndex = request.index();
-        request.routing((metaData.resolveIndexRouting(request.routing(), aliasOrIndex)));
-        request.index(metaData.concreteIndex(request.index()));
-
-        // Fail fast on the node that received the request, rather than failing when translating on the index or delete request.
-        if (request.routing() == null && state.getMetaData().routingRequired(request.index(), request.type())) {
-            throw new RoutingMissingException(request.index(), request.type(), request.id());
-        }
-        return true;
-    }
-
-    @Override
-    protected void doExecute(final UpdateRequest request, final ActionListener<UpdateResponse> listener) {
-        // if we don't have a master, we don't have metadata, that's fine, let it find a master using create index API
-        if (autoCreateIndex.shouldAutoCreate(request.index(), clusterService.state())) {
-            request.beforeLocalFork(); // we fork on another thread...
-            createIndexAction.execute(new CreateIndexRequest(request.index()).cause("auto(update api)").masterNodeTimeout(request.timeout()), new ActionListener<CreateIndexResponse>() {
-                @Override
-                public void onResponse(CreateIndexResponse result) {
-                    innerExecute(request, listener);
-                }
-
-                @Override
-                public void onFailure(Throwable e) {
-                    if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
-                        // we have the index, do it
-                        try {
-                            innerExecute(request, listener);
-                        } catch (Throwable e1) {
-                            listener.onFailure(e1);
-                        }
-                    } else {
-                        listener.onFailure(e);
-                    }
-                }
-            });
-        } else {
-            innerExecute(request, listener);
-        }
-    }
-
-    private void innerExecute(final UpdateRequest request, final ActionListener<UpdateResponse> listener) {
-        super.doExecute(request, listener);
-    }
-
-    @Override
-    protected ShardIterator shards(ClusterState clusterState, UpdateRequest request) throws ElasticsearchException {
-        if (request.shardId() != -1) {
-            return clusterState.routingTable().index(request.index()).shard(request.shardId()).primaryShardIt();
-        }
-        ShardIterator shardIterator = clusterService.operationRouting()
-                .indexShards(clusterService.state(), request.index(), request.type(), request.id(), request.routing());
-        ShardRouting shard;
-        while ((shard = shardIterator.nextOrNull()) != null) {
-            if (shard.primary()) {
-                return new PlainShardIterator(shardIterator.shardId(), ImmutableList.of(shard));
+            @Override
+            public boolean mustAck(DiscoveryNode discoveryNode) {
+                return true;
             }
-        }
-        return new PlainShardIterator(shardIterator.shardId(), ImmutableList.<ShardRouting>of());
-    }
 
-    @Override
-    protected void shardOperation(final UpdateRequest request, final ActionListener<UpdateResponse> listener) throws ElasticsearchException {
-        shardOperation(request, listener, 0);
-    }
+            @Override
+            public void onAllNodesAcked(@Nullable Throwable t) {
+                listener.onResponse(new ClusterRerouteResponse(true, clusterStateToSend));
+            }
 
-    protected void shardOperation(final UpdateRequest request, final ActionListener<UpdateResponse> listener, final int retryCount) throws ElasticsearchException {
-        final UpdateHelper.Result result = updateHelper.prepare(request);
-        switch (result.operation()) {
-            case UPSERT:
-                IndexRequest upsertRequest = result.action();
-                // we fetch it from the index request so we don't generate the bytes twice, its already done in the index request
-                final BytesReference upsertSourceBytes = upsertRequest.source();
-                indexAction.execute(upsertRequest, new ActionListener<IndexResponse>() {
-                    @Override
-                    public void onResponse(IndexResponse response) {
-                        UpdateResponse update = new UpdateResponse(response.getIndex(), response.getType(), response.getId(), response.getVersion(), response.isCreated());
-                        if (request.fields() != null && request.fields().length > 0) {
-                            Tuple<XContentType, Map<String, Object>> sourceAndContent = XContentHelper.convertToMap(upsertSourceBytes, true);
-                            update.setGetResult(updateHelper.extractGetResult(request, response.getVersion(), sourceAndContent.v2(), sourceAndContent.v1(), upsertSourceBytes));
-                        } else {
-                            update.setGetResult(null);
-                        }
-                        listener.onResponse(update);
-                    }
+            @Override
+            public void onAckTimeout() {
+                listener.onResponse(new ClusterRerouteResponse(false, clusterStateToSend));
+            }
 
-                    @Override
-                    public void onFailure(Throwable e) {
-                        e = ExceptionsHelper.unwrapCause(e);
-                        if (e instanceof VersionConflictEngineException || e instanceof DocumentAlreadyExistsException) {
-                            if (retryCount < request.retryOnConflict()) {
-                                threadPool.executor(executor()).execute(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        shardOperation(request, listener, retryCount + 1);
-                                    }
-                                });
-                                return;
-                            }
-                        }
-                        listener.onFailure(e);
-                    }
-                });
-                break;
-            case INDEX:
-                IndexRequest indexRequest = result.action();
-                // we fetch it from the index request so we don't generate the bytes twice, its already done in the index request
-                final BytesReference indexSourceBytes = indexRequest.source();
-                indexAction.execute(indexRequest, new ActionListener<IndexResponse>() {
-                    @Override
-                    public void onResponse(IndexResponse response) {
-                        UpdateResponse update = new UpdateResponse(response.getIndex(), response.getType(), response.getId(), response.getVersion(), response.isCreated());
-                        update.setGetResult(updateHelper.extractGetResult(request, response.getVersion(), result.updatedSourceAsMap(), result.updateSourceContentType(), indexSourceBytes));
-                        listener.onResponse(update);
-                    }
+            @Override
+            public TimeValue ackTimeout() {
+                return request.timeout();
+            }
 
-                    @Override
-                    public void onFailure(Throwable e) {
-                        e = ExceptionsHelper.unwrapCause(e);
-                        if (e instanceof VersionConflictEngineException) {
-                            if (retryCount < request.retryOnConflict()) {
-                                threadPool.executor(executor()).execute(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        shardOperation(request, listener, retryCount + 1);
-                                    }
-                                });
-                                return;
-                            }
-                        }
-                        listener.onFailure(e);
-                    }
-                });
-                break;
-            case DELETE:
-                DeleteRequest deleteRequest = result.action();
-                deleteAction.execute(deleteRequest, new ActionListener<DeleteResponse>() {
-                    @Override
-                    public void onResponse(DeleteResponse response) {
-                        UpdateResponse update = new UpdateResponse(response.getIndex(), response.getType(), response.getId(), response.getVersion(), false);
-                        update.setGetResult(updateHelper.extractGetResult(request, response.getVersion(), result.updatedSourceAsMap(), result.updateSourceContentType(), null));
-                        listener.onResponse(update);
-                    }
+            @Override
+            public TimeValue timeout() {
+                return request.masterNodeTimeout();
+            }
 
-                    @Override
-                    public void onFailure(Throwable e) {
-                        e = ExceptionsHelper.unwrapCause(e);
-                        if (e instanceof VersionConflictEngineException) {
-                            if (retryCount < request.retryOnConflict()) {
-                                threadPool.executor(executor()).execute(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        shardOperation(request, listener, retryCount + 1);
-                                    }
-                                });
-                                return;
-                            }
-                        }
-                        listener.onFailure(e);
-                    }
-                });
-                break;
-            case NONE:
-                UpdateResponse update = result.action();
-                listener.onResponse(update);
-                break;
-            default:
-                throw new ElasticsearchIllegalStateException("Illegal operation " + result.operation());
-        }
+            @Override
+            public void onFailure(String source, Throwable t) {
+                logger.debug("failed to perform [{}]", t, source);
+                listener.onFailure(t);
+            }
+
+            @Override
+            public ClusterState execute(ClusterState currentState) {
+                RoutingAllocation.Result routingResult = allocationService.reroute(currentState, request.commands);
+                ClusterState newState = ClusterState.builder(currentState).routingResult(routingResult).build();
+                clusterStateToSend = newState;
+                if (request.dryRun) {
+                    return currentState;
+                }
+                return newState;
+            }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+
+            }
+        });
     }
 }

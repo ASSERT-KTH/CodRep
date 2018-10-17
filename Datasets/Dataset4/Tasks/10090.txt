@@ -1,10 +1,10 @@
-public class NamedAnalyzer extends Analyzer {
+import org.elasticsearch.common.util.concurrent.ThreadSafe;
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
+ * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
+ * regarding copyright ownership. Elastic Search licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,85 +19,133 @@ public class NamedAnalyzer extends Analyzer {
  * under the License.
  */
 
-package org.elasticsearch.index.analysis;
+package org.elasticsearch.common.lucene.versioned;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.document.Fieldable;
+import org.elasticsearch.common.trove.ExtTIntIntHashMap;
+import org.elasticsearch.util.concurrent.ThreadSafe;
 
-import java.io.IOException;
-import java.io.Reader;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * Named analyzer is an analyzer wrapper around an actual analyzer ({@link #analyzer} that is associated
- * with a name ({@link #name()}.
+ * An implementation of {@link VersionedMap} based on trove {@link org.elasticsearch.util.gnu.trove.TIntIntHashMap}.
+ *
+ * @author kimchy (Shay Banon)
  */
-public final class NamedAnalyzer extends Analyzer {
+@ThreadSafe
+public class NativeVersionedMap implements VersionedMap {
 
-    private final String name;
+    /**
+     * Mask value for indexing into segments. The upper bits of a
+     * key's hash code are used to choose the segment.
+     */
+    private final int segmentMask;
 
-    private final AnalyzerScope scope;
+    /**
+     * Shift value for indexing within segments.
+     */
+    private final int segmentShift;
 
-    private final Analyzer analyzer;
+    private final Segment[] segments;
 
-    public NamedAnalyzer(String name, Analyzer analyzer) {
-        this(name, AnalyzerScope.INDEX, analyzer);
+    public NativeVersionedMap() {
+        this(16);
     }
 
-    public NamedAnalyzer(String name, AnalyzerScope scope, Analyzer analyzer) {
-        this.name = name;
-        this.scope = scope;
-        this.analyzer = analyzer;
+    public NativeVersionedMap(int concurrencyLevel) {
+        // Find power-of-two sizes best matching arguments
+        int sshift = 0;
+        int ssize = 1;
+        while (ssize < concurrencyLevel) {
+            ++sshift;
+            ssize <<= 1;
+        }
+        segmentShift = 32 - sshift;
+        segmentMask = ssize - 1;
+        this.segments = new Segment[ssize];
+        for (int i = 0; i < segments.length; i++) {
+            segments[i] = new Segment();
+        }
+    }
+
+    @Override public boolean beforeVersion(int key, int versionToCheck) {
+        Segment segment = segmentFor(hash(key));
+        segment.rwl.readLock().lock();
+        try {
+            int result = segment.map.get(key);
+            return result == -1 || versionToCheck < result;
+        } finally {
+            segment.rwl.readLock().unlock();
+        }
+    }
+
+    @Override public void putVersion(int key, int version) {
+        Segment segment = segmentFor(hash(key));
+        segment.rwl.writeLock().lock();
+        try {
+            segment.map.put(key, version);
+        } finally {
+            segment.rwl.writeLock().unlock();
+        }
+    }
+
+    @Override public void putVersionIfAbsent(int key, int version) {
+        Segment segment = segmentFor(hash(key));
+        segment.rwl.writeLock().lock();
+        try {
+            if (!segment.map.containsKey(key)) {
+                segment.map.put(key, version);
+            }
+        } finally {
+            segment.rwl.writeLock().unlock();
+        }
+    }
+
+    @Override public void clear() {
+        for (Segment segment : segments) {
+            segment.rwl.writeLock().lock();
+            try {
+                segment.map.clear();
+            } finally {
+                segment.rwl.writeLock().unlock();
+            }
+        }
     }
 
     /**
-     * The name of the analyzer.
+     * Applies a supplemental hash function to a given hashCode, which
+     * defends against poor quality hash functions.  This is critical
+     * because ConcurrentHashMap uses power-of-two length hash tables,
+     * that otherwise encounter collisions for hashCodes that do not
+     * differ in lower or upper bits.
      */
-    public String name() {
-        return this.name;
+    private static int hash(int h) {
+        // Spread bits to regularize both segment and index locations,
+        // using variant of single-word Wang/Jenkins hash.
+        h += (h << 15) ^ 0xffffcd7d;
+        h ^= (h >>> 10);
+        h += (h << 3);
+        h ^= (h >>> 6);
+        h += (h << 2) + (h << 14);
+        return h ^ (h >>> 16);
     }
 
     /**
-     * The scope of the analyzer.
+     * Returns the segment that should be used for key with given hash
+     *
+     * @param hash the hash code for the key
+     * @return the segment
      */
-    public AnalyzerScope scope() {
-        return this.scope;
+    final Segment segmentFor(int hash) {
+        return segments[(hash >>> segmentShift) & segmentMask];
     }
 
-    /**
-     * The actual analyzer.
-     */
-    public Analyzer analyzer() {
-        return this.analyzer;
-    }
+    private static class Segment {
+        final ReadWriteLock rwl = new ReentrantReadWriteLock();
+        final ExtTIntIntHashMap map = new ExtTIntIntHashMap();
 
-    @Override
-    public final TokenStream tokenStream(String fieldName, Reader reader) {
-        return analyzer.tokenStream(fieldName, reader);
-    }
-
-    @Override
-    public final TokenStream reusableTokenStream(String fieldName, Reader reader) throws IOException {
-        return analyzer.reusableTokenStream(fieldName, reader);
-    }
-
-    @Override
-    public int getPositionIncrementGap(String fieldName) {
-        return analyzer.getPositionIncrementGap(fieldName);
-    }
-
-    @Override
-    public int getOffsetGap(Fieldable field) {
-        return analyzer.getOffsetGap(field);
-    }
-
-    @Override
-    public void close() {
-        analyzer.close();
-    }
-
-    @Override
-    public String toString() {
-        return "analyzer name[" + name + "], analyzer [" + analyzer + "]";
+        private Segment() {
+            map.defaultReturnValue(-1);
+        }
     }
 }

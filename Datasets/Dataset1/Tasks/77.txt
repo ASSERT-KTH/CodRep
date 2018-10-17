@@ -1,13 +1,14 @@
-tableLengthPairs.add(new Pair<SSTableReader, Long>(table, table.onDiskLength()));
+refreshLock.unlock();
+
+package org.apache.lucene.search;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,182 +19,199 @@ tableLengthPairs.add(new Pair<SSTableReader, Long>(table, table.onDiskLength()))
  * limitations under the License.
  */
 
-package org.apache.cassandra.db.compaction;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import java.util.*;
-import java.util.Map.Entry;
+import org.apache.lucene.store.AlreadyClosedException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+/**
+ * Utility class to safely share instances of a certain type across multiple
+ * threads, while periodically refreshing them. This class ensures each
+ * reference is closed only once all threads have finished using it. It is
+ * recommended to consult the documentation of {@link ReferenceManager}
+ * implementations for their {@link #maybeRefresh()} semantics.
+ * 
+ * @param <G>
+ *          the concrete type that will be {@link #acquire() acquired} and
+ *          {@link #release(Object) released}.
+ * 
+ * @lucene.experimental
+ */
+public abstract class ReferenceManager<G> implements Closeable {
 
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DataTracker;
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.utils.Pair;
-
-public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
-{
-    private static final Logger logger = LoggerFactory.getLogger(SizeTieredCompactionStrategy.class);
-    protected static final long DEFAULT_MIN_SSTABLE_SIZE = 50L * 1024L * 1024L;
-    protected static final String MIN_SSTABLE_SIZE_KEY = "min_sstable_size";
-    protected static long minSSTableSize;
-    protected volatile int estimatedRemainingTasks;
-
-    public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
-    {
-       super(cfs, options);
-       this.estimatedRemainingTasks = 0;
-       String optionValue = options.get(MIN_SSTABLE_SIZE_KEY);
-       minSSTableSize = (null != optionValue) ? Long.parseLong(optionValue) : DEFAULT_MIN_SSTABLE_SIZE;
+  private static final String REFERENCE_MANAGER_IS_CLOSED_MSG = "this ReferenceManager is closed";
+  
+  protected volatile G current;
+  
+  private final Lock refreshLock = new ReentrantLock();
+  
+  private void ensureOpen() {
+    if (current == null) {
+      throw new AlreadyClosedException(REFERENCE_MANAGER_IS_CLOSED_MSG);
     }
+  }
+  
+  private synchronized void swapReference(G newReference) throws IOException {
+    ensureOpen();
+    final G oldReference = current;
+    current = newReference;
+    release(oldReference);
+  }
 
-    public List<AbstractCompactionTask> getBackgroundTasks(final int gcBefore)
-    {
-        if (cfs.isCompactionDisabled())
-        {
-            logger.debug("Compaction is currently disabled.");
-            return Collections.<AbstractCompactionTask>emptyList();
-        }
+  /** Decrement reference counting on the given reference. */
+  protected abstract void decRef(G reference) throws IOException;
+  
+  /**
+   * Refresh the given reference if needed. Returns {@code null} if no refresh
+   * was needed, otherwise a new refreshed reference.
+   */
+  protected abstract G refreshIfNeeded(G referenceToRefresh) throws IOException;
 
-        List<AbstractCompactionTask> tasks = new LinkedList<AbstractCompactionTask>();
-        List<List<SSTableReader>> buckets = getBuckets(createSSTableAndLengthPairs(cfs.getSSTables()), minSSTableSize);
+  /**
+   * Try to increment reference counting on the given reference. Return true if
+   * the operation was successful.
+   */
+  protected abstract boolean tryIncRef(G reference);
 
-        for (List<SSTableReader> bucket : buckets)
-        {
-            if (bucket.size() < cfs.getMinimumCompactionThreshold())
-                continue;
+  /**
+   * Obtain the current reference. You must match every call to acquire with one
+   * call to {@link #release}; it's best to do so in a finally clause, and set
+   * the reference to {@code null} to prevent accidental usage after it has been
+   * released.
+   */
+  public final G acquire() {
+    G ref;
+    do {
+      if ((ref = current) == null) {
+        throw new AlreadyClosedException(REFERENCE_MANAGER_IS_CLOSED_MSG);
+      }
+    } while (!tryIncRef(ref));
+    return ref;
+  }
 
-            Collections.sort(bucket, new Comparator<SSTableReader>()
-            {
-                public int compare(SSTableReader o1, SSTableReader o2)
-                {
-                    return o1.descriptor.generation - o2.descriptor.generation;
-                }
-            });
-            tasks.add(new CompactionTask(cfs, bucket.subList(0, Math.min(bucket.size(), cfs.getMaximumCompactionThreshold())), gcBefore));
-        }
-
-        updateEstimatedCompactionsByTasks(tasks);
-        return tasks;
+  /**
+   * Close this ReferenceManager to future {@link #acquire() acquiring}. Any
+   * references that were previously {@link #acquire() acquired} won't be
+   * affected, and they should still be {@link #release released} when they are
+   * not needed anymore.
+   */
+  public final synchronized void close() throws IOException {
+    if (current != null) {
+      // make sure we can call this more than once
+      // closeable javadoc says:
+      // if this is already closed then invoking this method has no effect.
+      swapReference(null);
+      afterClose();
     }
+  }
 
-    public List<AbstractCompactionTask> getMaximalTasks(final int gcBefore)
-    {
-        List<AbstractCompactionTask> tasks = new LinkedList<AbstractCompactionTask>();
-        if (!cfs.getSSTables().isEmpty())
-            tasks.add(new CompactionTask(cfs, cfs.getSSTables(), gcBefore));
-        return tasks;
-    }
+  /** Called after close(), so subclass can free any resources. */
+  protected void afterClose() throws IOException {
+  }
 
-    public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore)
-    {
-        return new CompactionTask(cfs, sstables, gcBefore)
-                .isUserDefined(true)
-                .compactionFileLocation(cfs.table.getDataFileLocation(1));
-    }
-
-    public int getEstimatedRemainingTasks()
-    {
-        return estimatedRemainingTasks;
-    }
-
-    private static List<Pair<SSTableReader, Long>> createSSTableAndLengthPairs(Collection<SSTableReader> collection)
-    {
-        List<Pair<SSTableReader, Long>> tableLengthPairs = new ArrayList<Pair<SSTableReader, Long>>();
-        for(SSTableReader table: collection)
-            tableLengthPairs.add(new Pair<SSTableReader, Long>(table, table.length()));
-        return tableLengthPairs;
-    }
-
-    /*
-     * Group files of similar size into buckets.
-     */
-    static <T> List<List<T>> getBuckets(Collection<Pair<T, Long>> files, long minSSTableSize)
-    {
-        // Sort the list in order to get deterministic results during the grouping below
-        List<Pair<T, Long>> sortedFiles = new ArrayList<Pair<T, Long>>(files);
-        Collections.sort(sortedFiles, new Comparator<Pair<T, Long>>()
-        {
-            public int compare(Pair<T, Long> p1, Pair<T, Long> p2)
-            {
-                return p1.right.compareTo(p2.right);
+  private void doMaybeRefresh() throws IOException {
+    // it's ok to call lock() here (blocking) because we're supposed to get here
+    // from either maybeRefreh() or maybeRefreshBlocking(), after the lock has
+    // already been obtained. Doing that protects us from an accidental bug
+    // where this method will be called outside the scope of refreshLock.
+    // Per ReentrantLock's javadoc, calling lock() by the same thread more than
+    // once is ok, as long as unlock() is called a matching number of times.
+    refreshLock.lock();
+    try {
+      final G reference = acquire();
+      try {
+        G newReference = refreshIfNeeded(reference);
+        if (newReference != null) {
+          assert newReference != reference : "refreshIfNeeded should return null if refresh wasn't needed";
+          boolean success = false;
+          try {
+            swapReference(newReference);
+            success = true;
+          } finally {
+            if (!success) {
+              release(newReference);
             }
-        });
-
-        Map<List<T>, Long> buckets = new HashMap<List<T>, Long>();
-
-        for (Pair<T, Long> pair: sortedFiles)
-        {
-            long size = pair.right;
-
-            boolean bFound = false;
-            // look for a bucket containing similar-sized files:
-            // group in the same bucket if it's w/in 50% of the average for this bucket,
-            // or this file and the bucket are all considered "small" (less than `minSSTableSize`)
-            for (Entry<List<T>, Long> entry : buckets.entrySet())
-            {
-                List<T> bucket = entry.getKey();
-                long averageSize = entry.getValue();
-                if ((size > (averageSize / 2) && size < (3 * averageSize) / 2)
-                    || (size < minSSTableSize && averageSize < minSSTableSize))
-                {
-                    // remove and re-add because adding changes the hash
-                    buckets.remove(bucket);
-                    long totalSize = bucket.size() * averageSize;
-                    averageSize = (totalSize + size) / (bucket.size() + 1);
-                    bucket.add(pair.left);
-                    buckets.put(bucket, averageSize);
-                    bFound = true;
-                    break;
-                }
-            }
-            // no similar bucket found; put it in a new one
-            if (!bFound)
-            {
-                ArrayList<T> bucket = new ArrayList<T>();
-                bucket.add(pair.left);
-                buckets.put(bucket, size);
-            }
+          }
         }
+      } finally {
+        release(reference);
+      }
+      afterRefresh();
+    } finally {
+      refreshLock.unlock();
+    }
+  }
+  
+  /**
+   * You must call this (or {@link #maybeRefreshBlocking()}), periodically, if
+   * you want that {@link #acquire()} will return refreshed instances.
+   * 
+   * <p>
+   * <b>Threads</b>: it's fine for more than one thread to call this at once.
+   * Only the first thread will attempt the refresh; subsequent threads will see
+   * that another thread is already handling refresh and will return
+   * immediately. Note that this means if another thread is already refreshing
+   * then subsequent threads will return right away without waiting for the
+   * refresh to complete.
+   * 
+   * <p>
+   * If this method returns true it means the calling thread either refreshed or
+   * that there were no changes to refresh. If it returns false it means another
+   * thread is currently refreshing.
+   */
+  public final boolean maybeRefresh() throws IOException {
+    ensureOpen();
 
-        return new LinkedList<List<T>>(buckets.keySet());
+    // Ensure only 1 thread does reopen at once; other threads just return immediately:
+    final boolean doTryRefresh = refreshLock.tryLock();
+    if (doTryRefresh) {
+      try {
+        doMaybeRefresh();
+      } finally {
+        refreshLock.unlock();
+      }
     }
 
-    private void updateEstimatedCompactionsByTasks(List<AbstractCompactionTask> tasks)
-    {
-        int n = 0;
-        for (AbstractCompactionTask task: tasks)
-        {
-            if (!(task instanceof CompactionTask))
-                continue;
+    return doTryRefresh;
+  }
+  
+  /**
+   * You must call this (or {@link #maybeRefresh()}), periodically, if you want
+   * that {@link #acquire()} will return refreshed instances.
+   * 
+   * <p>
+   * <b>Threads</b>: unlike {@link #maybeRefresh()}, if another thread is
+   * currently refreshing, this method blocks until that thread completes. It is
+   * useful if you want to guarantee that the next call to {@link #acquire()}
+   * will return a refreshed instance. Otherwise, consider using the
+   * non-blocking {@link #maybeRefresh()}.
+   */
+  public final void maybeRefreshBlocking() throws IOException, InterruptedException {
+    ensureOpen();
 
-            Collection<SSTableReader> sstablesToBeCompacted = task.getSSTables();
-            if (sstablesToBeCompacted.size() >= cfs.getMinimumCompactionThreshold())
-                n += Math.ceil((double)sstablesToBeCompacted.size() / cfs.getMaximumCompactionThreshold());
-        }
-        estimatedRemainingTasks = n;
+    // Ensure only 1 thread does reopen at once
+    refreshLock.lock();
+    try {
+      doMaybeRefresh();
+    } finally {
+      refreshLock.lock();
     }
+  }
 
-    public long getMinSSTableSize()
-    {
-        return minSSTableSize;
-    }
-
-    public long getMaxSSTableSize()
-    {
-        return Long.MAX_VALUE;
-    }
-
-    public boolean isKeyExistenceExpensive(Set<? extends SSTable> sstablesToIgnore)
-    {
-        return cfs.getSSTables().size() - sstablesToIgnore.size() > 20;
-    }
-
-    public String toString()
-    {
-        return String.format("SizeTieredCompactionStrategy[%s/%s]",
-            cfs.getMinimumCompactionThreshold(),
-            cfs.getMaximumCompactionThreshold());
-    }
+  /** Called after swapReference has installed a new
+   *  instance. */
+  protected void afterRefresh() throws IOException {
+  }
+  
+  /**
+   * Release the refernce previously obtained via {@link #acquire()}.
+   * <p>
+   * <b>NOTE:</b> it's safe to call this after {@link #close()}.
+   */
+  public final void release(G reference) throws IOException {
+    assert reference != null;
+    decRef(reference);
+  }
 }

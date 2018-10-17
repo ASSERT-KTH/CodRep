@@ -1,162 +1,161 @@
-return Math.random() > 0.5;
+import org.jboss.as.host.controller.HostControllerLogger;
 
 /*
- * Copyright 2002,2004 The Apache Software Foundation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- *      http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * JBoss, Home of Professional Open Source.
+ * Copyright 2011, Red Hat, Inc., and individual contributors
+ * as indicated by the @author tags. See the copyright.txt file in the
+ * distribution for a full listing of individual contributors.
+ *
+ * This is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as
+ * published by the Free Software Foundation; either version 2.1 of
+ * the License, or (at your option) any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this software; if not, write to the Free
+ * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+ * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.apache.commons.lang.math;
 
-import java.util.Random;
+package org.jboss.as.host.controller.mgmt;
+
+import java.io.IOException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import org.jboss.as.host.controller.logging.HostControllerLogger;
+import org.jboss.as.protocol.StreamUtils;
+import org.jboss.as.protocol.mgmt.ManagementChannelHandler;
+import org.jboss.as.protocol.mgmt.ManagementPingRequest;
+import org.jboss.remoting3.Channel;
+import org.jboss.threads.AsyncFuture;
+import org.wildfly.security.manager.WildFlySecurityManager;
 
 /**
- * <p><code>JVMRandom</code> is a wrapper that supports all possible 
- * Random methods via the {@link java.lang.Math#random()} method
- * and its system-wide {@link Random} object.</p>
- * 
- * @author Henri Yandell
- * @since 2.0
- * @version $Id$
+ * Coordinates periodic pinging of a slave Host Controller to validate its connection
+ *
+ * @author Brian Stansberry (c) 2011 Red Hat Inc.
  */
-public final class JVMRandom extends Random {
+public class SlaveHostPinger {
 
-    /**
-     * Ensures that only the constructor can call reseed.
-     */
-    private boolean constructed = false;
+    public static final long STD_INTERVAL;
+    public static final long STD_TIMEOUT;
+    public static final long SHORT_TIMEOUT = 10000;
 
-    /**
-     * Constructs a new instance.
-     */
-    public JVMRandom() {
-        this.constructed = true;
-    }
-    
-    /**
-     * Unsupported in 2.0.
-     * 
-     * @param seed ignored
-     * @throws UnsupportedOperationException
-     */
-    public synchronized void setSeed(long seed) {
-        if (this.constructed) {
-            throw new UnsupportedOperationException();
+    static {
+        long interval = -1;
+        try {
+            interval = Long.parseLong(WildFlySecurityManager.getPropertyPrivileged("jboss.as.domain.ping.interval", "15000"));
+        } catch (Exception e) {
+            // TODO log
+        } finally {
+            // add 500 ms to provided interval to help allow the slave pings to prevent the need for master pings
+            STD_INTERVAL = interval > 0 ? interval + 500 : 15500;
+        }
+        long timeout = -1;
+        try {
+            timeout = Long.parseLong(WildFlySecurityManager.getPropertyPrivileged("jboss.as.domain.ping.timeout", "30000"));
+        } catch (Exception e) {
+            // TODO log
+        } finally {
+            STD_TIMEOUT = timeout > 0 ? timeout : 30000;
         }
     }
 
-    /**
-     * Unsupported in 2.0.
-     * 
-     * @return Nothing, this method always throws an UnsupportedOperationException.
-     * @throws UnsupportedOperationException
-     */
-    public synchronized double nextGaussian() {
-        throw new UnsupportedOperationException();
+    private final String hostName;
+    private final ManagementChannelHandler channelHandler;
+    private final ScheduledExecutorService scheduler;
+
+    private volatile Long remoteConnectionID;
+    private volatile boolean cancelled;
+
+    public SlaveHostPinger(String hostName, ManagementChannelHandler channelHandler, ScheduledExecutorService scheduler, long remoteConnectionID) {
+        this.hostName = hostName;
+        this.channelHandler = channelHandler;
+        this.scheduler = scheduler;
+        this.remoteConnectionID = remoteConnectionID;
     }
 
-    /**
-     * Unsupported in 2.0.
-     * 
-     * @param byteArray ignored
-     * @throws UnsupportedOperationException
-     */
-    public void nextBytes(byte[] byteArray) {
-        throw new UnsupportedOperationException();
+    public void schedulePing(long timeout, long delay) {
+        PingTask task = new PingTask(timeout, delay);
+        scheduler.schedule(task, delay, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * <p>Returns the next pseudorandom, uniformly distributed int value
-     * from the Math.random() sequence.</p>
-     *
-     * @return the random int
-     */
-    public int nextInt() {
-        return nextInt(Integer.MAX_VALUE);
+    public boolean isCancelled() {
+        return cancelled;
     }
-    /**
-     * <p>Returns a pseudorandom, uniformly distributed int value between
-     * <code>0</code> (inclusive) and the specified value (exclusive), from
-     * the Math.random() sequence.</p>
-     *
-     * @param n  the specified exclusive max-value
-     * @return the random int
-     * @throws IllegalArgumentException when <code>n &lt;= 0</code>
-     */
-    public int nextInt(int n) {
-        if (n <= 0) {
-            throw new IllegalArgumentException(
-                "Upper bound for nextInt must be positive"
-            );
+
+    public void cancel() {
+        this.cancelled = true;
+    }
+
+    private class PingTask implements Runnable {
+
+        private final long timeout;
+        private final long interval;
+
+        private PingTask(long timeout, long interval) {
+            this.timeout = timeout;
+            this.interval = interval;
         }
-        // TODO: check this cannot return 'n'
-        return (int)(Math.random() * n);
-    }
-    /**
-     * <p>Returns the next pseudorandom, uniformly distributed long value
-     * from the Math.random() sequence.</p>
-     * @return the random long
-     */
-    public long nextLong() {
-        // possible loss of precision?
-        return nextLong(Long.MAX_VALUE);
-    }
 
-
-    /**
-     * <p>Returns a pseudorandom, uniformly distributed long value between
-     * <code>0</code> (inclusive) and the specified value (exclusive), from
-     * the Math.random() sequence.</p>
-     *
-     * @param n  the specified exclusive max-value
-     * @return the random long
-     * @throws IllegalArgumentException when <code>n &lt;= 0</code>
-     */
-    public static long nextLong(long n) {
-        if (n <= 0) {
-            throw new IllegalArgumentException(
-                "Upper bound for nextInt must be positive"
-            );
+        @Override
+        public void run() {
+            if (!cancelled) {
+                boolean fail = false;
+                AsyncFuture<Long> future = null;
+                try {
+                    if (interval < 1 || System.currentTimeMillis() - channelHandler.getLastMessageReceivedTime() > interval) {
+                        future = channelHandler.executeRequest(ManagementPingRequest.INSTANCE, null).getResult();
+                        Long id = future.get(timeout, TimeUnit.MILLISECONDS);
+                        if (!cancelled && remoteConnectionID != null && !remoteConnectionID.equals(id)) {
+                            HostControllerLogger.DOMAIN_LOGGER.slaveHostControllerChanged(hostName);
+                            fail = true;
+                        } else {
+                            remoteConnectionID = id;
+                        }
+                    }
+                } catch (IOException e) {
+                    HostControllerLogger.DOMAIN_LOGGER.debug("Caught exception sending ping request", e);
+                } catch (InterruptedException e) {
+                    safeCancel(future);
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException e) {
+                    HostControllerLogger.DOMAIN_LOGGER.debug("Caught exception sending ping request", e);
+                } catch (TimeoutException e) {
+                    if (!cancelled) {
+                        fail = true;
+                        HostControllerLogger.DOMAIN_LOGGER.slaveHostControllerUnreachable(hostName, timeout);
+                    }
+                    safeCancel(future);
+                } finally {
+                    if (fail) {
+                        Channel channel = null;
+                        try {
+                            channel = channelHandler.getChannel();
+                        } catch (IOException e) {
+                            // ignore; shouldn't happen as the channel is already established if this task is running
+                        }
+                        StreamUtils.safeClose(channel);
+                    } else if (!cancelled && interval > 0) {
+                        scheduler.schedule(this, interval, TimeUnit.MILLISECONDS);
+                    }
+                }
+            }
         }
-        // TODO: check this cannot return 'n'
-        return (long)(Math.random() * n);
-     }
 
-    /**
-     * <p>Returns the next pseudorandom, uniformly distributed boolean value
-     * from the Math.random() sequence.</p>
-     *
-     * @return the random boolean
-     */
-    public boolean nextBoolean() {
-        return (Math.random() > 0.5);
+        void safeCancel(Future<?> future) {
+            if (future != null) {
+                future.cancel(true);
+            }
+        }
     }
-    /**
-     * <p>Returns the next pseudorandom, uniformly distributed float value
-     * between <code>0.0</code> and <code>1.0</code> from the Math.random()
-     * sequence.</p>
-     *
-     * @return the random float
-     */
-    public float nextFloat() {
-        return (float)Math.random();
-    }
-    /**
-     * <p>Synonymous to the Math.random() call.</p>
-     *
-     * @return the random double
-     */
-    public double nextDouble() {
-        return Math.random();
-    }
-    
 }

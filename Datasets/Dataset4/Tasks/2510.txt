@@ -1,13 +1,13 @@
-return os.copiedByteArray();
+bucketsByKey.close();
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,369 +18,490 @@ return os.copiedByteArray();
  * specific language governing permissions and limitations
  * under the License.
  */
+package org.elasticsearch.search.aggregations.bucket.histogram;
 
-package org.elasticsearch.discovery.jgroups;
-
-import com.google.inject.Inject;
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchIllegalStateException;
-import org.elasticsearch.cluster.*;
-import org.elasticsearch.cluster.node.Node;
-import org.elasticsearch.cluster.node.Nodes;
-import org.elasticsearch.discovery.Discovery;
-import org.elasticsearch.discovery.DiscoveryException;
-import org.elasticsearch.discovery.InitialStateDiscoveryListener;
-import org.elasticsearch.env.Environment;
-import org.elasticsearch.transport.TransportService;
-import org.elasticsearch.util.component.AbstractComponent;
-import org.elasticsearch.util.component.Lifecycle;
-import org.elasticsearch.util.io.ByteArrayDataInputStream;
-import org.elasticsearch.util.io.ByteArrayDataOutputStream;
-import org.elasticsearch.util.io.HostResolver;
-import org.elasticsearch.util.settings.Settings;
-import org.jgroups.*;
+import com.carrotsearch.hppc.LongObjectOpenHashMap;
+import com.google.common.collect.Lists;
+import org.apache.lucene.util.CollectionUtil;
+import org.elasticsearch.Version;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.rounding.Rounding;
+import org.elasticsearch.common.text.StringText;
+import org.elasticsearch.common.text.Text;
+import org.elasticsearch.common.util.BigArrays;
+import org.elasticsearch.common.util.LongObjectPagedHashMap;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.search.aggregations.AggregationStreams;
+import org.elasticsearch.search.aggregations.Aggregations;
+import org.elasticsearch.search.aggregations.InternalAggregation;
+import org.elasticsearch.search.aggregations.InternalAggregations;
+import org.elasticsearch.search.aggregations.support.format.ValueFormatter;
+import org.elasticsearch.search.aggregations.support.format.ValueFormatterStreams;
 
 import java.io.IOException;
-import java.net.Inet4Address;
-import java.net.Inet6Address;
-import java.net.InetAddress;
-import java.net.URL;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicBoolean;
-
-import static com.google.common.collect.Maps.*;
-import static com.google.common.collect.Sets.*;
-import static org.elasticsearch.cluster.ClusterState.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.ListIterator;
 
 /**
- * @author kimchy (Shay Banon)
+ * TODO should be renamed to InternalNumericHistogram (see comment on {@link Histogram})?
  */
-public class JgroupsDiscovery extends AbstractComponent implements Discovery, Receiver {
+public class InternalHistogram<B extends InternalHistogram.Bucket> extends InternalAggregation implements Histogram {
 
-    static {
-        System.setProperty("jgroups.logging.log_factory_class", JgroupsCustomLogFactory.class.getName());
+    final static Type TYPE = new Type("histogram", "histo");
+    final static Factory FACTORY = new Factory();
+
+    private final static AggregationStreams.Stream STREAM = new AggregationStreams.Stream() {
+        @Override
+        public InternalHistogram readResult(StreamInput in) throws IOException {
+            InternalHistogram histogram = new InternalHistogram();
+            histogram.readFrom(in);
+            return histogram;
+        }
+    };
+
+    public static void registerStream() {
+        AggregationStreams.registerStream(STREAM, TYPE.stream());
     }
 
-    private final Lifecycle lifecycle = new Lifecycle();
+    public static class Bucket implements Histogram.Bucket {
 
-    private final ClusterName clusterName;
+        long key;
+        long docCount;
+        protected transient final @Nullable ValueFormatter formatter;
+        InternalAggregations aggregations;
 
-    private final TransportService transportService;
-
-    private final ClusterService clusterService;
-
-    private final Channel channel;
-
-    private volatile boolean addressSet = false;
-
-    private Node localNode;
-
-    private volatile boolean firstMaster = false;
-
-    private final AtomicBoolean initialStateSent = new AtomicBoolean();
-
-    private final CopyOnWriteArrayList<InitialStateDiscoveryListener> initialStateListeners = new CopyOnWriteArrayList<InitialStateDiscoveryListener>();
-
-    @Inject public JgroupsDiscovery(Settings settings, Environment environment, ClusterName clusterName,
-                                    TransportService transportService, ClusterService clusterService) {
-        super(settings);
-        this.clusterName = clusterName;
-        this.transportService = transportService;
-        this.clusterService = clusterService;
-
-        String config = componentSettings.get("config", "udp");
-        String actualConfig = config;
-        if (!config.endsWith(".xml")) {
-            actualConfig = "jgroups/" + config + ".xml";
+        public Bucket(long key, long docCount, @Nullable ValueFormatter formatter, InternalAggregations aggregations) {
+            this.key = key;
+            this.docCount = docCount;
+            this.formatter = formatter;
+            this.aggregations = aggregations;
         }
-        URL configUrl = environment.resolveConfig(actualConfig);
-        logger.debug("Using configuration [{}]", configUrl);
 
-        Map<String, String> sysPropsSet = newHashMap();
-        try {
-            // prepare system properties to configure jgroups based on the settings
-            for (Map.Entry<String, String> entry : settings.getAsMap().entrySet()) {
-                if (entry.getKey().startsWith("discovery.jgroups")) {
-                    String jgroupsKey = entry.getKey().substring("discovery.".length());
-                    if (System.getProperty(jgroupsKey) == null) {
-                        sysPropsSet.put(jgroupsKey, entry.getValue());
-                        System.setProperty(jgroupsKey, entry.getValue());
-                    }
+        @Override
+        public String getKey() {
+            return formatter != null ? formatter.format(key) : ValueFormatter.RAW.format(key);
+        }
+
+        @Override
+        public Text getKeyAsText() {
+            return new StringText(getKey());
+        }
+
+        @Override
+        public Number getKeyAsNumber() {
+            return key;
+        }
+
+        @Override
+        public long getDocCount() {
+            return docCount;
+        }
+
+        @Override
+        public Aggregations getAggregations() {
+            return aggregations;
+        }
+
+        <B extends Bucket> B reduce(List<B> buckets, BigArrays bigArrays) {
+            if (buckets.size() == 1) {
+                // we only need to reduce the sub aggregations
+                Bucket bucket = buckets.get(0);
+                bucket.aggregations.reduce(bigArrays);
+                return (B) bucket;
+            }
+            List<InternalAggregations> aggregations = new ArrayList<>(buckets.size());
+            Bucket reduced = null;
+            for (Bucket bucket : buckets) {
+                if (reduced == null) {
+                    reduced = bucket;
+                } else {
+                    reduced.docCount += bucket.docCount;
                 }
+                aggregations.add((InternalAggregations) bucket.getAggregations());
             }
+            reduced.aggregations = InternalAggregations.reduce(aggregations, bigArrays);
+            return (B) reduced;
+        }
 
-            if (System.getProperty("jgroups.bind_addr") == null) {
-                // automatically set the bind address based on ElasticSearch default bindings...
-                try {
-                    InetAddress bindAddress = HostResolver.resultBindHostAddress(null, settings, HostResolver.LOCAL_IP);
-                    if ((bindAddress instanceof Inet4Address && HostResolver.isIPv4()) || (bindAddress instanceof Inet6Address && !HostResolver.isIPv4())) {
-                        sysPropsSet.put("jgroups.bind_addr", bindAddress.getHostAddress());
-                        System.setProperty("jgroups.bind_addr", bindAddress.getHostAddress());
-                    }
-                } catch (IOException e) {
-                    // ignore this
+        void toXContent(XContentBuilder builder, Params params, boolean keyed, @Nullable ValueFormatter formatter) throws IOException {
+            if (formatter != null) {
+                Text keyTxt = new StringText(formatter.format(key));
+                if (keyed) {
+                    builder.startObject(keyTxt.string());
+                } else {
+                    builder.startObject();
                 }
-            }
-
-            channel = new JChannel(configUrl);
-        } catch (ChannelException e) {
-            throw new DiscoveryException("Failed to create jgroups channel with config [" + configUrl + "]", e);
-        } finally {
-            for (String keyToRemove : sysPropsSet.keySet()) {
-                System.getProperties().remove(keyToRemove);
-            }
-        }
-    }
-
-    @Override public void addListener(InitialStateDiscoveryListener listener) {
-        initialStateListeners.add(listener);
-    }
-
-    @Override public void removeListener(InitialStateDiscoveryListener listener) {
-        initialStateListeners.remove(listener);
-    }
-
-    @Override public Lifecycle.State lifecycleState() {
-        return this.lifecycle.state();
-    }
-
-    @Override public Discovery start() throws ElasticSearchException {
-        if (!lifecycle.moveToStarted()) {
-            return this;
-        }
-        try {
-            channel.connect(clusterName.value());
-            channel.setReceiver(this);
-            logger.debug("Connected to cluster [{}], address [{}]", channel.getClusterName(), channel.getAddress());
-            this.localNode = new Node(settings.get("name"), settings.getAsBoolean("node.data", true), channel.getAddress().toString(), transportService.boundAddress().publishAddress());
-
-            if (isMaster()) {
-                clusterService.submitStateUpdateTask("jgroups-disco-initialconnect(master)", new ProcessedClusterStateUpdateTask() {
-                    @Override public ClusterState execute(ClusterState currentState) {
-                        Nodes.Builder builder = new Nodes.Builder()
-                                .localNodeId(localNode.id())
-                                .masterNodeId(localNode.id())
-                                        // put our local node
-                                .put(localNode);
-                        return newClusterStateBuilder().state(currentState).nodes(builder).build();
-                    }
-
-                    @Override public void clusterStateProcessed(ClusterState clusterState) {
-                        sendInitialStateEventIfNeeded();
-                    }
-                });
-                firstMaster = true;
-                addressSet = true;
+                builder.field(CommonFields.KEY_AS_STRING, keyTxt);
             } else {
-                clusterService.submitStateUpdateTask("jgroups-disco-initialconnect", new ClusterStateUpdateTask() {
-                    @Override public ClusterState execute(ClusterState currentState) {
-                        Nodes.Builder builder = new Nodes.Builder()
-                                .localNodeId(localNode.id())
-                                .put(localNode);
-                        return newClusterStateBuilder().state(currentState).nodes(builder).build();
-                    }
-                });
-                try {
-                    channel.send(new Message(channel.getView().getCreator(), channel.getAddress(), nodeMessagePayload()));
-                    addressSet = true;
-                    logger.debug("Sent address [{}] to master [{}]", transportService.boundAddress().publishAddress(), channel.getView().getCreator());
-                } catch (Exception e) {
-                    logger.warn("Can't send address to master [" + channel.getView().getCreator() + "] will try again later...", e);
+                if (keyed) {
+                    builder.startObject(String.valueOf(getKeyAsNumber()));
+                } else {
+                    builder.startObject();
                 }
             }
-        } catch (ChannelException e) {
-            throw new DiscoveryException("Can't connect to group [" + clusterName + "]", e);
-        }
-        return this;
-    }
-
-    @Override public Discovery stop() throws ElasticSearchException {
-        if (!lifecycle.moveToStopped()) {
-            return this;
-        }
-        initialStateSent.set(false);
-        if (channel.isConnected()) {
-            channel.disconnect();
-        }
-        return this;
-    }
-
-    @Override public void close() throws DiscoveryException {
-        if (lifecycle.started()) {
-            stop();
-        }
-        if (!lifecycle.moveToClosed()) {
-            return;
-        }
-        if (channel.isOpen()) {
-            channel.close();
+            builder.field(CommonFields.KEY, key);
+            builder.field(CommonFields.DOC_COUNT, docCount);
+            aggregations.toXContentInternal(builder, params);
+            builder.endObject();
         }
     }
 
-    public String nodeDescription() {
-        return channel.getClusterName() + "/" + channel.getAddress();
-    }
+    static class EmptyBucketInfo {
 
-    @Override public boolean firstMaster() {
-        return firstMaster;
-    }
+        final Rounding rounding;
+        final InternalAggregations subAggregations;
+        final ExtendedBounds bounds;
 
-    @Override public void publish(ClusterState clusterState) {
-        if (!isMaster()) {
-            throw new ElasticSearchIllegalStateException("Shouldn't publish state when not master");
-        }
-        try {
-            channel.send(new Message(null, null, ClusterState.Builder.toBytes(clusterState)));
-        } catch (Exception e) {
-            logger.error("Failed to send cluster state to nodes", e);
-        }
-    }
-
-    @Override public void receive(Message msg) {
-        if (msg.getSrc().equals(channel.getAddress())) {
-            return; // my own message, ignore.
+        EmptyBucketInfo(Rounding rounding, InternalAggregations subAggregations) {
+            this(rounding, subAggregations, null);
         }
 
-        // message from the master, the cluster state has changed.
-        if (msg.getSrc().equals(channel.getView().getCreator())) {
-            try {
-                byte[] buffer = msg.getBuffer();
-                final ClusterState clusterState = ClusterState.Builder.fromBytes(buffer, settings, localNode);
-                // ignore cluster state messages that do not include "me", not in the game yet...
-                if (clusterState.nodes().localNode() != null) {
-                    clusterService.submitStateUpdateTask("jgroups-disco-receive(from master)", new ProcessedClusterStateUpdateTask() {
-                        @Override public ClusterState execute(ClusterState currentState) {
-                            return clusterState;
-                        }
+        EmptyBucketInfo(Rounding rounding, InternalAggregations subAggregations, ExtendedBounds bounds) {
+            this.rounding = rounding;
+            this.subAggregations = subAggregations;
+            this.bounds = bounds;
+        }
 
-                        @Override public void clusterStateProcessed(ClusterState clusterState) {
-                            sendInitialStateEventIfNeeded();
-                        }
-                    });
+        public static EmptyBucketInfo readFrom(StreamInput in) throws IOException {
+            Rounding rounding = Rounding.Streams.read(in);
+            InternalAggregations aggs = InternalAggregations.readAggregations(in);
+            if (in.getVersion().onOrAfter(Version.V_1_1_0)) {
+                if (in.readBoolean()) {
+                    return new EmptyBucketInfo(rounding, aggs, ExtendedBounds.readFrom(in));
                 }
-            } catch (Exception e) {
-                logger.error("Received corrupted cluster state.", e);
             }
-
-            return;
+            return new EmptyBucketInfo(rounding, aggs);
         }
 
-        // direct message from a member that indicate his state has changed.
-        if (isMaster()) {
-            try {
-                ByteArrayDataInputStream is = new ByteArrayDataInputStream(msg.getBuffer());
-                final Node newNode = Node.readNode(is);
-                is.close();
-                clusterService.submitStateUpdateTask("jgroups-disco-receive(from node[" + newNode + "])", new ClusterStateUpdateTask() {
-                    @Override public ClusterState execute(ClusterState currentState) {
-                        if (currentState.nodes().nodeExists(newNode.id())) {
-                            // no change, the node already exists in the cluster
-                            logger.warn("Received an address [{}] for an existing node [{}]", newNode.address(), newNode);
-                            return currentState;
-                        }
-                        return newClusterStateBuilder().state(currentState).nodes(currentState.nodes().newNode(newNode)).build();
-                    }
-                });
-            } catch (Exception e) {
-                logger.warn("Can't read address from cluster member, message [" + msg.getClass().getName() + "/" + msg + "]", e);
-            }
-
-            return;
-        }
-
-        logger.error("A message between two members that neither of them is the master is not allowed.");
-    }
-
-    private boolean isMaster() {
-        return channel.getAddress().equals(channel.getView().getCreator());
-    }
-
-    @Override public byte[] getState() {
-        return new byte[0];
-    }
-
-    @Override public void setState(byte[] state) {
-    }
-
-    @Override public void viewAccepted(final View newView) {
-        if (!addressSet) {
-            try {
-                channel.send(new Message(newView.getCreator(), channel.getAddress(), nodeMessagePayload()));
-                logger.debug("Sent address [{}] to master [{}]", localNode.address(), newView.getCreator());
-                addressSet = true;
-            } catch (Exception e) {
-                logger.warn("Can't send address to master [" + newView.getCreator() + "] will try again later...", e);
-            }
-        }
-        // I am the master
-        if (channel.getAddress().equals(newView.getCreator())) {
-            final Set<String> newMembers = newHashSet();
-            for (Address address : newView.getMembers()) {
-                newMembers.add(address.toString());
-            }
-
-            clusterService.submitStateUpdateTask("jgroups-disco-view", new ClusterStateUpdateTask() {
-                @Override public ClusterState execute(ClusterState currentState) {
-                    Nodes newNodes = currentState.nodes().removeDeadMembers(newMembers, newView.getCreator().toString());
-                    Nodes.Delta delta = newNodes.delta(currentState.nodes());
-                    if (delta.added()) {
-                        logger.warn("No new nodes should be created when a new discovery view is accepted");
-                    }
-                    // we want to send a new cluster state any how on view change (that's why its commented)
-                    // for cases where we have client node joining (and it needs the cluster state)
-//                    if (!delta.removed()) {
-//                        // no nodes were removed, return the current state
-//                        return currentState;
-//                    }
-                    return newClusterStateBuilder().state(currentState).nodes(newNodes).build();
+        public static void writeTo(EmptyBucketInfo info, StreamOutput out) throws IOException {
+            Rounding.Streams.write(info.rounding, out);
+            info.subAggregations.writeTo(out);
+            if (out.getVersion().onOrAfter(Version.V_1_1_0)) {
+                out.writeBoolean(info.bounds != null);
+                if (info.bounds != null) {
+                    info.bounds.writeTo(out);
                 }
-            });
+            }
+        }
+
+    }
+
+    static class Factory<B extends InternalHistogram.Bucket> {
+
+        protected Factory() {
+        }
+
+        public String type() {
+            return TYPE.name();
+        }
+
+        public InternalHistogram<B> create(String name, List<B> buckets, InternalOrder order, long minDocCount,
+                                           EmptyBucketInfo emptyBucketInfo, @Nullable ValueFormatter formatter, boolean keyed) {
+            return new InternalHistogram<>(name, buckets, order, minDocCount, emptyBucketInfo, formatter, keyed);
+        }
+
+        public B createBucket(long key, long docCount, InternalAggregations aggregations, @Nullable ValueFormatter formatter) {
+            return (B) new Bucket(key, docCount, formatter, aggregations);
+        }
+
+    }
+
+    protected List<B> buckets;
+    private LongObjectOpenHashMap<B> bucketsMap;
+    private InternalOrder order;
+    private @Nullable ValueFormatter formatter;
+    private boolean keyed;
+    private long minDocCount;
+    private EmptyBucketInfo emptyBucketInfo;
+
+    InternalHistogram() {} // for serialization
+
+    InternalHistogram(String name, List<B> buckets, InternalOrder order, long minDocCount,
+                      EmptyBucketInfo emptyBucketInfo, @Nullable ValueFormatter formatter, boolean keyed) {
+        super(name);
+        this.buckets = buckets;
+        this.order = order;
+        assert (minDocCount == 0) == (emptyBucketInfo != null);
+        this.minDocCount = minDocCount;
+        this.emptyBucketInfo = emptyBucketInfo;
+        this.formatter = formatter;
+        this.keyed = keyed;
+    }
+
+    @Override
+    public Type type() {
+        return TYPE;
+    }
+
+    @Override
+    public Collection<B> getBuckets() {
+        return buckets;
+    }
+
+    @Override
+    public B getBucketByKey(String key) {
+        return getBucketByKey(Long.valueOf(key));
+    }
+
+    @Override
+    public B getBucketByKey(Number key) {
+        if (bucketsMap == null) {
+            bucketsMap = new LongObjectOpenHashMap<>(buckets.size());
+            for (B bucket : buckets) {
+                bucketsMap.put(bucket.key, bucket);
+            }
+        }
+        return bucketsMap.get(key.longValue());
+    }
+
+    @Override
+    public InternalAggregation reduce(ReduceContext reduceContext) {
+        List<InternalAggregation> aggregations = reduceContext.aggregations();
+        if (aggregations.size() == 1) {
+
+            InternalHistogram<B> histo = (InternalHistogram<B>) aggregations.get(0);
+
+            if (minDocCount == 1) {
+                for (B bucket : histo.buckets) {
+                    bucket.aggregations.reduce(reduceContext.bigArrays());
+                }
+                return histo;
+            }
+
+            CollectionUtil.introSort(histo.buckets, order.asc ? InternalOrder.KEY_ASC.comparator() : InternalOrder.KEY_DESC.comparator());
+            List<B> list = order.asc ? histo.buckets : Lists.reverse(histo.buckets);
+            B lastBucket = null;
+            ListIterator<B> iter = list.listIterator();
+
+            // we need to fill the gaps with empty buckets
+            if (minDocCount == 0) {
+                ExtendedBounds bounds = emptyBucketInfo.bounds;
+
+                // first adding all the empty buckets *before* the actual data (based on th extended_bounds.min the user requested)
+                if (bounds != null) {
+                    B firstBucket = iter.hasNext() ? list.get(iter.nextIndex()) : null;
+                    if (firstBucket == null) {
+                        if (bounds.min != null && bounds.max != null) {
+                            long key = bounds.min;
+                            long max = bounds.max;
+                            while (key <= max) {
+                                iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                                key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                            }
+                        }
+                    } else {
+                        if (bounds.min != null) {
+                            long key = bounds.min;
+                            while (key < firstBucket.key) {
+                                iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                                key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                            }
+                        }
+                    }
+                }
+
+                // now adding the empty buckets within the actual data,
+                // e.g. if the data series is [1,2,3,7] there are 3 empty buckets that will be created for 4,5,6
+                while (iter.hasNext()) {
+                    // look ahead on the next bucket without advancing the iter
+                    // so we'll be able to insert elements at the right position
+                    B nextBucket = list.get(iter.nextIndex());
+                    nextBucket.aggregations.reduce(reduceContext.bigArrays());
+                    if (lastBucket != null) {
+                        long key = emptyBucketInfo.rounding.nextRoundingValue(lastBucket.key);
+                        while (key != nextBucket.key) {
+                            iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                            key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                        }
+                    }
+                    lastBucket = iter.next();
+                }
+
+                // finally, adding the empty buckets *after* the actual data (based on the extended_bounds.max requested by the user)
+                if (bounds != null && lastBucket != null && bounds.max != null && bounds.max > lastBucket.key) {
+                    long key = emptyBucketInfo.rounding.nextRoundingValue(lastBucket.key);
+                    long max = bounds.max;
+                    while (key <= max) {
+                        iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                        key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                    }
+                }
+
+            } else {
+                while (iter.hasNext()) {
+                    InternalHistogram.Bucket bucket = iter.next();
+                    if (bucket.getDocCount() < minDocCount) {
+                        iter.remove();
+                    } else {
+                        bucket.aggregations.reduce(reduceContext.bigArrays());
+                    }
+                }
+            }
+
+            if (order != InternalOrder.KEY_ASC && order != InternalOrder.KEY_DESC) {
+                CollectionUtil.introSort(histo.buckets, order.comparator());
+            }
+
+            return histo;
+        }
+
+        InternalHistogram reduced = (InternalHistogram) aggregations.get(0);
+
+        LongObjectPagedHashMap<List<B>> bucketsByKey = new LongObjectPagedHashMap<>(reduceContext.bigArrays());
+        for (InternalAggregation aggregation : aggregations) {
+            InternalHistogram<B> histogram = (InternalHistogram) aggregation;
+            for (B bucket : histogram.buckets) {
+                List<B> bucketList = bucketsByKey.get(bucket.key);
+                if (bucketList == null) {
+                    bucketList = new ArrayList<>(aggregations.size());
+                    bucketsByKey.put(bucket.key, bucketList);
+                }
+                bucketList.add(bucket);
+            }
+        }
+
+        List<B> reducedBuckets = new ArrayList<>((int) bucketsByKey.size());
+        for (LongObjectPagedHashMap.Cursor<List<B>> cursor : bucketsByKey) {
+            List<B> sameTermBuckets = cursor.value;
+            B bucket = sameTermBuckets.get(0).reduce(sameTermBuckets, reduceContext.bigArrays());
+            if (bucket.getDocCount() >= minDocCount) {
+                reducedBuckets.add(bucket);
+            }
+        }
+        bucketsByKey.release();
+
+        // adding empty buckets in needed
+        if (minDocCount == 0) {
+            CollectionUtil.introSort(reducedBuckets, order.asc ? InternalOrder.KEY_ASC.comparator() : InternalOrder.KEY_DESC.comparator());
+            List<B> list = order.asc ? reducedBuckets : Lists.reverse(reducedBuckets);
+            B lastBucket = null;
+            ExtendedBounds bounds = emptyBucketInfo.bounds;
+            ListIterator<B> iter = list.listIterator();
+
+            // first adding all the empty buckets *before* the actual data (based on th extended_bounds.min the user requested)
+            if (bounds != null) {
+                B firstBucket = iter.hasNext() ? list.get(iter.nextIndex()) : null;
+                if (firstBucket == null) {
+                    if (bounds.min != null && bounds.max != null) {
+                        long key = bounds.min;
+                        long max = bounds.max;
+                        while (key <= max) {
+                            iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                            key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                        }
+                    }
+                } else {
+                    if (bounds.min != null) {
+                        long key = bounds.min;
+                        if (key < firstBucket.key) {
+                            while (key < firstBucket.key) {
+                                iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                                key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // now adding the empty buckets within the actual data,
+            // e.g. if the data series is [1,2,3,7] there're 3 empty buckets that will be created for 4,5,6
+            while (iter.hasNext()) {
+                B nextBucket = list.get(iter.nextIndex());
+                if (lastBucket != null) {
+                    long key = emptyBucketInfo.rounding.nextRoundingValue(lastBucket.key);
+                    while (key != nextBucket.key) {
+                        iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                        key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                    }
+                }
+                lastBucket = iter.next();
+            }
+
+            // finally, adding the empty buckets *after* the actual data (based on the extended_bounds.max requested by the user)
+            if (bounds != null && lastBucket != null && bounds.max != null && bounds.max > lastBucket.key) {
+                long key = emptyBucketInfo.rounding.nextRoundingValue(lastBucket.key);
+                long max = bounds.max;
+                while (key <= max) {
+                    iter.add(createBucket(key, 0, emptyBucketInfo.subAggregations, formatter));
+                    key = emptyBucketInfo.rounding.nextRoundingValue(key);
+                }
+            }
+
+            if (order != InternalOrder.KEY_ASC && order != InternalOrder.KEY_DESC) {
+                CollectionUtil.introSort(reducedBuckets, order.comparator());
+            }
+
         } else {
-            // check whether I have been removed due to temporary disconnect
-            final String me = channel.getAddress().toString();
-            boolean foundMe = false;
-            for (Node node : clusterService.state().nodes()) {
-                if (node.id().equals(me)) {
-                    foundMe = true;
-                    break;
-                }
-            }
+            CollectionUtil.introSort(reducedBuckets, order.comparator());
+        }
 
-            if (!foundMe) {
-                logger.warn("Disconnected from cluster, resending address [{}] to master [{}]", localNode.address(), newView.getCreator());
-                try {
-                    channel.send(new Message(newView.getCreator(), channel.getAddress(), nodeMessagePayload()));
-                    addressSet = true;
-                } catch (Exception e) {
-                    addressSet = false;
-                    logger.warn("Can't send address to master [" + newView.getCreator() + "] will try again later...", e);
-                }
-            }
+
+        reduced.buckets = reducedBuckets;
+        return reduced;
+    }
+
+    protected B createBucket(long key, long docCount, InternalAggregations aggregations, @Nullable ValueFormatter formatter) {
+        return (B) new InternalHistogram.Bucket(key, docCount, formatter, aggregations);
+    }
+
+    @Override
+    public void readFrom(StreamInput in) throws IOException {
+        name = in.readString();
+        order = InternalOrder.Streams.readOrder(in);
+        minDocCount = in.readVLong();
+        if (minDocCount == 0) {
+            emptyBucketInfo = EmptyBucketInfo.readFrom(in);
+        }
+        formatter = ValueFormatterStreams.readOptional(in);
+        keyed = in.readBoolean();
+        int size = in.readVInt();
+        List<B> buckets = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            buckets.add(createBucket(in.readLong(), in.readVLong(), InternalAggregations.readAggregations(in), formatter));
+        }
+        this.buckets = buckets;
+        this.bucketsMap = null;
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeString(name);
+        InternalOrder.Streams.writeOrder(order, out);
+        out.writeVLong(minDocCount);
+        if (minDocCount == 0) {
+            EmptyBucketInfo.writeTo(emptyBucketInfo, out);
+        }
+        ValueFormatterStreams.writeOptional(formatter, out);
+        out.writeBoolean(keyed);
+        out.writeVInt(buckets.size());
+        for (B bucket : buckets) {
+            out.writeLong(bucket.key);
+            out.writeVLong(bucket.docCount);
+            bucket.aggregations.writeTo(out);
         }
     }
 
-    private byte[] nodeMessagePayload() throws IOException {
-        ByteArrayDataOutputStream os = new ByteArrayDataOutputStream();
-        localNode.writeTo(os);
-        os.close();
-        return os.unsafeByteArray();
-    }
-
-    private void sendInitialStateEventIfNeeded() {
-        if (initialStateSent.compareAndSet(false, true)) {
-            for (InitialStateDiscoveryListener listener : initialStateListeners) {
-                listener.initialStateProcessed();
-            }
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject(name);
+        if (keyed) {
+            builder.startObject(CommonFields.BUCKETS);
+        } else {
+            builder.startArray(CommonFields.BUCKETS);
         }
+        for (B bucket : buckets) {
+            bucket.toXContent(builder, params, keyed, formatter);
+        }
+        if (keyed) {
+            builder.endObject();
+        } else {
+            builder.endArray();
+        }
+        return builder.endObject();
     }
 
-
-    @Override public void suspect(Address suspectedMember) {
-    }
-
-    @Override public void block() {
-        logger.warn("Blocked...");
-    }
 }

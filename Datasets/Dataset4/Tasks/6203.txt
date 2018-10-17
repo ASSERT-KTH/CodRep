@@ -1,4 +1,4 @@
-import org.elasticsearch.util.guice.inject.Inject;
+import org.elasticsearch.util.inject.Inject;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,82 +19,193 @@ import org.elasticsearch.util.guice.inject.Inject;
  * under the License.
  */
 
-package org.elasticsearch.action.search;
+package org.elasticsearch.memcached.netty;
 
-import com.google.inject.Inject;
-import org.elasticsearch.ElasticSearchIllegalArgumentException;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.TransportActions;
-import org.elasticsearch.action.search.type.ParsedScrollId;
-import org.elasticsearch.action.search.type.TransportSearchScrollQueryAndFetchAction;
-import org.elasticsearch.action.search.type.TransportSearchScrollQueryThenFetchAction;
-import org.elasticsearch.action.support.BaseAction;
-import org.elasticsearch.transport.BaseTransportRequestHandler;
-import org.elasticsearch.transport.TransportChannel;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.http.BindHttpException;
+import org.elasticsearch.memcached.MemcachedServerTransport;
+import org.elasticsearch.rest.RestController;
+import org.elasticsearch.transport.BindTransportException;
+import org.elasticsearch.transport.netty.NettyInternalESLoggerFactory;
+import org.elasticsearch.util.SizeValue;
+import org.elasticsearch.util.component.AbstractLifecycleComponent;
+import org.elasticsearch.util.guice.inject.Inject;
+import org.elasticsearch.util.network.NetworkService;
+import org.elasticsearch.util.network.NetworkUtils;
 import org.elasticsearch.util.settings.Settings;
+import org.elasticsearch.util.transport.BoundTransportAddress;
+import org.elasticsearch.util.transport.InetSocketTransportAddress;
+import org.elasticsearch.util.transport.PortsRange;
+import org.jboss.netty.bootstrap.ServerBootstrap;
+import org.jboss.netty.channel.Channel;
+import org.jboss.netty.channel.ChannelPipeline;
+import org.jboss.netty.channel.ChannelPipelineFactory;
+import org.jboss.netty.channel.Channels;
+import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
+import org.jboss.netty.logging.InternalLogger;
+import org.jboss.netty.logging.InternalLoggerFactory;
 
-import static org.elasticsearch.action.search.type.ParsedScrollId.*;
-import static org.elasticsearch.action.search.type.TransportSearchHelper.*;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.elasticsearch.util.concurrent.DynamicExecutors.*;
 
 /**
- * @author kimchy (Shay Banon)
+ * @author kimchy (shay.banon)
  */
-public class TransportSearchScrollAction extends BaseAction<SearchScrollRequest, SearchResponse> {
+public class NettyMemcachedServerTransport extends AbstractLifecycleComponent<MemcachedServerTransport> implements MemcachedServerTransport {
 
-    private final TransportSearchScrollQueryThenFetchAction queryThenFetchAction;
-
-    private final TransportSearchScrollQueryAndFetchAction queryAndFetchAction;
-
-    @Inject public TransportSearchScrollAction(Settings settings, TransportService transportService,
-                                               TransportSearchScrollQueryThenFetchAction queryThenFetchAction,
-                                               TransportSearchScrollQueryAndFetchAction queryAndFetchAction) {
-        super(settings);
-        this.queryThenFetchAction = queryThenFetchAction;
-        this.queryAndFetchAction = queryAndFetchAction;
-
-        transportService.registerHandler(TransportActions.SEARCH_SCROLL, new TransportHandler());
-    }
-
-    @Override protected void doExecute(SearchScrollRequest request, ActionListener<SearchResponse> listener) {
-        try {
-            ParsedScrollId scrollId = parseScrollId(request.scrollId());
-            if (scrollId.type().equals(QUERY_THEN_FETCH_TYPE)) {
-                queryThenFetchAction.execute(request, scrollId, listener);
-            } else if (scrollId.type().equals(QUERY_AND_FETCH_TYPE)) {
-                queryAndFetchAction.execute(request, scrollId, listener);
-            } else {
-                throw new ElasticSearchIllegalArgumentException("Scroll id type [" + scrollId.type() + "] unrecognized");
+    static {
+        InternalLoggerFactory.setDefaultFactory(new NettyInternalESLoggerFactory() {
+            @Override public InternalLogger newInstance(String name) {
+                return super.newInstance(name.replace("org.jboss.netty.", "netty."));
             }
+        });
+    }
+
+    private final RestController restController;
+
+    private final NetworkService networkService;
+
+    private final int workerCount;
+
+    private final String port;
+
+    private final String bindHost;
+
+    private final String publishHost;
+
+    private final Boolean tcpNoDelay;
+
+    private final Boolean tcpKeepAlive;
+
+    private final Boolean reuseAddress;
+
+    private final SizeValue tcpSendBufferSize;
+
+    private final SizeValue tcpReceiveBufferSize;
+
+    private volatile ServerBootstrap serverBootstrap;
+
+    private volatile BoundTransportAddress boundAddress;
+
+    private volatile Channel serverChannel;
+
+    private volatile OpenChannelsHandler serverOpenChannels;
+
+    @Inject public NettyMemcachedServerTransport(Settings settings, RestController restController, NetworkService networkService) {
+        super(settings);
+        this.restController = restController;
+        this.networkService = networkService;
+
+        this.workerCount = componentSettings.getAsInt("worker_count", Runtime.getRuntime().availableProcessors());
+        this.port = componentSettings.get("port", "11211-11311");
+        this.bindHost = componentSettings.get("bind_host");
+        this.publishHost = componentSettings.get("publish_host");
+        this.tcpNoDelay = componentSettings.getAsBoolean("tcp_no_delay", true);
+        this.tcpKeepAlive = componentSettings.getAsBoolean("tcp_keep_alive", null);
+        this.reuseAddress = componentSettings.getAsBoolean("reuse_address", NetworkUtils.defaultReuseAddress());
+        this.tcpSendBufferSize = componentSettings.getAsSize("tcp_send_buffer_size", null);
+        this.tcpReceiveBufferSize = componentSettings.getAsSize("tcp_receive_buffer_size", null);
+    }
+
+    @Override public BoundTransportAddress boundAddress() {
+        return boundAddress;
+    }
+
+    @Override protected void doStart() throws ElasticSearchException {
+        this.serverOpenChannels = new OpenChannelsHandler();
+
+        serverBootstrap = new ServerBootstrap(new NioServerSocketChannelFactory(
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "memcachedBoss")),
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "memcachedIoWorker")),
+                workerCount));
+
+        ChannelPipelineFactory pipelineFactory = new ChannelPipelineFactory() {
+            @Override public ChannelPipeline getPipeline() throws Exception {
+                ChannelPipeline pipeline = Channels.pipeline();
+                pipeline.addLast("openChannels", serverOpenChannels);
+                pipeline.addLast("decoder", new MemcachedDecoder());
+                pipeline.addLast("dispatcher", new MemcachedDispatcher(restController));
+                return pipeline;
+            }
+        };
+
+        serverBootstrap.setPipelineFactory(pipelineFactory);
+
+        if (tcpNoDelay != null) {
+            serverBootstrap.setOption("child.tcpNoDelay", tcpNoDelay);
+        }
+        if (tcpKeepAlive != null) {
+            serverBootstrap.setOption("child.keepAlive", tcpKeepAlive);
+        }
+        if (tcpSendBufferSize != null) {
+            serverBootstrap.setOption("child.sendBufferSize", tcpSendBufferSize.bytes());
+        }
+        if (tcpReceiveBufferSize != null) {
+            serverBootstrap.setOption("child.receiveBufferSize", tcpReceiveBufferSize.bytes());
+        }
+        if (reuseAddress != null) {
+            serverBootstrap.setOption("reuseAddress", reuseAddress);
+            serverBootstrap.setOption("child.reuseAddress", reuseAddress);
+        }
+
+        // Bind and start to accept incoming connections.
+        InetAddress hostAddressX;
+        try {
+            hostAddressX = networkService.resolveBindHostAddress(bindHost);
+        } catch (IOException e) {
+            throw new BindHttpException("Failed to resolve host [" + bindHost + "]", e);
+        }
+        final InetAddress hostAddress = hostAddressX;
+
+        PortsRange portsRange = new PortsRange(port);
+        final AtomicReference<Exception> lastException = new AtomicReference<Exception>();
+        boolean success = portsRange.iterate(new PortsRange.PortCallback() {
+            @Override public boolean onPortNumber(int portNumber) {
+                try {
+                    serverChannel = serverBootstrap.bind(new InetSocketAddress(hostAddress, portNumber));
+                } catch (Exception e) {
+                    lastException.set(e);
+                    return false;
+                }
+                return true;
+            }
+        });
+        if (!success) {
+            throw new BindHttpException("Failed to bind to [" + port + "]", lastException.get());
+        }
+
+        InetSocketAddress boundAddress = (InetSocketAddress) serverChannel.getLocalAddress();
+        InetSocketAddress publishAddress;
+        try {
+            publishAddress = new InetSocketAddress(networkService.resolvePublishHostAddress(publishHost), boundAddress.getPort());
         } catch (Exception e) {
-            listener.onFailure(e);
+            throw new BindTransportException("Failed to resolve publish address", e);
+        }
+        this.boundAddress = new BoundTransportAddress(new InetSocketTransportAddress(boundAddress), new InetSocketTransportAddress(publishAddress));
+    }
+
+    @Override protected void doStop() throws ElasticSearchException {
+        if (serverChannel != null) {
+            serverChannel.close().awaitUninterruptibly();
+            serverChannel = null;
+        }
+
+        if (serverOpenChannels != null) {
+            serverOpenChannels.close();
+            serverOpenChannels = null;
+        }
+
+        if (serverBootstrap != null) {
+            serverBootstrap.releaseExternalResources();
+            serverBootstrap = null;
         }
     }
 
-    private class TransportHandler extends BaseTransportRequestHandler<SearchScrollRequest> {
-
-        @Override public SearchScrollRequest newInstance() {
-            return new SearchScrollRequest();
-        }
-
-        @Override public void messageReceived(SearchScrollRequest request, final TransportChannel channel) throws Exception {
-            execute(request, new ActionListener<SearchResponse>() {
-                @Override public void onResponse(SearchResponse result) {
-                    try {
-                        channel.sendResponse(result);
-                    } catch (Exception e) {
-                        onFailure(e);
-                    }
-                }
-
-                @Override public void onFailure(Throwable e) {
-                    try {
-                        channel.sendResponse(e);
-                    } catch (Exception e1) {
-                        logger.warn("Failed to send response for search", e1);
-                    }
-                }
-            });
-        }
+    @Override protected void doClose() throws ElasticSearchException {
     }
 }

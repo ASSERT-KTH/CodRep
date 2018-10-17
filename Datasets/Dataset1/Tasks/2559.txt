@@ -1,549 +1,823 @@
-if (!se.isLockTimeout()) {
+cores.load(solrHome, new ByteArrayInputStream(DEF_SOLR_XML.getBytes("UTF-8")));
 
-/*
-
-   Derby - Class org.apache.derby.impl.store.raw.data.ReclaimSpaceHelper
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.derby.impl.store.raw.data;
+package org.apache.solr.core;
 
-import org.apache.derby.impl.store.raw.data.BasePage;
-import org.apache.derby.impl.store.raw.data.ReclaimSpace;
+import java.io.*;
+import java.nio.channels.FileChannel;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.text.SimpleDateFormat;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.derby.iapi.services.daemon.DaemonService;
-import org.apache.derby.iapi.services.daemon.Serviceable;
-import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.error.StandardException;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathExpressionException;
 
-import org.apache.derby.iapi.store.access.TransactionController;
-
-import org.apache.derby.iapi.store.raw.ContainerKey;
-import org.apache.derby.iapi.store.raw.ContainerHandle;
-import org.apache.derby.iapi.store.raw.LockingPolicy;
-import org.apache.derby.iapi.store.raw.Page;
-import org.apache.derby.iapi.store.raw.PageKey;
-import org.apache.derby.iapi.store.raw.RecordHandle;
-import org.apache.derby.iapi.store.raw.Transaction;
-
-import org.apache.derby.iapi.store.raw.xact.RawTransaction;
-import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
-import org.apache.derby.shared.common.reference.SQLState;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.CoreAdminParams;
+import org.apache.solr.common.util.DOMUtil;
+import org.apache.solr.common.util.XML;
+import org.apache.solr.common.util.FileUtils;
+import org.apache.solr.handler.admin.CoreAdminHandler;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.commons.io.IOUtils;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
 
 
 /**
-	This class helps a BaseDataFactory reclaims unused space.
-
-Space needs to be reclaimed in the following cases:
-<BR><NL>
-<LI> Row with long columns or overflow row pieces is deleted
-<LI> Insertion of a row that has long columns or overflows to other row pieces is rolled back
-<LI> Row is updated and the head row or some row pieces shrunk
-<LI> Row is updated and some long columns are orphaned because they are updated
-<LI> Row is updated and some long columns are created but the update rolled back
-<LI> Row is updated and some new row pieces are created but the update rolled back
-</NL> <P>
-
-We can implement a lot of optimization if we know that btree does not overflow.
-However, since that is not the case and Raw Store cannot tell if it is dealing
-with a btree page or a heap page, they all have to be treated gingerly.  E.g.,
-in heap page, once a head row is deleted (via a delete operation or via a
-rollback of insert), all the long rows and long columns can be reclaimed - in
-fact, most of the head row can be removed and reclaimed, only a row stub needs
-to remain for locking purposes.  But in the btree, a deleted row still needs to
-contain the key values so it cannot be cleaned up until the row is purged.
-
-<P><B>
-Row with long columns or long row is deleted
-</B><BR>
-
-When Access purge a committed deleted row, the purge operation will see if the
-row has overflowed row pieces or if it has long columns.  If it has, then all
-the long columns and row pieces are purged before the head row piece can be
-purged.  When a row is purged from an overflow page and it is the only row on
-the page, then the page is deallocated in the same transaction. Note that
-non-overflow pages are removed by Access but overflow pages are removed by Raw
-Store.  Note that page removal is done in the same transaction and not post
-commit.  This is, in general, dangerous because if the transaction does not
-commit for a long time, uncommit deallocated page slows down page allocation
-for this container.  However, we know that access only purges committed delete
-row in access post commit processing so we know the transaction will tend to
-commit relatively fast.  The alternative is to queue up a post commit
-ReclaimSpace.PAGE to reclaim the page after the purge commits.  In order to do
-that, the time stamp of the page must also be remembered because post commit
-work may be queued more than once, but in this case, it can only be done once.
-Also, doing the page deallocation post commit adds to the overall cost and
-tends to fill up the post commit queue. <BR>
-
-This approach is simple but has the drawback that the entire long row and all
-the long columns are logged in the purge operation.  The alternative is more
-complicated, we can remember all the long columns on the head row piece and
-where the row chain starts and clean them up during post commit.  During post
-commit, because the head row piece is already purged, there is no need to log
-the long column or the long rows, just wipe the page or just reuse the page if
-that is the only thing on the page.  The problem with this approach is that we
-need to make sure the purging of the head row does indeed commit (the
-transaction may commit but the purging may be rolled back due to savepoint).
-So, we need to find the head row in the post commit and only when we cannot
-find it can we be sure that the purge is committed.  However, in cases where
-the page can reuse its record Id (namely in btree), a new row may reuse the
-same recordId.  In that case, the post commit can purge the long columns or the
-rest of the row piece only if the head piece no longer points to it.  Because
-of the complexity of this latter approach, the first simple approach is used.
-However, if the performance due to extra logging becomes unbearble, we can
-consider implementing the second approach.  
-
-<P><B>
-Insertion of a row with long column or long row is rolled back.
-</B><BR>
-
-Insertion can be rolled back with either delete or purge.  If the row is rolled
-back with purge, then all the overflow columns pieces and row pieces are also
-rolled back with purge.  When a row is purged from an overflow page and it is
-the only row on the page, then a post commit ReclaimSpace.PAGE work is queued
-by Raw Store to reclaim that page.<BR>
-
-If the row is rolled back with delete, then all the overflow columns pieces and
-row pieces are also rolled back with delete.  Access will purge the deleted row
-in due time, see above.
-
-<P><B>
-Row is updated and the head row or some row pieces shrunk
-</B><BR>
-
-Every page that an update operation touches will see if the record on that page
-has any reserve space.  It it does, and if the reserve space plus the record
-size exceed the mininum record size, then a post commit ROW_RESERVE work will
-be queued to reclaim all unnecessary row reserved space for the entire row.
-
-<P><B>
-Row is updated and old long columns are orphaned
-</B><BR>
-
-The ground rule is, whether a column is a long column or not before an update
-has nothing to do with whether a column will be a long column or not after the
-update.  In other words, update can turn a non-long column into a long column,
-or it can turn a long column into a non-long column, or a long column can be
-updated to another long column and a non-long column can be updated to a
-non-long column.  The last case - update of a non-long column to another
-non-long column - is only of concern if it shrinks the row piece it is on (see
-above).<BR>
-
-So update can be looked at as 2 separate problems: A) a column is a long column
-before the update and the update will "orphaned" it.  B) a column is a long
-column after the update and the rollback of the update will "orphaned" it if it
-is rolled back with a delete.  This section deals with problem A, next section
-deals with problem B.<BR>
-
-Update specifies a set of columns to be updated.  If a row piece contains one
-or more columns to be updated, those columns are examined to see if they are
-actually long column chains.  If they are, then after the update, those long
-column chains will be orphaned.  So before the update happens, a post commit
-ReclaimSpace.COLUMN_CHAIN work is queued which contains the head rows id, the
-column number, the location of the first piece of the column chain, and the
-time stamp of the first page of the column chain. <BR>
-
-If the update transaction commits, the post commit work will walk the row until
-it finds the column number (note that it may not be on the page where the
-update happened because of subsequent row splitting), and if it doesn't point
-to the head of the column chain, we know the update operation has indeed
-committed (versus rolled back by a savepoint).  If a piece of the the column
-chain takes up an entire page, then the entire page can be reclaimed without
-first purging the row because the column chain is already orphaned.<BR>
-
-We need to page time stamp of the first page of the column chain because if the
-post commit ReclaimSpace.COLUMN_CHAIN is queued more than once, as can happen
-in repeated rollback to savepoint, then after the first time the column is
-reclaimed, the pages in the column chain can be reused.  Therefore, we cannot
-reclaim the column chain again.  Since there is no back pointer from the column
-chain to the head row, we need the timestamp to tell us if that column chain
-has already been touched (reclaimed) or not.
-
-<P><B> 
-Row is updated with new long columns and update is rolled back.
-</B><BR>
-
-When the update is rolled back, the new long columns, which got there by
-insertion, got rolled back either by delete or by purge.  If they were rolled
-back with delete, then they will be orphaned and need to be cleaned up with
-post abort work.  Therefore, insertion of long columns due to update must be
-rolled back with purge.<BR>
-
-This is safe because the moment the rollback of the head row piece happens, the
-new long column is orphaned anyway and nobody will be able to get to it.  Since
-we don't attempt to share long column pages, we know that nobody else could be
-on the page and it is safe to deallocate the page.
-
-<P><B>
-Row is updated with new long row piece and update is rolled back.
-</B><BR>
-
-When the update is rolled back, the new long row piece, which got there by
-insertion, got rolled back either by delete or by purge.  Like update with new
-long row, they should be rolled back with purge.  However, there is a problem
-in that the insert log record does not contain the head row handle.  It is
-possible that another long row emanating from the same head page overflows to
-this page.  That row may since have been deleted and is now in the middle of a
-purge, but the purge has not commit.  To the code that is rolling back the
-insert (caused by the update that split off a new row piece) the overflow page
-looks empty.  If it went ahead and deallocate the page, then the transaction
-which purged the row piece on this page won't be able to roll back.  For this
-reason, the rollback to insert of a long row piece due to update must be rolled
-back with delete.  Furthermore, there is no easy way to lodge a post
-termination work to reclaim this deleted row piece so it will be lost forever.
-<BR>
-
-RESOLVE: need to log the head row's handle in the insert log record, i.e., any
-insert due to update of long row or column piece should have the head row's
-handle on it so that when the insert is rolled back with purge, and there is no
-more row on the page, it can file a post commit to reclaim the page safely.
-The post commit reclaim page needs to lock the head row and latch the head page
-to make sure the entire row chain is stable.
-
-<P><B>
-*/
-public class ReclaimSpaceHelper
+ * @version $Id$
+ * @since solr 1.3
+ */
+public class CoreContainer 
 {
-	/**
-		Reclaim space based on work.
-	 */
-	public static int reclaimSpace(BaseDataFileFactory dataFactory,
-							RawTransaction tran,
-							ReclaimSpace work) 
-		 throws StandardException
-	{
-	
-		if (work.reclaimWhat() == ReclaimSpace.CONTAINER)
-			return reclaimContainer(dataFactory, tran, work);
+  private static final String DEFAULT_DEFAULT_CORE_NAME = "collection1";
 
-		// Else, not reclaiming container. Get a no-wait shared lock on the 
-		// container regardless of how the user transaction had the
-		// container opened. 
+  protected static Logger log = LoggerFactory.getLogger(CoreContainer.class);
+  
+  protected final Map<String, SolrCore> cores = new LinkedHashMap<String, SolrCore>();
+  protected boolean persistent = false;
+  protected String adminPath = null;
+  protected String managementPath = null;
+  protected CoreAdminHandler coreAdminHandler = null;
+  protected File configFile = null;
+  protected String libDir = null;
+  protected ClassLoader libLoader = null;
+  protected SolrResourceLoader loader = null;
+  protected Properties containerProperties;
+  protected Map<String ,IndexSchema> indexSchemaCache;
+  protected String adminHandler;
+  protected boolean shareSchema;
+  protected String solrHome;
+  protected String solrConfigFilenameOverride;
+  private String defaultCoreName = "";
+  
+  // assigned by Initializer
+  private boolean defaultAbortOnConfigError = false;
+  // number of cores that either explicitly, or because of
+  // default, said to abort on config error
+  private int numCoresAbortOnConfigError = 0;
+  
+  public CoreContainer() {
+    solrHome = SolrResourceLoader.locateSolrHome();
+    log.info("New CoreContainer: solrHome=" + solrHome + " instance="+System.identityHashCode(this));
+  }
 
-		LockingPolicy container_rlock = 
-			tran.newLockingPolicy(LockingPolicy.MODE_RECORD,
-								  TransactionController.ISOLATION_SERIALIZABLE, 
-								  true /* stricter OK */ );
+  public Properties getContainerProperties() {
+    return containerProperties;
+  }
 
-		if (SanityManager.DEBUG)
-			SanityManager.ASSERT(container_rlock != null);
+  // Helper class to initialize the CoreContainer
+  public static class Initializer {
+    protected String solrConfigFilename = null;
+    // default to true for legacy behavior
+    protected boolean abortOnConfigurationError = true;
 
-		ContainerHandle containerHdl = 
-			openContainerNW(tran, container_rlock, work.getContainerId());
+    public boolean isAbortOnConfigurationError() {
+      return abortOnConfigurationError;
+    }
+    
+    /** Note for no good reason what so ever, this method has only ever
+     * influenced the default behavior of "single core" mode.  when using
+     * solr.xml values specified this way are ignored, and false is the default.
+     * initialize() will modify this value.
+     */
+    public void setAbortOnConfigurationError(boolean abortOnConfigurationError) {
+      this.abortOnConfigurationError = abortOnConfigurationError;
+    }
 
-		if (containerHdl == null)
-		{
-			tran.abort();
+    public String getSolrConfigFilename() {
+      return solrConfigFilename;
+    }
+   @Deprecated
+    public void setSolrConfigFilename(String solrConfigFilename) {
+      this.solrConfigFilename = solrConfigFilename;
+    }
 
-			if (SanityManager.DEBUG)
-            {
-                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
-                {
-                    SanityManager.DEBUG(
-                        DaemonService.DaemonTrace, " aborted " + work + 
-                        " because container is locked or dropped");
-                }
-            }
+    // core container instantiation
+    public CoreContainer initialize() throws IOException,
+        ParserConfigurationException, SAXException {
+      CoreContainer cores = null;
+      String solrHome = SolrResourceLoader.locateSolrHome();
+      File fconf = new File(solrHome, solrConfigFilename == null ? "solr.xml"
+          : solrConfigFilename);
+      log.info("looking for solr.xml: " + fconf.getAbsolutePath());
+      cores = new CoreContainer();
+      cores.solrConfigFilenameOverride = solrConfigFilename;
+      if (fconf.exists()) {
+        // default abortOnConfigurationError ignored in multicore
+        cores.defaultAbortOnConfigError = false;
+        cores.load(solrHome, fconf);
+      } else {
+        cores.defaultAbortOnConfigError = abortOnConfigurationError;
+        cores.load(solrHome, new ByteArrayInputStream(DEF_SOLR_XML.getBytes()));
+        cores.configFile = fconf;
+      }
+      setAbortOnConfigurationError(0 < cores.numCoresAbortOnConfigError);
+      
+      solrConfigFilename = cores.getConfigFile().getName();
+      
+      return cores;
+    }
+  }
 
-			if (work.incrAttempts() < 3) // retry this for serveral times
-				// it is however, unlikely that three tries will be 
-				// enough because there is no delay between retries.
-				// See DERBY-4059 and DERBY-4055 for details.
-            {
-				return Serviceable.REQUEUE;
-            }
-			else
-            {
-                // If code gets here, the space will be lost forever, and
-                // can only be reclaimed by a full offline compress of the
-                // table/index.
+  private static Properties getCoreProps(String instanceDir, String file, Properties defaults) {
+    if(file == null) file = "conf"+File.separator+ "solrcore.properties";
+    File corePropsFile = new File(file);
+    if(!corePropsFile.isAbsolute()){
+      corePropsFile = new File(instanceDir, file);
+    }
+    Properties p = defaults;
+    if (corePropsFile.exists() && corePropsFile.isFile()) {
+      p = new Properties(defaults);
+      InputStream is = null;
+      try {
+        is = new FileInputStream(corePropsFile);
+        p.load(is);
+      } catch (IOException e) {
+        log.warn("Error loading properties ",e);
+      } finally{
+        IOUtils.closeQuietly(is);        
+      }
+    }
+    return p;
+  }
 
-                if (SanityManager.DEBUG)
-                {
-                    if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
-                    {
-                        SanityManager.DEBUG(
-                            DaemonService.DaemonTrace, 
-                            "  gave up after 3 tries to get container lock " + 
-                            work);
-                    }
-                }
+  /**
+   * Initalize CoreContainer directly from the constructor
+   * 
+   * @param dir
+   * @param configFile
+   * @throws ParserConfigurationException
+   * @throws IOException
+   * @throws SAXException
+   */
+  public CoreContainer(String dir, File configFile) throws ParserConfigurationException, IOException, SAXException 
+  {
+    this.load(dir, configFile);
+  }
+  
+  /**
+   * Minimal CoreContainer constructor. 
+   * @param loader the CoreContainer resource loader
+   */
+  public CoreContainer(SolrResourceLoader loader) {
+    this.loader = loader;
+    this.solrHome = loader.getInstanceDir();
+  }
 
-				return Serviceable.DONE;
-            }
-		}	
+  public CoreContainer(String solrHome) {
+    this.solrHome = solrHome;
+  }
 
-		// At this point, container is opened with IX lock.
+  //-------------------------------------------------------------------
+  // Initialization / Cleanup
+  //-------------------------------------------------------------------
+  
+  /**
+   * Load a config file listing the available solr cores.
+   * @param dir the home directory of all resources.
+   * @param configFile the configuration file
+   * @throws javax.xml.parsers.ParserConfigurationException
+   * @throws java.io.IOException
+   * @throws org.xml.sax.SAXException
+   */
+  public void load(String dir, File configFile ) throws ParserConfigurationException, IOException, SAXException {
+    this.configFile = configFile;
+    this.load(dir, new FileInputStream(configFile));
+  } 
 
-		if (work.reclaimWhat() == ReclaimSpace.PAGE)
-		{
-			// Reclaiming a page - called by undo of insert which purged the
-			// last row off an overflow page. It is safe to reclaim the page
-			// without first locking the head row because unlike post commit
-			// work, this is post abort work.  Abort is guarenteed to happen
-			// and to happen only once, if at all.
-			Page p = containerHdl.getPageNoWait(work.getPageId().getPageNumber());
-			if (p != null)
-				containerHdl.removePage(p);
+  /**
+   * Load a config file listing the available solr cores.
+   * 
+   * @param dir the home directory of all resources.
+   * @param cfgis the configuration file InputStream
+   * @throws ParserConfigurationException
+   * @throws IOException
+   * @throws SAXException
+   */
+  public void load(String dir, InputStream cfgis)
+      throws ParserConfigurationException, IOException, SAXException {
+    this.loader = new SolrResourceLoader(dir);
+    solrHome = loader.getInstanceDir();
+    try {
+      Config cfg = new Config(loader, null, cfgis, null);
+      String dcoreName = cfg.get("solr/cores/@defaultCoreName", null);
+      if(dcoreName != null) {
+        defaultCoreName = dcoreName;
+      }
+      persistent = cfg.getBool( "solr/@persistent", false );
+      libDir     = cfg.get(     "solr/@sharedLib", null);
+      adminPath  = cfg.get(     "solr/cores/@adminPath", null );
+      shareSchema = cfg.getBool("solr/cores/@shareSchema", false );
+      if(shareSchema){
+        indexSchemaCache = new ConcurrentHashMap<String ,IndexSchema>();
+      }
+      adminHandler  = cfg.get("solr/cores/@adminHandler", null );
+      managementPath  = cfg.get("solr/cores/@managementPath", null );
 
-			tran.commit();
-			return Serviceable.DONE;
-		}
+      if (libDir != null) {
+        File f = FileUtils.resolvePath(new File(dir), libDir);
+        log.info( "loading shared library: "+f.getAbsolutePath() );
+        libLoader = SolrResourceLoader.createClassLoader(f, null);
+      }
 
-		// We are reclaiming row space or long column.  
-		// First get an xlock on the head row piece.
-		RecordHandle headRecord = work.getHeadRowHandle();
+      if (adminPath != null) {
+        if (adminHandler == null) {
+          coreAdminHandler = new CoreAdminHandler(this);
+        } else {
+          coreAdminHandler = this.createMultiCoreHandler(adminHandler);
+        }
+      }
 
-		if (!container_rlock.lockRecordForWrite(
-                tran, headRecord, false /* not insert */, false /* nowait */))
-		{
-			// cannot get the row lock, retry
-			tran.abort();
-			if (work.incrAttempts() < 3)
-            {
-				return Serviceable.REQUEUE;
-            }
-			else
-            {
-                // If code gets here, the space will be lost forever, and
-                // can only be reclaimed by a full offline compress of the
-                // table/index.
+      try {
+        containerProperties = readProperties(cfg, ((NodeList) cfg.evaluate("solr", XPathConstants.NODESET)).item(0));
+      } catch (Throwable e) {
+        SolrConfig.severeErrors.add(e);
+        SolrException.logOnce(log,null,e);
+      }
+      
+      // before looping over each core, let's check the names and fail 
+      // fast if the same one is reused multiple times.
+      { // local scope, won't need these vars again
+        NodeList nodes = (NodeList)cfg.evaluate("solr/cores/core/@name", 
+                                                XPathConstants.NODESET);
+        Set<String> names = new HashSet<String>();
+        for (int i=0; i<nodes.getLength(); i++) {
+          String name = DOMUtil.getText(nodes.item(i));
+          if (names.contains(name)) {
+            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+                                    "Multiple cores found with same name: " + 
+                                    name);
+          }
+          names.add(name);
+        }
+      }
 
-                if (SanityManager.DEBUG)
-                {
-                    if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
-                    {
-                        SanityManager.DEBUG(
-                            DaemonService.DaemonTrace, 
-                            "  gave up after 3 tries to get row lock " + 
-                            work);
-                    }
-                }
-				return Serviceable.DONE;
-            }
-		}
+      NodeList nodes = (NodeList)cfg.evaluate("solr/cores/core", XPathConstants.NODESET);
+      for (int i=0; i<nodes.getLength(); i++) {
+        Node node = nodes.item(i);
+        try {
+          String name = DOMUtil.getAttr(node, "name", null);
+          if (null == name) {
+            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+                                    "Each core in solr.xml must have a 'name'");
+          }
+          if (name.equals(defaultCoreName)){
+            // for the default core we use a blank name,
+            // later on attempts to access it by it's full name will 
+            // be mapped to this.
+            name="";
+          }
 
-		// The exclusive lock on the head row has been gotten.
+          CoreDescriptor p = new CoreDescriptor(this, name, DOMUtil.getAttr(node, "instanceDir", null));
 
-		if (work.reclaimWhat() == ReclaimSpace.ROW_RESERVE)
-		{
-			// This row may benefit from compaction.
-			containerHdl.compactRecord(headRecord);
+          // deal with optional settings
+          String opt = DOMUtil.getAttr(node, "config", null);
+          if(solrConfigFilenameOverride != null && name.equals("")) {
+            p.setConfigName(solrConfigFilenameOverride);
+          } else if (opt != null) {
+            p.setConfigName(opt);
+          }
+          opt = DOMUtil.getAttr(node, "schema", null);
+          if (opt != null) {
+            p.setSchemaName(opt);
+          }
+          opt = DOMUtil.getAttr(node, "properties", null);
+          if (opt != null) {
+            p.setPropertiesName(opt);
+          }
+          opt = DOMUtil.getAttr(node, CoreAdminParams.DATA_DIR, null);
+          if (opt != null) {
+            p.setDataDir(opt);
+          }
 
-            // This work is being done - post commit, there is no user 
-            // transaction that depends on the commit being sync'd.  It is safe
-            // to commitNoSync() This do as one of 2 things will happen:
-            //
-            //     1) if any data page associated with this transaction is
-            //        moved from cache to disk, then the transaction log
-            //        must be sync'd to the log record for that change and
-            //        all log records including the commit of this xact must
-            //        be sync'd before returning.
-            //
-            //     2) if the data page is never written then the log record
-            //        for the commit may never be written, and the xact will
-            //        never make to disk.  This is ok as no subsequent action
-            //        depends on this operation being committed.
-            //
-			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+          p.setCoreProperties(readProperties(cfg, node));
 
-			return Serviceable.DONE;
-		}
-		else
-		{
-			if (SanityManager.DEBUG)
-				SanityManager.ASSERT(work.reclaimWhat() == ReclaimSpace.COLUMN_CHAIN);
+          SolrCore core = create(p);
+          register(name, core, false);
+        }
+        catch (Throwable ex) {
+          SolrConfig.severeErrors.add( ex );
+          SolrException.logOnce(log,null,ex);
+        }
+      }
+    }
 
-			// Reclaiming a long column chain due to update.  The long column
-			// chain being reclaimed is the before image of the update
-			// operation.  
-			// 
-			long headPageId = ((PageKey)headRecord.getPageId()).getPageNumber();
-			//DERBY-4050 - we wait for the page so we don't have to retry.
-			// prior to the 4050 fix, we called getPageNoWait and just 
-			// retried 3 times.  This left unreclaimed space if we were 
-			// not successful after three tries.
-			StoredPage headRowPage = 
-				(StoredPage)containerHdl.getPage(headPageId);
-			if (headRowPage == null)
-			{
-				// It is not clear why headRowPage would be null,
-				// but logging the failure in case it happens.
-				// If code gets here, the space will be lost forever, and
-				// can only be reclaimed by a full offline compress of the
-				// table/index.
+    finally {
+      if (cfgis != null) {
+        try { cfgis.close(); } catch (Exception xany) {}
+      }
+    }
+  }
 
-				if (SanityManager.DEBUG)
-				{
-					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
-					{
-						SanityManager.DEBUG(
-								DaemonService.DaemonTrace, 
-								"gave up because hadRowPage was null" + 
-								work);
-					}
-				}
-				tran.abort();
-				return Serviceable.DONE;
-			}
-			try
-			{
-				headRowPage.removeOrphanedColumnChain(work, containerHdl);
-			}
-			finally
-			{
-				headRowPage.unlatch();
-			}
+  private Properties readProperties(Config cfg, Node node) throws XPathExpressionException {
+    XPath xpath = cfg.getXPath();
+    NodeList props = (NodeList) xpath.evaluate("property", node, XPathConstants.NODESET);
+    Properties properties = new Properties();
+    for (int i=0; i<props.getLength(); i++) {
+      Node prop = props.item(i);
+      properties.setProperty(DOMUtil.getAttr(prop, "name"), DOMUtil.getAttr(prop, "value"));
+    }
+    return properties;
+  }
+  private boolean isShutDown = false;
+  /**
+   * Stops all cores.
+   */
+  public void shutdown() {
+    synchronized(cores) {
+      try {
+        for(SolrCore core : cores.values()) {
+          core.close();
+        }
+        cores.clear();
+      } finally {
+        isShutDown = true;
+      }
+    }
+  }
+  
+  @Override
+  protected void finalize() throws Throwable {
+    try {
+      if(!isShutDown){
+        log.error("CoreContainer was not shutdown prior to finalize(), indicates a bug -- POSSIBLE RESOURCE LEAK!!!  instance=" + System.identityHashCode(this));
+        shutdown();
+      }
+    } finally {
+      super.finalize();
+    }
+  }
 
-            // This work is being done - post commit, there is no user 
-            // transaction that depends on the commit being sync'd.  It is safe
-            // to commitNoSync() This do as one of 2 things will happen:
-            //
-            //     1) if any data page associated with this transaction is
-            //        moved from cache to disk, then the transaction log
-            //        must be sync'd to the log record for that change and
-            //        all log records including the commit of this xact must
-            //        be sync'd before returning.
-            //
-            //     2) if the data page is never written then the log record
-            //        for the commit may never be written, and the xact will
-            //        never make to disk.  This is ok as no subsequent action
-            //        depends on this operation being committed.
-            //
-			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+  /**
+   * Registers a SolrCore descriptor in the registry using the specified name.
+   * If returnPrevNotClosed==false, the old core, if different, is closed. if true, it is returned w/o closing the core
+   *
+   * @return a previous core having the same name if it existed
+   */
+  public SolrCore register(String name, SolrCore core, boolean returnPrevNotClosed) {
+    if( core == null ) {
+      throw new RuntimeException( "Can not register a null core." );
+    }
+    if( name == null ||
+        name.indexOf( '/'  ) >= 0 ||
+        name.indexOf( '\\' ) >= 0 ){
+      throw new RuntimeException( "Invalid core name: "+name );
+    }
 
-			return Serviceable.DONE;
-		}
-	}
-
-	private static int reclaimContainer(BaseDataFileFactory dataFactory,
-										RawTransaction tran,
-										ReclaimSpace work) 
-		 throws StandardException
-	{
-		// when we want to reclaim the whole container, gets an exclusive
-		// XLock on the container, wait for the lock.
-
-		LockingPolicy container_xlock = 
-			tran.newLockingPolicy(LockingPolicy.MODE_CONTAINER,
-								  TransactionController.ISOLATION_SERIALIZABLE, 
-								  true /* stricter OK */ );
-
-		if (SanityManager.DEBUG)
-			SanityManager.ASSERT(container_xlock != null);
-
-		// Try to just get the container thru the transaction.
-		// Need to do this to transition the transaction to active state. 
-		RawContainerHandle containerHdl = tran.openDroppedContainer(
-								work.getContainerId(), 
-								container_xlock);
-
-		// if it can get lock but it is not deleted or has already been
-		// deleted, done work
-		if (containerHdl == null || 
-			containerHdl.getContainerStatus() == RawContainerHandle.NORMAL ||
-			containerHdl.getContainerStatus() == RawContainerHandle.COMMITTED_DROP)
-		{
-			if (containerHdl != null)
-				containerHdl.close();
-			tran.abort();	// release xlock, if any
-
-			if (SanityManager.DEBUG)
-            {
-                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
-                {
-                    SanityManager.DEBUG(
-                        DaemonService.DaemonTrace, "  aborted " + work);
-                }
-            }
-		}	
-		else
-		{
-			// we got an xlock on a dropped container.  Must be committed.
-			// Get rid of the container now.
-			ContainerOperation lop = new
-				ContainerOperation(containerHdl, ContainerOperation.REMOVE);
-
-			// mark the container as pre-dirtied so that if a checkpoint
-			// happens after the log record is sent to the log stream, the
-			// cache cleaning will wait for this change.
-			containerHdl.preDirty(true);
-			try
-			{
-				tran.logAndDo(lop);
-			}
-			finally
-			{
-				// in case logAndDo fail, make sure the container is not
-				// stuck in preDirty state.
-				containerHdl.preDirty(false);
-			}
-
-
-			containerHdl.close();
-			tran.commit();
-
-			if (SanityManager.DEBUG)
-            {
-                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
-                {
-                    SanityManager.DEBUG(
-                        DaemonService.DaemonTrace, "  committed " + work);
-                }
-            }
-		}
-
-		return Serviceable.DONE;
-
-	}
+    SolrCore old = null;
+    synchronized (cores) {
+      old = cores.put(name, core);
+      core.setName(name);
+    }
 
 
-	/**
-	 *	Open container shared no wait
-	 *
-	 * @param tran   Transaction
-	 * @param rlock  LockingPolicy
-	 * @param containerId container id.
-	 * 
-	 * @return ContainerHandle or null if it could not obtain lock.
-	 * 
-	 * @throws StandardException
-	 */
-	private static ContainerHandle openContainerNW(Transaction tran,
-		LockingPolicy rlock, ContainerKey containerId)
-		throws StandardException
-	{
-		ContainerHandle containerHdl = null;
-		try {
-				containerHdl = tran.openContainer
-				(containerId, rlock,
-						ContainerHandle.MODE_FORUPDATE |
-						ContainerHandle.MODE_LOCK_NOWAIT); 
-		} catch (StandardException se) {
-			// DERBY-4059
-			// if this is a lock timeout just return null.
-			// otherwise throw the exception
-			if (!se.getSQLState().equals(SQLState.LOCK_TIMEOUT)) {
-				throw se;
-			}
-		}
-		return containerHdl;
-	}
+    if( old == null || old == core) {
+      log.info( "registering core: "+name );
+      return null;
+    }
+    else {
+      log.info( "replacing core: "+name );
+      if (!returnPrevNotClosed) {
+        old.close();
+      }
+      return old;
+    }
+  }
 
+
+  /**
+   * Registers a SolrCore descriptor in the registry using the core's name.
+   * If returnPrev==false, the old core, if different, is closed.
+   * @return a previous core having the same name if it existed and returnPrev==true
+   */
+  public SolrCore register(SolrCore core, boolean returnPrev) {
+    return register(core.getName(), core, returnPrev);
+  }
+
+  /**
+   * Creates a new core based on a descriptor but does not register it.
+   *
+   * @param dcore a core descriptor
+   * @return the newly created core
+   * @throws javax.xml.parsers.ParserConfigurationException
+   * @throws java.io.IOException
+   * @throws org.xml.sax.SAXException
+   */
+  public SolrCore create(CoreDescriptor dcore)  throws ParserConfigurationException, IOException, SAXException {
+    // Make the instanceDir relative to the cores instanceDir if not absolute
+    File idir = new File(dcore.getInstanceDir());
+    if (!idir.isAbsolute()) {
+      idir = new File(solrHome, dcore.getInstanceDir());
+    }
+    String instanceDir = idir.getPath();
+    
+    // Initialize the solr config
+    SolrResourceLoader solrLoader = new SolrResourceLoader(instanceDir, libLoader, getCoreProps(instanceDir, dcore.getPropertiesName(),dcore.getCoreProperties()));
+    SolrConfig config = new SolrConfig(solrLoader, dcore.getConfigName(), null);
+
+    if (config.getBool("abortOnConfigurationError",defaultAbortOnConfigError)) {
+      numCoresAbortOnConfigError++;
+    }
+    
+    IndexSchema schema = null;
+    if(indexSchemaCache != null){
+      //schema sharing is enabled. so check if it already is loaded
+      File schemaFile = new File(dcore.getSchemaName());
+      if (!schemaFile.isAbsolute()) {
+        schemaFile = new File(solrLoader.getInstanceDir() + "conf" + File.separator + dcore.getSchemaName());
+      }
+      if(schemaFile. exists()){
+        String key = schemaFile.getAbsolutePath()+":"+new SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(new Date(schemaFile.lastModified()));
+        schema = indexSchemaCache.get(key);
+        if(schema == null){
+          log.info("creating new schema object for core: " + dcore.name);
+          schema = new IndexSchema(config, dcore.getSchemaName(), null);
+          indexSchemaCache.put(key,schema);
+        } else {
+          log.info("re-using schema object for core: " + dcore.name);
+        }
+      }
+    }
+    if(schema == null){
+      schema = new IndexSchema(config, dcore.getSchemaName(), null);
+    }
+    SolrCore core = new SolrCore(dcore.getName(), null, config, schema, dcore);
+    return core;
+  }
+    
+  /**
+   * @return a Collection of registered SolrCores
+   */
+  public Collection<SolrCore> getCores() {
+    List<SolrCore> lst = new ArrayList<SolrCore>();
+    synchronized (cores) {
+      lst.addAll(this.cores.values());
+    }
+    return lst;
+  }
+
+  /**
+   * @return a Collection of the names that cores are mapped to
+   */
+  public Collection<String> getCoreNames() {
+    List<String> lst = new ArrayList<String>();
+    synchronized (cores) {
+      lst.addAll(this.cores.keySet());
+    }
+    return lst;
+  }
+
+  /** This method is currently experimental.
+   * @return a Collection of the names that a specific core is mapped to.
+   */
+  public Collection<String> getCoreNames(SolrCore core) {
+    List<String> lst = new ArrayList<String>();
+    synchronized (cores) {
+      for (Map.Entry<String,SolrCore> entry : cores.entrySet()) {
+        if (core == entry.getValue()) {
+          lst.add(entry.getKey());
+        }
+      }
+    }
+    return lst;
+  }
+
+  // ---------------- Core name related methods --------------- 
+  /**
+   * Recreates a SolrCore.
+   * While the new core is loading, requests will continue to be dispatched to
+   * and processed by the old core
+   * 
+   * @param name the name of the SolrCore to reload
+   * @throws ParserConfigurationException
+   * @throws IOException
+   * @throws SAXException
+   */
+
+  public void reload(String name) throws ParserConfigurationException, IOException, SAXException {
+    name= checkDefault(name);
+    SolrCore core;
+    synchronized(cores) {
+      core = cores.get(name);
+    }
+    if (core == null)
+      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + name );
+
+    SolrCore newCore = create(core.getCoreDescriptor());
+    register(name, newCore, false);
+  }
+
+  private String checkDefault(String name) {
+    return name.length() == 0  || defaultCoreName.equals(name) || name.trim().length() == 0 ? "" : name;
+  } 
+
+  /**
+   * Swaps two SolrCore descriptors.
+   * @param n0
+   * @param n1
+   */
+  public void swap(String n0, String n1) {
+    if( n0 == null || n1 == null ) {
+      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Can not swap unnamed cores." );
+    }
+    n0 = checkDefault(n0);
+    n1 = checkDefault(n1);
+    synchronized( cores ) {
+      SolrCore c0 = cores.get(n0);
+      SolrCore c1 = cores.get(n1);
+      if (c0 == null)
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + n0 );
+      if (c1 == null)
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + n1 );
+      cores.put(n0, c1);
+      cores.put(n1, c0);
+
+      c0.setName(n1);
+      c0.getCoreDescriptor().name = n1;
+      c1.setName(n0);
+      c1.getCoreDescriptor().name = n0;
+    }
+
+
+    log.info("swaped: "+n0 + " with " + n1);
+  }
+  
+  /** Removes and returns registered core w/o decrementing it's reference count */
+  public SolrCore remove( String name ) {
+    name = checkDefault(name);    
+    synchronized(cores) {
+      return cores.remove( name );
+    }
+  }
+
+  
+  /** Gets a core by name and increase its refcount.
+   * @see SolrCore#open() 
+   * @see SolrCore#close() 
+   * @param name the core name
+   * @return the core if found
+   */
+  public SolrCore getCore(String name) {
+    name= checkDefault(name);
+    synchronized(cores) {
+      SolrCore core = cores.get(name);
+      if (core != null)
+        core.open();  // increment the ref count while still synchronized
+      return core;
+    }
+  }
+
+  // ---------------- Multicore self related methods ---------------
+  /** 
+   * Creates a CoreAdminHandler for this MultiCore.
+   * @return a CoreAdminHandler
+   */
+  protected CoreAdminHandler createMultiCoreHandler(final String adminHandlerClass) {
+    SolrResourceLoader loader = new SolrResourceLoader(null, libLoader, null);
+    Object obj = loader.newAdminHandlerInstance(CoreContainer.this, adminHandlerClass);
+    if ( !(obj instanceof CoreAdminHandler))
+    {
+      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR,
+          "adminHandlerClass is not of type "+ CoreAdminHandler.class );
+      
+    }
+    return (CoreAdminHandler) obj;
+  }
+
+  public CoreAdminHandler getMultiCoreHandler() {
+    return coreAdminHandler;
+  }
+  
+  public String getDefaultCoreName() {
+    return defaultCoreName;
+  }
+  
+  // all of the following properties aren't synchronized
+  // but this should be OK since they normally won't be changed rapidly
+  public boolean isPersistent() {
+    return persistent;
+  }
+  
+  public void setPersistent(boolean persistent) {
+    this.persistent = persistent;
+  }
+  
+  public String getAdminPath() {
+    return adminPath;
+  }
+  
+  public void setAdminPath(String adminPath) {
+      this.adminPath = adminPath;
+  }
+  
+
+  public String getManagementPath() {
+    return managementPath;
+  }
+  
+  /**
+   * Sets the alternate path for multicore handling:
+   * This is used in case there is a registered unnamed core (aka name is "") to
+   * declare an alternate way of accessing named cores.
+   * This can also be used in a pseudo single-core environment so admins can prepare
+   * a new version before swapping.
+   * @param path
+   */
+  public void setManagementPath(String path) {
+    this.managementPath = path;
+  }
+  
+  public File getConfigFile() {
+    return configFile;
+  }
+  
+/** Persists the cores config file in cores.xml. */
+  public void persist() {
+    persistFile(null);
+  }
+
+  /** Persists the cores config file in a user provided file. */
+  public void persistFile(File file) {
+    log.info("Persisting cores config to " + (file==null ? configFile : file));
+
+    File tmpFile = null;
+    try {
+      // write in temp first
+      if (file == null) {
+        file = tmpFile = File.createTempFile("solr", ".xml", configFile.getParentFile());
+      }
+      java.io.FileOutputStream out = new java.io.FileOutputStream(file);
+        Writer writer = new BufferedWriter(new OutputStreamWriter(out, "UTF-8"));
+        persist(writer);
+        writer.flush();
+        writer.close();
+        out.close();
+        // rename over origin or copy it this fails
+        if (tmpFile != null) {
+          if (tmpFile.renameTo(configFile))
+            tmpFile = null;
+          else
+            fileCopy(tmpFile, configFile);
+        }
+    } 
+    catch(java.io.FileNotFoundException xnf) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, xnf);
+    } 
+    catch(java.io.IOException xio) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, xio);
+    } 
+    finally {
+      if (tmpFile != null) {
+        if (!tmpFile.delete())
+          tmpFile.deleteOnExit();
+      }
+    }
+  }
+  
+  /** Write the cores configuration through a writer.*/
+  void persist(Writer w) throws IOException {
+    w.write("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
+    w.write("<solr");
+    if (this.libDir != null) {
+      writeAttribute(w,"sharedLib",libDir);
+    }
+    writeAttribute(w,"persistent",isPersistent());
+    w.write(">\n");
+
+    if (containerProperties != null && !containerProperties.isEmpty())  {
+      writeProperties(w, containerProperties, "  ");
+    }
+    w.write("  <cores");
+    writeAttribute(w, "adminPath",adminPath);
+    if(adminHandler != null) writeAttribute(w, "adminHandler",adminHandler);
+    if(shareSchema) writeAttribute(w, "shareSchema","true");
+    if(!defaultCoreName.equals("")) writeAttribute(w, "defaultCoreName", defaultCoreName);
+    w.write(">\n");
+
+    synchronized(cores) {
+      for (SolrCore solrCore : cores.values()) {
+        persist(w,solrCore.getCoreDescriptor());
+      }
+    }
+
+    w.write("  </cores>\n");
+    w.write("</solr>\n");
+  }
+
+  private void writeAttribute(Writer w, String name, Object value) throws IOException {
+    if (value == null) return;
+    w.write(" ");
+    w.write(name);
+    w.write("=\"");
+    XML.escapeAttributeValue(value.toString(), w);
+    w.write("\"");
+  }
+  
+  /** Writes the cores configuration node for a given core. */
+  void persist(Writer w, CoreDescriptor dcore) throws IOException {
+    w.write("    <core");
+    writeAttribute(w,"name",dcore.name.equals("") ? defaultCoreName : dcore.name);
+    writeAttribute(w,"instanceDir",dcore.getInstanceDir());
+    //write config (if not default)
+    String opt = dcore.getConfigName();
+    if (opt != null && !opt.equals(dcore.getDefaultConfigName())) {
+      writeAttribute(w, "config",opt);
+    }
+    //write schema (if not default)
+    opt = dcore.getSchemaName();
+    if (opt != null && !opt.equals(dcore.getDefaultSchemaName())) {
+      writeAttribute(w,"schema",opt);
+    }
+    opt = dcore.getPropertiesName();
+    if (opt != null) {
+      writeAttribute(w,"properties",opt);
+    }
+    opt = dcore.dataDir;
+    if (opt != null) writeAttribute(w,"dataDir",opt);
+    if (dcore.getCoreProperties() == null || dcore.getCoreProperties().isEmpty())
+      w.write("/>\n"); // core
+    else  {
+      w.write(">\n");
+      writeProperties(w, dcore.getCoreProperties(), "      ");
+      w.write("    </core>\n");
+    }
+  }
+
+  private void writeProperties(Writer w, Properties props, String indent) throws IOException {
+    for (Map.Entry<Object, Object> entry : props.entrySet()) {
+      w.write(indent + "<property");
+      writeAttribute(w,"name",entry.getKey());
+      writeAttribute(w,"value",entry.getValue());
+      w.write("/>\n");
+    }
+  }
+
+  /** Copies a src file to a dest file:
+   *  used to circumvent the platform discrepancies regarding renaming files.
+   */
+  public static void fileCopy(File src, File dest) throws IOException {
+    IOException xforward = null;
+    FileInputStream fis =  null;
+    FileOutputStream fos = null;
+    FileChannel fcin = null;
+    FileChannel fcout = null;
+    try {
+      fis = new FileInputStream(src);
+      fos = new FileOutputStream(dest);
+      fcin = fis.getChannel();
+      fcout = fos.getChannel();
+      // do the file copy 32Mb at a time
+      final int MB32 = 32*1024*1024;
+      long size = fcin.size();
+      long position = 0;
+      while (position < size) {
+        position += fcin.transferTo(position, MB32, fcout);
+      }
+    } 
+    catch(IOException xio) {
+      xforward = xio;
+    } 
+    finally {
+      if (fis   != null) try { fis.close(); fis = null; } catch(IOException xio) {}
+      if (fos   != null) try { fos.close(); fos = null; } catch(IOException xio) {}
+      if (fcin  != null && fcin.isOpen() ) try { fcin.close();  fcin = null;  } catch(IOException xio) {}
+      if (fcout != null && fcout.isOpen()) try { fcout.close(); fcout = null; } catch(IOException xio) {}
+    }
+    if (xforward != null) {
+      throw xforward;
+    }
+  }
+
+  public String getSolrHome() {
+    return solrHome;
+  }
+  private static final String DEF_SOLR_XML ="<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n" +
+          "<solr persistent=\"false\">\n" +
+          "  <cores adminPath=\"/admin/cores\" defaultCoreName=\"" + DEFAULT_DEFAULT_CORE_NAME + "\">\n" +
+          "    <core name=\""+ DEFAULT_DEFAULT_CORE_NAME + "\" instanceDir=\".\" />\n" +
+          "  </cores>\n" +
+          "</solr>";
 }

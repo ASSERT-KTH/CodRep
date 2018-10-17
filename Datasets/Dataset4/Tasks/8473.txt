@@ -1,10 +1,10 @@
-ScriptTermsStringFieldFacetExecutor.this.total = total;
+if (maxMergeAtOnceExplicit != TieredMergePolicyProvider.this.maxMergeAtOnceExplicit) {
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
+ * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
+ * regarding copyright ownership. Elastic Search licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,182 +19,228 @@ ScriptTermsStringFieldFacetExecutor.this.total = total;
  * under the License.
  */
 
-package org.elasticsearch.search.facet.terms.strings;
+package org.elasticsearch.index.merge.policy;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
-import gnu.trove.iterator.TObjectIntIterator;
-import gnu.trove.map.hash.TObjectIntHashMap;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.util.BytesRef;
-import org.elasticsearch.common.CacheRecycler;
-import org.elasticsearch.common.collect.BoundedTreeSet;
-import org.elasticsearch.script.SearchScript;
-import org.elasticsearch.search.facet.FacetExecutor;
-import org.elasticsearch.search.facet.InternalFacet;
-import org.elasticsearch.search.facet.terms.support.EntryPriorityQueue;
-import org.elasticsearch.search.internal.SearchContext;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.SegmentInfo;
+import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.index.TieredMergePolicy;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.index.settings.IndexSettingsService;
+import org.elasticsearch.index.shard.AbstractIndexShardComponent;
+import org.elasticsearch.index.store.Store;
 
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 
-/**
- *
- */
-public class ScriptTermsStringFieldFacetExecutor extends FacetExecutor {
+public class TieredMergePolicyProvider extends AbstractIndexShardComponent implements MergePolicyProvider<TieredMergePolicy> {
 
-    private final InternalStringTermsFacet.ComparatorType comparatorType;
-    private final int size;
-    private final SearchScript script;
-    private final Matcher matcher;
-    private final ImmutableSet<BytesRef> excluded;
-    private final int numberOfShards;
+    private final IndexSettingsService indexSettingsService;
 
-    final TObjectIntHashMap<BytesRef> facets;
-    long missing;
-    long total;
+    private final Set<CustomTieredMergePolicyProvider> policies = new CopyOnWriteArraySet<CustomTieredMergePolicyProvider>();
 
-    public ScriptTermsStringFieldFacetExecutor(int size, InternalStringTermsFacet.ComparatorType comparatorType, SearchContext context,
-                                               ImmutableSet<BytesRef> excluded, Pattern pattern, String scriptLang, String script, Map<String, Object> params) {
-        this.size = size;
-        this.comparatorType = comparatorType;
-        this.numberOfShards = context.numberOfShards();
-        this.script = context.scriptService().search(context.lookup(), scriptLang, script, params);
+    private volatile boolean compoundFormat;
+    private volatile double expungeDeletesPctAllowed;
+    private volatile ByteSizeValue floorSegment;
+    private volatile int maxMergeAtOnce;
+    private volatile int maxMergeAtOnceExplicit;
+    private volatile ByteSizeValue maxMergedSegment;
+    private volatile double segmentsPerTier;
+    private boolean asyncMerge;
 
-        this.excluded = excluded;
-        this.matcher = pattern != null ? pattern.matcher("") : null;
+    private final ApplySettings applySettings = new ApplySettings();
 
-        this.facets = CacheRecycler.popObjectIntMap();
+    @Inject public TieredMergePolicyProvider(Store store, IndexSettingsService indexSettingsService) {
+        super(store.shardId(), store.indexSettings());
+        this.indexSettingsService = indexSettingsService;
+
+        this.compoundFormat = indexSettings.getAsBoolean("index.compound_format", store.suggestUseCompoundFile());
+        this.asyncMerge = indexSettings.getAsBoolean("index.merge.async", true);
+        this.expungeDeletesPctAllowed = componentSettings.getAsDouble("expunge_deletes_allowed", 10d); // percentage
+        this.floorSegment = componentSettings.getAsBytesSize("floor_segment", new ByteSizeValue(2, ByteSizeUnit.MB));
+        this.maxMergeAtOnce = componentSettings.getAsInt("max_merge_at_once", 10);
+        this.maxMergeAtOnceExplicit = componentSettings.getAsInt("max_merge_at_once_explicit", 30);
+        // TODO is this really a good default number for max_merge_segment, what happens for large indices, won't they end up with many segments?
+        this.maxMergedSegment = componentSettings.getAsBytesSize("max_merge_segment", new ByteSizeValue(5, ByteSizeUnit.GB));
+        this.segmentsPerTier = componentSettings.getAsDouble("segments_per_tier", 10d);
+
+        logger.debug("using [tiered] merge policy with expunge_deletes_allowed[{}], floor_segment[{}], max_merge_at_once[{}], max_merge_at_once_explicit[{}], max_merge_segment[{}], segments_per_tier[{}], async_merge[{}]",
+                expungeDeletesPctAllowed, floorSegment, maxMergeAtOnce, maxMergeAtOnceExplicit, maxMergedSegment, segmentsPerTier, asyncMerge);
+
+        indexSettingsService.addListener(applySettings);
     }
 
-    @Override
-    public Collector collector() {
-        return new Collector(matcher, excluded, script, facets);
-    }
 
-    @Override
-    public InternalFacet buildFacet(String facetName) {
-        if (facets.isEmpty()) {
-            CacheRecycler.pushObjectIntMap(facets);
-            return new InternalStringTermsFacet(facetName, comparatorType, size, ImmutableList.<InternalStringTermsFacet.TermEntry>of(), missing, total);
+    @Override public TieredMergePolicy newMergePolicy() {
+        CustomTieredMergePolicyProvider mergePolicy;
+        if (asyncMerge) {
+            mergePolicy = new EnableMergeTieredMergePolicyProvider(this);
         } else {
-            if (size < EntryPriorityQueue.LIMIT) {
-                EntryPriorityQueue ordered = new EntryPriorityQueue(size, comparatorType.comparator());
-                for (TObjectIntIterator<BytesRef> it = facets.iterator(); it.hasNext(); ) {
-                    it.advance();
-                    ordered.insertWithOverflow(new InternalStringTermsFacet.TermEntry(it.key(), it.value()));
+            mergePolicy = new CustomTieredMergePolicyProvider(this);
+        }
+        mergePolicy.setUseCompoundFile(compoundFormat);
+        mergePolicy.setExpungeDeletesPctAllowed(expungeDeletesPctAllowed);
+        mergePolicy.setFloorSegmentMB(floorSegment.mbFrac());
+        mergePolicy.setMaxMergeAtOnce(maxMergeAtOnce);
+        mergePolicy.setMaxMergeAtOnceExplicit(maxMergeAtOnceExplicit);
+        mergePolicy.setMaxMergedSegmentMB(maxMergedSegment.mbFrac());
+        mergePolicy.setSegmentsPerTier(segmentsPerTier);
+        return mergePolicy;
+    }
+
+    @Override public void close(boolean delete) throws ElasticSearchException {
+        indexSettingsService.removeListener(applySettings);
+    }
+
+    static {
+        IndexMetaData.addDynamicSettings(
+                "index.merge.policy.expunge_deletes_allowed",
+                "index.merge.policy.floor_segment",
+                "index.merge.policy.max_merge_at_once",
+                "index.merge.policy.max_merge_at_once_explicit",
+                "index.merge.policy.max_merged_segment",
+                "index.merge.policy.segments_per_tier",
+                "index.compound_format"
+        );
+    }
+
+    class ApplySettings implements IndexSettingsService.Listener {
+        @Override public void onRefreshSettings(Settings settings) {
+            double expungeDeletesPctAllowed = settings.getAsDouble("index.merge.policy.expunge_deletes_allowed", TieredMergePolicyProvider.this.expungeDeletesPctAllowed);
+            if (expungeDeletesPctAllowed != TieredMergePolicyProvider.this.expungeDeletesPctAllowed) {
+                logger.info("updating [expunge_deletes_allowed] from [{}] to [{}]", TieredMergePolicyProvider.this.expungeDeletesPctAllowed, expungeDeletesPctAllowed);
+                TieredMergePolicyProvider.this.expungeDeletesPctAllowed = expungeDeletesPctAllowed;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setExpungeDeletesPctAllowed(expungeDeletesPctAllowed);
                 }
-                InternalStringTermsFacet.TermEntry[] list = new InternalStringTermsFacet.TermEntry[ordered.size()];
-                for (int i = ordered.size() - 1; i >= 0; i--) {
-                    list[i] = ((InternalStringTermsFacet.TermEntry) ordered.pop());
+            }
+
+            ByteSizeValue floorSegment = settings.getAsBytesSize("index.merge.policy.floor_segment", TieredMergePolicyProvider.this.floorSegment);
+            if (!floorSegment.equals(TieredMergePolicyProvider.this.floorSegment)) {
+                logger.info("updating [floor_segment] from [{}] to [{}]", TieredMergePolicyProvider.this.floorSegment, floorSegment);
+                TieredMergePolicyProvider.this.floorSegment = floorSegment;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setFloorSegmentMB(floorSegment.mbFrac());
                 }
-                CacheRecycler.pushObjectIntMap(facets);
-                return new InternalStringTermsFacet(facetName, comparatorType, size, Arrays.asList(list), missing, total);
-            } else {
-                BoundedTreeSet<InternalStringTermsFacet.TermEntry> ordered = new BoundedTreeSet<InternalStringTermsFacet.TermEntry>(comparatorType.comparator(), size);
-                for (TObjectIntIterator<BytesRef> it = facets.iterator(); it.hasNext(); ) {
-                    it.advance();
-                    ordered.add(new InternalStringTermsFacet.TermEntry(it.key(), it.value()));
+            }
+
+            int maxMergeAtOnce = settings.getAsInt("index.merge.policy.max_merge_at_once", TieredMergePolicyProvider.this.maxMergeAtOnce);
+            if (maxMergeAtOnce != TieredMergePolicyProvider.this.maxMergeAtOnce) {
+                logger.info("updating [max_merge_at_once] from [{}] to [{}]", TieredMergePolicyProvider.this.maxMergeAtOnce, maxMergeAtOnce);
+                TieredMergePolicyProvider.this.maxMergeAtOnce = maxMergeAtOnce;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setMaxMergeAtOnce(maxMergeAtOnce);
                 }
-                CacheRecycler.pushObjectIntMap(facets);
-                return new InternalStringTermsFacet(facetName, comparatorType, size, ordered, missing, total);
+            }
+
+            int maxMergeAtOnceExplicit = settings.getAsInt("index.merge.policy.max_merge_at_once_explicit", TieredMergePolicyProvider.this.maxMergeAtOnceExplicit);
+            if (maxMergeAtOnce != TieredMergePolicyProvider.this.maxMergeAtOnceExplicit) {
+                logger.info("updating [max_merge_at_once_explicit] from [{}] to [{}]", TieredMergePolicyProvider.this.maxMergeAtOnceExplicit, maxMergeAtOnceExplicit);
+                TieredMergePolicyProvider.this.maxMergeAtOnceExplicit = maxMergeAtOnceExplicit;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setMaxMergeAtOnceExplicit(maxMergeAtOnceExplicit);
+                }
+            }
+
+            ByteSizeValue maxMergedSegment = settings.getAsBytesSize("index.merge.policy.max_merged_segment", TieredMergePolicyProvider.this.maxMergedSegment);
+            if (!maxMergedSegment.equals(TieredMergePolicyProvider.this.maxMergedSegment)) {
+                logger.info("updating [max_merged_segment] from [{}] to [{}]", TieredMergePolicyProvider.this.maxMergedSegment, maxMergedSegment);
+                TieredMergePolicyProvider.this.maxMergedSegment = maxMergedSegment;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setFloorSegmentMB(maxMergedSegment.mbFrac());
+                }
+            }
+
+            double segmentsPerTier = settings.getAsDouble("index.merge.policy.segments_per_tier", TieredMergePolicyProvider.this.segmentsPerTier);
+            if (segmentsPerTier != TieredMergePolicyProvider.this.segmentsPerTier) {
+                logger.info("updating [segments_per_tier] from [{}] to [{}]", TieredMergePolicyProvider.this.segmentsPerTier, segmentsPerTier);
+                TieredMergePolicyProvider.this.segmentsPerTier = segmentsPerTier;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setSegmentsPerTier(segmentsPerTier);
+                }
+            }
+
+            boolean compoundFormat = settings.getAsBoolean("index.compound_format", TieredMergePolicyProvider.this.compoundFormat);
+            if (compoundFormat != TieredMergePolicyProvider.this.compoundFormat) {
+                logger.info("updating index.compound_format from [{}] to [{}]", TieredMergePolicyProvider.this.compoundFormat, compoundFormat);
+                TieredMergePolicyProvider.this.compoundFormat = compoundFormat;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setUseCompoundFile(compoundFormat);
+                }
             }
         }
     }
 
-    class Collector extends FacetExecutor.Collector {
+    public static class CustomTieredMergePolicyProvider extends TieredMergePolicy {
 
-        private final Matcher matcher;
-        private final ImmutableSet<BytesRef> excluded;
-        private final SearchScript script;
-        private final TObjectIntHashMap<BytesRef> facets;
+        private final TieredMergePolicyProvider provider;
 
-        long missing;
-        long total;
-
-        Collector(Matcher matcher, ImmutableSet<BytesRef> excluded, SearchScript script, TObjectIntHashMap<BytesRef> facets) {
-            this.matcher = matcher;
-            this.excluded = excluded;
-            this.script = script;
-            this.facets = facets;
+        public CustomTieredMergePolicyProvider(TieredMergePolicyProvider provider) {
+            super();
+            this.provider = provider;
         }
 
-        @Override
-        public void setScorer(Scorer scorer) throws IOException {
-            script.setScorer(scorer);
+        @Override public void close() {
+            super.close();
+            provider.policies.remove(this);
         }
+    }
 
-        @Override
-        public void setNextReader(AtomicReaderContext context) throws IOException {
-            script.setNextReader(context);
-        }
+    public static class EnableMergeTieredMergePolicyProvider extends CustomTieredMergePolicyProvider implements EnableMergePolicy {
 
-        @Override
-        public void collect(int doc) throws IOException {
-            script.setNextDocId(doc);
-            Object o = script.run();
-            if (o == null) {
-                missing++;
-                return;
+        private final ThreadLocal<Boolean> enableMerge = new ThreadLocal<Boolean>() {
+            @Override protected Boolean initialValue() {
+                return Boolean.FALSE;
             }
-            if (o instanceof Iterable) {
-                boolean found = false;
-                for (Object o1 : ((Iterable) o)) {
-                    String value = o1.toString();
-                    if (match(value)) {
-                        found = true;
-                        // LUCENE 4 UPGRADE: should be possible to convert directly to BR
-                        facets.adjustOrPutValue(new BytesRef(value), 1, 1);
-                        total++;
-                    }
-                }
-                if (!found) {
-                    missing++;
-                }
-            } else if (o instanceof Object[]) {
-                boolean found = false;
-                for (Object o1 : ((Object[]) o)) {
-                    String value = o1.toString();
-                    if (match(value)) {
-                        found = true;
-                        // LUCENE 4 UPGRADE: should be possible to convert directly to BR
-                        facets.adjustOrPutValue(new BytesRef(value), 1, 1);
-                        total++;
-                    }
-                }
-                if (!found) {
-                    missing++;
-                }
-            } else {
-                String value = o.toString();
-                if (match(value)) {
-                    // LUCENE 4 UPGRADE: should be possible to convert directly to BR
-                    facets.adjustOrPutValue(new BytesRef(value), 1, 1);
-                    total++;
-                } else {
-                    missing++;
-                }
-            }
+        };
+
+        public EnableMergeTieredMergePolicyProvider(TieredMergePolicyProvider provider) {
+            super(provider);
         }
 
-        @Override
-        public void postCollection() {
-            ScriptTermsStringFieldFacetExecutor.this.missing = missing;
-            ScriptTermsStringFieldFacetExecutor.this.total = missing;
+        @Override public void enableMerge() {
+            enableMerge.set(Boolean.TRUE);
         }
 
-        private boolean match(String value) {
-            if (excluded != null && excluded.contains(new BytesRef(value))) {
-                return false;
+        @Override public void disableMerge() {
+            enableMerge.set(Boolean.FALSE);
+        }
+
+        @Override public boolean isMergeEnabled() {
+            return enableMerge.get() == Boolean.TRUE;
+        }
+
+        @Override public void close() {
+            enableMerge.remove();
+            super.close();
+        }
+
+        @Override public MergePolicy.MergeSpecification findMerges(SegmentInfos infos) throws IOException {
+            if (enableMerge.get() == Boolean.FALSE) {
+                return null;
             }
-            if (matcher != null && !matcher.reset(value).matches()) {
-                return false;
+            return super.findMerges(infos);
+        }
+
+        @Override public MergePolicy.MergeSpecification findMergesToExpungeDeletes(SegmentInfos segmentInfos) throws CorruptIndexException, IOException {
+            if (enableMerge.get() == Boolean.FALSE) {
+                return null;
             }
-            return true;
+            return super.findMergesToExpungeDeletes(segmentInfos);
+        }
+
+        @Override public MergePolicy.MergeSpecification findMergesForOptimize(SegmentInfos infos, int maxNumSegments, Set<SegmentInfo> segmentsToOptimize) throws IOException {
+            if (enableMerge.get() == Boolean.FALSE) {
+                return null;
+            }
+            return super.findMergesForOptimize(infos, maxNumSegments, segmentsToOptimize);
         }
     }
 }

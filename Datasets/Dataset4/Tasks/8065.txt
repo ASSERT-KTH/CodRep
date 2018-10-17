@@ -1,83 +1,142 @@
-stage.getViewport().update(width, height);
+threadPool.generic().execute(new Runnable() {
 
-/*******************************************************************************
- * Copyright 2011 See AUTHORS file.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- ******************************************************************************/
+/*
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.tests;
+package org.elasticsearch.gateway.shared;
 
-import com.badlogic.gdx.Gdx;
-import com.badlogic.gdx.graphics.GL20;
-import com.badlogic.gdx.scenes.scene2d.InputEvent;
-import com.badlogic.gdx.scenes.scene2d.Stage;
-import com.badlogic.gdx.scenes.scene2d.ui.Skin;
-import com.badlogic.gdx.scenes.scene2d.ui.Table;
-import com.badlogic.gdx.scenes.scene2d.ui.TextButton;
-import com.badlogic.gdx.scenes.scene2d.ui.Tree;
-import com.badlogic.gdx.scenes.scene2d.ui.Tree.Node;
-import com.badlogic.gdx.scenes.scene2d.utils.ClickListener;
-import com.badlogic.gdx.tests.utils.GdxTest;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.cluster.ClusterChangedEvent;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateListener;
+import org.elasticsearch.cluster.metadata.MetaData;
+import org.elasticsearch.common.StopWatch;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.gateway.Gateway;
+import org.elasticsearch.gateway.GatewayException;
+import org.elasticsearch.threadpool.ThreadPool;
 
-public class TreeTest extends GdxTest {
-	Stage stage;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 
-	public void create () {
-		stage = new Stage();
-		Gdx.input.setInputProcessor(stage);
+import static java.util.concurrent.Executors.newSingleThreadExecutor;
+import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadFactory;
 
-		Skin skin = new Skin(Gdx.files.internal("data/uiskin.json"));
+/**
+ *
+ */
+public abstract class SharedStorageGateway extends AbstractLifecycleComponent<Gateway> implements Gateway, ClusterStateListener {
 
-		Table table = new Table();
-		table.setFillParent(true);
-		stage.addActor(table);
+    private final ClusterService clusterService;
 
-		final Tree tree = new Tree(skin);
+    private final ThreadPool threadPool;
 
-		final Node moo1 = new Node(new TextButton("moo1", skin));
-		final Node moo2 = new Node(new TextButton("moo2", skin));
-		final Node moo3 = new Node(new TextButton("moo3", skin));
-		final Node moo4 = new Node(new TextButton("moo4", skin));
-		final Node moo5 = new Node(new TextButton("moo5", skin));
-		tree.add(moo1);
-		tree.add(moo2);
-		moo2.add(moo3);
-		moo3.add(moo4);
-		tree.add(moo5);
+    private ExecutorService writeStateExecutor;
 
-		moo5.getActor().addListener(new ClickListener() {
-			public void clicked (InputEvent event, float x, float y) {
-				tree.remove(moo4);
-			}
-		});
+    public SharedStorageGateway(Settings settings, ThreadPool threadPool, ClusterService clusterService) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.clusterService = clusterService;
+        this.writeStateExecutor = newSingleThreadExecutor(daemonThreadFactory(settings, "gateway#writeMetaData"));
+        clusterService.add(this);
+    }
 
-		table.add(tree).fill().expand();
-	}
+    @Override
+    protected void doStart() throws ElasticSearchException {
+    }
 
-	public void render () {
-		// System.out.println(meow.getValue());
-		Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT);
-		stage.act(Gdx.graphics.getDeltaTime());
-		stage.draw();
-		Table.drawDebug(stage);
-	}
+    @Override
+    protected void doStop() throws ElasticSearchException {
+    }
 
-	public void resize (int width, int height) {
-		stage.setViewport(width, height, true);
-	}
+    @Override
+    protected void doClose() throws ElasticSearchException {
+        clusterService.remove(this);
+        writeStateExecutor.shutdown();
+        try {
+            writeStateExecutor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // ignore
+        }
+    }
 
-	public void dispose () {
-		stage.dispose();
-	}
+    @Override
+    public void performStateRecovery(final GatewayStateRecoveredListener listener) throws GatewayException {
+        threadPool.cached().execute(new Runnable() {
+            @Override
+            public void run() {
+                logger.debug("reading state from gateway {} ...", this);
+                StopWatch stopWatch = new StopWatch().start();
+                MetaData metaData;
+                try {
+                    metaData = read();
+                    logger.debug("read state from gateway {}, took {}", this, stopWatch.stop().totalTime());
+                    if (metaData == null) {
+                        logger.debug("no state read from gateway");
+                        listener.onSuccess(ClusterState.builder().build());
+                    } else {
+                        listener.onSuccess(ClusterState.builder().metaData(metaData).build());
+                    }
+                } catch (Exception e) {
+                    logger.error("failed to read from gateway", e);
+                    listener.onFailure(ExceptionsHelper.detailedMessage(e));
+                }
+            }
+        });
+    }
+
+    @Override
+    public void clusterChanged(final ClusterChangedEvent event) {
+        if (!lifecycle.started()) {
+            return;
+        }
+
+        // nothing to do until we actually recover from the gateway or any other block indicates we need to disable persistency
+        if (event.state().blocks().disableStatePersistence()) {
+            return;
+        }
+
+        if (event.localNodeMaster()) {
+            if (!event.metaDataChanged()) {
+                return;
+            }
+            writeStateExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    logger.debug("writing to gateway {} ...", this);
+                    StopWatch stopWatch = new StopWatch().start();
+                    try {
+                        write(event.state().metaData());
+                        logger.debug("wrote to gateway {}, took {}", this, stopWatch.stop().totalTime());
+                        // TODO, we need to remember that we failed, maybe add a retry scheduler?
+                    } catch (Exception e) {
+                        logger.error("failed to write to gateway", e);
+                    }
+                }
+            });
+        }
+    }
+
+    protected abstract MetaData read() throws ElasticSearchException;
+
+    protected abstract void write(MetaData metaData) throws ElasticSearchException;
 }

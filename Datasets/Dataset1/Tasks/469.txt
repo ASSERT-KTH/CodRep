@@ -1,4 +1,4 @@
-public float score() {
+public void setNextEnum(TermsEnum termsEnum) {
 
 package org.apache.lucene.search;
 
@@ -20,301 +20,203 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.Arrays;
 
-import org.apache.lucene.index.*;
-import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.index.TermState;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.ByteBlockPool;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefHash;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.BytesRefHash.DirectBytesStartArray;
 
-final class ExactPhraseScorer extends Scorer {
-  private final int endMinus1;
+class ConstantScoreAutoRewrite extends TermCollectingRewrite<BooleanQuery> {
 
-  private final static int CHUNK = 4096;
+  // Defaults derived from rough tests with a 20.0 million
+  // doc Wikipedia index.  With more than 350 terms in the
+  // query, the filter method is fastest:
+  public static int DEFAULT_TERM_COUNT_CUTOFF = 350;
 
-  private int gen;
-  private final int[] counts = new int[CHUNK];
-  private final int[] gens = new int[CHUNK];
+  // If the query will hit more than 1 in 1000 of the docs
+  // in the index (0.1%), the filter method is fastest:
+  public static double DEFAULT_DOC_COUNT_PERCENT = 0.1;
 
-  boolean noDocs;
+  private int termCountCutoff = DEFAULT_TERM_COUNT_CUTOFF;
+  private double docCountPercent = DEFAULT_DOC_COUNT_PERCENT;
 
-  private final static class ChunkState {
-    final DocsAndPositionsEnum posEnum;
-    final int offset;
-    final boolean useAdvance;
-    int posUpto;
-    int posLimit;
-    int pos;
-    int lastPos;
-
-    public ChunkState(DocsAndPositionsEnum posEnum, int offset, boolean useAdvance) {
-      this.posEnum = posEnum;
-      this.offset = offset;
-      this.useAdvance = useAdvance;
-    }
+  /** If the number of terms in this query is equal to or
+   *  larger than this setting then {@link
+   *  MultiTermQuery#CONSTANT_SCORE_FILTER_REWRITE} is used. */
+  public void setTermCountCutoff(int count) {
+    termCountCutoff = count;
   }
 
-  private final ChunkState[] chunkStates;
+  /** @see #setTermCountCutoff */
+  public int getTermCountCutoff() {
+    return termCountCutoff;
+  }
 
-  private int docID = -1;
-  private int freq;
+  /** If the number of documents to be visited in the
+   *  postings exceeds this specified percentage of the
+   *  maxDoc() for the index, then {@link
+   *  MultiTermQuery#CONSTANT_SCORE_FILTER_REWRITE} is used.
+   *  @param percent 0.0 to 100.0 */
+  public void setDocCountPercent(double percent) {
+    docCountPercent = percent;
+  }
 
-  private final Similarity.ExactSimScorer docScorer;
+  /** @see #setDocCountPercent */
+  public double getDocCountPercent() {
+    return docCountPercent;
+  }
+
+  @Override
+  protected BooleanQuery getTopLevelQuery() {
+    return new BooleanQuery(true);
+  }
   
-  ExactPhraseScorer(Weight weight, PhraseQuery.PostingsAndFreq[] postings,
-                    Similarity.ExactSimScorer docScorer) throws IOException {
-    super(weight);
-    this.docScorer = docScorer;
-
-    chunkStates = new ChunkState[postings.length];
-
-    endMinus1 = postings.length-1;
-
-    for(int i=0;i<postings.length;i++) {
-
-      // Coarse optimization: advance(target) is fairly
-      // costly, so, if the relative freq of the 2nd
-      // rarest term is not that much (> 1/5th) rarer than
-      // the first term, then we just use .nextDoc() when
-      // ANDing.  This buys ~15% gain for phrases where
-      // freq of rarest 2 terms is close:
-      final boolean useAdvance = postings[i].docFreq > 5*postings[0].docFreq;
-      chunkStates[i] = new ChunkState(postings[i].postings, -postings[i].position, useAdvance);
-      if (i > 0 && postings[i].postings.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
-        noDocs = true;
-        return;
-      }
-    }
+  @Override
+  protected void addClause(BooleanQuery topLevel, Term term, int docFreq, float boost /*ignored*/, TermContext states) {
+    topLevel.add(new TermQuery(term, states), BooleanClause.Occur.SHOULD);
   }
 
   @Override
-  public int nextDoc() throws IOException {
-    while(true) {
+  public Query rewrite(final IndexReader reader, final MultiTermQuery query) throws IOException {
 
-      // first (rarest) term
-      final int doc = chunkStates[0].posEnum.nextDoc();
-      if (doc == DocIdSetIterator.NO_MORE_DOCS) {
-        docID = doc;
-        return doc;
+    // Get the enum and start visiting terms.  If we
+    // exhaust the enum before hitting either of the
+    // cutoffs, we use ConstantBooleanQueryRewrite; else,
+    // ConstantFilterRewrite:
+    final int docCountCutoff = (int) ((docCountPercent / 100.) * reader.maxDoc());
+    final int termCountLimit = Math.min(BooleanQuery.getMaxClauseCount(), termCountCutoff);
+
+    final CutOffTermCollector col = new CutOffTermCollector(docCountCutoff, termCountLimit);
+    collectTerms(reader, query, col);
+    final int size = col.pendingTerms.size();
+    if (col.hasCutOff) {
+      return MultiTermQuery.CONSTANT_SCORE_FILTER_REWRITE.rewrite(reader, query);
+    } else if (size == 0) {
+      return getTopLevelQuery();
+    } else {
+      final BooleanQuery bq = getTopLevelQuery();
+      final BytesRefHash pendingTerms = col.pendingTerms;
+      final int sort[] = pendingTerms.sort(col.termsEnum.getComparator());
+      for(int i = 0; i < size; i++) {
+        final int pos = sort[i];
+        // docFreq is not used for constant score here, we pass 1
+        // to explicitely set a fake value, so it's not calculated
+        addClause(bq, new Term(query.field, pendingTerms.get(pos, new BytesRef())), 1, 1.0f, col.array.termState[pos]);
       }
-
-      // not-first terms
-      int i = 1;
-      while(i < chunkStates.length) {
-        final ChunkState cs = chunkStates[i];
-        int doc2 = cs.posEnum.docID();
-        if (cs.useAdvance) {
-          if (doc2 < doc) {
-            doc2 = cs.posEnum.advance(doc);
-          }
-        } else {
-          int iter = 0;
-          while(doc2 < doc) {
-            // safety net -- fallback to .advance if we've
-            // done too many .nextDocs
-            if (++iter == 50) {
-              doc2 = cs.posEnum.advance(doc);
-              break;
-            } else {
-              doc2 = cs.posEnum.nextDoc();
-            }
-          }
-        }
-        if (doc2 > doc) {
-          break;
-        }
-        i++;
-      }
-
-      if (i == chunkStates.length) {
-        // this doc has all the terms -- now test whether
-        // phrase occurs
-        docID = doc;
-
-        freq = phraseFreq();
-        if (freq != 0) {
-          return docID;
-        }
-      }
+      // Strip scores
+      final Query result = new ConstantScoreQuery(bq);
+      result.setBoost(query.getBoost());
+      return result;
     }
   }
-
-  @Override
-  public int advance(int target) throws IOException {
-
-    // first term
-    int doc = chunkStates[0].posEnum.advance(target);
-    if (doc == DocIdSetIterator.NO_MORE_DOCS) {
-      docID = DocIdSetIterator.NO_MORE_DOCS;
-      return doc;
+  
+  static final class CutOffTermCollector extends TermCollector {
+    CutOffTermCollector(int docCountCutoff, int termCountLimit) {
+      this.docCountCutoff = docCountCutoff;
+      this.termCountLimit = termCountLimit;
     }
-
-    while(true) {
+  
+    @Override
+    public void setNextEnum(TermsEnum termsEnum) throws IOException {
+      this.termsEnum = termsEnum;
+    }
       
-      // not-first terms
-      int i = 1;
-      while(i < chunkStates.length) {
-        int doc2 = chunkStates[i].posEnum.docID();
-        if (doc2 < doc) {
-          doc2 = chunkStates[i].posEnum.advance(doc);
-        }
-        if (doc2 > doc) {
-          break;
-        }
-        i++;
+    @Override
+    public boolean collect(BytesRef bytes) throws IOException {
+      int pos = pendingTerms.add(bytes);
+      docVisitCount += termsEnum.docFreq();
+      if (pendingTerms.size() >= termCountLimit || docVisitCount >= docCountCutoff) {
+        hasCutOff = true;
+        return false;
       }
-
-      if (i == chunkStates.length) {
-        // this doc has all the terms -- now test whether
-        // phrase occurs
-        docID = doc;
-        freq = phraseFreq();
-        if (freq != 0) {
-          return docID;
-        }
+      
+      final TermState termState = termsEnum.termState();
+      assert termState != null;
+      if (pos < 0) {
+        pos = (-pos)-1;
+        array.termState[pos].register(termState, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+      } else {
+        array.termState[pos] = new TermContext(topReaderContext, termState, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
       }
-
-      doc = chunkStates[0].posEnum.nextDoc();
-      if (doc == DocIdSetIterator.NO_MORE_DOCS) {
-        docID = doc;
-        return doc;
-      }
+      return true;
     }
+    
+    int docVisitCount = 0;
+    boolean hasCutOff = false;
+    TermsEnum termsEnum;
+
+    final int docCountCutoff, termCountLimit;
+    final TermStateByteStart array = new TermStateByteStart(16);
+    final BytesRefHash pendingTerms = new BytesRefHash(new ByteBlockPool(new ByteBlockPool.DirectAllocator()), 16, array);
   }
 
   @Override
-  public String toString() {
-    return "ExactPhraseScorer(" + weight + ")";
+  public int hashCode() {
+    final int prime = 1279;
+    return (int) (prime * termCountCutoff + Double.doubleToLongBits(docCountPercent));
   }
 
   @Override
-  public float freq() {
-    return freq;
-  }
+  public boolean equals(Object obj) {
+    if (this == obj)
+      return true;
+    if (obj == null)
+      return false;
+    if (getClass() != obj.getClass())
+      return false;
 
-  @Override
-  public int docID() {
-    return docID;
-  }
-
-  @Override
-  public float score() throws IOException {
-    return docScorer.score(docID, freq);
-  }
-
-  private int phraseFreq() throws IOException {
-
-    freq = 0;
-
-    // init chunks
-    for(int i=0;i<chunkStates.length;i++) {
-      final ChunkState cs = chunkStates[i];
-      cs.posLimit = cs.posEnum.freq();
-      cs.pos = cs.offset + cs.posEnum.nextPosition();
-      cs.posUpto = 1;
-      cs.lastPos = -1;
+    ConstantScoreAutoRewrite other = (ConstantScoreAutoRewrite) obj;
+    if (other.termCountCutoff != termCountCutoff) {
+      return false;
     }
 
-    int chunkStart = 0;
-    int chunkEnd = CHUNK;
-
-    // process chunk by chunk
-    boolean end = false;
-
-    // TODO: we could fold in chunkStart into offset and
-    // save one subtract per pos incr
-
-    while(!end) {
-
-      gen++;
-
-      if (gen == 0) {
-        // wraparound
-        Arrays.fill(gens, 0);
-        gen++;
-      }
-
-      // first term
-      {
-        final ChunkState cs = chunkStates[0];
-        while(cs.pos < chunkEnd) {
-          if (cs.pos > cs.lastPos) {
-            cs.lastPos = cs.pos;
-            final int posIndex = cs.pos - chunkStart;
-            counts[posIndex] = 1;
-            assert gens[posIndex] != gen;
-            gens[posIndex] = gen;
-          }
-
-          if (cs.posUpto == cs.posLimit) {
-            end = true;
-            break;
-          }
-          cs.posUpto++;
-          cs.pos = cs.offset + cs.posEnum.nextPosition();
-        }
-      }
-
-      // middle terms
-      boolean any = true;
-      for(int t=1;t<endMinus1;t++) {
-        final ChunkState cs = chunkStates[t];
-        any = false;
-        while(cs.pos < chunkEnd) {
-          if (cs.pos > cs.lastPos) {
-            cs.lastPos = cs.pos;
-            final int posIndex = cs.pos - chunkStart;
-            if (posIndex >= 0 && gens[posIndex] == gen && counts[posIndex] == t) {
-              // viable
-              counts[posIndex]++;
-              any = true;
-            }
-          }
-
-          if (cs.posUpto == cs.posLimit) {
-            end = true;
-            break;
-          }
-          cs.posUpto++;
-          cs.pos = cs.offset + cs.posEnum.nextPosition();
-        }
-
-        if (!any) {
-          break;
-        }
-      }
-
-      if (!any) {
-        // petered out for this chunk
-        chunkStart += CHUNK;
-        chunkEnd += CHUNK;
-        continue;
-      }
-
-      // last term
-
-      {
-        final ChunkState cs = chunkStates[endMinus1];
-        while(cs.pos < chunkEnd) {
-          if (cs.pos > cs.lastPos) {
-            cs.lastPos = cs.pos;
-            final int posIndex = cs.pos - chunkStart;
-            if (posIndex >= 0 && gens[posIndex] == gen && counts[posIndex] == endMinus1) {
-              freq++;
-            }
-          }
-
-          if (cs.posUpto == cs.posLimit) {
-            end = true;
-            break;
-          }
-          cs.posUpto++;
-          cs.pos = cs.offset + cs.posEnum.nextPosition();
-        }
-      }
-
-      chunkStart += CHUNK;
-      chunkEnd += CHUNK;
+    if (Double.doubleToLongBits(other.docCountPercent) != Double.doubleToLongBits(docCountPercent)) {
+      return false;
+    }
+    
+    return true;
+  }
+  
+  /** Special implementation of BytesStartArray that keeps parallel arrays for {@link TermContext} */
+  static final class TermStateByteStart extends DirectBytesStartArray  {
+    TermContext[] termState;
+    
+    public TermStateByteStart(int initSize) {
+      super(initSize);
     }
 
-    return freq;
+    @Override
+    public int[] init() {
+      final int[] ord = super.init();
+      termState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+      assert termState.length >= ord.length;
+      return ord;
+    }
+
+    @Override
+    public int[] grow() {
+      final int[] ord = super.grow();
+      if (termState.length < ord.length) {
+        TermContext[] tmpTermState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+        System.arraycopy(termState, 0, tmpTermState, 0, termState.length);
+        termState = tmpTermState;
+      }      
+      assert termState.length >= ord.length;
+      return ord;
+    }
+
+    @Override
+    public int[] clear() {
+     termState = null;
+     return super.clear();
+    }
+    
   }
 }

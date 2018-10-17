@@ -1,13 +1,12 @@
-return new File(DatabaseDescriptor.getNextAvailableDataLocation() + File.separator + table_, fname).getAbsolutePath();
+if (lowercaseOperators && i>0 && i+1<clauses.size()) {
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,1618 +17,1354 @@ return new File(DatabaseDescriptor.getNextAvailableDataLocation() + File.separat
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+/*
+ * This parser was originally derived from DismaxQParser from Solr.
+ * All changes are Copyright 2008, Lucid Imagination, Inc.
+ */
 
-import java.io.File;
-import java.io.IOException;
-import java.io.Closeable;
-import java.lang.management.ManagementFactory;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+package org.apache.solr.search;
 
-import org.apache.cassandra.service.SliceRange;
-import org.apache.log4j.Logger;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.io.*;
-import java.net.InetAddress;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.util.TokenFilterFactory;
+import org.apache.lucene.queries.function.BoostedQuery;
+import org.apache.lucene.queries.function.FunctionQuery;
+import org.apache.lucene.queries.function.ValueSource;
+import org.apache.lucene.queries.function.valuesource.ProductFloatFunction;
+import org.apache.lucene.queries.function.valuesource.QueryValueSource;
+import org.apache.lucene.queryparser.classic.ParseException;
+import org.apache.lucene.queryparser.classic.QueryParser;
+import org.apache.lucene.search.*;
+import org.apache.solr.analysis.StopFilterFactory;
+import org.apache.solr.analysis.TokenizerChain;
+import org.apache.solr.search.SolrQueryParser.MagicFieldName;
+import org.apache.solr.common.params.DisMaxParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.util.SolrPluginUtils;
 
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.service.AntiEntropyService;
-import org.apache.cassandra.utils.*;
-import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
-import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.db.marshal.AbstractType;
+/**
+ * An advanced multi-field query parser.
+ * @lucene.experimental
+ */
+public class ExtendedDismaxQParserPlugin extends QParserPlugin {
+  public static final String NAME = "edismax";
 
-import org.apache.commons.lang.StringUtils;
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.commons.collections.IteratorUtils;
-import org.apache.commons.collections.PredicateUtils;
-import org.apache.commons.collections.iterators.CollatingIterator;
-import org.apache.commons.collections.iterators.FilterIterator;
+  public void init(NamedList args) {
+  }
 
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-import com.google.common.collect.Iterators;
-import com.google.common.base.Predicate;
+  @Override
+  public QParser createParser(String qstr, SolrParams localParams, SolrParams params, SolrQueryRequest req) {
+    return new ExtendedDismaxQParser(qstr, localParams, params, req);
+  }
+}
 
-public final class ColumnFamilyStore implements ColumnFamilyStoreMBean
-{
-    private static Logger logger_ = Logger.getLogger(ColumnFamilyStore.class);
 
-    /*
-     * submitFlush first puts [Binary]Memtable.getSortedContents on the flushSorter executor,
-     * which then puts the sorted results on the writer executor.  This is because sorting is CPU-bound,
-     * and writing is disk-bound; we want to be able to do both at once.  When the write is complete,
-     * we turn the writer into an SSTableReader and add it to ssTables_ where it is available for reads.
-     *
-     * For BinaryMemtable that's about all that happens.  For live Memtables there are two other things
-     * that switchMemtable does (which should be the only caller of submitFlush in this case).
-     * First, it puts the Memtable into memtablesPendingFlush, where it stays until the flush is complete
-     * and it's been added as an SSTableReader to ssTables_.  Second, it adds an entry to commitLogUpdater
-     * that waits for the flush to complete, then calls onMemtableFlush.  This allows multiple flushes
-     * to happen simultaneously on multicore systems, while still calling onMF in the correct order,
-     * which is necessary for replay in case of a restart since CommitLog assumes that when onMF is
-     * called, all data up to the given context has been persisted to SSTables.
-     */
-    private static NonBlockingHashMap<String, Set<Memtable>> memtablesPendingFlush = new NonBlockingHashMap<String, Set<Memtable>>();
-    private static ExecutorService flushSorter_
-            = new DebuggableThreadPoolExecutor(1,
-                                               Runtime.getRuntime().availableProcessors(),
-                                               Integer.MAX_VALUE,
-                                               TimeUnit.SECONDS,
-                                               new LinkedBlockingQueue<Runnable>(1 + 2 * Runtime.getRuntime().availableProcessors()),
-                                               new NamedThreadFactory("FLUSH-SORTER-POOL"));
-    private static ExecutorService flushWriter_
-            = new DebuggableThreadPoolExecutor(DatabaseDescriptor.getAllDataFileLocations().length,
-                                               DatabaseDescriptor.getAllDataFileLocations().length,
-                                               Integer.MAX_VALUE,
-                                               TimeUnit.SECONDS,
-                                               new LinkedBlockingQueue<Runnable>(),
-                                               new NamedThreadFactory("FLUSH-WRITER-POOL"));
-    private static ExecutorService commitLogUpdater_ = new DebuggableThreadPoolExecutor("MEMTABLE-POST-FLUSHER");
+class ExtendedDismaxQParser extends QParser {
 
-    private static final int KEY_RANGE_FILE_BUFFER_SIZE = 256 * 1024;
+  /**
+   * A field we can't ever find in any schema, so we can safely tell
+   * DisjunctionMaxQueryParser to use it as our defaultField, and
+   * map aliases from it to any field in our schema.
+   */
+  private static String IMPOSSIBLE_FIELD_NAME = "\uFFFC\uFFFC\uFFFC";
 
-    private final String table_;
-    public final String columnFamily_;
-    private final boolean isSuper_;
+  /** shorten the class references for utilities */
+  private static class U extends SolrPluginUtils {
+    /* :NOOP */
+  }
 
-    private volatile Integer memtableSwitchCount = 0;
-
-    /* This is used to generate the next index for a SSTable */
-    private AtomicInteger fileIndexGenerator_ = new AtomicInteger(0);
-
-    /* active memtable associated with this ColumnFamilyStore. */
-    private Memtable memtable_;
-
-    // TODO binarymemtable ops are not threadsafe (do they need to be?)
-    private AtomicReference<BinaryMemtable> binaryMemtable_;
-
-    /* SSTables on disk for this column family */
-    private SSTableTracker ssTables_ = new SSTableTracker();
-
-    private TimedStatsDeque readStats_ = new TimedStatsDeque(60000);
-    private TimedStatsDeque writeStats_ = new TimedStatsDeque(60000);
-    
-    private final IPartitioner partitioner = StorageService.getPartitioner();
-
-    ColumnFamilyStore(String table, String columnFamilyName, boolean isSuper, int indexValue) throws IOException
-    {
-        table_ = table;
-        columnFamily_ = columnFamilyName;
-        isSuper_ = isSuper;
-        fileIndexGenerator_.set(indexValue);
-        memtable_ = new Memtable(table_, columnFamily_);
-        binaryMemtable_ = new AtomicReference<BinaryMemtable>(new BinaryMemtable(table_, columnFamily_));
-    }
-
-    public static ColumnFamilyStore getColumnFamilyStore(String table, String columnFamily) throws IOException
-    {
-        /*
-         * Get all data files associated with old Memtables for this table.
-         * These files are named as follows <Table>-1.db, ..., <Table>-n.db. Get
-         * the max which in this case is n and increment it to use it for next
-         * index.
-         */
-        List<Integer> generations = new ArrayList<Integer>();
-        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocationsForTable(table);
-        for (String directory : dataFileDirectories)
-        {
-            File fileDir = new File(directory);
-            File[] files = fileDir.listFiles();
-            
-            for (File file : files)
-            {
-                String filename = file.getName();
-                String cfName = getColumnFamilyFromFileName(filename);
-
-                if (cfName.equals(columnFamily))
-                {
-                    generations.add(getGenerationFromFileName(filename));
-                }
-            }
-        }
-        Collections.sort(generations);
-        int value = (generations.size() > 0) ? (generations.get(generations.size() - 1)) : 0;
-
-        ColumnFamilyStore cfs = new ColumnFamilyStore(table, columnFamily, "Super".equals(DatabaseDescriptor.getColumnType(table, columnFamily)), value);
-
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(cfs, new ObjectName(
-                    "org.apache.cassandra.db:type=ColumnFamilyStores,name=" + table + ",columnfamily=" + columnFamily));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        return cfs;
-    }
-
-    void onStart() throws IOException
-    {
-        if (logger_.isDebugEnabled())
-            logger_.debug("Starting CFS " + columnFamily_);
-        // scan for data files corresponding to this CF
-        List<File> sstableFiles = new ArrayList<File>();
-        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
-        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocationsForTable(table_);
-        for (String directory : dataFileDirectories)
-        {
-            File fileDir = new File(directory);
-            File[] files = fileDir.listFiles();
-            for (File file : files)
-            {
-                String filename = file.getName();
-                String cfName = getColumnFamilyFromFileName(filename);
-
-                // skip files that are not from this column family
-                if (!cfName.equals(columnFamily_))
-                    continue;
-
-                /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
-                Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
-                if (matcher.matches())
-                {
-                    String basePath = matcher.group(1);
-                    if (!new File(basePath + "-Data.db").exists())
-                    {
-                        logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
-                        FileUtils.deleteWithConfirm(file);
-                        continue;
-                    }
-                }
-
-                if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
-                {
-                    FileUtils.deleteWithConfirm(file);
-                    continue;
-                }
-
-                if (filename.contains("-Data.db"))
-                {
-                    sstableFiles.add(file.getAbsoluteFile());
-                }
-            }
-        }
-        Collections.sort(sstableFiles, new FileUtils.FileComparator());
-
-        /* Load the index files and the Bloom Filters associated with them. */
-        List<SSTableReader> sstables = new ArrayList<SSTableReader>();
-        for (File file : sstableFiles)
-        {
-            String filename = file.getAbsolutePath();
-            if (SSTable.deleteIfCompacted(filename))
-                continue;
-
-            SSTableReader sstable;
-            try
-            {
-                sstable = SSTableReader.open(filename);
-            }
-            catch (IOException ex)
-            {
-                logger_.error("Corrupt file " + filename + "; skipped", ex);
-                continue;
-            }
-            sstables.add(sstable);
-        }
-        ssTables_.onStart(sstables);
-
-        // submit initial check-for-compaction request
-        CompactionManager.instance().submit(ColumnFamilyStore.this);
-
-        // schedule hinted handoff
-        if (table_.equals(Table.SYSTEM_TABLE) && columnFamily_.equals(HintedHandOffManager.HINTS_CF))
-        {
-            HintedHandOffManager.instance().scheduleHandoffsFor(this);
-        }
-    }
-
-    /*
-     * This method is called to obtain statistics about
-     * the Column Family represented by this Column Family
-     * Store. It will report the total number of files on
-     * disk and the total space oocupied by the data files
-     * associated with this Column Family.
-    */
-    public String cfStats(String newLineSeparator)
-    {
-        StringBuilder sb = new StringBuilder();
-        /*
-         * We want to do this so that if there are
-         * no files on disk we do not want to display
-         * something ugly on the admin page.
-        */
-        if (ssTables_.size() == 0)
-        {
-            return sb.toString();
-        }
-        sb.append(columnFamily_ + " statistics :");
-        sb.append(newLineSeparator);
-        sb.append("Number of files on disk : " + ssTables_.size());
-        sb.append(newLineSeparator);
-        double totalSpace = 0d;
-        for (SSTableReader sstable: ssTables_)
-        {
-            File f = new File(sstable.getFilename());
-            totalSpace += f.length();
-        }
-        String diskSpace = FileUtils.stringifyFileSize(totalSpace);
-        sb.append("Total disk space : " + diskSpace);
-        sb.append(newLineSeparator);
-        sb.append("--------------------------------------");
-        sb.append(newLineSeparator);
-        return sb.toString();
-    }
-    
-    /*
-     * This method forces a compaction of the SSTables on disk. We wait
-     * for the process to complete by waiting on a future pointer.
-    */
-    List<SSTableReader> forceAntiCompaction(Collection<Range> ranges, InetAddress target)
-    {
-        assert ranges != null;
-        Future<List<SSTableReader>> futurePtr = CompactionManager.instance().submitAnti(ColumnFamilyStore.this,
-                                                                                        ranges, target);
-
-        List<SSTableReader> result;
-        try
-        {
-            /* Waiting for the compaction to complete. */
-            result = futurePtr.get();
-            if (logger_.isDebugEnabled())
-              logger_.debug("Done forcing compaction ...");
-        }
-        catch (Exception ex)
-        {
-            throw new RuntimeException(ex);
-        }
-        return result;
-    }
-
+  /** shorten the class references for utilities */
+  private static interface DMP extends DisMaxParams {
     /**
-     * @return the name of the column family
+     * User fields. The fields that can be used by the end user to create field-specific queries.
      */
-    public String getColumnFamilyName()
-    {
-        return columnFamily_;
-    }
+    public static String UF = "uf";
+  }
 
-    private static String getColumnFamilyFromFileName(String filename)
-            {
-        return filename.split("-")[0];
-    }
 
-    public static int getGenerationFromFileName(String filename)
-    {
-        /*
-         * File name is of the form <table>-<column family>-<index>-Data.db.
-         * This tokenizer will strip the .db portion.
-         */
-        StringTokenizer st = new StringTokenizer(filename, "-");
-        /*
-         * Now I want to get the index portion of the filename. We accumulate
-         * the indices and then sort them to get the max index.
-         */
-        int count = st.countTokens();
-        int i = 0;
-        String index = null;
-        while (st.hasMoreElements())
-        {
-            index = (String) st.nextElement();
-            if (i == (count - 2))
-            {
-                break;
-            }
-            ++i;
-        }
-        return Integer.parseInt(index);
-    }
+  public ExtendedDismaxQParser(String qstr, SolrParams localParams, SolrParams params, SolrQueryRequest req) {
+    super(qstr, localParams, params, req);
+  }
 
-    /*
-     * @return a temporary file name for an sstable.
-     * When the sstable object is closed, it will be renamed to a non-temporary
-     * format, so incomplete sstables can be recognized and removed on startup.
+  /** 
+   * The field names specified by 'qf' that (most) clauses will 
+   * be queried against 
+   */
+  private Map<String,Float> queryFields;
+   
+  /** 
+   * The field names specified by 'uf' that users are 
+   * allowed to include literally in their query string.  The Float
+   * boost values will be applied automaticly to any clause using that 
+   * field name. '*' will be treated as an alias for any 
+   * field that exists in the schema. Wildcards are allowed to
+   * express dynamicFields.
+   */
+  private UserFields userFields;
+
+  private Query parsedUserQuery;
+
+  private String[] boostParams;
+  private String[] multBoosts;
+  private List<Query> boostQueries;
+  private Query altUserQuery;
+  private QParser altQParser;
+  private SolrParams solrParams;
+
+
+  @Override
+  public Query parse() throws ParseException {
+    SolrParams localParams = getLocalParams();
+    SolrParams params = getParams();
+    
+    solrParams = SolrParams.wrapDefaults(localParams, params);
+
+    final String minShouldMatch = 
+      DisMaxQParser.parseMinShouldMatch(req.getSchema(), solrParams);
+
+    userFields = new UserFields(U.parseFieldBoosts(solrParams.getParams(DMP.UF)));
+    
+    queryFields = DisMaxQParser.parseQueryFields(req.getSchema(), solrParams);
+    
+    // Boosted phrase of the full query string
+    List<FieldParams> phraseFields = 
+      U.parseFieldBoostsAndSlop(solrParams.getParams(DMP.PF),0);
+    // Boosted Bi-Term Shingles from the query string
+    List<FieldParams> phraseFields2 = 
+      U.parseFieldBoostsAndSlop(solrParams.getParams("pf2"),2);
+    // Boosted Tri-Term Shingles from the query string
+    List<FieldParams> phraseFields3 = 
+      U.parseFieldBoostsAndSlop(solrParams.getParams("pf3"),3);
+
+
+    float tiebreaker = solrParams.getFloat(DisMaxParams.TIE, 0.0f);
+
+    int pslop = solrParams.getInt(DisMaxParams.PS, 0);
+    int qslop = solrParams.getInt(DisMaxParams.QS, 0);
+
+    // remove stopwords from mandatory "matching" component?
+    boolean stopwords = solrParams.getBool("stopwords", true);
+
+    /* the main query we will execute.  we disable the coord because
+     * this query is an artificial construct
      */
-    synchronized String getTempSSTablePath()
-    {
-        String fname = getTempSSTableFileName();
-        return new File(DatabaseDescriptor.getDataFileLocationForTable(table_), fname).getAbsolutePath();
+    BooleanQuery query = new BooleanQuery(true);
+
+    /* * * Main User Query * * */
+    parsedUserQuery = null;
+    String userQuery = getString();
+    altUserQuery = null;
+    if( userQuery == null || userQuery.trim().length() == 0 ) {
+      // If no query is specified, we may have an alternate
+      String altQ = solrParams.get( DisMaxParams.ALTQ );
+      if (altQ != null) {
+        altQParser = subQuery(altQ, null);
+        altUserQuery = altQParser.getQuery();
+        query.add( altUserQuery , BooleanClause.Occur.MUST );
+      } else {
+        return null;
+        // throw new ParseException("missing query string" );
+      }
     }
+    else {     
+      // There is a valid query string
+      // userQuery = partialEscape(U.stripUnbalancedQuotes(userQuery)).toString();
 
-    public String getTempSSTableFileName()
-    {
-        return String.format("%s-%s-%s-Data.db",
-                             columnFamily_, SSTable.TEMPFILE_MARKER, fileIndexGenerator_.incrementAndGet());
-    }
+      boolean lowercaseOperators = solrParams.getBool("lowercaseOperators", true);
+      String mainUserQuery = userQuery;
 
-    Future<?> switchMemtable(Memtable oldMemtable, final boolean writeCommitLog) throws IOException
-    {
-        /**
-         *  If we can get the writelock, that means no new updates can come in and 
-         *  all ongoing updates to memtables have completed. We can get the tail
-         *  of the log and use it as the starting position for log replay on recovery.
-         */
-        Table.flusherLock_.writeLock().lock();
-        try
-        {
-            final CommitLog.CommitLogContext ctx = CommitLog.open().getContext(); // this is harmless if !writeCommitLog
+      ExtendedSolrQueryParser up =
+        new ExtendedSolrQueryParser(this, IMPOSSIBLE_FIELD_NAME);
+      up.addAlias(IMPOSSIBLE_FIELD_NAME,
+                tiebreaker, queryFields);
+      addAliasesFromRequest(up, tiebreaker);
+      up.setPhraseSlop(qslop);     // slop for explicit user phrase queries
+      up.setAllowLeadingWildcard(true);
 
-            if (oldMemtable.isFrozen())
-            {
-                return null;
-            }
-            logger_.info(columnFamily_ + " has reached its threshold; switching in a fresh Memtable");
-            oldMemtable.freeze();
-            final Condition condition = submitFlush(oldMemtable);
-            memtable_ = new Memtable(table_, columnFamily_);
-            // a second executor that makes sure the onMemtableFlushes get called in the right order,
-            // while keeping the wait-for-flush (future.get) out of anything latency-sensitive.
-            return commitLogUpdater_.submit(new Runnable()
-            {
-                public void run()
-                {
-                    try
-                    {
-                        condition.await();
-                        if (writeCommitLog)
-                        {
-                            // if we're not writing to the commit log, we are replaying the log, so marking
-                            // the log header with "you can discard anything written before the context" is not valid
-                            onMemtableFlush(ctx);
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        throw new RuntimeException(e);
-                    }
-                }
-            });
+      // defer escaping and only do if lucene parsing fails, or we need phrases
+      // parsing fails.  Need to sloppy phrase queries anyway though.
+      List<Clause> clauses = null;
+      int numPluses = 0;
+      int numMinuses = 0;
+      int numOR = 0;
+      int numNOT = 0;
+
+      clauses = splitIntoClauses(userQuery, false);
+      for (Clause clause : clauses) {
+        if (clause.must == '+') numPluses++;
+        if (clause.must == '-') numMinuses++;
+        if (clause.isBareWord()) {
+          String s = clause.val;
+          if ("OR".equals(s)) {
+            numOR++;
+          } else if ("NOT".equals(s)) {
+            numNOT++;
+          } else if (lowercaseOperators && "or".equals(s)) {
+            numOR++;
+          }
         }
-        finally
-        {
-            Table.flusherLock_.writeLock().unlock();
-            if (memtableSwitchCount == Integer.MAX_VALUE)
-            {
-                memtableSwitchCount = 0;
-            }
-            memtableSwitchCount++;
+      }
+
+      // Always rebuild mainUserQuery from clauses to catch modifications from splitIntoClauses
+      // This was necessary for userFields modifications to get propagated into the query.
+      // Convert lower or mixed case operators to uppercase if we saw them.
+      // only do this for the lucene query part and not for phrase query boosting
+      // since some fields might not be case insensitive.
+      // We don't use a regex for this because it might change and AND or OR in
+      // a phrase query in a case sensitive field.
+      StringBuilder sb = new StringBuilder();
+      for (int i=0; i<clauses.size(); i++) {
+        Clause clause = clauses.get(i);
+        String s = clause.raw;
+        // and and or won't be operators at the start or end
+        if (i>0 && i+1<clauses.size()) {
+          if ("AND".equalsIgnoreCase(s)) {
+            s="AND";
+          } else if ("OR".equalsIgnoreCase(s)) {
+            s="OR";
+          }
         }
-    }
+        sb.append(s);
+        sb.append(' ');
+      }
+      
+      mainUserQuery = sb.toString();
+      
+      // For correct lucene queries, turn off mm processing if there
+      // were explicit operators (except for AND).
+      boolean doMinMatched = (numOR + numNOT + numPluses + numMinuses) == 0;
 
-    void switchBinaryMemtable(String key, byte[] buffer) throws IOException
-    {
-        binaryMemtable_.set(new BinaryMemtable(table_, columnFamily_));
-        binaryMemtable_.get().put(key, buffer);
-    }
+      try {
+        up.setRemoveStopFilter(!stopwords);
+        up.exceptions = true;
+        parsedUserQuery = up.parse(mainUserQuery);
 
-    public void forceFlushIfExpired() throws IOException
-    {
-        if (memtable_.isExpired())
-            forceFlush();
-    }
+        if (stopwords && isEmpty(parsedUserQuery)) {
+         // if the query was all stop words, remove none of them
+          up.setRemoveStopFilter(true);
+          parsedUserQuery = up.parse(mainUserQuery);          
+        }
+      } catch (Exception e) {
+        // ignore failure and reparse later after escaping reserved chars
+        up.exceptions = false;
+      }
 
-    public Future<?> forceFlush() throws IOException
-    {
-        if (memtable_.isClean())
-            return null;
+      if (parsedUserQuery != null && doMinMatched) {
+        if (parsedUserQuery instanceof BooleanQuery) {
+          SolrPluginUtils.setMinShouldMatch((BooleanQuery)parsedUserQuery, minShouldMatch);
+        }
+      }
 
-        return switchMemtable(memtable_, true);
-    }
+      if (parsedUserQuery == null) {
+        sb = new StringBuilder();
+        for (Clause clause : clauses) {
 
-    void forceBlockingFlush() throws IOException, ExecutionException, InterruptedException
-    {
-        Future<?> future = forceFlush();
-        if (future != null)
-            future.get();
-    }
+          boolean doQuote = clause.isPhrase;
 
-    public void forceFlushBinary()
-    {
-        if (binaryMemtable_.get().isClean())
-            return;
+          String s=clause.val;
+          if (!clause.isPhrase && ("OR".equals(s) || "AND".equals(s) || "NOT".equals(s))) {
+            doQuote=true;
+          }
 
-        submitFlush(binaryMemtable_.get());
-    }
+          if (clause.must != 0) {
+            sb.append(clause.must);
+          }
+          if (clause.field != null) {
+            sb.append(clause.field);
+            sb.append(':');
+          }
+          if (doQuote) {
+            sb.append('"');
+          }
+          sb.append(clause.val);
+          if (doQuote) {
+            sb.append('"');
+          }
+          if (clause.field != null) {
+            // Add the default user field boost, if any
+            Float boost = userFields.getBoost(clause.field);
+            if(boost != null)
+              sb.append("^").append(boost);
+          }
+          sb.append(' ');
+        }
+        String escapedUserQuery = sb.toString();
+        parsedUserQuery = up.parse(escapedUserQuery);
 
-    /**
-     * Insert/Update the column family for this key.
-     * Caller is responsible for acquiring Table.flusherLock!
-     * param @ lock - lock that needs to be used.
-     * param @ key - key for update/insert
-     * param @ columnFamily - columnFamily changes
-     */
-    Memtable apply(String key, ColumnFamily columnFamily) throws IOException
-    {
-        long start = System.currentTimeMillis();
+        if (parsedUserQuery instanceof BooleanQuery) {
+          BooleanQuery t = new BooleanQuery();
+          SolrPluginUtils.flattenBooleanQuery(t, (BooleanQuery)parsedUserQuery);
+          SolrPluginUtils.setMinShouldMatch(t, minShouldMatch);
+          parsedUserQuery = t;
+        }
+      }
 
-        boolean flushRequested = memtable_.isThresholdViolated();
-        memtable_.put(key, columnFamily);
-        writeStats_.add(System.currentTimeMillis() - start);
+      query.add(parsedUserQuery, BooleanClause.Occur.MUST);
+
+      // sloppy phrase queries for proximity
+      List<FieldParams> allPhraseFields = new ArrayList<FieldParams>();
+      allPhraseFields.addAll(phraseFields);
+      allPhraseFields.addAll(phraseFields2);
+      allPhraseFields.addAll(phraseFields3);
+
+      if (allPhraseFields.size() > 0) {
+        // find non-field clauses
+        List<Clause> normalClauses = new ArrayList<Clause>(clauses.size());
+        for (Clause clause : clauses) {
+          if (clause.field != null || clause.isPhrase) continue;
+          // check for keywords "AND,OR,TO"
+          if (clause.isBareWord()) {
+            String s = clause.val.toString();
+            // avoid putting explict operators in the phrase query
+            if ("OR".equals(s) || "AND".equals(s) || "NOT".equals(s) || "TO".equals(s)) continue;
+          }
+          normalClauses.add(clause);
+        }
+
+        // full phrase and shingles
+        for (FieldParams phraseField: allPhraseFields) {
+          int slop = (phraseField.getSlop() == 0) ? pslop : phraseField.getSlop();
+          Map<String,Float> pf = new HashMap<String,Float>(1);
+          pf.put(phraseField.getField(),phraseField.getBoost());
+          addShingledPhraseQueries(query, normalClauses, pf,   
+				   phraseField.getWordGrams(),tiebreaker, slop);
+        }
         
-        return flushRequested ? memtable_ : null;
+      }
     }
 
-    /*
-     * Insert/Update the column family for this key. param @ lock - lock that
-     * needs to be used. param @ key - key for update/insert param @
-     * columnFamily - columnFamily changes
-     */
-    void applyBinary(String key, byte[] buffer) throws IOException
-    {
-        long start = System.currentTimeMillis();
-        binaryMemtable_.get().put(key, buffer);
-        writeStats_.add(System.currentTimeMillis() - start);
-    }
 
-    /*
-     This is complicated because we need to preserve deleted columns, supercolumns, and columnfamilies
-     until they have been deleted for at least GC_GRACE_IN_SECONDS.  But, we do not need to preserve
-     their contents; just the object itself as a "tombstone" that can be used to repair other
-     replicas that do not know about the deletion.
-     */
-    static ColumnFamily removeDeleted(ColumnFamily cf)
-    {
-        return removeDeleted(cf, getDefaultGCBefore());
-    }
 
-    public static int getDefaultGCBefore()
-    {
-        return (int)(System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds();
-    }
-
-    public static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
-    {
-        if (cf == null)
-        {
-            return null;
+    /* * * Boosting Query * * */
+    boostParams = solrParams.getParams(DisMaxParams.BQ);
+    boostQueries=null;
+    if (boostParams!=null && boostParams.length>0) {
+      Map<String,Float> bqBoosts = SolrPluginUtils.parseFieldBoosts(boostParams);
+      boostQueries = new ArrayList<Query>();
+      for (Map.Entry<String,Float> bqs : bqBoosts.entrySet()) {
+        if (bqs.getKey().trim().length()==0) continue;
+        Query q = subQuery(bqs.getKey(), null).getQuery();
+        Float b = bqs.getValue();
+        if(b!=null) {
+          q.setBoost(b);
         }
-
-        if (cf.isSuper())
-            removeDeletedSuper(cf, gcBefore);
-        else
-            removeDeletedStandard(cf, gcBefore);
-
-        // in case of a timestamp tie, tombstones get priority over non-tombstones.
-        // (we want this to be deterministic to avoid confusion.)
-        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
-        {
-            return null;
-        }
-        return cf;
+        boostQueries.add(q);
+      }
+    }
+    if (null != boostQueries) {
+      for(Query f : boostQueries) {
+        query.add(f, BooleanClause.Occur.SHOULD);
+      }
     }
 
-    private static void removeDeletedStandard(ColumnFamily cf, int gcBefore)
-    {
-        for (byte[] cname : cf.getColumnNames())
-        {
-            IColumn c = cf.getColumnsMap().get(cname);
-            if ((c.isMarkedForDelete() && c.getLocalDeletionTime() <= gcBefore)
-                || c.timestamp() <= cf.getMarkedForDeleteAt())
-            {
-                cf.remove(cname);
+    /* * * Boosting Functions * * */
+
+    String[] boostFuncs = solrParams.getParams(DisMaxParams.BF);
+    if (null != boostFuncs && 0 != boostFuncs.length) {
+      for (String boostFunc : boostFuncs) {
+        if(null == boostFunc || "".equals(boostFunc)) continue;
+        Map<String,Float> ff = SolrPluginUtils.parseFieldBoosts(boostFunc);
+        for (String f : ff.keySet()) {
+          Query fq = subQuery(f, FunctionQParserPlugin.NAME).getQuery();
+          Float b = ff.get(f);
+          if (null != b) {
+            fq.setBoost(b);
+          }
+          query.add(fq, BooleanClause.Occur.SHOULD);
+        }
+      }
+    }
+
+
+    //
+    // create a boosted query (scores multiplied by boosts)
+    //
+    Query topQuery = query;
+    multBoosts = solrParams.getParams("boost");
+    if (multBoosts!=null && multBoosts.length>0) {
+
+      List<ValueSource> boosts = new ArrayList<ValueSource>();
+      for (String boostStr : multBoosts) {
+        if (boostStr==null || boostStr.length()==0) continue;
+        Query boost = subQuery(boostStr, FunctionQParserPlugin.NAME).getQuery();
+        ValueSource vs;
+        if (boost instanceof FunctionQuery) {
+          vs = ((FunctionQuery)boost).getValueSource();
+        } else {
+          vs = new QueryValueSource(boost, 1.0f);
+        }
+        boosts.add(vs);
+      }
+
+      if (boosts.size()>1) {
+        ValueSource prod = new ProductFloatFunction(boosts.toArray(new ValueSource[boosts.size()]));
+        topQuery = new BoostedQuery(query, prod);
+      } else if (boosts.size() == 1) {
+        topQuery = new BoostedQuery(query, boosts.get(0));
+      }
+    }
+
+    return topQuery;
+  }
+
+  /**
+   * Extracts all the alised fields from the requests and adds them to up
+   * @param up
+   * @param tiebreaker
+   * @throws ParseException 
+   */
+  private void addAliasesFromRequest(ExtendedSolrQueryParser up, float tiebreaker) throws ParseException {
+    Iterator<String> it = solrParams.getParameterNamesIterator();
+    while(it.hasNext()) {
+      String param = it.next();
+      if(param.startsWith("f.") && param.endsWith(".qf")) {
+        // Add the alias
+        String fname = param.substring(2,param.length()-3);
+        String qfReplacement = solrParams.get(param);
+        Map<String,Float> parsedQf = SolrPluginUtils.parseFieldBoosts(qfReplacement);
+        if(parsedQf.size() == 0)
+          return;
+        up.addAlias(fname, tiebreaker, parsedQf);
+      }
+    }
+  }
+
+  /**
+   * Modifies the main query by adding a new optional Query consisting
+   * of shingled phrase queries across the specified clauses using the 
+   * specified field =&gt; boost mappings.
+   *
+   * @param mainQuery Where the phrase boosting queries will be added
+   * @param clauses Clauses that will be used to construct the phrases
+   * @param fields Field =&gt; boost mappings for the phrase queries
+   * @param shingleSize how big the phrases should be, 0 means a single phrase
+   * @param tiebreaker tie breker value for the DisjunctionMaxQueries
+   * @param slop slop value for the constructed phrases
+   */
+  private void addShingledPhraseQueries(final BooleanQuery mainQuery, 
+                                        final List<Clause> clauses,
+                                        final Map<String,Float> fields,
+                                        int shingleSize,
+                                        final float tiebreaker,
+                                        final int slop) 
+    throws ParseException {
+    
+    if (null == fields || fields.isEmpty() || 
+        null == clauses || clauses.size() < shingleSize ) 
+      return;
+    
+    if (0 == shingleSize) shingleSize = clauses.size();
+
+    final int goat = shingleSize-1; // :TODO: better name for var?
+
+    StringBuilder userPhraseQuery = new StringBuilder();
+      for (int i=0; i < clauses.size() - goat; i++) {
+        userPhraseQuery.append('"');
+        for (int j=0; j <= goat; j++) {
+          userPhraseQuery.append(clauses.get(i + j).val);
+          userPhraseQuery.append(' ');
+        }
+        userPhraseQuery.append('"');
+        userPhraseQuery.append(' ');
+      }
+
+      /* for parsing sloppy phrases using DisjunctionMaxQueries */
+      ExtendedSolrQueryParser pp =
+        new ExtendedSolrQueryParser(this, IMPOSSIBLE_FIELD_NAME);
+
+      pp.addAlias(IMPOSSIBLE_FIELD_NAME, tiebreaker, fields);
+      pp.setPhraseSlop(slop);
+      pp.setRemoveStopFilter(true);  // remove stop filter and keep stopwords
+
+      /* :TODO: reevaluate using makeDismax=true vs false...
+       * 
+       * The DismaxQueryParser always used DisjunctionMaxQueries for the 
+       * pf boost, for the same reasons it used them for the qf fields.
+       * When Yonik first wrote the ExtendedDismaxQParserPlugin, he added
+       * the "makeDismax=false" property to use BooleanQueries instead, but 
+       * when asked why his response was "I honestly don't recall" ...
+       *
+       * https://issues.apache.org/jira/browse/SOLR-1553?focusedCommentId=12793813#action_12793813
+       *
+       * so for now, we continue to use dismax style queries becuse it 
+       * seems the most logical and is back compatible, but we should 
+       * try to figure out what Yonik was thinking at the time (because he 
+       * rarely does things for no reason)
+       */
+      pp.makeDismax = true; 
+
+
+      // minClauseSize is independent of the shingleSize because of stop words
+      // (if they are removed from the middle, so be it, but we need at least 
+      // two or there shouldn't be a boost)
+      pp.minClauseSize = 2;  
+      
+      // TODO: perhaps we shouldn't use synonyms either...
+
+      Query phrase = pp.parse(userPhraseQuery.toString());
+      if (phrase != null) {
+        mainQuery.add(phrase, BooleanClause.Occur.SHOULD);
+      }
+  }
+
+
+  @Override
+  public String[] getDefaultHighlightFields() {
+    String[] highFields = queryFields.keySet().toArray(new String[0]);
+    return highFields;
+  }
+
+  @Override
+  public Query getHighlightQuery() throws ParseException {
+    return parsedUserQuery == null ? altUserQuery : parsedUserQuery;
+  }
+
+  @Override
+  public void addDebugInfo(NamedList<Object> debugInfo) {
+    super.addDebugInfo(debugInfo);
+    debugInfo.add("altquerystring", altUserQuery);
+    if (null != boostQueries) {
+      debugInfo.add("boost_queries", boostParams);
+      debugInfo.add("parsed_boost_queries",
+                QueryParsing.toString(boostQueries, getReq().getSchema()));
+    }
+    debugInfo.add("boostfuncs", getReq().getParams().getParams(DisMaxParams.BF));
+  }
+
+
+  
+  public static CharSequence partialEscape(CharSequence s) {
+    StringBuilder sb = new StringBuilder();
+
+    int len = s.length();
+    for (int i = 0; i < len; i++) {
+      char c = s.charAt(i);
+      if (c == ':') {
+        // look forward to make sure it's something that won't
+        // cause a parse exception (something that won't be escaped... like
+        // +,-,:, whitespace
+        if (i+1<len && i>0) {
+          char ch = s.charAt(i+1);
+          if (!(Character.isWhitespace(ch) || ch=='+' || ch=='-' || ch==':')) {
+            // OK, at this point the chars after the ':' will be fine.
+            // now look back and try to determine if this is a fieldname
+            // [+,-]? [letter,_] [letter digit,_,-,.]*
+            // This won't cover *all* possible lucene fieldnames, but we should
+            // only pick nice names to begin with
+            int start, pos;
+            for (start=i-1; start>=0; start--) {
+              ch = s.charAt(start);
+              if (Character.isWhitespace(ch)) break;
             }
-        }
-    }
 
-    private static void removeDeletedSuper(ColumnFamily cf, int gcBefore)
-    {
-        // TODO assume deletion means "most are deleted?" and add to clone, instead of remove from original?
-        // this could be improved by having compaction, or possibly even removeDeleted, r/m the tombstone
-        // once gcBefore has passed, so if new stuff is added in it doesn't used the wrong algorithm forever
-        for (byte[] cname : cf.getColumnNames())
-        {
-            IColumn c = cf.getColumnsMap().get(cname);
-            long minTimestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
-            for (IColumn subColumn : c.getSubColumns())
-            {
-                if (subColumn.timestamp() <= minTimestamp
-                    || (subColumn.isMarkedForDelete() && subColumn.getLocalDeletionTime() <= gcBefore))
-                {
-                    ((SuperColumn)c).remove(subColumn.name());
-                }
+            // skip whitespace
+            pos = start+1;
+
+            // skip leading + or -
+            ch = s.charAt(pos);
+            if (ch=='+' || ch=='-') {
+              pos++;
             }
-            if (c.getSubColumns().isEmpty() && c.getLocalDeletionTime() <= gcBefore)
-            {
-                cf.remove(c.name());
-            }
-        }
-    }
 
-    /*
-     * This method is called when the Memtable is frozen and ready to be flushed
-     * to disk. This method informs the CommitLog that a particular ColumnFamily
-     * is being flushed to disk.
-     */
-    void onMemtableFlush(CommitLog.CommitLogContext cLogCtx) throws IOException
-    {
-        if (cLogCtx.isValidContext())
-        {
-            CommitLog.open().onMemtableFlush(table_, columnFamily_, cLogCtx);
-        }
-    }
+            // we don't need to explicitly check for end of string
+            // since ':' will act as our sentinal
 
-    /*
-     * Called after the Memtable flushes its in-memory data, or we add a file
-     * via bootstrap. This information is
-     * cached in the ColumnFamilyStore. This is useful for reads because the
-     * ColumnFamilyStore first looks in the in-memory store and the into the
-     * disk to find the key. If invoked during recoveryMode the
-     * onMemtableFlush() need not be invoked.
-     *
-     * param @ filename - filename just flushed to disk
-     */
-    public void addSSTable(SSTableReader sstable)
-    {
-        ssTables_.add(sstable);
-        CompactionManager.instance().submit(this);
-    }
+              // first char can't be '-' or '.'
+              ch = s.charAt(pos++);
+              if (Character.isJavaIdentifierPart(ch)) {
 
-    /*
-     * Group files of similar size into buckets.
-     */
-    static Set<List<SSTableReader>> getCompactionBuckets(Iterable<SSTableReader> files, long min)
-    {
-        Map<List<SSTableReader>, Long> buckets = new HashMap<List<SSTableReader>, Long>();
-        for (SSTableReader sstable : files)
-        {
-            long size = sstable.length();
-
-            boolean bFound = false;
-            // look for a bucket containing similar-sized files:
-            // group in the same bucket if it's w/in 50% of the average for this bucket,
-            // or this file and the bucket are all considered "small" (less than `min`)
-            for (List<SSTableReader> bucket : buckets.keySet())
-            {
-                long averageSize = buckets.get(bucket);
-                if ((size > averageSize / 2 && size < 3 * averageSize / 2)
-                    || (size < min && averageSize < min))
-                {
-                    // remove and re-add because adding changes the hash
-                    buckets.remove(bucket);
-                    averageSize = (averageSize + size) / 2;
-                    bucket.add(sstable);
-                    buckets.put(bucket, averageSize);
-                    bFound = true;
+                for(;;) {
+                  ch = s.charAt(pos++);
+                  if (!(Character.isJavaIdentifierPart(ch) || ch=='-' || ch=='.')) {
                     break;
+                  }
                 }
-            }
-            // no similar bucket found; put it in a new one
-            if (!bFound)
-            {
-                ArrayList<SSTableReader> bucket = new ArrayList<SSTableReader>();
-                bucket.add(sstable);
-                buckets.put(bucket, size);
-            }
-        }
 
-        return buckets.keySet();
-    }
-
-    /*
-     * Break the files into buckets and then compact.
-     */
-    int doCompaction(int minThreshold, int maxThreshold) throws IOException
-    {
-        int filesCompacted = 0;
-        if (minThreshold > 0 && maxThreshold > 0)
-        {
-            logger_.debug("Checking to see if compaction of " + columnFamily_ + " would be useful");
-            for (List<SSTableReader> sstables : getCompactionBuckets(ssTables_, 50L * 1024L * 1024L))
-            {
-                if (sstables.size() < minThreshold)
-                {
-                    continue;
+                if (pos<=i) {
+                  // OK, we got to the ':' and everything looked like a valid fieldname, so
+                  // don't escape the ':'
+                  sb.append(':');
+                  continue;  // jump back to start of outer-most loop
                 }
-                // if we have too many to compact all at once, compact older ones first -- this avoids
-                // re-compacting files we just created.
-                Collections.sort(sstables);
-                filesCompacted += doFileCompaction(sstables.subList(0, Math.min(sstables.size(), maxThreshold)));
-            }
-            logger_.debug(filesCompacted + " files compacted");
+
+              }
+
+
+          }
         }
-        else
-        {
-            logger_.debug("Compaction is currently disabled.");
-        }
-        return filesCompacted;
+
+        // we fell through to here, so we should escape this like other reserved chars.
+        sb.append('\\');
+      }
+      else if (c == '\\' || c == '!' || c == '(' || c == ')' ||
+          c == '^' || c == '[' || c == ']' ||
+          c == '{'  || c == '}' || c == '~' || c == '*' || c == '?'
+          )
+      {
+        sb.append('\\');
+      }
+      sb.append(c);
+    }
+    return sb;
+  }
+
+
+  static class Clause {
+
+    boolean isBareWord() {
+      return must==0 && !isPhrase;
     }
 
-    void doMajorCompaction(long skip) throws IOException
-    {
-        doMajorCompactionInternal(skip);
+    String field;
+    boolean isPhrase;
+    boolean hasWhitespace;
+    boolean hasSpecialSyntax;
+    boolean syntaxError;
+    char must;   // + or -
+    String val;  // the field value (minus the field name, +/-, quotes)
+    String raw;  // the raw clause w/o leading/trailing whitespace
+  }
+
+  
+  public List<Clause> splitIntoClauses(String s, boolean ignoreQuote) {
+    ArrayList<Clause> lst = new ArrayList<Clause>(4);
+    Clause clause;
+
+    int pos=0;
+    int end=s.length();
+    char ch=0;
+    int start;
+    boolean disallowUserField;
+    outer: while (pos < end) {
+      clause = new Clause();
+      disallowUserField = true;
+      
+      ch = s.charAt(pos);
+
+      while (Character.isWhitespace(ch)) {
+        if (++pos >= end) break;
+        ch = s.charAt(pos);
+      }
+
+      start = pos;      
+
+      if (ch=='+' || ch=='-') {
+        clause.must = ch;
+        pos++;
+      }
+
+      clause.field = getFieldName(s, pos, end);
+      if(clause.field != null && !userFields.isAllowed(clause.field)) {
+        clause.field = null;
+      }
+      if (clause.field != null) {
+        disallowUserField = false;
+        pos += clause.field.length(); // skip the field name
+        pos++;  // skip the ':'
+      }
+
+      if (pos>=end) break;
+
+
+      char inString=0;
+
+      ch = s.charAt(pos);
+      if (!ignoreQuote && ch=='"') {
+        clause.isPhrase = true;
+        inString = '"';
+        pos++;
+      }
+
+      StringBuilder sb = new StringBuilder();
+      while (pos < end) {
+        ch = s.charAt(pos++);
+        if (ch=='\\') {    // skip escaped chars, but leave escaped
+          sb.append(ch);
+          if (pos >= end) {
+            sb.append(ch); // double backslash if we are at the end of the string
+            break;
+          }
+          ch = s.charAt(pos++);
+          sb.append(ch);
+          continue;
+        } else if (inString != 0 && ch == inString) {
+          inString=0;
+          break;
+        } else if (Character.isWhitespace(ch)) {
+          clause.hasWhitespace=true;
+          if (inString == 0) {
+            // end of the token if we aren't in a string, backing
+            // up the position.
+            pos--;
+            break;
+          }
+        }
+
+        if (inString == 0) {
+          switch (ch) {
+            case '!':
+            case '(':
+            case ')':
+            case ':':
+            case '^':
+            case '[':
+            case ']':
+            case '{':
+            case '}':
+            case '~':
+            case '*':
+            case '?':
+            case '"':
+            case '+':
+            case '-':
+              clause.hasSpecialSyntax = true;
+              sb.append('\\');
+          }
+        } else if (ch=='"') {
+          // only char we need to escape in a string is double quote
+          sb.append('\\');
+        }
+        sb.append(ch);
+      }
+      clause.val = sb.toString();
+ 
+      if (clause.isPhrase) {
+        if (inString != 0) {
+          // detected bad quote balancing... retry
+          // parsing with quotes like any other char
+          return splitIntoClauses(s, true);
+        }
+
+        // special syntax in a string isn't special
+        clause.hasSpecialSyntax = false;        
+      } else {
+        // an empty clause... must be just a + or - on it's own
+        if (clause.val.length() == 0) {
+          clause.syntaxError = true;
+          if (clause.must != 0) {
+            clause.val="\\"+clause.must;
+            clause.must = 0;
+            clause.hasSpecialSyntax = true;
+          } else {
+            // uh.. this shouldn't happen.
+            clause=null;
+          }
+        }
+      }
+
+      if (clause != null) {
+        if(disallowUserField) {
+          clause.raw = s.substring(start, pos);
+          // escape colons, except for "match all" query
+          if(!"*:*".equals(clause.raw)) {
+            clause.raw = clause.raw.replaceAll(":", "\\\\:");
+          }
+        } else {
+          clause.raw = s.substring(start, pos);
+          // Add default userField boost if no explicit boost exists
+          if(userFields.isAllowed(clause.field) && !clause.raw.contains("^")) {
+            Float boost = userFields.getBoost(clause.field);
+            if(boost != null)
+              clause.raw += "^" + boost;
+          }
+        }
+        lst.add(clause);
+      }
     }
 
-    /*
-     * Compact all the files irrespective of the size.
-     * skip : is the amount in GB of the files to be skipped
-     * all files greater than skip GB are skipped for this compaction.
-     * Except if skip is 0 , in that case this is ignored and all files are taken.
+    return lst;
+  }
+
+  /** 
+   * returns a field name or legal field alias from the current 
+   * position of the string 
+   */
+  public String getFieldName(String s, int pos, int end) {
+    if (pos >= end) return null;
+    int p=pos;
+    int colon = s.indexOf(':',pos);
+    // make sure there is space after the colon, but not whitespace
+    if (colon<=pos || colon+1>=end || Character.isWhitespace(s.charAt(colon+1))) return null;
+    char ch = s.charAt(p++);
+    if (!Character.isJavaIdentifierPart(ch)) return null;
+    while (p<colon) {
+      ch = s.charAt(p++);
+      if (!(Character.isJavaIdentifierPart(ch) || ch=='-' || ch=='.')) return null;
+    }
+    String fname = s.substring(pos, p);
+    boolean isInSchema = getReq().getSchema().getFieldTypeNoEx(fname) != null;
+    boolean isAlias = solrParams.get("f."+fname+".qf") != null;
+    boolean isMagic = (null != MagicFieldName.get(fname));
+    
+    return (isInSchema || isAlias || isMagic) ? fname : null;
+  }
+
+  public static List<String> split(String s, boolean ignoreQuote) {
+    ArrayList<String> lst = new ArrayList<String>(4);
+    int pos=0, start=0, end=s.length();
+    char inString=0;
+    char ch=0;
+    while (pos < end) {
+      char prevChar=ch;
+      ch = s.charAt(pos++);
+      if (ch=='\\') {    // skip escaped chars
+        pos++;
+      } else if (inString != 0 && ch==inString) {
+        inString=0;
+      } else if (!ignoreQuote && ch=='"') {
+        // If char is directly preceeded by a number or letter
+        // then don't treat it as the start of a string.
+        if (!Character.isLetterOrDigit(prevChar)) {
+          inString=ch;
+        }
+      } else if (Character.isWhitespace(ch) && inString==0) {
+        lst.add(s.substring(start,pos-1));
+        start=pos;
+      }
+    }
+    if (start < end) {
+      lst.add(s.substring(start,end));
+    }
+
+    if (inString != 0) {
+      // unbalanced quote... ignore them
+      return split(s, true);
+    }
+
+    return lst;
+  }
+
+
+
+
+    enum QType {
+      FIELD,
+      PHRASE,
+      PREFIX,
+      WILDCARD,
+      FUZZY,
+      RANGE
+    }
+
+
+  static final RuntimeException unknownField = new RuntimeException("UnknownField");
+  static {
+    unknownField.fillInStackTrace();
+  }
+
+  /**
+   * A subclass of SolrQueryParser that supports aliasing fields for
+   * constructing DisjunctionMaxQueries.
+   */
+  static class ExtendedSolrQueryParser extends SolrQueryParser {
+
+
+    /** A simple container for storing alias info
      */
-    void doMajorCompactionInternal(long skip) throws IOException
-    {
-        Collection<SSTableReader> sstables;
-        if (skip > 0)
-        {
-            sstables = new ArrayList<SSTableReader>();
-            for (SSTableReader sstable : ssTables_)
-            {
-                if (sstable.length() < skip * 1024L * 1024L * 1024L)
-                {
-                    sstables.add(sstable);
-                }
-            }
-        }
-        else
-        {
-            sstables = ssTables_.getSSTables();
-        }
-
-        doFileCompaction(sstables);
+    protected class Alias {
+      public float tie;
+      public Map<String,Float> fields;
     }
 
-    /*
-     * Add up all the files sizes this is the worst case file
-     * size for compaction of all the list of files given.
+    boolean makeDismax=true;
+    boolean disableCoord=true;
+    boolean allowWildcard=true;
+    int minClauseSize = 0;    // minimum number of clauses per phrase query...
+                              // used when constructing boosting part of query via sloppy phrases
+    boolean exceptions;  //  allow exceptions to be thrown (for example on a missing field)
+
+    private Map<String, Analyzer> nonStopFilterAnalyzerPerField;
+    private boolean removeStopFilter;
+
+    /**
+     * Where we store a map from field name we expect to see in our query
+     * string, to Alias object containing the fields to use in our
+     * DisjunctionMaxQuery and the tiebreaker to use.
      */
-    long getExpectedCompactedFileSize(Iterable<SSTableReader> sstables)
-    {
-        long expectedFileSize = 0;
-        for (SSTableReader sstable : sstables)
-        {
-            long size = sstable.length();
-            expectedFileSize = expectedFileSize + size;
-        }
-        return expectedFileSize;
+    protected Map<String,Alias> aliases = new HashMap<String,Alias>(3);
+
+    public ExtendedSolrQueryParser(QParser parser, String defaultField) {
+      super(parser, defaultField, null);
+      // don't trust that our parent class won't ever change it's default
+      setDefaultOperator(QueryParser.Operator.OR);
     }
 
-    /*
-     *  Find the maximum size file in the list .
-     */
-    SSTableReader getMaxSizeFile(Iterable<SSTableReader> sstables)
-    {
-        long maxSize = 0L;
-        SSTableReader maxFile = null;
-        for (SSTableReader sstable : sstables)
-        {
-            if (sstable.length() > maxSize)
-            {
-                maxSize = sstable.length();
-                maxFile = sstable;
-            }
-        }
-        return maxFile;
+    public void setRemoveStopFilter(boolean remove) {
+//      analyzer.removeStopFilter = remove;
+      removeStopFilter = remove;
     }
 
-    List<SSTableReader> doAntiCompaction(Collection<Range> ranges, InetAddress target) throws IOException
-    {
-        return doFileAntiCompaction(ssTables_.getSSTables(), ranges, target);
+    @Override
+    protected Query getBooleanQuery(List clauses, boolean disableCoord) throws ParseException {
+      Query q = super.getBooleanQuery(clauses, disableCoord);
+      if (q != null) {
+        q = QueryUtils.makeQueryable(q);
+      }
+      return q;
     }
 
-    void forceCleanup()
-    {
-        CompactionManager.instance().submitCleanup(ColumnFamilyStore.this);
+
+    ////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+
+    @Override
+    protected void addClause(List clauses, int conj, int mods, Query q) {
+//System.out.println("addClause:clauses="+clauses+" conj="+conj+" mods="+mods+" q="+q);
+      super.addClause(clauses, conj, mods, q);
     }
 
     /**
-     * This function goes over each file and removes the keys that the node is not responsible for
-     * and only keeps keys that this node is responsible for.
+     * Add an alias to this query parser.
      *
-     * @throws IOException
+     * @param field the field name that should trigger alias mapping
+     * @param fieldBoosts the mapping from fieldname to boost value that
+     *                    should be used to build up the clauses of the
+     *                    DisjunctionMaxQuery.
+     * @param tiebreaker to the tiebreaker to be used in the
+     *                   DisjunctionMaxQuery
+     * @see SolrPluginUtils#parseFieldBoosts
      */
-    void doCleanupCompaction() throws IOException
-    {
-        for (SSTableReader sstable : ssTables_)
-        {
-            doCleanup(sstable);
-        }
-        gcAfterRpcTimeout();
-    }
+    public void addAlias(String field, float tiebreaker,
+                         Map<String,Float> fieldBoosts) {
 
+      Alias a = new Alias();
+      a.tie = tiebreaker;
+      a.fields = fieldBoosts;
+      aliases.put(field, a);
+    }
+    
     /**
-     * cleans up one particular file by removing keys that this node is not responsible for.
-     * @throws IOException
-     */
-    /* TODO: Take care of the comments later. */
-    void doCleanup(SSTableReader sstable) throws IOException
-    {
-        assert sstable != null;
-        List<SSTableReader> sstables = doFileAntiCompaction(Arrays.asList(sstable), StorageService.instance().getLocalRanges(), null);
-        if (!sstables.isEmpty())
-        {
-            assert sstables.size() == 1;
-            addSSTable(sstables.get(0));
-        }
-        if (logger_.isDebugEnabled())
-          logger_.debug("Original file : " + sstable + " of size " + sstable.length());
-        ssTables_.markCompacted(Arrays.asList(sstable));
-    }
-
-    /**
-     * This function is used to do the anti compaction process , it spits out the file which has keys that belong to a given range
-     * If the target is not specified it spits out the file as a compacted file with the unecessary ranges wiped out.
-     *
-     * @param sstables
-     * @param ranges
-     * @param target
-     * @return
-     * @throws IOException
-     */
-    List<SSTableReader> doFileAntiCompaction(Collection<SSTableReader> sstables, final Collection<Range> ranges, InetAddress target) throws IOException
-    {
-        logger_.info("AntiCompacting [" + StringUtils.join(sstables, ",") + "]");
-        // Calculate the expected compacted filesize
-        long expectedRangeFileSize = getExpectedCompactedFileSize(sstables) / 2;
-        String compactionFileLocation = DatabaseDescriptor.getDataFileLocationForTable(table_, expectedRangeFileSize);
-        if (compactionFileLocation == null)
-        {
-            throw new UnsupportedOperationException("disk full");
-        }
-        if (target != null)
-        {
-            // compacting for streaming: send to subdirectory
-            compactionFileLocation = compactionFileLocation + File.separator + DatabaseDescriptor.STREAMING_SUBDIR;
-        }
-        List<SSTableReader> results = new ArrayList<SSTableReader>();
-
-        long startTime = System.currentTimeMillis();
-        long totalkeysWritten = 0;
-
-        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)(SSTableReader.getApproximateKeyCount(sstables) / 2));
-        if (logger_.isDebugEnabled())
-          logger_.debug("Expected bloom filter size : " + expectedBloomFilterSize);
-
-        SSTableWriter writer = null;
-	CompactionIterator ci = new AntiCompactionIterator(sstables, ranges, getDefaultGCBefore(), sstables.size() == ssTables_.size());
-        Iterator nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
-
-        try
-        {
-            if (!nni.hasNext())
-            {
-                return results;
-            }
-
-            while (nni.hasNext())
-            {
-                CompactionIterator.CompactedRow row = (CompactionIterator.CompactedRow) nni.next();
-		if (writer == null)
-		{
-		    FileUtils.createDirectory(compactionFileLocation);
-		    String newFilename = new File(compactionFileLocation, getTempSSTableFileName()).getAbsolutePath();
-		    writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
-		}
-		writer.append(row.key, row.buffer);
-		totalkeysWritten++;
-            }
-        }
-        finally
-        {
-            ci.close();
-        }
-
-        if (writer != null)
-        {
-            results.add(writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_)));
-            String format = "AntiCompacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
-            long dTime = System.currentTimeMillis() - startTime;
-            logger_.info(String.format(format, writer.getFilename(), getTotalBytes(sstables), results.get(0).length(), totalkeysWritten, dTime));
-        }
-
-        return results;
-    }
-
-    private int doFileCompaction(Collection<SSTableReader> sstables) throws IOException
-    {
-        return doFileCompaction(sstables, getDefaultGCBefore());
-    }
-
-    /*
-    * This function does the actual compaction for files.
-    * It maintains a priority queue of with the first key from each file
-    * and then removes the top of the queue and adds it to the SStable and
-    * repeats this process while reading the next from each file until its
-    * done with all the files . The SStable to which the keys are written
-    * represents the new compacted file. Before writing if there are keys
-    * that occur in multiple files and are the same then a resolution is done
-    * to get the latest data.
-    *
-    * The collection of sstables passed may be empty (but not null); even if
-    * it is not empty, it may compact down to nothing if all rows are deleted.
-    */
-    int doFileCompaction(Collection<SSTableReader> sstables, int gcBefore) throws IOException
-    {
-        if (DatabaseDescriptor.isSnapshotBeforeCompaction())
-            Table.open(table_).snapshot("compact-" + columnFamily_);
-        logger_.info("Compacting [" + StringUtils.join(sstables, ",") + "]");
-        String compactionFileLocation = DatabaseDescriptor.getDataFileLocationForTable(table_, getExpectedCompactedFileSize(sstables));
-        // If the compaction file path is null that means we have no space left for this compaction.
-        // try again w/o the largest one.
-        if (compactionFileLocation == null)
-        {
-            SSTableReader maxFile = getMaxSizeFile(sstables);
-            List<SSTableReader> smallerSSTables = new ArrayList<SSTableReader>(sstables);
-            smallerSSTables.remove(maxFile);
-            return doFileCompaction(smallerSSTables, gcBefore);
-        }
-
-        // new sstables from flush can be added during a compaction, but only the compaction can remove them,
-        // so in our single-threaded compaction world this is a valid way of determining if we're compacting
-        // all the sstables (that existed when we started)
-        boolean major = sstables.size() == ssTables_.size();
-
-        long startTime = System.currentTimeMillis();
-        long totalkeysWritten = 0;
-
-        // TODO the int cast here is potentially buggy
-        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)SSTableReader.getApproximateKeyCount(sstables));
-        if (logger_.isDebugEnabled())
-          logger_.debug("Expected bloom filter size : " + expectedBloomFilterSize);
-
-        SSTableWriter writer;
-        CompactionIterator ci = new CompactionIterator(sstables, gcBefore, major); // retain a handle so we can call close()
-        Iterator nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
-
-        try
-        {
-            if (!nni.hasNext())
-            {
-                // don't mark compacted in the finally block, since if there _is_ nondeleted data,
-                // we need to sync it (via closeAndOpen) first, so there is no period during which
-                // a crash could cause data loss.
-                ssTables_.markCompacted(sstables);
-                return 0;
-            }
-
-            String newFilename = new File(compactionFileLocation, getTempSSTableFileName()).getAbsolutePath();
-            writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
-
-            // validate the CF as we iterate over it
-            AntiEntropyService.IValidator validator = AntiEntropyService.instance().getValidator(table_, columnFamily_, null, major);
-            validator.prepare();
-            while (nni.hasNext())
-            {
-                CompactionIterator.CompactedRow row = (CompactionIterator.CompactedRow) nni.next();
-                writer.append(row.key, row.buffer);
-                validator.add(row);
-                totalkeysWritten++;
-            }
-            validator.complete();
-        }
-        finally
-        {
-            ci.close();
-        }
-
-        SSTableReader ssTable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_));
-        ssTables_.add(ssTable);
-        ssTables_.markCompacted(sstables);
-        gcAfterRpcTimeout();
-        CompactionManager.instance().submit(ColumnFamilyStore.this);
-
-        String format = "Compacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
-        long dTime = System.currentTimeMillis() - startTime;
-        logger_.info(String.format(format, writer.getFilename(), getTotalBytes(sstables), ssTable.length(), totalkeysWritten, dTime));
-        return sstables.size();
-    }
-
-    /**
-     * perform a GC to clean out obsolete sstables, sleeping rpc timeout first so that most in-progress ops can complete
-     * (thus, no longer reference the sstables in question)
-     */
-    private void gcAfterRpcTimeout()
-    {
-        new Thread(new Runnable()
-        {
-            public void run()
-            {
-                try
-                {
-                    Thread.sleep(DatabaseDescriptor.getRpcTimeout());
-                }
-                catch (InterruptedException e)
-                {
-                    throw new AssertionError(e);
-                }
-                System.gc();
-            }
-        }).start();
-    }
-
-    /**
-     * Performs a readonly compaction of all sstables in order to validate
-     * them on request, but without performing any writes.
-     */
-    void doReadonlyCompaction(InetAddress initiator) throws IOException
-    {
-        Collection<SSTableReader> sstables = ssTables_.getSSTables();
-        CompactionIterator ci = new CompactionIterator(sstables, getDefaultGCBefore(), true);
-        try
-        {
-            Iterator nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
-
-            // validate the CF as we iterate over it
-            AntiEntropyService.IValidator validator = AntiEntropyService.instance().getValidator(table_, columnFamily_, initiator, true);
-            validator.prepare();
-            while (nni.hasNext())
-            {
-                CompactionIterator.CompactedRow row = (CompactionIterator.CompactedRow) nni.next();
-                validator.add(row);
-            }
-            validator.complete();
-        }
-        finally
-        {
-            ci.close();
-        }
-    }
-
-    private long getTotalBytes(Iterable<SSTableReader> sstables)
-    {
-        long sum = 0;
-        for (SSTableReader sstable : sstables)
-        {
-            sum += sstable.length();
-        }
-        return sum;
-    }
-
-    public static List<Memtable> getUnflushedMemtables(String cfName)
-    {
-        return new ArrayList<Memtable>(getMemtablesPendingFlushNotNull(cfName));
-    }
-
-    static Set<Memtable> getMemtablesPendingFlushNotNull(String columnFamilyName)
-    {
-        Set<Memtable> memtables = memtablesPendingFlush.get(columnFamilyName);
-        if (memtables == null)
-        {
-            memtablesPendingFlush.putIfAbsent(columnFamilyName, new ConcurrentSkipListSet<Memtable>());
-            memtables = memtablesPendingFlush.get(columnFamilyName); // might not be the object we just put, if there was a race!
-        }
-        return memtables;
-    }
-
-    /**
-     * submits flush sort on the flushSorter executor, which will in turn submit to flushWriter when sorted.
-     * TODO because our executors use CallerRunsPolicy, when flushSorter fills up, no writes will proceed
-     * because the next flush will start executing on the caller, mutation-stage thread that has the
-     * flush write lock held.  (writes aquire this as a read lock before proceeding.)
-     * This is good, because it backpressures flushes, but bad, because we can't write until that last
-     * flushing thread finishes sorting, which will almost always be longer than any of the flushSorter threads proper
-     * (since, by definition, it started last).
-     */
-    Condition submitFlush(final IFlushable flushable)
-    {
-        logger_.info("Enqueuing flush of " + flushable);
-        if (flushable instanceof Memtable)
-        {
-            // special-casing Memtable here is a bit messy, but it's best to keep the flush-related happenings in one place
-            // since they're a little complicated.  (We dont' want to move the remove back to switchMemtable, which is
-            // the other sane option, since that could mean keeping a flushed memtable in the Historical set unnecessarily
-            // while earlier flushes finish.)
-            getMemtablesPendingFlushNotNull(columnFamily_).add((Memtable) flushable); // it's ok for the MT to briefly be both active and pendingFlush
-        }
-        final Condition condition = new SimpleCondition();
-        flushSorter_.submit(new Runnable()
-        {
-            public void run()
-            {
-                final List sortedKeys = flushable.getSortedKeys();
-                flushWriter_.submit(new Runnable()
-                {
-                    public void run()
-                    {
-                        try
-                        {
-                            addSSTable(flushable.writeSortedContents(sortedKeys));
-                        }
-                        catch (IOException e)
-                        {
-                            throw new RuntimeException(e);
-                        }
-                        if (flushable instanceof Memtable)
-                        {
-                            getMemtablesPendingFlushNotNull(columnFamily_).remove(flushable);
-                        }
-                        condition.signalAll();
-                    }
-                });
-            }
-        });
-        return condition;
-    }
-
-    public boolean isSuper()
-    {
-        return isSuper_;
-    }
-
-    public int getMemtableColumnsCount()
-    {
-        return getMemtableThreadSafe().getCurrentObjectCount();
-    }
-
-    public int getMemtableDataSize()
-    {
-        return getMemtableThreadSafe().getCurrentSize();
-    }
-
-    public int getMemtableSwitchCount()
-    {
-        return memtableSwitchCount;
-    }
-
-    /**
-     * get the current memtable in a threadsafe fashion.  note that simply "return memtable_" is
-     * incorrect; you need to lock to introduce a thread safe happens-before ordering.
-     *
-     * do NOT use this method to do either a put or get on the memtable object, since it could be
-     * flushed in the meantime (and its executor terminated).
-     *
-     * also do NOT make this method public or it will really get impossible to reason about these things.
+     * Returns the aliases found for a field.
+     * Returns null if there are no aliases for the field
+     * @param field
      * @return
      */
-    private Memtable getMemtableThreadSafe()
-    {
-        Table.flusherLock_.readLock().lock();
-        try
-        {
-            return memtable_;
+    public Alias getAlias(String field) {
+      return aliases.get(field);
+    }
+
+
+    QType type;
+    String field;
+    String val;
+    String val2;
+    boolean bool;
+    boolean bool2;
+    float flt;
+    int slop;
+
+    @Override
+    protected Query getFieldQuery(String field, String val, boolean quoted) throws ParseException {
+//System.out.println("getFieldQuery: val="+val);
+
+      this.type = QType.FIELD;
+      this.field = field;
+      this.val = val;
+      this.slop = getPhraseSlop(); // unspecified
+      return getAliasedQuery();
+    }
+
+    @Override
+    protected Query getFieldQuery(String field, String val, int slop) throws ParseException {
+//System.out.println("getFieldQuery: val="+val+" slop="+slop);
+
+      this.type = QType.PHRASE;
+      this.field = field;
+      this.val = val;
+      this.slop = slop;
+      return getAliasedQuery();
+    }
+
+    @Override
+    protected Query getPrefixQuery(String field, String val) throws ParseException {
+//System.out.println("getPrefixQuery: val="+val);
+      if (val.equals("") && field.equals("*")) {
+        return new MatchAllDocsQuery();
+      }
+      this.type = QType.PREFIX;
+      this.field = field;
+      this.val = val;
+      return getAliasedQuery();
+    }
+
+    @Override
+    protected Query newFieldQuery(Analyzer analyzer, String field, String queryText, boolean quoted) throws ParseException {
+      Analyzer actualAnalyzer;
+      if (removeStopFilter) {
+        if (nonStopFilterAnalyzerPerField == null) {
+          nonStopFilterAnalyzerPerField = new HashMap<String, Analyzer>();
         }
-        finally
-        {
-            Table.flusherLock_.readLock().unlock();
+        actualAnalyzer = nonStopFilterAnalyzerPerField.get(field);
+        if (actualAnalyzer == null) {
+          actualAnalyzer = noStopwordFilterAnalyzer(field);
         }
+      } else {
+        actualAnalyzer = parser.getReq().getSchema().getFieldType(field).getQueryAnalyzer();
+      }
+      return super.newFieldQuery(actualAnalyzer, field, queryText, quoted);
     }
 
-    public Iterator<DecoratedKey> memtableKeyIterator() throws ExecutionException, InterruptedException
-    {
-        Table.flusherLock_.readLock().lock();
-        try
-        {
-             return memtable_.getKeyIterator();
+    @Override
+     protected Query getRangeQuery(String field, String a, String b, boolean startInclusive, boolean endInclusive) throws ParseException {
+//System.out.println("getRangeQuery:");
+
+      this.type = QType.RANGE;
+      this.field = field;
+      this.val = a;
+      this.val2 = b;
+      this.bool = startInclusive;
+      this.bool2 = endInclusive;
+      return getAliasedQuery();
+    }
+
+    @Override
+    protected Query getWildcardQuery(String field, String val) throws ParseException {
+//System.out.println("getWildcardQuery: val="+val);
+
+      if (val.equals("*")) {
+        if (field.equals("*")) {
+          return new MatchAllDocsQuery();
+        } else{
+          return getPrefixQuery(field,"");
         }
-        finally
-        {
-            Table.flusherLock_.readLock().unlock();
-        }
+      }
+      this.type = QType.WILDCARD;
+      this.field = field;
+      this.val = val;
+      return getAliasedQuery();
     }
 
-    public Collection<SSTableReader> getSSTables()
-    {
-        return ssTables_.getSSTables();
-    }
+    @Override
+    protected Query getFuzzyQuery(String field, String val, float minSimilarity) throws ParseException {
+//System.out.println("getFuzzyQuery: val="+val);
 
-    public int getReadCount()
-    {
-        return readStats_.size();
-    }
-
-    public double getReadLatency()
-    {
-        return readStats_.mean();
-    }
-
-    // TODO this actually isn't a good meature of pending tasks
-    public int getPendingTasks()
-    {
-        return Table.flusherLock_.getQueueLength();
-    }
-
-    /**
-     * @return the number of write operations on this column family in the last minute
-     */
-    public int getWriteCount() {
-        return writeStats_.size();
-    }
-
-    /**
-     * @return average latency per write operation in the last minute
-     */
-    public double getWriteLatency() {
-        return writeStats_.mean();
-    }
-
-    public ColumnFamily getColumnFamily(String key, QueryPath path, byte[] start, byte[] finish, boolean reversed, int limit) throws IOException
-    {
-        return getColumnFamily(new SliceQueryFilter(key, path, start, finish, reversed, limit));
-    }
-
-    public ColumnFamily getColumnFamily(QueryFilter filter) throws IOException
-    {
-        return getColumnFamily(filter, getDefaultGCBefore());
-    }
-
-    /**
-     * get a list of columns starting from a given column, in a specified order.
-     * only the latest version of a column is returned.
-     * @return null if there is no data and no tombstones; otherwise a ColumnFamily
-     */
-    public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore) throws IOException
-    {
-        assert columnFamily_.equals(filter.getColumnFamilyName());
-
-        long start = System.currentTimeMillis();
-        try
-        {
-            // if we are querying subcolumns of a supercolumn, fetch the supercolumn with NQF, then filter in-memory.
-            if (filter.path.superColumnName != null)
-            {
-                QueryFilter nameFilter = new NamesQueryFilter(filter.key, new QueryPath(columnFamily_), filter.path.superColumnName);
-                ColumnFamily cf = getColumnFamilyInternal(nameFilter, gcBefore);
-                if (cf == null || cf.getColumnCount() == 0)
-                    return cf;
-
-                assert cf.getSortedColumns().size() == 1;
-                SuperColumn sc = (SuperColumn)cf.getSortedColumns().iterator().next();
-                SuperColumn scFiltered = filter.filterSuperColumn(sc, gcBefore);
-                ColumnFamily cfFiltered = cf.cloneMeShallow();
-                cfFiltered.addColumn(scFiltered);
-                return removeDeleted(cfFiltered, gcBefore);
-            }
-
-            return removeDeleted(getColumnFamilyInternal(filter, gcBefore), gcBefore);
-        }
-        finally
-        {
-            readStats_.add(System.currentTimeMillis() - start);
-        }
-    }
-
-    private ColumnFamily getColumnFamilyInternal(QueryFilter filter, int gcBefore) throws IOException
-    {
-        // we are querying top-level columns, do a merging fetch with indexes.
-        List<ColumnIterator> iterators = new ArrayList<ColumnIterator>();
-        try
-        {
-            final ColumnFamily returnCF;
-            ColumnIterator iter;
-
-            /* add the current memtable */
-            Table.flusherLock_.readLock().lock();
-            try
-            {
-                iter = filter.getMemColumnIterator(memtable_, getComparator());
-                returnCF = iter.getColumnFamily();
-            }
-            finally
-            {
-                Table.flusherLock_.readLock().unlock();
-            }
-            iterators.add(iter);
-
-            /* add the memtables being flushed */
-            List<Memtable> memtables = getUnflushedMemtables(filter.getColumnFamilyName());
-            for (Memtable memtable:memtables)
-            {
-                iter = filter.getMemColumnIterator(memtable, getComparator());
-                returnCF.delete(iter.getColumnFamily());
-                iterators.add(iter);
-            }
-
-            /* add the SSTables on disk */
-            for (SSTableReader sstable : ssTables_)
-            {
-                iter = filter.getSSTableColumnIterator(sstable);
-                if (iter.hasNext()) // initializes iter.CF
-                {
-                    returnCF.delete(iter.getColumnFamily());
-                }
-                iterators.add(iter);
-            }
-
-            Comparator<IColumn> comparator = filter.getColumnComparator(getComparator());
-            Iterator collated = IteratorUtils.collatedIterator(comparator, iterators);
-            if (!collated.hasNext())
-                return null;
-
-            filter.collectCollatedColumns(returnCF, collated, gcBefore);
-            return returnCF;
-        }
-        finally
-        {
-            /* close all cursors */
-            for (ColumnIterator ci : iterators)
-            {
-                try
-                {
-                    ci.close();
-                }
-                catch (Throwable th)
-                {
-                    logger_.error("error closing " + ci, th);
-                }
-            }
-        }
+      this.type = QType.FUZZY;
+      this.field = field;
+      this.val = val;
+      this.flt = minSimilarity;
+      return getAliasedQuery();
     }
 
     /**
-     * @param startWith key to start with, inclusive.  empty string = start at beginning.
-     * @param stopAt key to stop at, inclusive.  empty string = stop only when keys are exhausted.
-     * @param maxResults
-     * @return list of keys between startWith and stopAt
+     * Delegates to the super class unless the field has been specified
+     * as an alias -- in which case we recurse on each of
+     * the aliased fields, and the results are composed into a
+     * DisjunctionMaxQuery.  (so yes: aliases which point at other
+     * aliases should work)
      */
-    public RangeReply getKeyRange(final String startWith, final String stopAt, int maxResults)
-    throws IOException, ExecutionException, InterruptedException
-    {
-        final DecoratedKey startWithDK = partitioner.decorateKey(startWith);
-        final DecoratedKey stopAtDK = partitioner.decorateKey(stopAt);
+    protected Query getAliasedQuery() throws ParseException {
+      Alias a = aliases.get(field);
+      this.validateCyclicAliasing(field);
+      if (a != null) {
+        List<Query> lst = getQueries(a);
+        if (lst == null || lst.size()==0)
+            return getQuery();
+        // make a DisjunctionMaxQuery in this case too... it will stop
+        // the "mm" processing from making everything required in the case
+        // that the query expanded to multiple clauses.
+        // DisMaxQuery.rewrite() removes itself if there is just a single clause anyway.
+        // if (lst.size()==1) return lst.get(0);
 
-        // create a CollatedIterator that will return unique keys from different sources
-        // (current memtable, historical memtables, and SSTables) in the correct order.
-        List<Iterator<DecoratedKey>> iterators = new ArrayList<Iterator<DecoratedKey>>();
+        if (makeDismax) {
+          DisjunctionMaxQuery q = new DisjunctionMaxQuery(lst, a.tie);
+          return q;
+        } else {
+          // should we disable coord?
+          BooleanQuery q = new BooleanQuery(disableCoord);
+          for (Query sub : lst) {
+            q.add(sub, BooleanClause.Occur.SHOULD);
+          }
+          return q;
+        }
+      } else {
 
-        // we iterate through memtables with a priority queue to avoid more sorting than necessary.
-        // this predicate throws out the keys before the start of our range.
-        Predicate<DecoratedKey> p = new Predicate<DecoratedKey>()
-        {
-            public boolean apply(DecoratedKey key)
-            {
-                return startWithDK.compareTo(key) <= 0
-                       && (stopAt.isEmpty() || key.compareTo(stopAtDK) <= 0);
-            }
-        };
-
-        // current memtable keys.  have to go through the CFS api for locking.
-        iterators.add(Iterators.filter(memtableKeyIterator(), p));
-        // historical memtables
-        for (Memtable memtable : ColumnFamilyStore.getUnflushedMemtables(columnFamily_))
-        {
-            iterators.add(Iterators.filter(memtable.getKeyIterator(), p));
+        // verify that a fielded query is actually on a field that exists... if not,
+        // then throw an exception to get us out of here, and we'll treat it like a
+        // literal when we try the escape+re-parse.
+        if (exceptions) {
+          FieldType ft = schema.getFieldTypeNoEx(field);
+          if (ft == null && null == MagicFieldName.get(field)) {
+            throw unknownField;
+          }
         }
 
-        // sstables
-        for (SSTableReader sstable : ssTables_)
-        {
-            final SSTableScanner scanner = sstable.getScanner(KEY_RANGE_FILE_BUFFER_SIZE);
-            scanner.seekTo(startWithDK);
-            Iterator<DecoratedKey> iter = new CloseableIterator<DecoratedKey>()
-            {
-                public boolean hasNext()
-                {
-                    return scanner.hasNext();
-                }
-                public DecoratedKey next()
-                {
-                    return scanner.next().getKey();
-                }
-                public void remove()
-                {
-                    throw new UnsupportedOperationException();
-                }
-                public void close() throws IOException
-                {
-                    scanner.close();
-                }
-            };
-            assert iter instanceof Closeable; // otherwise we leak FDs
-            iterators.add(iter);
-        }
-
-        Iterator<DecoratedKey> collated = IteratorUtils.collatedIterator(DecoratedKey.comparator, iterators);
-        Iterable<DecoratedKey> reduced = new ReducingIterator<DecoratedKey, DecoratedKey>(collated) {
-            DecoratedKey current;
-
-            public void reduce(DecoratedKey current)
-            {
-                 this.current = current;
-            }
-
-            protected DecoratedKey getReduced()
-            {
-                return current;
-            }
-        };
-
-        try
-        {
-            // pull keys out of the CollatedIterator.  checking tombstone status is expensive,
-            // so we set an arbitrary limit on how many we'll do at once.
-            List<String> keys = new ArrayList<String>();
-            boolean rangeCompletedLocally = false;
-            for (DecoratedKey current : reduced)
-            {
-                if (!stopAt.isEmpty() && stopAtDK.compareTo(current) < 0)
-                {
-                    rangeCompletedLocally = true;
-                    break;
-                }
-                // make sure there is actually non-tombstone content associated w/ this key
-                // TODO record the key source(s) somehow and only check that source (e.g., memtable or sstable)
-                QueryFilter filter = new SliceQueryFilter(current.key, new QueryPath(columnFamily_), ArrayUtils.EMPTY_BYTE_ARRAY, ArrayUtils.EMPTY_BYTE_ARRAY, false, 1);
-                if (getColumnFamily(filter, Integer.MAX_VALUE) != null)
-                {
-                    keys.add(current.key);
-                }
-                if (keys.size() >= maxResults)
-                {
-                    rangeCompletedLocally = true;
-                    break;
-                }
-            }
-            return new RangeReply(keys, rangeCompletedLocally);
-        }
-        finally
-        {
-            for (Iterator iter : iterators)
-            {
-                if (iter instanceof Closeable)
-                {
-                    ((Closeable)iter).close();
-                }
-            }
-        }
+        return getQuery();
+      }
     }
 
     /**
-     * @param startWith key to start with, inclusive.  empty string = start at beginning.
-     * @param stopAt key to stop at, inclusive.  empty string = stop only when keys are exhausted.
-     * @param maxResults
-     * @return list of keys between startWith and stopAt
-
-       TODO refactor better.  this is just getKeyRange w/o the deletion check, for the benefit of
-       range_slice.  still opens one randomaccessfile per key, which sucks.  something like compactioniterator
-       would be better.
+     * Validate there is no cyclic referencing in the aliasing
      */
-    public RangeReply getKeyRangeRaw(final DecoratedKey startWith, final DecoratedKey stopAt, int maxResults)
-    throws IOException, ExecutionException, InterruptedException
-    {
-        // create a CollatedIterator that will return unique keys from different sources
-        // (current memtable, historical memtables, and SSTables) in the correct order.
-        List<Iterator<DecoratedKey>> iterators = new ArrayList<Iterator<DecoratedKey>>();
-
-        // we iterate through memtables with a priority queue to avoid more sorting than necessary.
-        // this predicate throws out the keys before the start of our range.
-        Predicate<DecoratedKey> p = new Predicate<DecoratedKey>()
-        {
-            public boolean apply(DecoratedKey key)
-            {
-                return startWith.compareTo(key) <= 0
-                       && (stopAt.isEmpty() || key.compareTo(stopAt) <= 0);
-            }
-        };
-
-        // current memtable keys.  have to go through the CFS api for locking.
-        iterators.add(Iterators.filter(memtableKeyIterator(), p));
-        // historical memtables
-        for (Memtable memtable : ColumnFamilyStore.getUnflushedMemtables(columnFamily_))
-        {
-            iterators.add(Iterators.filter(memtable.getKeyIterator(), p));
+    private void validateCyclicAliasing(String field) throws ParseException {
+       Set<String> set = new HashSet<String>();
+       set.add(field);
+       if(validateField(field, set)) {
+         throw new ParseException("Field aliases lead to a cycle");
+       }
+    }
+    
+    private boolean validateField(String field, Set<String> set) {
+      if(this.getAlias(field) == null) {
+        return false;
+      }
+      boolean hascycle = false;
+      for(String referencedField:this.getAlias(field).fields.keySet()) {
+        if(!set.add(referencedField)) {
+          hascycle = true;
+        } else {
+          if(validateField(referencedField, set)) {
+            hascycle = true;
+          }
+          set.remove(referencedField);
         }
+      }
+      return hascycle;
+    }
 
-        // sstables
-        for (SSTableReader sstable : ssTables_)
-        {
-            final SSTableScanner scanner = sstable.getScanner(KEY_RANGE_FILE_BUFFER_SIZE);
-            scanner.seekTo(startWith);
-            Iterator<DecoratedKey> iter = new CloseableIterator<DecoratedKey>()
-            {
-                public boolean hasNext()
-                {
-                    return scanner.hasNext();
-                }
-                public DecoratedKey next()
-                {
-                    return scanner.next().getKey();
-                }
-                public void remove()
-                {
-                    throw new UnsupportedOperationException();
-                }
-                public void close() throws IOException
-                {
-                    scanner.close();
-                }
-            };
-            assert iter instanceof Closeable; // otherwise we leak FDs
-            iterators.add(iter);
+    protected List<Query> getQueries(Alias a) throws ParseException {
+       if (a == null) return null;
+       if (a.fields.size()==0) return null;
+       List<Query> lst= new ArrayList<Query>(4);
+
+       for (String f : a.fields.keySet()) {
+         this.field = f;
+         Query sub = getAliasedQuery();
+         if (sub != null) {
+           Float boost = a.fields.get(f);
+           if (boost != null) {
+              sub.setBoost(boost);
+           }
+           lst.add(sub);
+         }
+       }
+       return lst;
+     }
+
+    private Query getQuery() throws ParseException {
+      try {
+
+        switch (type) {
+          case FIELD:  // fallthrough
+          case PHRASE:
+            Query query = super.getFieldQuery(field, val, type == QType.PHRASE);
+            if (query instanceof PhraseQuery) {
+              PhraseQuery pq = (PhraseQuery)query;
+              if (minClauseSize > 1 && pq.getTerms().length < minClauseSize) return null;
+              ((PhraseQuery)query).setSlop(slop);
+            } else if (query instanceof MultiPhraseQuery) {
+              MultiPhraseQuery pq = (MultiPhraseQuery)query;
+              if (minClauseSize > 1 && pq.getTermArrays().size() < minClauseSize) return null;
+              ((MultiPhraseQuery)query).setSlop(slop);
+            } else if (minClauseSize > 1) {
+              // if it's not a type of phrase query, it doesn't meet the minClauseSize requirements
+              return null;
+            }
+            return query;
+          case PREFIX: return super.getPrefixQuery(field, val);
+          case WILDCARD: return super.getWildcardQuery(field, val);
+          case FUZZY: return super.getFuzzyQuery(field, val, flt);
+          case RANGE: return super.getRangeQuery(field, val, val2, bool, bool2);
         }
+        return null;
 
-        Iterator<DecoratedKey> collated = IteratorUtils.collatedIterator(DecoratedKey.comparator, iterators);
-        Iterable<DecoratedKey> reduced = new ReducingIterator<DecoratedKey, DecoratedKey>(collated) {
-            DecoratedKey current;
+      } catch (Exception e) {
+        // an exception here is due to the field query not being compatible with the input text
+        // for example, passing a string to a numeric field.
+        return null;
+      }
+    }
 
-            public void reduce(DecoratedKey current)
-            {
-                 this.current = current;
-            }
+    private Analyzer noStopwordFilterAnalyzer(String fieldName) {
+      FieldType ft = parser.getReq().getSchema().getFieldType(fieldName);
+      Analyzer qa = ft.getQueryAnalyzer();
+      if (!(qa instanceof TokenizerChain)) {
+        return qa;
+      }
 
-            protected DecoratedKey getReduced()
-            {
-                return current;
-            }
-        };
+      TokenizerChain tcq = (TokenizerChain) qa;
+      Analyzer ia = ft.getAnalyzer();
+      if (ia == qa || !(ia instanceof TokenizerChain)) {
+        return qa;
+      }
+      TokenizerChain tci = (TokenizerChain) ia;
 
-        try
-        {
-            // pull keys out of the CollatedIterator
-            List<String> keys = new ArrayList<String>();
-            boolean rangeCompletedLocally = false;
-            for (DecoratedKey current : reduced)
-            {
-                if (!stopAt.isEmpty() && stopAt.compareTo(current) < 0)
-                {
-                    rangeCompletedLocally = true;
-                    break;
-                }
-                keys.add(current.key);
-                if (keys.size() >= maxResults)
-                {
-                    rangeCompletedLocally = true;
-                    break;
-                }
-            }
-            return new RangeReply(keys, rangeCompletedLocally);
+      // make sure that there isn't a stop filter in the indexer
+      for (TokenFilterFactory tf : tci.getTokenFilterFactories()) {
+        if (tf instanceof StopFilterFactory) {
+          return qa;
         }
-        finally
-        {
-            for (Iterator iter : iterators)
-            {
-                if (iter instanceof Closeable)
-                {
-                    ((Closeable)iter).close();
-                }
-            }
+      }
+
+      // now if there is a stop filter in the query analyzer, remove it
+      int stopIdx = -1;
+      TokenFilterFactory[] facs = tcq.getTokenFilterFactories();
+
+      for (int i = 0; i < facs.length; i++) {
+        TokenFilterFactory tf = facs[i];
+        if (tf instanceof StopFilterFactory) {
+          stopIdx = i;
+          break;
         }
+      }
+
+      if (stopIdx == -1) {
+        // no stop filter exists
+        return qa;
+      }
+
+      TokenFilterFactory[] newtf = new TokenFilterFactory[facs.length - 1];
+      for (int i = 0, j = 0; i < facs.length; i++) {
+        if (i == stopIdx) continue;
+        newtf[j++] = facs[i];
+      }
+
+      TokenizerChain newa = new TokenizerChain(tcq.getTokenizerFactory(), newtf);
+      newa.setPositionIncrementGap(tcq.getPositionIncrementGap(fieldName));
+      return newa;
+    }
+  }
+
+  static boolean isEmpty(Query q) {
+    if (q==null) return true;
+    if (q instanceof BooleanQuery && ((BooleanQuery)q).clauses().size()==0) return true;
+    return false;
+  }
+  
+  /**
+   * Class that encapsulates the input from userFields parameter and can answer whether
+   * a field allowed or disallowed as fielded query in the query string
+   */
+  static class UserFields {
+    private Map<String,Float> userFieldsMap;
+    private DynamicField[] dynamicUserFields;
+    private DynamicField[] negativeDynamicUserFields;
+
+    UserFields(Map<String,Float> ufm) {
+      userFieldsMap = ufm;
+      if (0 == userFieldsMap.size()) {
+        userFieldsMap.put("*", null);
+      }
+      
+      // Process dynamic patterns in userFields
+      ArrayList<DynamicField> dynUserFields = new ArrayList<DynamicField>();
+      ArrayList<DynamicField> negDynUserFields = new ArrayList<DynamicField>();
+      for(String f : userFieldsMap.keySet()) {
+        if(f.contains("*")) {
+          if(f.startsWith("-"))
+            negDynUserFields.add(new DynamicField(f.substring(1)));
+          else
+            dynUserFields.add(new DynamicField(f));
+        }
+      }
+      Collections.sort(dynUserFields);
+      dynamicUserFields = dynUserFields.toArray(new DynamicField[dynUserFields.size()]);
+      Collections.sort(negDynUserFields);
+      negativeDynamicUserFields = negDynUserFields.toArray(new DynamicField[negDynUserFields.size()]);
+//      System.out.println("** userF="+userFieldsMap+", dynUF="+Arrays.toString(dynamicUserFields)+", negDynUF="+Arrays.toString(negativeDynamicUserFields));
+    }
+    
+    /**
+     * Is the given field name allowed according to UserFields spec given in the uf parameter?
+     * @param fname the field name to examine
+     * @return true if the fielded queries are allowed on this field
+     */
+    public boolean isAllowed(String fname) {
+      boolean res = ((userFieldsMap.containsKey(fname) || isDynField(fname, false)) && 
+          !userFieldsMap.containsKey("-"+fname) &&
+          !isDynField(fname, true));
+      return res;
+    }
+    
+    private boolean isDynField(String field, boolean neg) {
+      return getDynFieldForName(field, neg) == null ? false : true;
+    }
+    
+    private String getDynFieldForName(String f, boolean neg) {
+      for( DynamicField df : neg?negativeDynamicUserFields:dynamicUserFields ) {
+        if( df.matches( f ) ) return df.wildcard;
+      }
+      return null;
+    }
+    
+    /**
+     * Finds the default user field boost associated with the given field.
+     * This is parsed from the uf parameter, and may be specified as wildcards, e.g. *name^2.0 or *^3.0
+     * @param field the field to find boost for
+     * @return the float boost value associated with the given field or a wildcard matching the field
+     */
+    public Float getBoost(String field) {
+      return (userFieldsMap.containsKey(field)) ?
+          userFieldsMap.get(field) : // Exact field
+          userFieldsMap.get(getDynFieldForName(field, false)); // Dynamic field
+    }
+  }
+  
+  /* Represents a dynamic field, for easier matching, inspired by same class in IndexSchema */
+  static class DynamicField implements Comparable<DynamicField> {
+    final static int STARTS_WITH=1;
+    final static int ENDS_WITH=2;
+    final static int CATCHALL=3;
+
+    final String wildcard;
+    final int type;
+
+    final String str;
+
+    protected DynamicField(String wildcard) {
+      this.wildcard = wildcard;
+      if (wildcard.equals("*")) {
+        type=CATCHALL;
+        str=null;
+      }
+      else if (wildcard.startsWith("*")) {
+        type=ENDS_WITH;
+        str=wildcard.substring(1);
+      }
+      else if (wildcard.endsWith("*")) {
+        type=STARTS_WITH;
+        str=wildcard.substring(0,wildcard.length()-1);
+      }
+      else {
+        throw new RuntimeException("dynamic field name must start or end with *");
+      }
+    }
+
+    /*
+     * Returns true if the regex wildcard for this DynamicField would match the input field name
+     */
+    public boolean matches(String name) {
+      if (type==CATCHALL) return true;
+      else if (type==STARTS_WITH && name.startsWith(str)) return true;
+      else if (type==ENDS_WITH && name.endsWith(str)) return true;
+      else return false;
     }
 
     /**
-     *
-     * @param super_column
-     * @param startKey key to start at (inclusive). empty string = start at the beginning.
-     * @param finishKey key to stop at (inclusive). empty string = stop at the end.
-     * @param keyMax maximum number of keys to process, regardless of startKey/finishKey
-     * @param sliceRange may be null if columnNames is specified. specifies contiguous columns to return in what order.
-     * @param columnNames may be null if sliceRange is specified. specifies which columns to return in what order.      @return list of key->list<column> tuples.
-     * @throws IOException
-     * @throws ExecutionException
-     * @throws InterruptedException
+     * Sort order is based on length of regex.  Longest comes first.
+     * @param other The object to compare to.
+     * @return a negative integer, zero, or a positive integer
+     * as this object is less than, equal to, or greater than
+     * the specified object.
      */
-    public RangeSliceReply getRangeSlice(byte[] super_column, final DecoratedKey startKey, final DecoratedKey finishKey, int keyMax, SliceRange sliceRange, List<byte[]> columnNames)
-    throws IOException, ExecutionException, InterruptedException
-    {
-        RangeReply rr = getKeyRangeRaw(startKey, finishKey, keyMax);
-        List<Row> rows = new ArrayList<Row>(rr.keys.size());
-        final QueryPath queryPath =  new QueryPath(columnFamily_, super_column, null);
-        final SortedSet<byte[]> columnNameSet = new TreeSet<byte[]>(getComparator());
-        if (columnNames != null)
-            columnNameSet.addAll(columnNames);
-        for (String key : rr.keys)
-        {
-            QueryFilter filter = sliceRange == null ? new NamesQueryFilter(key, queryPath, columnNameSet) : new SliceQueryFilter(key, queryPath, sliceRange.start, sliceRange.finish, sliceRange.reversed, sliceRange.count);
-            rows.add(new Row(key, getColumnFamily(filter)));
-        }
-
-        return new RangeSliceReply(rows, rr.rangeCompletedLocally);
+    public int compareTo(DynamicField other) {
+      return other.wildcard.length() - wildcard.length();
     }
-
-    public AbstractType getComparator()
-    {
-        return DatabaseDescriptor.getComparator(table_, columnFamily_);
+    
+    public String toString() {
+      return this.wildcard;
     }
-
-    /**
-     * Take a snap shot of this columnfamily store.
-     * 
-     * @param snapshotName the name of the associated with the snapshot 
-     */
-    public void snapshot(String snapshotName) throws IOException
-    {
-        try
-        {
-            forceBlockingFlush();
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
-
-        for (SSTableReader ssTable : ssTables_)
-        {
-            // mkdir
-            File sourceFile = new File(ssTable.getFilename());
-            File dataDirectory = sourceFile.getParentFile().getParentFile();
-            String snapshotDirectoryPath = Table.getSnapshotPath(dataDirectory.getAbsolutePath(), table_, snapshotName);
-            FileUtils.createDirectory(snapshotDirectoryPath);
-
-            // hard links
-            File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
-            FileUtils.createHardLink(sourceFile, targetLink);
-
-            sourceFile = new File(ssTable.indexFilename());
-            targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
-            FileUtils.createHardLink(sourceFile, targetLink);
-
-            sourceFile = new File(ssTable.filterFilename());
-            targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
-            FileUtils.createHardLink(sourceFile, targetLink);
-
-            if (logger_.isDebugEnabled())
-                logger_.debug("Snapshot for " + table_ + " table data file " + sourceFile.getAbsolutePath() +
-                    " created as " + targetLink.getAbsolutePath());
-        }
-    }
-
-    /**
-     * for testing.  no effort is made to clear historical memtables.
-     */
-    void clearUnsafe()
-    {
-        memtable_.clearUnsafe();
-        ssTables_.clearUnsafe();
-    }
-
-    private static class AntiCompactionIterator extends CompactionIterator
-    {
-        public AntiCompactionIterator(Collection<SSTableReader> sstables, Collection<Range> ranges, int gcBefore, boolean isMajor)
-                throws IOException
-        {
-            super(getCollatedRangeIterator(sstables, ranges), gcBefore, isMajor);
-        }
-
-        private static Iterator getCollatedRangeIterator(Collection<SSTableReader> sstables, final Collection<Range> ranges)
-                throws IOException
-        {
-            org.apache.commons.collections.Predicate rangesPredicate = new org.apache.commons.collections.Predicate()
-            {
-                public boolean evaluate(Object row)
-                {
-                    return Range.isTokenInRanges(((IteratingRow)row).getKey().token, ranges);
-                }
-            };
-            CollatingIterator iter = FBUtilities.<IteratingRow>getCollatingIterator();
-            for (SSTableReader sstable : sstables)
-            {
-                SSTableScanner scanner = sstable.getScanner(FILE_BUFFER_SIZE);
-                iter.addIterator(new FilterIterator(scanner, rangesPredicate));
-            }
-            return iter;
-        }
-
-        public void close() throws IOException
-        {
-            for (Object o : ((CollatingIterator)source).getIterators())
-            {
-                ((SSTableScanner)((FilterIterator)o).getIterator()).close();
-            }
-        }
-    }
+  }
 }

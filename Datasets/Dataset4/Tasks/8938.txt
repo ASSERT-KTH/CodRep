@@ -1,4 +1,4 @@
-import org.elasticsearch.util.inject.Inject;
+import org.elasticsearch.common.xcontent.XContentBuilder;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,167 +19,209 @@ import org.elasticsearch.util.inject.Inject;
  * under the License.
  */
 
-package org.elasticsearch.action.search.type;
+package org.elasticsearch.rest.action.search;
 
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.search.*;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.search.SearchShardTarget;
-import org.elasticsearch.search.action.SearchServiceListener;
-import org.elasticsearch.search.action.SearchServiceTransportAction;
-import org.elasticsearch.search.controller.SearchPhaseController;
-import org.elasticsearch.search.fetch.FetchSearchRequest;
-import org.elasticsearch.search.fetch.FetchSearchResult;
-import org.elasticsearch.search.internal.InternalSearchRequest;
-import org.elasticsearch.search.internal.InternalSearchResponse;
-import org.elasticsearch.search.query.QuerySearchResult;
-import org.elasticsearch.search.query.QuerySearchResultProvider;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.util.guice.inject.Inject;
-import org.elasticsearch.util.settings.Settings;
-import org.elasticsearch.util.trove.ExtTIntArrayList;
+import org.elasticsearch.action.search.SearchOperationThreading;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.Client;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.builder.XContentBuilder;
+import org.elasticsearch.index.query.xcontent.QueryBuilders;
+import org.elasticsearch.index.query.xcontent.QueryStringQueryBuilder;
+import org.elasticsearch.rest.*;
+import org.elasticsearch.rest.action.support.RestActions;
+import org.elasticsearch.search.Scroll;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.sort.SortOrder;
 
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.io.IOException;
+import java.util.regex.Pattern;
+
+import static org.elasticsearch.common.unit.TimeValue.*;
+import static org.elasticsearch.rest.RestRequest.Method.*;
+import static org.elasticsearch.rest.RestResponse.Status.*;
+import static org.elasticsearch.rest.action.support.RestXContentBuilder.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class TransportSearchQueryThenFetchAction extends TransportSearchTypeAction {
+public class RestSearchAction extends BaseRestHandler {
 
-    @Inject public TransportSearchQueryThenFetchAction(Settings settings, ThreadPool threadPool, ClusterService clusterService, IndicesService indicesService,
-                                                       TransportSearchCache transportSearchCache, SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
-        super(settings, threadPool, clusterService, indicesService, transportSearchCache, searchService, searchPhaseController);
+    private final static Pattern fieldsPattern;
+
+    private final static Pattern indicesBoostPattern;
+
+    static {
+        fieldsPattern = Pattern.compile(",");
+        indicesBoostPattern = Pattern.compile(",");
     }
 
-    @Override protected void doExecute(SearchRequest searchRequest, ActionListener<SearchResponse> listener) {
-        new AsyncAction(searchRequest, listener).start();
+    @Inject public RestSearchAction(Settings settings, Client client, RestController controller) {
+        super(settings, client);
+        controller.registerHandler(GET, "/_search", this);
+        controller.registerHandler(POST, "/_search", this);
+        controller.registerHandler(GET, "/{index}/_search", this);
+        controller.registerHandler(POST, "/{index}/_search", this);
+        controller.registerHandler(GET, "/{index}/{type}/_search", this);
+        controller.registerHandler(POST, "/{index}/{type}/_search", this);
     }
 
-    private class AsyncAction extends BaseAsyncAction<QuerySearchResult> {
-
-        private final Map<SearchShardTarget, QuerySearchResultProvider> queryResults = searchCache.obtainQueryResults();
-
-        private final Map<SearchShardTarget, FetchSearchResult> fetchResults = searchCache.obtainFetchResults();
-
-        private volatile Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad;
-
-        private AsyncAction(SearchRequest request, ActionListener<SearchResponse> listener) {
-            super(request, listener);
-        }
-
-        @Override protected String firstPhaseName() {
-            return "query";
-        }
-
-        @Override protected void sendExecuteFirstPhase(DiscoveryNode node, InternalSearchRequest request, SearchServiceListener<QuerySearchResult> listener) {
-            searchService.sendExecuteQuery(node, request, listener);
-        }
-
-        @Override protected void processFirstPhaseResult(ShardRouting shard, QuerySearchResult result) {
-            queryResults.put(result.shardTarget(), result);
-        }
-
-        @Override protected void moveToSecondPhase() {
-            sortedShardList = searchPhaseController.sortDocs(queryResults.values());
-            final Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad = searchPhaseController.docIdsToLoad(sortedShardList);
-            this.docIdsToLoad = docIdsToLoad;
-
-            if (docIdsToLoad.isEmpty()) {
-                finishHim();
+    @Override public void handleRequest(final RestRequest request, final RestChannel channel) {
+        SearchRequest searchRequest;
+        try {
+            searchRequest = parseSearchRequest(request);
+            searchRequest.listenerThreaded(false);
+            SearchOperationThreading operationThreading = SearchOperationThreading.fromString(request.param("operation_threading"), SearchOperationThreading.SINGLE_THREAD);
+            if (operationThreading == SearchOperationThreading.NO_THREADS) {
+                // since we don't spawn, don't allow no_threads, but change it to a single thread
+                operationThreading = SearchOperationThreading.SINGLE_THREAD;
             }
-
-            final AtomicInteger counter = new AtomicInteger(docIdsToLoad.size());
-
-            int localOperations = 0;
-            for (Map.Entry<SearchShardTarget, ExtTIntArrayList> entry : docIdsToLoad.entrySet()) {
-                DiscoveryNode node = nodes.get(entry.getKey().nodeId());
-                if (node.id().equals(nodes.localNodeId())) {
-                    localOperations++;
-                } else {
-                    FetchSearchRequest fetchSearchRequest = new FetchSearchRequest(queryResults.get(entry.getKey()).id(), entry.getValue());
-                    executeFetch(counter, fetchSearchRequest, node);
-                }
-            }
-
-            if (localOperations > 0) {
-                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
-                    threadPool.execute(new Runnable() {
-                        @Override public void run() {
-                            for (Map.Entry<SearchShardTarget, ExtTIntArrayList> entry : docIdsToLoad.entrySet()) {
-                                DiscoveryNode node = nodes.get(entry.getKey().nodeId());
-                                if (node.id().equals(nodes.localNodeId())) {
-                                    FetchSearchRequest fetchSearchRequest = new FetchSearchRequest(queryResults.get(entry.getKey()).id(), entry.getValue());
-                                    executeFetch(counter, fetchSearchRequest, node);
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
-                    for (Map.Entry<SearchShardTarget, ExtTIntArrayList> entry : docIdsToLoad.entrySet()) {
-                        final DiscoveryNode node = nodes.get(entry.getKey().nodeId());
-                        if (node.id().equals(nodes.localNodeId())) {
-                            final FetchSearchRequest fetchSearchRequest = new FetchSearchRequest(queryResults.get(entry.getKey()).id(), entry.getValue());
-                            if (localAsync) {
-                                threadPool.execute(new Runnable() {
-                                    @Override public void run() {
-                                        executeFetch(counter, fetchSearchRequest, node);
-                                    }
-                                });
-                            } else {
-                                executeFetch(counter, fetchSearchRequest, node);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        private void executeFetch(final AtomicInteger counter, FetchSearchRequest fetchSearchRequest, DiscoveryNode node) {
-            searchService.sendExecuteFetch(node, fetchSearchRequest, new SearchServiceListener<FetchSearchResult>() {
-                @Override public void onResult(FetchSearchResult result) {
-                    fetchResults.put(result.shardTarget(), result);
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
-                    }
-                }
-
-                @Override public void onFailure(Throwable t) {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Failed to execute fetch phase", t);
-                    }
-                    AsyncAction.this.shardFailures.add(new ShardSearchFailure(t));
-                    successulOps.decrementAndGet();
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
-                    }
-                }
-            });
-        }
-
-        private void finishHim() {
+            searchRequest.operationThreading(operationThreading);
+        } catch (Exception e) {
             try {
-                innerFinishHim();
-            } catch (Exception e) {
-                invokeListener(new ReduceSearchPhaseException("fetch", "", e, buildShardFailures()));
-            } finally {
-                releaseIrrelevantSearchContexts(queryResults, docIdsToLoad);
-                searchCache.releaseQueryResults(queryResults);
-                searchCache.releaseFetchResults(fetchResults);
+                XContentBuilder builder = restContentBuilder(request);
+                channel.sendResponse(new XContentRestResponse(request, BAD_REQUEST, builder.startObject().field("error", e.getMessage()).endObject()));
+            } catch (IOException e1) {
+                logger.error("Failed to send failure response", e1);
+            }
+            return;
+        }
+        client.search(searchRequest, new ActionListener<SearchResponse>() {
+            @Override public void onResponse(SearchResponse response) {
+                try {
+                    XContentBuilder builder = restContentBuilder(request);
+                    builder.startObject();
+                    response.toXContent(builder, request);
+                    builder.endObject();
+                    channel.sendResponse(new XContentRestResponse(request, OK, builder));
+                } catch (Exception e) {
+                    onFailure(e);
+                }
+            }
+
+            @Override public void onFailure(Throwable e) {
+                try {
+                    channel.sendResponse(new XContentThrowableRestResponse(request, e));
+                } catch (IOException e1) {
+                    logger.error("Failed to send failure response", e1);
+                }
+            }
+        });
+    }
+
+    private SearchRequest parseSearchRequest(RestRequest request) {
+        String[] indices = RestActions.splitIndices(request.param("index"));
+        SearchRequest searchRequest = new SearchRequest(indices);
+        // get the content, and put it in the body
+        if (request.hasContent()) {
+            searchRequest.source(request.contentByteArray(), request.contentByteArrayOffset(), request.contentLength(), request.contentUnsafe());
+        } else {
+            String source = request.param("source");
+            if (source != null) {
+                searchRequest.source(source);
+            }
+        }
+        // add extra source based on the request parameters
+        searchRequest.extraSource(parseSearchSource(request));
+
+        searchRequest.searchType(request.param("search_type"));
+
+        String scroll = request.param("scroll");
+        if (scroll != null) {
+            searchRequest.scroll(new Scroll(parseTimeValue(scroll, null)));
+        }
+
+        searchRequest.timeout(request.paramAsTime("timeout", null));
+        searchRequest.types(RestActions.splitTypes(request.param("type")));
+        searchRequest.queryHint(request.param("query_hint"));
+
+        return searchRequest;
+    }
+
+    private SearchSourceBuilder parseSearchSource(RestRequest request) {
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        String queryString = request.param("q");
+        if (queryString != null) {
+            QueryStringQueryBuilder queryBuilder = QueryBuilders.queryString(queryString);
+            queryBuilder.defaultField(request.param("df"));
+            queryBuilder.analyzer(request.param("analyzer"));
+            String defaultOperator = request.param("default_operator");
+            if (defaultOperator != null) {
+                if ("OR".equals(defaultOperator)) {
+                    queryBuilder.defaultOperator(QueryStringQueryBuilder.Operator.OR);
+                } else if ("AND".equals(defaultOperator)) {
+                    queryBuilder.defaultOperator(QueryStringQueryBuilder.Operator.AND);
+                } else {
+                    throw new ElasticSearchIllegalArgumentException("Unsupported defaultOperator [" + defaultOperator + "], can either be [OR] or [AND]");
+                }
+            }
+            searchSourceBuilder.query(queryBuilder);
+        }
+
+        int from = request.paramAsInt("from", -1);
+        if (from != -1) {
+            searchSourceBuilder.from(from);
+        }
+        int size = request.paramAsInt("size", -1);
+        if (size != -1) {
+            searchSourceBuilder.size(size);
+        }
+
+
+        searchSourceBuilder.queryParserName(request.param("query_parser_name"));
+        searchSourceBuilder.explain(request.paramAsBoolean("explain", null));
+
+        String sField = request.param("fields");
+        if (sField != null) {
+            String[] sFields = fieldsPattern.split(sField);
+            if (sFields != null) {
+                for (String field : sFields) {
+                    searchSourceBuilder.field(field);
+                }
             }
         }
 
-        private void innerFinishHim() {
-            InternalSearchResponse internalResponse = searchPhaseController.merge(sortedShardList, queryResults, fetchResults);
-            String scrollId = null;
-            if (request.scroll() != null) {
-                scrollId = TransportSearchHelper.buildScrollId(request.searchType(), queryResults.values());
+        String sSorts = request.param("sort");
+        if (sSorts != null) {
+            String[] sorts = fieldsPattern.split(sSorts);
+            for (String sort : sorts) {
+                int delimiter = sort.lastIndexOf(":");
+                if (delimiter != -1) {
+                    String sortField = sort.substring(0, delimiter);
+                    String reverse = sort.substring(delimiter + 1);
+                    if ("asc".equals(reverse)) {
+                        searchSourceBuilder.sort(sortField, SortOrder.ASC);
+                    } else if ("desc".equals(reverse)) {
+                        searchSourceBuilder.sort(sortField, SortOrder.DESC);
+                    }
+                } else {
+                    searchSourceBuilder.sort(sort);
+                }
             }
-            invokeListener(new SearchResponse(internalResponse, scrollId, expectedSuccessfulOps, successulOps.get(), buildShardFailures()));
         }
+
+        String sIndicesBoost = request.param("indices_boost");
+        if (sIndicesBoost != null) {
+            String[] indicesBoost = indicesBoostPattern.split(sIndicesBoost);
+            for (String indexBoost : indicesBoost) {
+                int divisor = indexBoost.indexOf(',');
+                if (divisor == -1) {
+                    throw new ElasticSearchIllegalArgumentException("Illegal index boost [" + indexBoost + "], no ','");
+                }
+                String indexName = indexBoost.substring(0, divisor);
+                String sBoost = indexBoost.substring(divisor + 1);
+                try {
+                    searchSourceBuilder.indexBoost(indexName, Float.parseFloat(sBoost));
+                } catch (NumberFormatException e) {
+                    throw new ElasticSearchIllegalArgumentException("Illegal index boost [" + indexBoost + "], boost not a float number");
+                }
+            }
+        }
+
+        return searchSourceBuilder;
     }
 }

@@ -1,8 +1,8 @@
-this(true, false);
+import org.wildfly.security.manager.action.GetAccessControlContextAction;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2011, Red Hat, Inc., and individual contributors
+ * Copyright 2012, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,81 +22,174 @@ this(true, false);
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.clustering.msc;
+package org.jboss.as.server.mgmt.domain;
 
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
-
+import org.jboss.as.controller.ControlledProcessState;
+import org.jboss.as.controller.ControlledProcessStateService;
+import org.jboss.as.network.NetworkUtils;
+import org.jboss.as.protocol.ProtocolConnectionConfiguration;
+import org.jboss.as.protocol.StreamUtils;
+import org.jboss.as.server.ServerMessages;
+import org.wildfly.security.manager.GetAccessControlContextAction;
 import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
 import org.jboss.msc.service.StartContext;
 import org.jboss.msc.service.StartException;
 import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
+import org.jboss.remoting3.Endpoint;
+import org.jboss.threads.JBossThreadFactory;
+import org.xnio.IoUtils;
+import org.xnio.OptionMap;
+import org.xnio.Options;
+import org.xnio.Sequence;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
+import java.io.IOException;
+import java.net.URI;
+import java.security.GeneralSecurityException;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+
+import static java.security.AccessController.doPrivileged;
 
 /**
- * Base service class that executes service start/stop asynchronously.
- * @author Paul Ferraro
+ * Service setting up the connection to the local host controller.
+ *
+ * @author Emanuel Muckenhuber
  */
-public abstract class AsynchronousService<T> implements Service<T> {
+public class HostControllerConnectionService implements Service<HostControllerClient> {
 
-    private final Executor executor = Executors.newCachedThreadPool();
-    private final boolean startAsynchronously;
-    private final boolean stopAsynchronously;
+    public static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("host", "controller", "client");
 
-    protected AsynchronousService() {
-        this(true, true);
-    }
+    private static final String JBOSS_LOCAL_USER = "JBOSS-LOCAL-USER";
+    private static final long SERVER_CONNECTION_TIMEOUT = 60000;
 
-    protected AsynchronousService(boolean startAsynchronously, boolean stopAsynchronously) {
-        this.startAsynchronously = startAsynchronously;
-        this.stopAsynchronously = stopAsynchronously;
+    private final InjectedValue<Endpoint> endpointInjector = new InjectedValue<Endpoint>();
+    private final InjectedValue<ControlledProcessStateService> processStateServiceInjectedValue = new InjectedValue<ControlledProcessStateService>();
+
+    private final int port;
+    private final String hostName;
+    private final String serverName;
+    private final String userName;
+    private final String serverProcessName;
+    private final byte[] initialAuthKey;
+    private final ThreadFactory threadFactory = new JBossThreadFactory(new ThreadGroup("host-controller-connection-threads"), Boolean.FALSE, null, "%G - %t", null, null, doPrivileged(GetAccessControlContextAction.getInstance()));
+    private final ExecutorService executor = Executors.newCachedThreadPool(threadFactory);
+    private final int connectOperationID;
+    private final boolean managementSubsystemEndpoint;
+
+    private HostControllerClient client;
+
+    public HostControllerConnectionService(final String hostName, final int port, final String serverName, final String serverProcessName,
+                                           final byte[] authKey, final int connectOperationID,
+                                           final boolean managementSubsystemEndpoint) {
+        this.port = port;
+        this.hostName = hostName;
+        this.serverName = serverName;
+        this.userName = "=" + serverName;
+        this.serverProcessName = serverProcessName;
+        this.initialAuthKey = authKey;
+        this.connectOperationID = connectOperationID;
+        this.managementSubsystemEndpoint = managementSubsystemEndpoint;
     }
 
     @Override
-    public void start(final StartContext context) throws StartException {
-        if (this.startAsynchronously) {
-            Runnable task = new Runnable() {
+    @SuppressWarnings("deprecation")
+    public synchronized void start(final StartContext context) throws StartException {
+        final Endpoint endpoint = endpointInjector.getValue();
+        try {
+            final URI connectionURI = new URI("remote://" + NetworkUtils.formatPossibleIpv6Address(hostName) + ":" + port);
+            final OptionMap options = OptionMap.create(Options.SASL_DISALLOWED_MECHANISMS, Sequence.of(JBOSS_LOCAL_USER));
+            // Create the connection configuration
+            final ProtocolConnectionConfiguration configuration = ProtocolConnectionConfiguration.create(endpoint, connectionURI, options);
+            configuration.setCallbackHandler(HostControllerConnection.createClientCallbackHandler(userName, initialAuthKey));
+            configuration.setConnectionTimeout(SERVER_CONNECTION_TIMEOUT);
+            configuration.setSslContext(getAcceptingSSLContext());
+            // Create the connection
+            final HostControllerConnection connection = new HostControllerConnection(serverProcessName, userName, connectOperationID, configuration, executor);
+            // Trigger the started notification based on the process state listener
+            final ControlledProcessStateService processService = processStateServiceInjectedValue.getValue();
+            processService.addPropertyChangeListener(new PropertyChangeListener() {
                 @Override
-                public void run() {
-                    try {
-                        AsynchronousService.this.start();
-                        context.complete();
-                    } catch (Exception e) {
-                        context.failed(new StartException(e));
+                public void propertyChange(final PropertyChangeEvent evt) {
+                    final ControlledProcessState.State old = (ControlledProcessState.State) evt.getOldValue();
+                    final ControlledProcessState.State current = (ControlledProcessState.State) evt.getNewValue();
+                    if (old == ControlledProcessState.State.STARTING) {
+                        // After starting reload has to be cleared, may still require a restart
+                        if(current == ControlledProcessState.State.RUNNING
+                                || current == ControlledProcessState.State.RESTART_REQUIRED) {
+                            connection.started();
+                        } else {
+                            IoUtils.safeClose(connection);
+                        }
                     }
                 }
-            };
-            context.asynchronous();
-            this.executor.execute(task);
-        } else {
-            try {
-                this.start();
-            } catch (Exception e) {
-                throw new StartException(e);
-            }
+            });
+            this.client = new HostControllerClient(serverName, connection.getChannelHandler(), connection, managementSubsystemEndpoint);
+        } catch (Exception e) {
+            throw new StartException(e);
         }
     }
 
     @Override
-    public void stop(final StopContext context) {
-        if (this.stopAsynchronously) {
-            Runnable task = new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        AsynchronousService.this.stop();
-                    } finally {
-                        context.complete();
-                    }
+    public synchronized void stop(final StopContext context) {
+        StreamUtils.safeClose(client);
+        client = null;
+    }
+
+    @Override
+    public synchronized HostControllerClient getValue() throws IllegalStateException, IllegalArgumentException {
+        final HostControllerClient client = this.client;
+        if(client == null) {
+            throw new IllegalStateException();
+        }
+        return client;
+    }
+
+    public InjectedValue<ControlledProcessStateService> getProcessStateServiceInjectedValue() {
+        return processStateServiceInjectedValue;
+    }
+
+    public InjectedValue<Endpoint> getEndpointInjector() {
+        return endpointInjector;
+    }
+
+    private static SSLContext getAcceptingSSLContext() throws IOException {
+        /*
+         * This connection is only a connection back to the local host controller.
+         *
+         * The HostController that started this process will have already provided the
+         * required information regarding the connection so quietly allow the SSL connection
+         * to be established.
+         */
+        try {
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            TrustManager[] trustManagers = new TrustManager[] { new X509TrustManager() {
+                public void checkClientTrusted(X509Certificate[] arg0, String arg1) throws CertificateException {
                 }
-            };
-            context.asynchronous();
-            this.executor.execute(task);
-        } else {
-            this.stop();
+
+                public void checkServerTrusted(X509Certificate[] arg0, String arg1) throws CertificateException {
+                }
+
+                public X509Certificate[] getAcceptedIssuers() {
+                    return null;
+                }
+            } };
+
+            sslContext.init(null, trustManagers, null);
+
+            return sslContext;
+        } catch (GeneralSecurityException e) {
+            throw ServerMessages.MESSAGES.unableToInitialiseSSLContext(e.getMessage());
         }
     }
 
-    protected abstract void start() throws Exception;
-
-    protected abstract void stop();
 }

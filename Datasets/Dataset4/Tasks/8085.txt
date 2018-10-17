@@ -1,13 +1,13 @@
-super(name, factories, valuesSource, estimatedBucketCount, null, bucketCountThresholds, includeExclude, aggregationContext, parent, SubAggCollectionMode.DEPTH_FIRST, false);
+public void close() throws ElasticSearchException {
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,102 +18,172 @@ super(name, factories, valuesSource, estimatedBucketCount, null, bucketCountThre
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.search.aggregations.bucket.significant;
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.util.BytesRef;
-import org.elasticsearch.common.lease.Releasables;
-import org.elasticsearch.search.aggregations.Aggregator;
-import org.elasticsearch.search.aggregations.AggregatorFactories;
-import org.elasticsearch.search.aggregations.bucket.terms.StringTermsAggregator;
-import org.elasticsearch.search.aggregations.bucket.terms.support.IncludeExclude;
-import org.elasticsearch.search.aggregations.support.AggregationContext;
-import org.elasticsearch.search.aggregations.support.ValuesSource;
-import org.elasticsearch.search.internal.ContextIndexSearcher;
+package org.elasticsearch.index.merge.policy;
+
+import org.apache.lucene.index.LogByteSizeMergePolicy;
+import org.apache.lucene.index.SegmentInfos;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.common.Preconditions;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.index.settings.IndexSettingsService;
+import org.elasticsearch.index.shard.AbstractIndexShardComponent;
+import org.elasticsearch.index.store.Store;
 
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
- * An aggregator of significant string values.
+ *
  */
-public class SignificantStringTermsAggregator extends StringTermsAggregator {
+public class LogByteSizeMergePolicyProvider extends AbstractIndexShardComponent implements MergePolicyProvider<LogByteSizeMergePolicy> {
 
-    protected long numCollectedDocs;
-    protected final SignificantTermsAggregatorFactory termsAggFactory;
+    private final IndexSettingsService indexSettingsService;
 
-    public SignificantStringTermsAggregator(String name, AggregatorFactories factories, ValuesSource valuesSource,
-            long estimatedBucketCount, BucketCountThresholds bucketCountThresholds,
-            IncludeExclude includeExclude, AggregationContext aggregationContext, Aggregator parent,
-            SignificantTermsAggregatorFactory termsAggFactory) {
+    private volatile boolean compoundFormat;
+    private volatile ByteSizeValue minMergeSize;
+    private volatile ByteSizeValue maxMergeSize;
+    private volatile int mergeFactor;
+    private volatile int maxMergeDocs;
+    private final boolean calibrateSizeByDeletes;
+    private boolean asyncMerge;
 
-        super(name, factories, valuesSource, estimatedBucketCount, null, bucketCountThresholds, includeExclude, aggregationContext, parent, SubAggCollectionMode.DEPTH_FIRST);
-        this.termsAggFactory = termsAggFactory;
+    private final Set<CustomLogByteSizeMergePolicy> policies = new CopyOnWriteArraySet<CustomLogByteSizeMergePolicy>();
+
+    private final ApplySettings applySettings = new ApplySettings();
+
+    @Inject
+    public LogByteSizeMergePolicyProvider(Store store, IndexSettingsService indexSettingsService) {
+        super(store.shardId(), store.indexSettings());
+        Preconditions.checkNotNull(store, "Store must be provided to merge policy");
+        this.indexSettingsService = indexSettingsService;
+
+        this.compoundFormat = indexSettings.getAsBoolean(INDEX_COMPOUND_FORMAT, store.suggestUseCompoundFile());
+        this.minMergeSize = componentSettings.getAsBytesSize("min_merge_size", new ByteSizeValue((long) (LogByteSizeMergePolicy.DEFAULT_MIN_MERGE_MB * 1024 * 1024), ByteSizeUnit.BYTES));
+        this.maxMergeSize = componentSettings.getAsBytesSize("max_merge_size", new ByteSizeValue((long) LogByteSizeMergePolicy.DEFAULT_MAX_MERGE_MB, ByteSizeUnit.MB));
+        this.mergeFactor = componentSettings.getAsInt("merge_factor", LogByteSizeMergePolicy.DEFAULT_MERGE_FACTOR);
+        this.maxMergeDocs = componentSettings.getAsInt("max_merge_docs", LogByteSizeMergePolicy.DEFAULT_MAX_MERGE_DOCS);
+        this.calibrateSizeByDeletes = componentSettings.getAsBoolean("calibrate_size_by_deletes", true);
+        this.asyncMerge = indexSettings.getAsBoolean("index.merge.async", true);
+        logger.debug("using [log_bytes_size] merge policy with merge_factor[{}], min_merge_size[{}], max_merge_size[{}], max_merge_docs[{}], calibrate_size_by_deletes[{}], async_merge[{}]",
+                mergeFactor, minMergeSize, maxMergeSize, maxMergeDocs, calibrateSizeByDeletes, asyncMerge);
+
+        indexSettingsService.addListener(applySettings);
     }
 
     @Override
-    public void collect(int doc, long owningBucketOrdinal) throws IOException {
-        super.collect(doc, owningBucketOrdinal);
-        numCollectedDocs++;
+    public LogByteSizeMergePolicy newMergePolicy() {
+        CustomLogByteSizeMergePolicy mergePolicy;
+        if (asyncMerge) {
+            mergePolicy = new EnableMergeLogByteSizeMergePolicy(this);
+        } else {
+            mergePolicy = new CustomLogByteSizeMergePolicy(this);
+        }
+        mergePolicy.setMinMergeMB(minMergeSize.mbFrac());
+        mergePolicy.setMaxMergeMB(maxMergeSize.mbFrac());
+        mergePolicy.setMergeFactor(mergeFactor);
+        mergePolicy.setMaxMergeDocs(maxMergeDocs);
+        mergePolicy.setCalibrateSizeByDeletes(calibrateSizeByDeletes);
+        mergePolicy.setUseCompoundFile(compoundFormat);
+
+        policies.add(mergePolicy);
+        return mergePolicy;
     }
 
     @Override
-    public SignificantStringTerms buildAggregation(long owningBucketOrdinal) {
-        assert owningBucketOrdinal == 0;
+    public void close(boolean delete) throws ElasticSearchException {
+        indexSettingsService.removeListener(applySettings);
+    }
 
-        final int size = (int) Math.min(bucketOrds.size(), bucketCountThresholds.getShardSize());
-        long supersetSize = termsAggFactory.prepareBackground(context);
-        long subsetSize = numCollectedDocs;
+    public static final String INDEX_MERGE_POLICY_MIN_MERGE_SIZE = "index.merge.policy.min_merge_size";
+    public static final String INDEX_MERGE_POLICY_MAX_MERGE_SIZE = "index.merge.policy.max_merge_size";
+    public static final String INDEX_MERGE_POLICY_MAX_MERGE_DOCS = "index.merge.policy.max_merge_docs";
+    public static final String INDEX_MERGE_POLICY_MERGE_FACTOR = "index.merge.policy.merge_factor";
+    public static final String INDEX_COMPOUND_FORMAT = "index.compound_format";
 
-        BucketSignificancePriorityQueue ordered = new BucketSignificancePriorityQueue(size);
-        SignificantStringTerms.Bucket spare = null;
-        for (int i = 0; i < bucketOrds.size(); i++) {
-            if (spare == null) {
-                spare = new SignificantStringTerms.Bucket(new BytesRef(), 0, 0, 0, 0, null);
+    class ApplySettings implements IndexSettingsService.Listener {
+        @Override
+        public void onRefreshSettings(Settings settings) {
+            ByteSizeValue minMergeSize = settings.getAsBytesSize(INDEX_MERGE_POLICY_MIN_MERGE_SIZE, LogByteSizeMergePolicyProvider.this.minMergeSize);
+            if (!minMergeSize.equals(LogByteSizeMergePolicyProvider.this.minMergeSize)) {
+                logger.info("updating min_merge_size from [{}] to [{}]", LogByteSizeMergePolicyProvider.this.minMergeSize, minMergeSize);
+                LogByteSizeMergePolicyProvider.this.minMergeSize = minMergeSize;
+                for (CustomLogByteSizeMergePolicy policy : policies) {
+                    policy.setMinMergeMB(minMergeSize.mbFrac());
+                }
             }
 
-            bucketOrds.get(i, spare.termBytes);
-            spare.subsetDf = bucketDocCount(i);
-            spare.subsetSize = subsetSize;
-            spare.supersetDf = termsAggFactory.getBackgroundFrequency(spare.termBytes);
-            spare.supersetSize = supersetSize;
-            // During shard-local down-selection we use subset/superset stats
-            // that are for this shard only
-            // Back at the central reducer these properties will be updated with
-            // global stats
-            spare.updateScore(termsAggFactory.getSignificanceHeuristic());
+            ByteSizeValue maxMergeSize = settings.getAsBytesSize(INDEX_MERGE_POLICY_MAX_MERGE_SIZE, LogByteSizeMergePolicyProvider.this.maxMergeSize);
+            if (!maxMergeSize.equals(LogByteSizeMergePolicyProvider.this.maxMergeSize)) {
+                logger.info("updating max_merge_size from [{}] to [{}]", LogByteSizeMergePolicyProvider.this.maxMergeSize, maxMergeSize);
+                LogByteSizeMergePolicyProvider.this.maxMergeSize = maxMergeSize;
+                for (CustomLogByteSizeMergePolicy policy : policies) {
+                    policy.setMaxMergeMB(maxMergeSize.mbFrac());
+                }
+            }
 
-            spare.bucketOrd = i;
-            if (spare.subsetDf >= bucketCountThresholds.getShardMinDocCount()) {
-                spare = (SignificantStringTerms.Bucket) ordered.insertWithOverflow(spare);
+            int maxMergeDocs = settings.getAsInt(INDEX_MERGE_POLICY_MAX_MERGE_DOCS, LogByteSizeMergePolicyProvider.this.maxMergeDocs);
+            if (maxMergeDocs != LogByteSizeMergePolicyProvider.this.maxMergeDocs) {
+                logger.info("updating max_merge_docs from [{}] to [{}]", LogByteSizeMergePolicyProvider.this.maxMergeDocs, maxMergeDocs);
+                LogByteSizeMergePolicyProvider.this.maxMergeDocs = maxMergeDocs;
+                for (CustomLogByteSizeMergePolicy policy : policies) {
+                    policy.setMaxMergeDocs(maxMergeDocs);
+                }
+            }
+
+            int mergeFactor = settings.getAsInt(INDEX_MERGE_POLICY_MERGE_FACTOR, LogByteSizeMergePolicyProvider.this.mergeFactor);
+            if (mergeFactor != LogByteSizeMergePolicyProvider.this.mergeFactor) {
+                logger.info("updating merge_factor from [{}] to [{}]", LogByteSizeMergePolicyProvider.this.mergeFactor, mergeFactor);
+                LogByteSizeMergePolicyProvider.this.mergeFactor = mergeFactor;
+                for (CustomLogByteSizeMergePolicy policy : policies) {
+                    policy.setMergeFactor(mergeFactor);
+                }
+            }
+
+            boolean compoundFormat = settings.getAsBoolean(INDEX_COMPOUND_FORMAT, LogByteSizeMergePolicyProvider.this.compoundFormat);
+            if (compoundFormat != LogByteSizeMergePolicyProvider.this.compoundFormat) {
+                logger.info("updating index.compound_format from [{}] to [{}]", LogByteSizeMergePolicyProvider.this.compoundFormat, compoundFormat);
+                LogByteSizeMergePolicyProvider.this.compoundFormat = compoundFormat;
+                for (CustomLogByteSizeMergePolicy policy : policies) {
+                    policy.setUseCompoundFile(compoundFormat);
+                }
             }
         }
+    }
 
-        final InternalSignificantTerms.Bucket[] list = new InternalSignificantTerms.Bucket[ordered.size()];
-        for (int i = ordered.size() - 1; i >= 0; i--) {
-            final SignificantStringTerms.Bucket bucket = (SignificantStringTerms.Bucket) ordered.pop();
-            // the terms are owned by the BytesRefHash, we need to pull a copy since the BytesRef hash data may be recycled at some point
-            bucket.termBytes = BytesRef.deepCopyOf(bucket.termBytes);
-            bucket.aggregations = bucketAggregations(bucket.bucketOrd);
-            list[i] = bucket;
+    public static class CustomLogByteSizeMergePolicy extends LogByteSizeMergePolicy {
+
+        private final LogByteSizeMergePolicyProvider provider;
+
+        public CustomLogByteSizeMergePolicy(LogByteSizeMergePolicyProvider provider) {
+            super();
+            this.provider = provider;
         }
 
-        return new SignificantStringTerms(subsetSize, supersetSize, name, bucketCountThresholds.getRequiredSize(), bucketCountThresholds.getMinDocCount(), termsAggFactory.getSignificanceHeuristic(), Arrays.asList(list));
+        @Override
+        public void close() {
+            super.close();
+            provider.policies.remove(this);
+        }
     }
 
-    @Override
-    public SignificantStringTerms buildEmptyAggregation() {
-        // We need to account for the significance of a miss in our global stats - provide corpus size as context
-        ContextIndexSearcher searcher = context.searchContext().searcher();
-        IndexReader topReader = searcher.getIndexReader();
-        int supersetSize = topReader.numDocs();
-        return new SignificantStringTerms(0, supersetSize, name, bucketCountThresholds.getRequiredSize(), bucketCountThresholds.getMinDocCount(), termsAggFactory.getSignificanceHeuristic(), Collections.<InternalSignificantTerms.Bucket>emptyList());
-    }
+    public static class EnableMergeLogByteSizeMergePolicy extends CustomLogByteSizeMergePolicy {
 
-    @Override
-    public void doClose() {
-        Releasables.close(bucketOrds, termsAggFactory);
-    }
+        public EnableMergeLogByteSizeMergePolicy(LogByteSizeMergePolicyProvider provider) {
+            super(provider);
+        }
 
+        @Override
+        public MergeSpecification findMerges(MergeTrigger trigger, SegmentInfos infos) throws IOException {
+            // we don't enable merges while indexing documents, we do them in the background
+            if (trigger == MergeTrigger.SEGMENT_FLUSH) {
+                return null;
+            }
+            return super.findMerges(trigger, infos);
+        }
+    }
 }

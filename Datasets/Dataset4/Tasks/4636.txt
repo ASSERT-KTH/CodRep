@@ -1,13 +1,13 @@
-request.index(state.metaData().concreteSingleIndex(request.index()));
+values = indexFieldData.load(context).getBytesValues(false);
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,107 +19,273 @@ request.index(state.metaData().concreteSingleIndex(request.index()));
  * under the License.
  */
 
-package org.elasticsearch.action.get;
+package org.elasticsearch.search.facet.terms.strings;
 
-import org.elasticsearch.ElasticsearchException;
-import org.elasticsearch.action.RoutingMissingException;
-import org.elasticsearch.action.support.single.shard.TransportShardSingleOperationAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
-import org.elasticsearch.cluster.routing.ShardIterator;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.engine.Engine;
-import org.elasticsearch.index.get.GetResult;
-import org.elasticsearch.index.service.IndexService;
-import org.elasticsearch.index.shard.service.IndexShard;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.TransportService;
+import com.google.common.collect.ImmutableSet;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.UnicodeUtil;
+import org.elasticsearch.cache.recycler.CacheRecycler;
+import org.elasticsearch.common.collect.BoundedTreeSet;
+import org.elasticsearch.common.util.IntArray;
+import org.elasticsearch.common.util.IntArrays;
+import org.elasticsearch.index.fielddata.BytesValues;
+import org.elasticsearch.index.fielddata.IndexFieldData;
+import org.elasticsearch.index.fielddata.ordinals.Ordinals;
+import org.elasticsearch.search.facet.FacetExecutor;
+import org.elasticsearch.search.facet.InternalFacet;
+import org.elasticsearch.search.facet.terms.TermsFacet;
+import org.elasticsearch.search.facet.terms.support.EntryPriorityQueue;
+import org.elasticsearch.search.internal.SearchContext;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Performs the get operation.
+ *
  */
-public class TransportGetAction extends TransportShardSingleOperationAction<GetRequest, GetResponse> {
+public class TermsStringOrdinalsFacetExecutor extends FacetExecutor {
 
-    public static final boolean REFRESH_FORCE = false;
+    private final IndexFieldData.WithOrdinals indexFieldData;
 
-    private final IndicesService indicesService;
-    private final boolean realtime;
+    final CacheRecycler cacheRecycler;
+    private final TermsFacet.ComparatorType comparatorType;
+    private final int size;
+    private final int shardSize;
+    private final int minCount;
+    private final ImmutableSet<BytesRef> excluded;
+    private final Matcher matcher;
+    final int ordinalsCacheAbove;
 
-    @Inject
-    public TransportGetAction(Settings settings, ClusterService clusterService, TransportService transportService,
-                              IndicesService indicesService, ThreadPool threadPool) {
-        super(settings, threadPool, clusterService, transportService);
-        this.indicesService = indicesService;
+    final List<ReaderAggregator> aggregators;
+    long missing;
+    long total;
 
-        this.realtime = settings.getAsBoolean("action.get.realtime", true);
-    }
+    public TermsStringOrdinalsFacetExecutor(IndexFieldData.WithOrdinals indexFieldData, int size, int shardSize, TermsFacet.ComparatorType comparatorType, boolean allTerms, SearchContext context,
+                                            ImmutableSet<BytesRef> excluded, Pattern pattern, int ordinalsCacheAbove) {
+        this.indexFieldData = indexFieldData;
+        this.size = size;
+        this.shardSize = shardSize;
+        this.comparatorType = comparatorType;
+        this.ordinalsCacheAbove = ordinalsCacheAbove;
 
-    @Override
-    protected String executor() {
-        return ThreadPool.Names.GET;
-    }
-
-    @Override
-    protected String transportAction() {
-        return GetAction.NAME;
-    }
-
-    @Override
-    protected ClusterBlockException checkGlobalBlock(ClusterState state, GetRequest request) {
-        return state.blocks().globalBlockedException(ClusterBlockLevel.READ);
-    }
-
-    @Override
-    protected ClusterBlockException checkRequestBlock(ClusterState state, GetRequest request) {
-        return state.blocks().indexBlockedException(ClusterBlockLevel.READ, request.index());
-    }
-
-    @Override
-    protected ShardIterator shards(ClusterState state, GetRequest request) {
-        return clusterService.operationRouting()
-                .getShards(clusterService.state(), request.index(), request.type(), request.id(), request.routing(), request.preference());
-    }
-
-    @Override
-    protected void resolveRequest(ClusterState state, GetRequest request) {
-        if (request.realtime == null) {
-            request.realtime = this.realtime;
+        if (excluded == null || excluded.isEmpty()) {
+            this.excluded = null;
+        } else {
+            this.excluded = excluded;
         }
-        // update the routing (request#index here is possibly an alias)
-        request.routing(state.metaData().resolveIndexRouting(request.routing(), request.index()));
-        request.index(state.metaData().concreteIndex(request.index()));
+        this.matcher = pattern != null ? pattern.matcher("") : null;
 
-        // Fail fast on the node that received the request.
-        if (request.routing() == null && state.getMetaData().routingRequired(request.index(), request.type())) {
-            throw new RoutingMissingException(request.index(), request.type(), request.id());
-        }
-    }
-
-    @Override
-    protected GetResponse shardOperation(GetRequest request, int shardId) throws ElasticsearchException {
-        IndexService indexService = indicesService.indexServiceSafe(request.index());
-        IndexShard indexShard = indexService.shardSafe(shardId);
-
-        if (request.refresh() && !request.realtime()) {
-            indexShard.refresh(new Engine.Refresh("refresh_flag_get").force(REFRESH_FORCE));
+        // minCount is offset by -1
+        if (allTerms) {
+            minCount = -1;
+        } else {
+            minCount = 0;
         }
 
-        GetResult result = indexShard.getService().get(request.type(), request.id(), request.fields(),
-                request.realtime(), request.version(), request.versionType(), request.fetchSourceContext());
-        return new GetResponse(result);
+        this.cacheRecycler = context.cacheRecycler();
+
+        this.aggregators = new ArrayList<ReaderAggregator>(context.searcher().getIndexReader().leaves().size());
     }
 
     @Override
-    protected GetRequest newRequest() {
-        return new GetRequest();
+    public Collector collector() {
+        return new Collector();
     }
 
     @Override
-    protected GetResponse newResponse() {
-        return new GetResponse();
+    public InternalFacet buildFacet(String facetName) {
+        final CharsRef spare = new CharsRef();
+        AggregatorPriorityQueue queue = new AggregatorPriorityQueue(aggregators.size());
+        for (ReaderAggregator aggregator : aggregators) {
+            if (aggregator.nextPosition()) {
+                queue.add(aggregator);
+            }
+        }
+
+        // YACK, we repeat the same logic, but once with an optimizer priority queue for smaller sizes
+        if (shardSize < EntryPriorityQueue.LIMIT) {
+            // optimize to use priority size
+            EntryPriorityQueue ordered = new EntryPriorityQueue(shardSize, comparatorType.comparator());
+
+            while (queue.size() > 0) {
+                ReaderAggregator agg = queue.top();
+                BytesRef value = agg.copyCurrent(); // we need to makeSafe it, since we end up pushing it... (can we get around this?)
+                int count = 0;
+                do {
+                    count += agg.counts.get(agg.position);
+                    if (agg.nextPosition()) {
+                        agg = queue.updateTop();
+                    } else {
+                        // we are done with this reader
+                        queue.pop();
+                        agg = queue.top();
+                    }
+                } while (agg != null && value.equals(agg.current));
+
+                if (count > minCount) {
+                    if (excluded != null && excluded.contains(value)) {
+                        continue;
+                    }
+                    if (matcher != null) {
+                        UnicodeUtil.UTF8toUTF16(value, spare);
+                        assert spare.toString().equals(value.utf8ToString());
+                        if (!matcher.reset(spare).matches()) {
+                            continue;
+                        }
+                    }
+                    InternalStringTermsFacet.TermEntry entry = new InternalStringTermsFacet.TermEntry(value, count);
+                    ordered.insertWithOverflow(entry);
+                }
+            }
+            InternalStringTermsFacet.TermEntry[] list = new InternalStringTermsFacet.TermEntry[ordered.size()];
+            for (int i = ordered.size() - 1; i >= 0; i--) {
+                list[i] = (InternalStringTermsFacet.TermEntry) ordered.pop();
+            }
+
+            return new InternalStringTermsFacet(facetName, comparatorType, size, Arrays.asList(list), missing, total);
+        }
+
+        BoundedTreeSet<InternalStringTermsFacet.TermEntry> ordered = new BoundedTreeSet<InternalStringTermsFacet.TermEntry>(comparatorType.comparator(), shardSize);
+
+        while (queue.size() > 0) {
+            ReaderAggregator agg = queue.top();
+            BytesRef value = agg.copyCurrent(); // we need to makeSafe it, since we end up pushing it... (can we work around that?)
+            int count = 0;
+            do {
+                count += agg.counts.get(agg.position);
+                if (agg.nextPosition()) {
+                    agg = queue.updateTop();
+                } else {
+                    // we are done with this reader
+                    queue.pop();
+                    agg = queue.top();
+                }
+            } while (agg != null && value.equals(agg.current));
+
+            if (count > minCount) {
+                if (excluded != null && excluded.contains(value)) {
+                    continue;
+                }
+                if (matcher != null) {
+                    UnicodeUtil.UTF8toUTF16(value, spare);
+                    assert spare.toString().equals(value.utf8ToString());
+                    if (!matcher.reset(spare).matches()) {
+                        continue;
+                    }
+                }
+                InternalStringTermsFacet.TermEntry entry = new InternalStringTermsFacet.TermEntry(value, count);
+                ordered.add(entry);
+            }
+        }
+
+        return new InternalStringTermsFacet(facetName, comparatorType, size, ordered, missing, total);
+    }
+
+    class Collector extends FacetExecutor.Collector {
+
+        private long missing;
+        private long total;
+        private BytesValues.WithOrdinals values;
+        private ReaderAggregator current;
+        private Ordinals.Docs ordinals;
+
+        @Override
+        public void setNextReader(AtomicReaderContext context) throws IOException {
+            if (current != null) {
+                missing += current.counts.get(0);
+                total += current.total - current.counts.get(0);
+                if (current.values.ordinals().getNumOrds() > 0) {
+                    aggregators.add(current);
+                }
+            }
+            values = indexFieldData.load(context).getBytesValues();
+            current = new ReaderAggregator(values, ordinalsCacheAbove, cacheRecycler);
+            ordinals = values.ordinals();
+        }
+
+        @Override
+        public void collect(int doc) throws IOException {
+            final int length = ordinals.setDocument(doc);
+            int missing = 1;
+            for (int i = 0; i < length; i++) {
+                current.onOrdinal(doc, ordinals.nextOrd());
+                missing = 0;
+            }
+            current.incrementMissing(missing);
+        }
+
+        @Override
+        public void postCollection() {
+            if (current != null) {
+                missing += current.counts.get(0);
+                total += current.total - current.counts.get(0);
+                // if we have values for this one, add it
+                if (current.values.ordinals().getNumOrds() > 0) {
+                    aggregators.add(current);
+                }
+                current = null;
+            }
+            TermsStringOrdinalsFacetExecutor.this.missing = missing;
+            TermsStringOrdinalsFacetExecutor.this.total = total;
+        }
+    }
+
+    public static final class ReaderAggregator {
+
+        private final long maxOrd;
+
+        final BytesValues.WithOrdinals values;
+        final IntArray counts;
+        long position = 0;
+        BytesRef current;
+        int total;
+
+
+        public ReaderAggregator(BytesValues.WithOrdinals values, int ordinalsCacheLimit, CacheRecycler cacheRecycler) {
+            this.values = values;
+            this.maxOrd = values.ordinals().getMaxOrd();
+            this.counts = IntArrays.allocate(maxOrd);
+        }
+
+        final void onOrdinal(int docId, long ordinal) {
+            counts.increment(ordinal, 1);
+            total++;
+        }
+
+        final void incrementMissing(int numMissing) {
+            counts.increment(0, numMissing);
+            total += numMissing;
+        }
+
+        public boolean nextPosition() {
+            if (++position >= maxOrd) {
+                return false;
+            }
+            current = values.getValueByOrd(position);
+            return true;
+        }
+
+        public BytesRef copyCurrent() {
+            return values.copyShared();
+        }
+    }
+
+    public static class AggregatorPriorityQueue extends PriorityQueue<ReaderAggregator> {
+
+        public AggregatorPriorityQueue(int size) {
+            super(size);
+        }
+
+        @Override
+        protected boolean lessThan(ReaderAggregator a, ReaderAggregator b) {
+            return a.current.compareTo(b.current) < 0;
+        }
     }
 }

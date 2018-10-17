@@ -1,4 +1,4 @@
-private final Map<String, Integer> secureListeners = new ConcurrentHashMap<>(1);
+import org.wildfly.security.manager.action.GetAccessControlContextAction;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -21,80 +21,101 @@ private final Map<String, Integer> secureListeners = new ConcurrentHashMap<>(1);
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
+package org.wildfly.clustering.web.infinispan.session;
 
-package org.jboss.as.undertow;
+import java.security.AccessController;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 
-import java.util.ConcurrentModificationException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-import io.undertow.servlet.api.DeploymentInfo;
-import io.undertow.servlet.api.ServletContainer;
-import org.jboss.msc.service.Service;
-import org.jboss.msc.service.StartContext;
-import org.jboss.msc.service.StartException;
-import org.jboss.msc.service.StopContext;
+import org.jboss.as.clustering.concurrent.Scheduler;
+import org.jboss.as.clustering.infinispan.invoker.Evictor;
+import org.jboss.threads.JBossThreadFactory;
+import org.wildfly.clustering.web.Batch;
+import org.wildfly.clustering.web.Batcher;
+import org.wildfly.clustering.web.infinispan.InfinispanWebLogger;
+import org.wildfly.clustering.web.session.ImmutableSession;
+import org.wildfly.security.manager.GetAccessControlContextAction;
 
 /**
- * Central Undertow 'Container' HTTP listeners will make this container accessible whilst deployers will add content.
- *
- * @author <a href="mailto:darran.lofthouse@jboss.com">Darran Lofthouse</a>
+ * Session eviction scheduler that eagerly evicts the oldest sessions when
+ * the number of active sessions exceeds the configured maximum.
+ * @author Paul Ferraro
  */
-public class ServletContainerService implements Service<ServletContainerService> {
-    private volatile ServletContainer servletContainer;
-    @Deprecated
-    private Map<String, Integer> secureListeners = new ConcurrentHashMap<>(1);
+public class SessionEvictionScheduler implements Scheduler<ImmutableSession> {
 
-    static String getDeployedContextPath(DeploymentInfo deploymentInfo) {
-        return "".equals(deploymentInfo.getContextPath()) ? "/" : deploymentInfo.getContextPath();
+    private final Set<String> evictionQueue = new LinkedHashSet<>();
+    final Batcher batcher;
+    final Evictor<String> evictor;
+    private final ExecutorService executor;
+    private final int maxSize;
+
+    public SessionEvictionScheduler(Batcher batcher, Evictor<String> evictor, int maxSize) {
+        this(batcher, evictor, maxSize, Executors.newCachedThreadPool(createThreadFactory()));
     }
 
-    public void start(StartContext context) throws StartException {
-
-        servletContainer = ServletContainer.Factory.newInstance();
+    private static ThreadFactory createThreadFactory() {
+        return new JBossThreadFactory(new ThreadGroup(SessionEvictionScheduler.class.getSimpleName()), Boolean.FALSE, null, "%G - %t", null, null, AccessController.doPrivileged(GetAccessControlContextAction.getInstance()));
     }
 
-    public void stop(StopContext context) {
-
+    public SessionEvictionScheduler(Batcher batcher, Evictor<String> evictor, int maxSize, ExecutorService executor) {
+        this.batcher = batcher;
+        this.evictor = evictor;
+        this.maxSize = maxSize;
+        this.executor = executor;
     }
 
-    public ServletContainerService getValue() throws IllegalStateException, IllegalArgumentException {
-        return this;
+    @Override
+    public void cancel(ImmutableSession session) {
+        synchronized (this.evictionQueue) {
+            this.evictionQueue.remove(session.getId());
+        }
     }
 
-    public ServletContainer getServletContainer() {
-        return servletContainer;
+    @Override
+    public void schedule(ImmutableSession session) {
+        synchronized (this.evictionQueue) {
+            this.evictionQueue.add(session.getId());
+            // Trigger eviction of oldest session if necessary
+            if (this.evictionQueue.size() > this.maxSize) {
+                Iterator<String> sessions = this.evictionQueue.iterator();
+                this.executor.submit(new EvictionTask(sessions.next()));
+                sessions.remove();
+            }
+        }
     }
 
-    public Integer lookupSecurePort(final String listenerName) {
-        Integer response = null;
-        response = secureListeners.get(listenerName);
-        if (response == null) {
-            while (response == null && secureListeners.isEmpty() == false) {
-                try {
-                    response = secureListeners.values().iterator().next();
-                } catch (ConcurrentModificationException cme) {
-                    // Ignored - The chance of happening is so small but do not wish to add
-                    // additional synchronisation. If listeners are being added and removed
-                    // to a server under load then behaviour could not be expected to be consistent.
+    @Override
+    public void close() {
+        this.evictionQueue.clear();
+        this.executor.shutdown();
+    }
+
+    private class EvictionTask implements Runnable {
+        private final String id;
+
+        EvictionTask(String id) {
+            this.id = id;
+        }
+
+        @Override
+        public void run() {
+            Batch batch = SessionEvictionScheduler.this.batcher.startBatch();
+            boolean success = false;
+            try {
+                InfinispanWebLogger.ROOT_LOGGER.tracef("Passivating session %s", this.id);
+                SessionEvictionScheduler.this.evictor.evict(this.id);
+                success = true;
+            } finally {
+                if (success) {
+                    batch.close();
+                } else {
+                    batch.discard();
                 }
             }
         }
-
-        if (response == null) {
-            throw new IllegalStateException("No secure listeners defined.");
-        }
-
-        return response;
-
     }
-
-    public void registerSecurePort(final String listenerName, final Integer port) {
-        secureListeners.put(listenerName, port);
-    }
-
-    public void unregisterSecurePort(final String name) {
-        secureListeners.remove(name);
-    }
-
 }

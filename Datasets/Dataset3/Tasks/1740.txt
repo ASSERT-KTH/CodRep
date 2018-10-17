@@ -1,8 +1,8 @@
-context.stepCompleted();
+public synchronized void persistProperties() throws IOException {
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2011, Red Hat, Inc., and individual contributors
+ * Copyright 2012, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,106 +22,173 @@ context.stepCompleted();
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.domain.controller.operations.coordination;
+package org.jboss.as.domain.management.security;
 
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.HOST;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OPERATION_HEADERS;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.RUNNING_SERVER;
-import static org.jboss.as.domain.controller.DomainControllerLogger.HOST_CONTROLLER_LOGGER;
-import static org.jboss.as.domain.controller.DomainControllerMessages.MESSAGES;
+import static org.jboss.as.domain.management.DomainManagementLogger.ROOT_LOGGER;
+import static org.jboss.as.domain.management.DomainManagementMessages.MESSAGES;
 
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Properties;
 
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.OperationStepHandler;
-import org.jboss.as.controller.PathAddress;
-import org.jboss.as.controller.ProxyController;
-import org.jboss.as.controller.registry.ImmutableManagementResourceRegistration;
-import org.jboss.as.domain.controller.LocalHostControllerInfo;
-import org.jboss.as.host.controller.ignored.IgnoredDomainResourceRegistry;
-import org.jboss.as.repository.ContentRepository;
-import org.jboss.dmr.ModelNode;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
 
 /**
- * Initial step handler for a {@link org.jboss.as.controller.ModelController} that is the model controller for a host controller.
+ * The base class for services depending on loading a properties file, loads the properties on
+ * start up and re-loads as required where updates to the file are detected.
  *
- * @author Brian Stansberry (c) 2011 Red Hat Inc.
+ * @author <a href="mailto:darran.lofthouse@jboss.com">Darran Lofthouse</a>
  */
-public class PrepareStepHandler  implements OperationStepHandler {
+public abstract class PropertiesFileLoader {
 
-    public static final String EXECUTE_FOR_COORDINATOR = "execute-for-coordinator";
+    private final String path;
+    private final InjectedValue<String> relativeTo = new InjectedValue<String>();
 
-    private final LocalHostControllerInfo localHostControllerInfo;
-    private final OperationCoordinatorStepHandler coordinatorHandler;
-    private final OperationSlaveStepHandler slaveHandler;
+    private File propertiesFile;
+    private volatile long fileUpdated = -1;
+    private volatile Properties properties = null;
 
-    public PrepareStepHandler(final LocalHostControllerInfo localHostControllerInfo,
-                              final ContentRepository contentRepository,
-                              final Map<String, ProxyController> hostProxies,
-                              final Map<String, ProxyController> serverProxies,
-                              final IgnoredDomainResourceRegistry ignoredDomainResourceRegistry) {
-        this.localHostControllerInfo = localHostControllerInfo;
-        this.slaveHandler = new OperationSlaveStepHandler(localHostControllerInfo, serverProxies, ignoredDomainResourceRegistry);
-        this.coordinatorHandler = new OperationCoordinatorStepHandler(localHostControllerInfo, contentRepository, hostProxies, serverProxies, slaveHandler);
+    protected PropertiesFileLoader(final String path) {
+        this.path = path;
     }
 
-    @Override
-    public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
+    public InjectedValue<String> getRelativeToInjector() {
+        return relativeTo;
+    }
 
-        if (context.isBooting()) {
-            executeDirect(context, operation);
-        } else if (operation.hasDefined(OPERATION_HEADERS)
-                && operation.get(OPERATION_HEADERS).hasDefined(EXECUTE_FOR_COORDINATOR)
-                && operation.get(OPERATION_HEADERS).get(EXECUTE_FOR_COORDINATOR).asBoolean()) {
-            // Coordinator wants us to execute locally and send result including the steps needed for execution on the servers
-            // TODO verify this is actually the master requesting this
-            slaveHandler.execute(context, operation);
-        } else if (isServerOperation(operation)) {
-            // Pass direct requests for the server through whether they come from the master or not
-            executeDirect(context, operation);
-        } else {
-            coordinatorHandler.execute(context, operation);
+    public void start(StartContext context) throws StartException {
+        String relativeTo = this.relativeTo.getOptionalValue();
+        String file = relativeTo == null ? path : relativeTo + "/" + path;
+
+        propertiesFile = new File(file);
+        try {
+            getProperties();
+        } catch (IOException ioe) {
+            throw MESSAGES.unableToLoadProperties(ioe);
         }
     }
 
-    public void setExecutorService(final ExecutorService executorService) {
-        coordinatorHandler.setExecutorService(executorService);
+    public void stop(StopContext context) {
+        properties.clear();
+        properties = null;
+        propertiesFile = null;
     }
 
-    private boolean isServerOperation(ModelNode operation) {
-        PathAddress addr = PathAddress.pathAddress(operation.get(OP_ADDR));
-        return addr.size() > 1
-                && HOST.equals(addr.getElement(0).getKey())
-                && localHostControllerInfo.getLocalHostName().equals(addr.getElement(0).getValue())
-                && RUNNING_SERVER.equals(addr.getElement(1).getKey());
+    protected Properties getProperties() throws IOException {
+        /*
+         * This method does attempt to minimise the effect of race conditions, however this is not overly critical as if you
+         * have users attempting to authenticate at the exact point their details are added to the file there is also a chance
+         * of a race.
+         */
+
+        boolean loadRequired = properties == null || fileUpdated != propertiesFile.lastModified();
+
+        if (loadRequired) {
+            synchronized (this) {
+                // Cache the value as there is still a chance of further modification.
+                long fileLastModified = propertiesFile.lastModified();
+                boolean loadReallyRequired = properties == null || fileUpdated != fileLastModified;
+                if (loadReallyRequired) {
+                    ROOT_LOGGER.debugf("Reloading properties file '%s'", propertiesFile.getAbsolutePath());
+                    Properties props = new Properties();
+                    InputStream is = new FileInputStream(propertiesFile);
+                    try {
+                        props.load(is);
+                    } finally {
+                        is.close();
+                    }
+                    verifyProperties(props);
+
+                    properties = props;
+                    // Update this last otherwise the check outside the synchronized block could return true before the file is
+                    // set.
+                    fileUpdated = fileLastModified;
+                }
+            }
+        }
+
+        return properties;
+    }
+
+    private synchronized void persistProperties() throws IOException {
+        Properties toSave = (Properties) properties.clone();
+
+        File backup = new File(propertiesFile.getCanonicalPath() + ".bak");
+        if (backup.exists()) {
+            if (backup.delete() == false) {
+                throw new IllegalStateException("Unable to delete backup properties file.");
+            }
+        }
+
+        if (propertiesFile.renameTo(backup) == false) {
+            throw new IllegalStateException("Unable to backup properties file.");
+        }
+
+        FileReader fr = new FileReader(backup);
+        BufferedReader br = new BufferedReader(fr);
+
+        FileWriter fw = new FileWriter(propertiesFile);
+        BufferedWriter bw = new BufferedWriter(fw);
+
+        try {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String trimmed = line.trim();
+                if (trimmed.startsWith("#")) {
+                    bw.append(line);
+                    bw.newLine();
+                } else if (trimmed.length() == 0) {
+                    bw.newLine();
+                } else {
+                    int equals = trimmed.indexOf('=');
+                    if (equals > 0) {
+                        String userName = trimmed.substring(0, equals);
+                        if (toSave.contains(userName)) {
+                            bw.append(userName + "=" + toSave.getProperty(userName));
+                            bw.newLine();
+                            toSave.remove(userName);
+                        }
+                    }
+                }
+            }
+
+            // Append any additional users to the end of the file.
+            for (Object currentKey : toSave.keySet()) {
+                bw.append(currentKey + "=" + toSave.getProperty((String) currentKey));
+                bw.newLine();
+            }
+            bw.newLine();
+        } finally {
+            safeClose(bw);
+            safeClose(fw);
+            safeClose(br);
+            safeClose(fr);
+        }
+    }
+
+    private void safeClose(final Closeable c) {
+        try {
+            c.close();
+        } catch (IOException ignored) {
+        }
     }
 
     /**
-     * Directly handles the op in the standard way the default prepare step handler would
-     * @param context the operation execution context
-     * @param operation the operation
-     * @throws OperationFailedException if there is no handler registered for the operation
+     * Provides the base class with an opportunity to verify the contents of the properties before they are used.
+     *
+     * @param properties - The Properties instance to verify.
      */
-    private void executeDirect(OperationContext context, ModelNode operation) throws OperationFailedException {
-        if (HOST_CONTROLLER_LOGGER.isTraceEnabled()) {
-            HOST_CONTROLLER_LOGGER.tracef("%s executing direct", getClass().getSimpleName());
-        }
-        final String operationName =  operation.require(OP).asString();
-        OperationStepHandler stepHandler = null;
-        final ImmutableManagementResourceRegistration registration = context.getResourceRegistration();
-        if (registration != null) {
-            stepHandler = registration.getOperationHandler(PathAddress.EMPTY_ADDRESS, operationName);
-        }
-        if(stepHandler != null) {
-            context.addStep(stepHandler, OperationContext.Stage.MODEL);
-        } else {
-            context.getFailureDescription().set(MESSAGES.noHandlerForOperation(operationName, PathAddress.pathAddress(operation.get(OP_ADDR))));
-        }
-        context.completeStep();
-    }
+    protected void verifyProperties(Properties properties) throws IOException {
+    };
 
 }

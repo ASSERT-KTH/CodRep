@@ -1,12 +1,13 @@
-conf = getConfiguration();
+stages.put(GOSSIP_STAGE, new JMXEnabledThreadPoolExecutor("GOSSIP_STAGE"));
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,123 +18,98 @@ conf = getConfiguration();
  * limitations under the License.
  */
 
-package org.apache.mahout.utils.vectors.lucene;
+package org.apache.cassandra.concurrent;
 
-import com.google.common.collect.Sets;
-import com.google.common.io.Closeables;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.SequenceFile;
-import org.apache.hadoop.io.Text;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.standard.StandardAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.SimpleFSDirectory;
-import org.apache.lucene.util.Version;
-import org.apache.mahout.common.MahoutTestCase;
-import org.junit.Before;
-import org.junit.Test;
-
-import java.io.File;
-import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
-public class DriverTest extends MahoutTestCase {
+import org.apache.cassandra.config.DatabaseDescriptor;
 
-  private File indexDir;
-  private File outputDir;
-  private Configuration conf;
+import static org.apache.cassandra.config.DatabaseDescriptor.getConcurrentReaders;
+import static org.apache.cassandra.config.DatabaseDescriptor.getConcurrentWriters;
 
-  @Before
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    indexDir = getTestTempDir("intermediate");
-    indexDir.delete();
-    outputDir = getTestTempDir("output");
-    outputDir.delete();
 
-    conf = new Configuration();
-  }
+/**
+ * This class manages executor services for Messages recieved: each Message requests
+ * running on a specific "stage" for concurrency control; hence the Map approach,
+ * even though stages (executors) are not created dynamically.
+ */
+public class StageManager
+{
+    private static Map<String, ThreadPoolExecutor> stages = new HashMap<String, ThreadPoolExecutor>();
 
-  private Document asDocument(String line) {
-    Document doc = new Document();
-    doc.add(new TextFieldWithTermVectors("text", line));
-    return doc;
-  }
+    public final static String READ_STAGE = "ROW-READ-STAGE";
+    public final static String MUTATION_STAGE = "ROW-MUTATION-STAGE";
+    public final static String STREAM_STAGE = "STREAM-STAGE";
+    public final static String GOSSIP_STAGE = "GS";
+    public static final String RESPONSE_STAGE = "RESPONSE-STAGE";
+    public final static String AE_SERVICE_STAGE = "AE-SERVICE-STAGE";
+    private static final String LOADBALANCE_STAGE = "LOAD-BALANCER-STAGE";
+    public static final String MIGRATION_STAGE = "MIGRATION-STAGE";
 
-  static class TextFieldWithTermVectors extends Field {
+    public static final long KEEPALIVE = 60; // seconds to keep "extra" threads alive for when idle
 
-    public static final FieldType TYPE = new FieldType();
-
-    static {
-      TYPE.setIndexed(true);
-      TYPE.setOmitNorms(true);
-      TYPE.setIndexOptions(FieldInfo.IndexOptions.DOCS_AND_FREQS);
-      TYPE.setStored(true);
-      TYPE.setTokenized(true);
-      TYPE.setStoreTermVectors(true);
-      TYPE.freeze();
+    static
+    {
+        stages.put(MUTATION_STAGE, multiThreadedConfigurableStage(MUTATION_STAGE, getConcurrentWriters()));
+        stages.put(READ_STAGE, multiThreadedConfigurableStage(READ_STAGE, getConcurrentReaders()));        
+        stages.put(RESPONSE_STAGE, multiThreadedStage(RESPONSE_STAGE, Math.max(2, Runtime.getRuntime().availableProcessors())));
+        // the rest are all single-threaded
+        stages.put(STREAM_STAGE, new JMXEnabledThreadPoolExecutor(STREAM_STAGE));
+        stages.put(GOSSIP_STAGE, new JMXEnabledThreadPoolExecutor("GMFD"));
+        stages.put(AE_SERVICE_STAGE, new JMXEnabledThreadPoolExecutor(AE_SERVICE_STAGE));
+        stages.put(LOADBALANCE_STAGE, new JMXEnabledThreadPoolExecutor(LOADBALANCE_STAGE));
+        stages.put(MIGRATION_STAGE, new JMXEnabledThreadPoolExecutor(MIGRATION_STAGE));
     }
 
-    public TextFieldWithTermVectors(String name, String value) {
-      super(name, value, TYPE);
+    private static ThreadPoolExecutor multiThreadedStage(String name, int numThreads)
+    {
+        // avoid running afoul of requirement in DebuggableThreadPoolExecutor that single-threaded executors
+        // must have unbounded queues
+        assert numThreads > 1 : "multi-threaded stages must have at least 2 threads";
+
+        return new JMXEnabledThreadPoolExecutor(numThreads,
+                                                numThreads,
+                                                KEEPALIVE,
+                                                TimeUnit.SECONDS,
+                                                new LinkedBlockingQueue<Runnable>(DatabaseDescriptor.getStageQueueSize()),
+                                                new NamedThreadFactory(name));
     }
-  }
-
-  @Test
-  public void sequenceFileDictionary() throws IOException {
-
-    Directory index = new SimpleFSDirectory(indexDir);
-    Analyzer analyzer = new StandardAnalyzer(Version.LUCENE_43);
-    IndexWriterConfig config = new IndexWriterConfig(Version.LUCENE_43, analyzer);
-    final IndexWriter writer = new IndexWriter(index, config);
-
-    try {
-      writer.addDocument(asDocument("One Ring to rule them all"));
-      writer.addDocument(asDocument("One Ring to find them,"));
-      writer.addDocument(asDocument("One Ring to bring them all"));
-      writer.addDocument(asDocument("and in the darkness bind them"));
-
-    } finally {
-      writer.close(true);
-    }
-
-    File seqDict = new File(outputDir, "dict.seq");
-
-    Driver.main(new String[] {
-        "--dir", indexDir.getAbsolutePath(),
-        "--output", new File(outputDir, "out").getAbsolutePath(),
-        "--field", "text",
-        "--dictOut", new File(outputDir, "dict.txt").getAbsolutePath(),
-        "--seqDictOut", seqDict.getAbsolutePath(),
-    });
-
-    SequenceFile.Reader reader = null;
-    Set<String> indexTerms = Sets.newHashSet();
-    try {
-      reader = new SequenceFile.Reader(FileSystem.getLocal(conf), new Path(seqDict.getAbsolutePath()), conf);
-      Text term = new Text();
-      IntWritable termIndex = new IntWritable();
-
-      while (reader.next(term, termIndex)) {
-        indexTerms.add(term.toString());
-      }
-    } finally {
-      Closeables.close(reader, true);
+    
+    private static ThreadPoolExecutor multiThreadedConfigurableStage(String name, int numThreads)
+    {
+        assert numThreads > 1 : "multi-threaded stages must have at least 2 threads";
+        
+        return new JMXConfigurableThreadPoolExecutor(numThreads,
+                                                     numThreads,
+                                                     KEEPALIVE,
+                                                     TimeUnit.SECONDS,
+                                                     new LinkedBlockingQueue<Runnable>(DatabaseDescriptor.getStageQueueSize()),
+                                                     new NamedThreadFactory(name));
     }
 
-    Set<String> expectedIndexTerms = Sets.newHashSet("all", "bind", "bring", "darkness", "find", "one", "ring", "rule");
-
-    // should contain the same terms as expected
-    assertEquals(expectedIndexTerms.size(), Sets.union(expectedIndexTerms, indexTerms).size());
-  }
+    /**
+     * Retrieve a stage from the StageManager
+     * @param stageName name of the stage to be retrieved.
+    */
+    public static ThreadPoolExecutor getStage(String stageName)
+    {
+        return stages.get(stageName);
+    }
+    
+    /**
+     * This method shuts down all registered stages.
+     */
+    public static void shutdownNow()
+    {
+        Set<String> stages = StageManager.stages.keySet();
+        for (String stage : stages)
+        {
+            StageManager.stages.get(stage).shutdownNow();
+        }
+    }
 }

@@ -1,4 +1,4 @@
-import org.jboss.as.server.legacy.ExtensionContext.SubsystemConfiguration;
+import org.jboss.as.ee.component.lifecycle.ComponentLifecycle;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,66 +22,219 @@ import org.jboss.as.server.legacy.ExtensionContext.SubsystemConfiguration;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.model.base.util;
+package org.jboss.as.ee.component;
 
-import java.util.Collections;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
-
-import javax.xml.namespace.QName;
-import javax.xml.stream.XMLStreamConstants;
-import javax.xml.stream.XMLStreamException;
-
-import org.jboss.as.server.ExtensionContext.SubsystemConfiguration;
-import org.jboss.as.model.AbstractSubsystemAdd;
-import org.jboss.as.model.AbstractSubsystemUpdate;
-import org.jboss.as.model.ParseResult;
-import org.jboss.as.model.ParseUtils;
-import org.jboss.as.model.UpdateContext;
-import org.jboss.as.model.UpdateResultHandler;
-import org.jboss.staxmapper.XMLElementReader;
-import org.jboss.staxmapper.XMLExtendedStreamReader;
-import org.jboss.staxmapper.XMLMapper;
+import java.util.Map;
+import javax.naming.Context;
+import static org.jboss.as.ee.component.SecurityActions.getContextClassLoader;
+import static org.jboss.as.ee.component.SecurityActions.setContextClassLoader;
+import org.jboss.as.ee.component.injection.ResourceInjection;
+import org.jboss.as.ee.component.interceptor.ComponentInstanceInterceptor;
+import org.jboss.as.ee.component.interceptor.ContextSelectorInterceptor;
+import org.jboss.as.ee.component.liefcycle.ComponentLifecycle;
+import org.jboss.invocation.Interceptor;
+import org.jboss.invocation.InterceptorFactory;
+import org.jboss.invocation.InterceptorInvocationHandler;
+import org.jboss.invocation.Interceptors;
+import org.jboss.invocation.proxy.ProxyFactory;
 
 /**
+ * @author John Bailey
  */
-public final class MockSubystemElementParser implements XMLElementReader<ParseResult<SubsystemConfiguration<MockSubsystemElement>>>, XMLStreamConstants {
+public abstract class AbstractComponent<T> implements Component<T> {
+    private final Class<T> beanClass;
+    private final ClassLoader beanClassLoader;
+    private final List<ResourceInjection> resourceInjections;
+    private final List<ComponentLifecycle> postConstrucInterceptors;
+    private final List<ComponentLifecycle> preDestroyInterceptors;
+    private final Map<Method, InterceptorFactory> methodInterceptorFactories;
+    private final ProxyFactory<T> proxyFactory;
 
-    public static void registerXMLElementReaders(XMLMapper mapper) {
-        mapper.registerRootElement(new QName(MockSubsystemElement.NAMESPACE, MockSubsystemElement.SUBSYSTEM), new MockSubystemElementParser(MockSubsystemElement.NAMESPACE));
-        mapper.registerRootElement(new QName(MockSubsystemElement.ANOTHER_NAMESPACE, MockSubsystemElement.SUBSYSTEM), new MockSubystemElementParser(MockSubsystemElement.ANOTHER_NAMESPACE));
+    private Context applicationContext;
+    private Context moduleContext;
+    private Context componentContext;
+
+    protected AbstractComponent(final Class<T> beanClass, final ClassLoader beanClassLoader, final List<ResourceInjection> resourceInjections, final List<ComponentLifecycle> postConstrucInterceptors, final List<ComponentLifecycle> preDestroyInterceptors, final Map<Method, InterceptorFactory> methodInterceptorFactories) {
+        this.beanClass = beanClass;
+        this.beanClassLoader = beanClassLoader;
+        this.resourceInjections = resourceInjections;
+        this.postConstrucInterceptors = postConstrucInterceptors;
+        this.preDestroyInterceptors = preDestroyInterceptors;
+        this.methodInterceptorFactories = methodInterceptorFactories;
+        this.proxyFactory = new ProxyFactory<T>(beanClass);
     }
 
-    private final String namespaceURI;
-
-    private MockSubystemElementParser(String namespaceURI) {
-        this.namespaceURI = namespaceURI;
+    /**
+     * {@inheritDoc}
+     */
+    public T getInstance() {
+        final Class<T> beanClass = getBeanClass();
+        T instance;
+        try {
+            instance = beanClass.newInstance();
+        } catch (Throwable t) {
+            throw new RuntimeException("Failed to instantiate instance of bean: " + beanClass);
+        }
+        applyInjections(instance);
+        performPostConstructLifecycle(instance);
+        return instance;
     }
 
-    /** {@inheritDoc} */
-    public void readElement(final XMLExtendedStreamReader reader, final ParseResult<SubsystemConfiguration<MockSubsystemElement>> updates) throws XMLStreamException {
-        ParseUtils.requireNoContent(reader);
-        List<AbstractSubsystemUpdate<MockSubsystemElement, ?>> list = Collections.emptyList();
-        SubsystemConfiguration<MockSubsystemElement> result = new SubsystemConfiguration<MockSubsystemElement>(new MockSubsystemAdd(), list);
-        updates.setResult(result);
+    protected Class<T> getBeanClass() {
+        return beanClass;
     }
 
-    private class MockSubsystemAdd extends AbstractSubsystemAdd<MockSubsystemElement> {
-
-        private static final long serialVersionUID = 1L;
-
-        MockSubsystemAdd() {
-            super(namespaceURI);
+    /**
+     * {@inheritDoc}
+     */
+    public T createProxy() {
+        final Interceptor defaultChain = Interceptors.getChainedInterceptor(getComponentLevelInterceptors());
+        try {
+            return proxyFactory.newInstance(new InterceptorInvocationHandler(defaultChain));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create proxy instance for bean component: " + beanClass, e);
         }
-        @Override
-        protected <P> void applyUpdate(UpdateContext updateContext,
-                UpdateResultHandler<? super Void, P> resultHandler, P param) {
-            // no-op
-        }
+    }
 
-        @Override
-        protected MockSubsystemElement createSubsystemElement() {
-            return new MockSubsystemElement(namespaceURI);
+    /**
+     * Apply the injections to a newly retrieved bean instance.
+     *
+     * @param instance The bean instance
+     */
+    protected void applyInjections(final T instance) {
+        for (ResourceInjection resourceInjection : getResourceInjections()) {
+            resourceInjection.inject(instance);
         }
+    }
 
+    protected List<ResourceInjection> getResourceInjections() {
+        return resourceInjections;
+    }
+
+    /**
+     * Perform any post-construct life-cycle routines.  By default this will run any post-construct methods.
+     *
+     * @param instance The bean instance
+     */
+    protected void performPostConstructLifecycle(final T instance) {
+        final List<ComponentLifecycle> postConstructMethods = postConstrucInterceptors;
+        if (postConstructMethods != null && !postConstructMethods.isEmpty()) {
+            final ClassLoader contextCl = getContextClassLoader();
+            setContextClassLoader(beanClassLoader);
+            try {
+                for (ComponentLifecycle postConstructMethod : postConstructMethods) {
+                    try {
+                        postConstructMethod.invoke(instance);
+                    } catch (Throwable t) {
+                        throw new RuntimeException("Failed to invoke post construct method for class " + getBeanClass(), t);
+                    }
+                }
+            } finally {
+                setContextClassLoader(contextCl);
+            }
+        }
+    }
+
+    protected Map<Method, InterceptorFactory> getMethodInterceptorFactories() {
+        return methodInterceptorFactories;
+    }
+
+    protected List<Interceptor> getComponentLevelInterceptors() {
+        final List<Interceptor> componentLevelInterceptors = new ArrayList<Interceptor>();
+        componentLevelInterceptors.add(new ContextSelectorInterceptor(this));
+
+        // TODO:  Figure out how to route the rest in.
+
+        // Add the instance interceptor last
+        componentLevelInterceptors.add(new ComponentInstanceInterceptor<T>(this, getMethodInterceptorFactories()));
+        return componentLevelInterceptors;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void returnInstance(final T instance) {
+        performPreDestroyLifecycle(instance);
+        applyUninjections(instance);
+    }
+
+    protected void applyUninjections(final T instance) {
+        for (ResourceInjection resourceInjection : getResourceInjections()) {
+            resourceInjection.uninject(instance);
+        }
+    }
+
+    /**
+     * Perform any pre-destroy life-cycle routines.  By default it will invoke all pre-destroy methods.
+     *
+     * @param instance The bean instance
+     */
+    protected void performPreDestroyLifecycle(final T instance) {
+        final List<ComponentLifecycle> preDestroyInterceptors = this.preDestroyInterceptors;
+        if (preDestroyInterceptors == null || !preDestroyInterceptors.isEmpty()) {
+            return;
+        }
+        // Execute the post construct life-cycle
+        final ClassLoader contextCl = getContextClassLoader();
+        setContextClassLoader(beanClassLoader);
+        try {
+            for (ComponentLifecycle preDestroyMethod : preDestroyInterceptors) {
+                try {
+                    preDestroyMethod.invoke(instance);
+                } catch (Throwable t) {
+                    throw new RuntimeException("Failed to invoke pre destroy method for class " + getBeanClass(), t);
+                }
+            }
+        } finally {
+            setContextClassLoader(contextCl);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void start() {
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void stop() {
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public Context getComponentContext() {
+        return componentContext;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public Context getModuleContext() {
+        return moduleContext;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public Context getApplicationContext() {
+        return applicationContext;
+    }
+
+    public void setApplicationContext(Context applicationContext) {
+        this.applicationContext = applicationContext;
+    }
+
+    public void setModuleContext(Context moduleContext) {
+        this.moduleContext = moduleContext;
+    }
+
+    public void setComponentContext(Context componentContext) {
+        this.componentContext = componentContext;
     }
 }

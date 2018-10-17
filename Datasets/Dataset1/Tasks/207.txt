@@ -1,6 +1,6 @@
-message("unable to remove file \"" + fileName + "\": " + e.toString() + "; Will re-try later.");
+FSDirectory fs1 = FSDirectory.getDirectory(indexDirName, lockFactory, false);
 
-package org.apache.lucene.index;
+package org.apache.lucene.store;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,634 +19,538 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.LuceneTestCase;
+
+import java.util.Hashtable;
+import java.util.Enumeration;
 
 import java.io.IOException;
-import java.io.FileNotFoundException;
-import java.io.PrintStream;
-import java.util.Map;
-import java.util.HashMap;
+import java.io.File;
 
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Collection;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.Hits;
+import org.apache.lucene.analysis.WhitespaceAnalyzer;
 
-/*
- * This class keeps track of each SegmentInfos instance that
- * is still "live", either because it corresponds to a
- * segments_N file in the Directory (a "commit", i.e. a
- * committed SegmentInfos) or because it's an in-memory
- * SegmentInfos that a writer is actively updating but has
- * not yet committed.  This class uses simple reference
- * counting to map the live SegmentInfos instances to
- * individual files in the Directory.
- *
- * The same directory file may be referenced by more than
- * one IndexCommit, i.e. more than one SegmentInfos.
- * Therefore we count how many commits reference each file.
- * When all the commits referencing a certain file have been
- * deleted, the refcount for that file becomes zero, and the
- * file is deleted.
- *
- * A separate deletion policy interface
- * (IndexDeletionPolicy) is consulted on creation (onInit)
- * and once per commit (onCommit), to decide when a commit
- * should be removed.
- * 
- * It is the business of the IndexDeletionPolicy to choose
- * when to delete commit points.  The actual mechanics of
- * file deletion, retrying, etc, derived from the deletion
- * of commit points is the business of the IndexFileDeleter.
- * 
- * The current default deletion policy is {@link
- * KeepOnlyLastCommitDeletionPolicy}, which removes all
- * prior commits when a new commit has completed.  This
- * matches the behavior before 2.2.
- *
- * Note that you must hold the write.lock before
- * instantiating this class.  It opens segments_N file(s)
- * directly with no retry logic.
- */
+public class TestLockFactory extends LuceneTestCase {
 
-final class IndexFileDeleter {
+    // Verify: we can provide our own LockFactory implementation, the right
+    // methods are called at the right time, locks are created, etc.
 
-  /* Files that we tried to delete but failed (likely
-   * because they are open and we are running on Windows),
-   * so we will retry them again later: */
-  private List<String> deletable;
+    public void testCustomLockFactory() throws IOException {
+        Directory dir = new RAMDirectory();
+        MockLockFactory lf = new MockLockFactory();
+        dir.setLockFactory(lf);
 
-  /* Reference count for all files in the index.  
-   * Counts how many existing commits reference a file.
-   **/
-  private Map<String, RefCount> refCounts = new HashMap<String, RefCount>();
+        // Lock prefix should have been set:
+        assertTrue("lock prefix was not set by the RAMDirectory", lf.lockPrefixSet);
 
-  /* Holds all commits (segments_N) currently in the index.
-   * This will have just 1 commit if you are using the
-   * default delete policy (KeepOnlyLastCommitDeletionPolicy).
-   * Other policies may leave commit points live for longer
-   * in which case this list would be longer than 1: */
-  private List<CommitPoint> commits = new ArrayList<CommitPoint>();
+        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true);
 
-  /* Holds files we had incref'd from the previous
-   * non-commit checkpoint: */
-  private List<Collection<String>> lastFiles = new ArrayList<Collection<String>>();
+        // add 100 documents (so that commit lock is used)
+        for (int i = 0; i < 100; i++) {
+            addDoc(writer);
+        }
 
-  /* Commits that the IndexDeletionPolicy have decided to delete: */ 
-  private List<CommitPoint> commitsToDelete = new ArrayList<CommitPoint>();
+        // Both write lock and commit lock should have been created:
+        assertEquals("# of unique locks created (after instantiating IndexWriter)",
+                     1, lf.locksCreated.size());
+        assertTrue("# calls to makeLock is 0 (after instantiating IndexWriter)",
+                   lf.makeLockCount >= 1);
+        
+        for(Enumeration e = lf.locksCreated.keys(); e.hasMoreElements();) {
+            String lockName = (String) e.nextElement();
+            MockLockFactory.MockLock lock = (MockLockFactory.MockLock) lf.locksCreated.get(lockName);
+            assertTrue("# calls to Lock.obtain is 0 (after instantiating IndexWriter)",
+                       lock.lockAttempts > 0);
+        }
+        
+        writer.close();
+    }
 
-  private PrintStream infoStream;
-  private Directory directory;
-  private IndexDeletionPolicy policy;
-  private DocumentsWriter docWriter;
+    // Verify: we can use the NoLockFactory with RAMDirectory w/ no
+    // exceptions raised:
+    // Verify: NoLockFactory allows two IndexWriters
+    public void testRAMDirectoryNoLocking() throws IOException {
+        Directory dir = new RAMDirectory();
+        dir.setLockFactory(NoLockFactory.getNoLockFactory());
 
-  final boolean startingCommitDeleted;
+        assertTrue("RAMDirectory.setLockFactory did not take",
+                   NoLockFactory.class.isInstance(dir.getLockFactory()));
 
-  /** Change to true to see details of reference counts when
-   *  infoStream != null */
-  public static boolean VERBOSE_REF_COUNTS = false;
+        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true);
 
-  void setInfoStream(PrintStream infoStream) {
-    this.infoStream = infoStream;
-    if (infoStream != null)
-      message("setInfoStream deletionPolicy=" + policy);
-  }
-  
-  private void message(String message) {
-    infoStream.println("IFD [" + Thread.currentThread().getName() + "]: " + message);
-  }
+        // Create a 2nd IndexWriter.  This is normally not allowed but it should run through since we're not
+        // using any locks:
+        IndexWriter writer2 = null;
+        try {
+            writer2 = new IndexWriter(dir, new WhitespaceAnalyzer(), false);
+        } catch (Exception e) {
+            e.printStackTrace(System.out);
+            fail("Should not have hit an IOException with no locking");
+        }
 
-  /**
-   * Initialize the deleter: find all previous commits in
-   * the Directory, incref the files they reference, call
-   * the policy to let it delete commits.  This will remove
-   * any files not referenced by any of the commits.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, SegmentInfos segmentInfos, PrintStream infoStream, DocumentsWriter docWriter)
-    throws CorruptIndexException, IOException {
+        writer.close();
+        if (writer2 != null) {
+            writer2.close();
+        }
+    }
 
-    this.docWriter = docWriter;
-    this.infoStream = infoStream;
+    // Verify: SingleInstanceLockFactory is the default lock for RAMDirectory
+    // Verify: RAMDirectory does basic locking correctly (can't create two IndexWriters)
+    public void testDefaultRAMDirectory() throws IOException {
+        Directory dir = new RAMDirectory();
 
-    if (infoStream != null)
-      message("init: current segments file is \"" + segmentInfos.getCurrentSegmentFileName() + "\"; deletionPolicy=" + policy);
+        assertTrue("RAMDirectory did not use correct LockFactory: got " + dir.getLockFactory(),
+                   SingleInstanceLockFactory.class.isInstance(dir.getLockFactory()));
 
-    this.policy = policy;
-    this.directory = directory;
+        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true);
 
-    // First pass: walk the files and initialize our ref
-    // counts:
-    long currentGen = segmentInfos.getGeneration();
-    IndexFileNameFilter filter = IndexFileNameFilter.getFilter();
+        // Create a 2nd IndexWriter.  This should fail:
+        IndexWriter writer2 = null;
+        try {
+            writer2 = new IndexWriter(dir, new WhitespaceAnalyzer(), false);
+            fail("Should have hit an IOException with two IndexWriters on default SingleInstanceLockFactory");
+        } catch (IOException e) {
+        }
 
-    String[] files = directory.listAll();
+        writer.close();
+        if (writer2 != null) {
+            writer2.close();
+        }
+    }
 
-    CommitPoint currentCommitPoint = null;
+    // Verify: SimpleFSLockFactory is the default for FSDirectory
+    // Verify: FSDirectory does basic locking correctly
+    public void testDefaultFSDirectory() throws IOException {
+        String indexDirName = "index.TestLockFactory1";
 
-    for(int i=0;i<files.length;i++) {
+        IndexWriter writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
 
-      String fileName = files[i];
+        assertTrue("FSDirectory did not use correct LockFactory: got " + writer.getDirectory().getLockFactory(),
+                   SimpleFSLockFactory.class.isInstance(writer.getDirectory().getLockFactory()) ||
+                   NativeFSLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
 
-      if (filter.accept(null, fileName) && !fileName.equals(IndexFileNames.SEGMENTS_GEN)) {
+        IndexWriter writer2 = null;
 
-        // Add this file to refCounts with initial count 0:
-        getRefCount(fileName);
+        // Create a 2nd IndexWriter.  This should fail:
+        try {
+            writer2 = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), false);
+            fail("Should have hit an IOException with two IndexWriters on default SimpleFSLockFactory");
+        } catch (IOException e) {
+        }
 
-        if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
+        writer.close();
+        if (writer2 != null) {
+            writer2.close();
+        }
 
-          // This is a commit (segments or segments_N), and
-          // it's valid (<= the max gen).  Load it, then
-          // incref all files it refers to:
-          if (SegmentInfos.generationFromSegmentsFileName(fileName) <= currentGen) {
-            if (infoStream != null) {
-              message("init: load commit \"" + fileName + "\"");
-            }
-            SegmentInfos sis = new SegmentInfos();
+        // Cleanup
+        rmDir(indexDirName);
+    }
+
+    // Verify: FSDirectory's default lockFactory clears all locks correctly
+    public void testFSDirectoryTwoCreates() throws IOException {
+        String indexDirName = "index.TestLockFactory2";
+
+        IndexWriter writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+
+        assertTrue("FSDirectory did not use correct LockFactory: got " + writer.getDirectory().getLockFactory(),
+                   SimpleFSLockFactory.class.isInstance(writer.getDirectory().getLockFactory()) ||
+                   NativeFSLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
+
+        // Intentionally do not close the first writer here.
+        // The goal is to "simulate" a crashed writer and
+        // ensure the second writer, with create=true, is
+        // able to remove the lock files.  This works OK
+        // with SimpleFSLockFactory as the locking
+        // implementation.  Note, however, that this test
+        // will not work on WIN32 when we switch to
+        // NativeFSLockFactory as the default locking for
+        // FSDirectory because the second IndexWriter cannot
+        // remove those lock files since they are held open
+        // by the first writer.  This is because leaving the
+        // first IndexWriter open is not really a good way
+        // to simulate a crashed writer.
+        
+        // Create a 2nd IndexWriter.  This should not fail:
+        IndexWriter writer2 = null;
+        try {
+            writer2 = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+        } catch (IOException e) {
+            e.printStackTrace(System.out);
+            fail("Should not have hit an IOException with two IndexWriters with create=true, on default SimpleFSLockFactory");
+        }
+
+        writer.close();
+        if (writer2 != null) {
+            writer2.close();
+        }
+
+        // Cleanup
+        rmDir(indexDirName);
+    }
+    
+
+    // Verify: setting custom lock factory class (as system property) works:
+    // Verify: all 4 builtin LockFactory implementations are
+    //         settable this way 
+    // Verify: FSDirectory does basic locking correctly
+    public void testLockClassProperty() throws IOException {
+        String indexDirName = "index.TestLockFactory3";
+        String prpName = "org.apache.lucene.store.FSDirectoryLockFactoryClass";
+
+        try {
+
+          // NoLockFactory:
+          System.setProperty(prpName, "org.apache.lucene.store.NoLockFactory");
+          IndexWriter writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+          assertTrue("FSDirectory did not use correct LockFactory: got " + writer.getDirectory().getLockFactory(),
+                     NoLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
+          writer.close();
+
+          // SingleInstanceLockFactory:
+          System.setProperty(prpName, "org.apache.lucene.store.SingleInstanceLockFactory");
+          writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+          assertTrue("FSDirectory did not use correct LockFactory: got " + writer.getDirectory().getLockFactory(),
+                     SingleInstanceLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
+          writer.close();
+
+          // NativeFSLockFactory:
+          System.setProperty(prpName, "org.apache.lucene.store.NativeFSLockFactory");
+          writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+          assertTrue("FSDirectory did not use correct LockFactory: got " + writer.getDirectory().getLockFactory(),
+                     NativeFSLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
+          writer.close();
+
+          // SimpleFSLockFactory:
+          System.setProperty(prpName, "org.apache.lucene.store.SimpleFSLockFactory");
+          writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+          assertTrue("FSDirectory did not use correct LockFactory: got " + writer.getDirectory().getLockFactory(),
+                     SimpleFSLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
+          writer.close();
+        } finally {
+          // Put back to the correct default for subsequent tests:
+          System.setProperty("org.apache.lucene.store.FSDirectoryLockFactoryClass", "");
+        }
+
+        // Cleanup
+        rmDir(indexDirName);
+    }
+
+    // Verify: setDisableLocks works
+    public void testDisableLocks() throws IOException {
+        String indexDirName = "index.TestLockFactory4";
+        
+        assertTrue("Locks are already disabled", !FSDirectory.getDisableLocks());
+        FSDirectory.setDisableLocks(true);
+
+        IndexWriter writer = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), true);
+
+        assertTrue("FSDirectory did not use correct default LockFactory: got " + writer.getDirectory().getLockFactory(),
+                   NoLockFactory.class.isInstance(writer.getDirectory().getLockFactory()));
+
+        // Should be no error since locking is disabled:
+        IndexWriter writer2 = null;
+        try {
+            writer2 = new IndexWriter(indexDirName, new WhitespaceAnalyzer(), false);
+        } catch (IOException e) {
+            e.printStackTrace(System.out);
+            fail("Should not have hit an IOException with locking disabled");
+        }
+
+        FSDirectory.setDisableLocks(false);
+        writer.close();
+        if (writer2 != null) {
+            writer2.close();
+        }
+        // Cleanup
+        rmDir(indexDirName);
+    }
+
+    // Verify: if I try to getDirectory() with two different locking implementations, I get an IOException
+    public void testFSDirectoryDifferentLockFactory() throws IOException {
+        String indexDirName = "index.TestLockFactory5";
+
+        LockFactory lf = new SingleInstanceLockFactory();
+        FSDirectory fs1 = FSDirectory.getDirectory(indexDirName, lf);
+
+        // Different lock factory instance should hit IOException:
+        try {
+            FSDirectory fs2 = FSDirectory.getDirectory(indexDirName, new SingleInstanceLockFactory());
+            fail("Should have hit an IOException because LockFactory instances differ");
+        } catch (IOException e) {
+        }
+
+        FSDirectory fs2 = null;
+
+        // Same lock factory instance should not:
+        try {
+            fs2 = FSDirectory.getDirectory(indexDirName, lf);
+        } catch (IOException e) {
+            e.printStackTrace(System.out);
+            fail("Should not have hit an IOException because LockFactory instances are the same");
+        }
+
+        fs1.close();
+        if (fs2 != null) {
+            fs2.close();
+        }
+        // Cleanup
+        rmDir(indexDirName);
+    }
+
+    // Verify: do stress test, by opening IndexReaders and
+    // IndexWriters over & over in 2 threads and making sure
+    // no unexpected exceptions are raised:
+    public void testStressLocks() throws IOException {
+      _testStressLocks(null, "index.TestLockFactory6");
+    }
+
+    // Verify: do stress test, by opening IndexReaders and
+    // IndexWriters over & over in 2 threads and making sure
+    // no unexpected exceptions are raised, but use
+    // NativeFSLockFactory:
+    public void testStressLocksNativeFSLockFactory() throws IOException {
+      _testStressLocks(new NativeFSLockFactory("index.TestLockFactory7"), "index.TestLockFactory7");
+    }
+
+    public void _testStressLocks(LockFactory lockFactory, String indexDirName) throws IOException {
+        FSDirectory fs1 = FSDirectory.getDirectory(indexDirName, lockFactory);
+
+        // First create a 1 doc index:
+        IndexWriter w = new IndexWriter(fs1, new WhitespaceAnalyzer(), true);
+        addDoc(w);
+        w.close();
+
+        WriterThread writer = new WriterThread(100, fs1);
+        SearcherThread searcher = new SearcherThread(100, fs1);
+        writer.start();
+        searcher.start();
+
+        while(writer.isAlive() || searcher.isAlive()) {
             try {
-              sis.read(directory, fileName);
-            } catch (FileNotFoundException e) {
-              // LUCENE-948: on NFS (and maybe others), if
-              // you have writers switching back and forth
-              // between machines, it's very likely that the
-              // dir listing will be stale and will claim a
-              // file segments_X exists when in fact it
-              // doesn't.  So, we catch this and handle it
-              // as if the file does not exist
-              if (infoStream != null) {
-                message("init: hit FileNotFoundException when loading commit \"" + fileName + "\"; skipping this commit point");
-              }
-              sis = null;
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
             }
-            if (sis != null) {
-              CommitPoint commitPoint = new CommitPoint(commitsToDelete, directory, sis);
-              if (sis.getGeneration() == segmentInfos.getGeneration()) {
-                currentCommitPoint = commitPoint;
-              }
-              commits.add(commitPoint);
-              incRef(sis, true);
+        }
+
+        assertTrue("IndexWriter hit unexpected exceptions", !writer.hitException);
+        assertTrue("IndexSearcher hit unexpected exceptions", !searcher.hitException);
+
+        // Cleanup
+        rmDir(indexDirName);
+    }
+
+    // Verify: NativeFSLockFactory works correctly
+    public void testNativeFSLockFactory() throws IOException {
+
+      NativeFSLockFactory f = new NativeFSLockFactory(System.getProperty("tempDir"));
+
+      NativeFSLockFactory f2 = new NativeFSLockFactory(System.getProperty("tempDir"));
+
+      f.setLockPrefix("test");
+      Lock l = f.makeLock("commit");
+      Lock l2 = f.makeLock("commit");
+
+      assertTrue("failed to obtain lock", l.obtain());
+      assertTrue("succeeded in obtaining lock twice", !l2.obtain());
+      l.release();
+
+      assertTrue("failed to obtain 2nd lock after first one was freed", l2.obtain());
+      l2.release();
+
+      // Make sure we can obtain first one again:
+      assertTrue("failed to obtain lock", l.obtain());
+      l.release();
+    }
+
+    // Verify: NativeFSLockFactory assigns different lock
+    // prefixes to different directories:
+    public void testNativeFSLockFactoryPrefix() throws IOException {
+
+      // Make sure we get identical instances:
+      Directory dir1 = FSDirectory.getDirectory("TestLockFactory.8", new NativeFSLockFactory("TestLockFactory.8"));
+      Directory dir2 = FSDirectory.getDirectory("TestLockFactory.9", new NativeFSLockFactory("TestLockFactory.9"));
+
+      String prefix1 = dir1.getLockFactory().getLockPrefix();
+      String prefix2 = dir2.getLockFactory().getLockPrefix();
+
+      assertTrue("Native Lock Factories are incorrectly shared: dir1 and dir2 have same lock prefix '" + prefix1 + "'; they should be different",
+                 !prefix1.equals(prefix2));
+      rmDir("TestLockFactory.8");
+      rmDir("TestLockFactory.9");
+    }
+
+    // Verify: default LockFactory has no prefix (ie
+    // write.lock is stored in index):
+    public void testDefaultFSLockFactoryPrefix() throws IOException {
+
+      // Make sure we get null prefix:
+      Directory dir = FSDirectory.getDirectory("TestLockFactory.10");
+
+      String prefix = dir.getLockFactory().getLockPrefix();
+
+      assertTrue("Default lock prefix should be null", null == prefix);
+
+      rmDir("TestLockFactory.10");
+    }
+
+    private class WriterThread extends Thread { 
+        private Directory dir;
+        private int numIteration;
+        public boolean hitException = false;
+        public WriterThread(int numIteration, Directory dir) {
+            this.numIteration = numIteration;
+            this.dir = dir;
+        }
+        public void run() {
+            WhitespaceAnalyzer analyzer = new WhitespaceAnalyzer();
+            IndexWriter writer = null;
+            for(int i=0;i<this.numIteration;i++) {
+                try {
+                    writer = new IndexWriter(dir, analyzer, false);
+                } catch (IOException e) {
+                    if (e.toString().indexOf(" timed out:") == -1) {
+                        hitException = true;
+                    } else {
+                        // lock obtain timed out
+                        // NOTE: we should at some point
+                        // consider this a failure?  The lock
+                        // obtains, across IndexReader &
+                        // IndexWriters should be "fair" (ie
+                        // FIFO).
+                    }
+                } catch (Exception e) {
+                    hitException = true;
+                    System.out.println("Stress Test Index Writer: creation hit unexpected exception: " + e.toString());
+                    e.printStackTrace(System.out);
+                    break;
+                }
+                if (writer != null) {
+                    try {
+                        addDoc(writer);
+                    } catch (IOException e) {
+                        hitException = true;
+                        System.out.println("Stress Test Index Writer: addDoc hit unexpected exception: " + e.toString());
+                        e.printStackTrace(System.out);
+                        break;
+                    }
+                    try {
+                        writer.close();
+                    } catch (IOException e) {
+                        hitException = true;
+                        System.out.println("Stress Test Index Writer: close hit unexpected exception: " + e.toString());
+                        e.printStackTrace(System.out);
+                        break;
+                    }
+                    writer = null;
+                }
             }
-          }
         }
-      }
     }
 
-    if (currentCommitPoint == null) {
-      // We did not in fact see the segments_N file
-      // corresponding to the segmentInfos that was passed
-      // in.  Yet, it must exist, because our caller holds
-      // the write lock.  This can happen when the directory
-      // listing was stale (eg when index accessed via NFS
-      // client with stale directory listing cache).  So we
-      // try now to explicitly open this commit point:
-      SegmentInfos sis = new SegmentInfos();
-      try {
-        sis.read(directory, segmentInfos.getCurrentSegmentFileName());
-      } catch (IOException e) {
-        throw new CorruptIndexException("failed to locate current segments_N file");
-      }
-      if (infoStream != null)
-        message("forced open of current segments file " + segmentInfos.getCurrentSegmentFileName());
-      currentCommitPoint = new CommitPoint(commitsToDelete, directory, sis);
-      commits.add(currentCommitPoint);
-      incRef(sis, true);
-    }
-
-    // We keep commits list in sorted order (oldest to newest):
-    Collections.sort(commits);
-
-    // Now delete anything with ref count at 0.  These are
-    // presumably abandoned files eg due to crash of
-    // IndexWriter.
-    for(Map.Entry<String, RefCount> entry : refCounts.entrySet() ) {  
-      RefCount rc = entry.getValue();
-      final String fileName = entry.getKey();
-      if (0 == rc.count) {
-        if (infoStream != null) {
-          message("init: removing unreferenced file \"" + fileName + "\"");
+    private class SearcherThread extends Thread { 
+        private Directory dir;
+        private int numIteration;
+        public boolean hitException = false;
+        public SearcherThread(int numIteration, Directory dir) {
+            this.numIteration = numIteration;
+            this.dir = dir;
         }
-        deleteFile(fileName);
-      }
-    }
-
-    // Finally, give policy a chance to remove things on
-    // startup:
-    policy.onInit(commits);
-
-    // Always protect the incoming segmentInfos since
-    // sometime it may not be the most recent commit
-    checkpoint(segmentInfos, false);
-    
-    startingCommitDeleted = currentCommitPoint.isDeleted();
-
-    deleteCommits();
-  }
-
-  /**
-   * Remove the CommitPoints in the commitsToDelete List by
-   * DecRef'ing all files from each SegmentInfos.
-   */
-  private void deleteCommits() throws IOException {
-
-    int size = commitsToDelete.size();
-
-    if (size > 0) {
-
-      // First decref all files that had been referred to by
-      // the now-deleted commits:
-      for(int i=0;i<size;i++) {
-        CommitPoint commit = commitsToDelete.get(i);
-        if (infoStream != null) {
-          message("deleteCommits: now decRef commit \"" + commit.getSegmentsFileName() + "\"");
+        public void run() {
+            IndexSearcher searcher = null;
+            WhitespaceAnalyzer analyzer = new WhitespaceAnalyzer();
+            Query query = new TermQuery(new Term("content", "aaa"));
+            for(int i=0;i<this.numIteration;i++) {
+                try{
+                    searcher = new IndexSearcher(dir);
+                } catch (Exception e) {
+                    hitException = true;
+                    System.out.println("Stress Test Index Searcher: create hit unexpected exception: " + e.toString());
+                    e.printStackTrace(System.out);
+                    break;
+                }
+                if (searcher != null) {
+                    Hits hits = null;
+                    try {
+                        hits = searcher.search(query);
+                    } catch (IOException e) {
+                        hitException = true;
+                        System.out.println("Stress Test Index Searcher: search hit unexpected exception: " + e.toString());
+                        e.printStackTrace(System.out);
+                        break;
+                    }
+                    // System.out.println(hits.length() + " total results");
+                    try {
+                        searcher.close();
+                    } catch (IOException e) {
+                        hitException = true;
+                        System.out.println("Stress Test Index Searcher: close hit unexpected exception: " + e.toString());
+                        e.printStackTrace(System.out);
+                        break;
+                    }
+                    searcher = null;
+                }
+            }
         }
-        for (final String file : commit.files) {
-          decRef(file);
+    }
+
+    public class MockLockFactory extends LockFactory {
+
+        public boolean lockPrefixSet;
+        public Hashtable locksCreated = new Hashtable();
+        public int makeLockCount = 0;
+
+        public void setLockPrefix(String lockPrefix) {    
+            super.setLockPrefix(lockPrefix);
+            lockPrefixSet = true;
         }
-      }
-      commitsToDelete.clear();
 
-      // Now compact commits to remove deleted ones (preserving the sort):
-      size = commits.size();
-      int readFrom = 0;
-      int writeTo = 0;
-      while(readFrom < size) {
-        CommitPoint commit = commits.get(readFrom);
-        if (!commit.deleted) {
-          if (writeTo != readFrom) {
-            commits.set(writeTo, commits.get(readFrom));
-          }
-          writeTo++;
+        synchronized public Lock makeLock(String lockName) {
+            Lock lock = new MockLock();
+            locksCreated.put(lockName, lock);
+            makeLockCount++;
+            return lock;
         }
-        readFrom++;
-      }
 
-      while(size > writeTo) {
-        commits.remove(size-1);
-        size--;
-      }
-    }
-  }
+        public void clearLock(String specificLockName) {}
 
-  /**
-   * Writer calls this when it has hit an error and had to
-   * roll back, to tell us that there may now be
-   * unreferenced files in the filesystem.  So we re-list
-   * the filesystem and delete such files.  If segmentName
-   * is non-null, we will only delete files corresponding to
-   * that segment.
-   */
-  public void refresh(String segmentName) throws IOException {
-    String[] files = directory.listAll();
-    IndexFileNameFilter filter = IndexFileNameFilter.getFilter();
-    String segmentPrefix1;
-    String segmentPrefix2;
-    if (segmentName != null) {
-      segmentPrefix1 = segmentName + ".";
-      segmentPrefix2 = segmentName + "_";
-    } else {
-      segmentPrefix1 = null;
-      segmentPrefix2 = null;
-    }
-    
-    for(int i=0;i<files.length;i++) {
-      String fileName = files[i];
-      if (filter.accept(null, fileName) &&
-          (segmentName == null || fileName.startsWith(segmentPrefix1) || fileName.startsWith(segmentPrefix2)) &&
-          !refCounts.containsKey(fileName) &&
-          !fileName.equals(IndexFileNames.SEGMENTS_GEN)) {
-        // Unreferenced file, so remove it
-        if (infoStream != null) {
-          message("refresh [prefix=" + segmentName + "]: removing newly created unreferenced file \"" + fileName + "\"");
+        public class MockLock extends Lock {
+            public int lockAttempts;
+
+            public boolean obtain() {
+                lockAttempts++;
+                return true;
+            }
+            public void release() {
+                // do nothing
+            }
+            public boolean isLocked() {
+                return false;
+            }
         }
-        deleteFile(fileName);
-      }
-    }
-  }
-
-  public void refresh() throws IOException {
-    refresh(null);
-  }
-
-  public void close() throws IOException {
-    // DecRef old files from the last checkpoint, if any:
-    int size = lastFiles.size();
-    if (size > 0) {
-      for(int i=0;i<size;i++)
-        decRef(lastFiles.get(i));
-      lastFiles.clear();
     }
 
-    deletePendingFiles();
-  }
-
-  private void deletePendingFiles() throws IOException {
-    if (deletable != null) {
-      List<String> oldDeletable = deletable;
-      deletable = null;
-      int size = oldDeletable.size();
-      for(int i=0;i<size;i++) {
-        if (infoStream != null)
-          message("delete pending file " + oldDeletable.get(i));
-        deleteFile(oldDeletable.get(i));
-      }
-    }
-  }
-
-  /**
-   * For definition of "check point" see IndexWriter comments:
-   * "Clarification: Check Points (and commits)".
-   * 
-   * Writer calls this when it has made a "consistent
-   * change" to the index, meaning new files are written to
-   * the index and the in-memory SegmentInfos have been
-   * modified to point to those files.
-   *
-   * This may or may not be a commit (segments_N may or may
-   * not have been written).
-   *
-   * We simply incref the files referenced by the new
-   * SegmentInfos and decref the files we had previously
-   * seen (if any).
-   *
-   * If this is a commit, we also call the policy to give it
-   * a chance to remove other commits.  If any commits are
-   * removed, we decref their files as well.
-   */
-  public void checkpoint(SegmentInfos segmentInfos, boolean isCommit) throws IOException {
-
-    if (infoStream != null) {
-      message("now checkpoint \"" + segmentInfos.getCurrentSegmentFileName() + "\" [" + segmentInfos.size() + " segments " + "; isCommit = " + isCommit + "]");
+    private void addDoc(IndexWriter writer) throws IOException {
+        Document doc = new Document();
+        doc.add(new Field("content", "aaa", Field.Store.NO, Field.Index.TOKENIZED));
+        writer.addDocument(doc);
     }
 
-    // Try again now to delete any previously un-deletable
-    // files (because they were in use, on Windows):
-    deletePendingFiles();
-
-    // Incref the files:
-    incRef(segmentInfos, isCommit);
-
-    if (isCommit) {
-      // Append to our commits list:
-      commits.add(new CommitPoint(commitsToDelete, directory, segmentInfos));
-
-      // Tell policy so it can remove commits:
-      policy.onCommit(commits);
-
-      // Decref files for commits that were deleted by the policy:
-      deleteCommits();
-    } else {
-
-      final List<String> docWriterFiles;
-      if (docWriter != null) {
-        docWriterFiles = docWriter.openFiles();
-        if (docWriterFiles != null)
-          // We must incRef these files before decRef'ing
-          // last files to make sure we don't accidentally
-          // delete them:
-          incRef(docWriterFiles);
-      } else
-        docWriterFiles = null;
-
-      // DecRef old files from the last checkpoint, if any:
-      int size = lastFiles.size();
-      if (size > 0) {
-        for(int i=0;i<size;i++)
-          decRef(lastFiles.get(i));
-        lastFiles.clear();
-      }
-
-      // Save files so we can decr on next checkpoint/commit:
-      lastFiles.add(segmentInfos.files(directory, false));
-
-      if (docWriterFiles != null)
-        lastFiles.add(docWriterFiles);
-    }
-  }
-
-  void incRef(SegmentInfos segmentInfos, boolean isCommit) throws IOException {
-     // If this is a commit point, also incRef the
-     // segments_N file:
-    for( final String fileName: segmentInfos.files(directory, isCommit) ) {
-      incRef(fileName);
-    }
-  }
-
-  void incRef(List<String> files) throws IOException {
-    for(final String file : files) {
-      incRef(file);
-    }
-  }
-
-  void incRef(String fileName) throws IOException {
-    RefCount rc = getRefCount(fileName);
-    if (infoStream != null && VERBOSE_REF_COUNTS) {
-      message("  IncRef \"" + fileName + "\": pre-incr count is " + rc.count);
-    }
-    rc.IncRef();
-  }
-
-  void decRef(Collection<String> files) throws IOException {
-    for(final String file : files) {
-      decRef(file);
-    }
-  }
-
-  void decRef(String fileName) throws IOException {
-    RefCount rc = getRefCount(fileName);
-    if (infoStream != null && VERBOSE_REF_COUNTS) {
-      message("  DecRef \"" + fileName + "\": pre-decr count is " + rc.count);
-    }
-    if (0 == rc.DecRef()) {
-      // This file is no longer referenced by any past
-      // commit points nor by the in-memory SegmentInfos:
-      deleteFile(fileName);
-      refCounts.remove(fileName);
-    }
-  }
-
-  void decRef(SegmentInfos segmentInfos) throws IOException {
-    for (final String file : segmentInfos.files(directory, false)) {
-      decRef(file);
-    }
-  }
-
-  private RefCount getRefCount(String fileName) {
-    RefCount rc;
-    if (!refCounts.containsKey(fileName)) {
-      rc = new RefCount(fileName);
-      refCounts.put(fileName, rc);
-    } else {
-      rc = refCounts.get(fileName);
-    }
-    return rc;
-  }
-
-  void deleteFiles(List<String> files) throws IOException {
-    for(final String file: files)
-      deleteFile(file);
-  }
-
-  /** Deletes the specified files, but only if they are new
-   *  (have not yet been incref'd). */
-  void deleteNewFiles(Collection<String> files) throws IOException {
-    for (final String fileName: files) {
-      if (!refCounts.containsKey(fileName))
-        deleteFile(fileName);
-    }
-  }
-
-  void deleteFile(String fileName)
-       throws IOException {
-    try {
-      if (infoStream != null) {
-        message("delete \"" + fileName + "\"");
-      }
-      directory.deleteFile(fileName);
-    } catch (IOException e) {			  // if delete fails
-      if (directory.fileExists(fileName)) {
-
-        // Some operating systems (e.g. Windows) don't
-        // permit a file to be deleted while it is opened
-        // for read (e.g. by another process or thread). So
-        // we assume that when a delete fails it is because
-        // the file is open in another process, and queue
-        // the file for subsequent deletion.
-
-        if (infoStream != null) {
-          message("IndexFileDeleter: unable to remove file \"" + fileName + "\": " + e.toString() + "; Will re-try later.");
+    private void rmDir(String dirName) {
+        File dir = new java.io.File(dirName);
+        String[] files = dir.list();            // clear old files
+        for (int i = 0; i < files.length; i++) {
+            File file = new File(dir, files[i]);
+            file.delete();
         }
-        if (deletable == null) {
-          deletable = new ArrayList<String>();
-        }
-        deletable.add(fileName);                  // add to deletable
-      }
+        dir.delete();
     }
-  }
-
-  /**
-   * Tracks the reference count for a single index file:
-   */
-  final private static class RefCount {
-
-    // fileName used only for better assert error messages
-    final String fileName;
-    boolean initDone;
-    RefCount(String fileName) {
-      this.fileName = fileName;
-    }
-
-    int count;
-
-    public int IncRef() {
-      if (!initDone) {
-        initDone = true;
-      } else {
-        assert count > 0: "RefCount is 0 pre-increment for file \"" + fileName + "\"";
-      }
-      return ++count;
-    }
-
-    public int DecRef() {
-      assert count > 0: "RefCount is 0 pre-decrement for file \"" + fileName + "\"";
-      return --count;
-    }
-  }
-
-  /**
-   * Holds details for each commit point.  This class is
-   * also passed to the deletion policy.  Note: this class
-   * has a natural ordering that is inconsistent with
-   * equals.
-   */
-
-  final private static class CommitPoint extends IndexCommit implements Comparable<CommitPoint> {
-
-    long gen;
-    Collection<String> files;
-    String segmentsFileName;
-    boolean deleted;
-    Directory directory;
-    Collection<CommitPoint> commitsToDelete;
-    long version;
-    long generation;
-    final boolean isOptimized;
-    final Map<String,String> userData;
-
-    public CommitPoint(Collection<CommitPoint> commitsToDelete, Directory directory, SegmentInfos segmentInfos) throws IOException {
-      this.directory = directory;
-      this.commitsToDelete = commitsToDelete;
-      userData = segmentInfos.getUserData();
-      segmentsFileName = segmentInfos.getCurrentSegmentFileName();
-      version = segmentInfos.getVersion();
-      generation = segmentInfos.getGeneration();
-      files = Collections.unmodifiableCollection(segmentInfos.files(directory, true));
-      gen = segmentInfos.getGeneration();
-      isOptimized = segmentInfos.size() == 1 && !segmentInfos.info(0).hasDeletions();
-
-      assert !segmentInfos.hasExternalSegments(directory);
-    }
-
-    @Override
-    public boolean isOptimized() {
-      return isOptimized;
-    }
-
-    @Override
-    public String getSegmentsFileName() {
-      return segmentsFileName;
-    }
-
-    @Override
-    public Collection<String> getFileNames() throws IOException {
-      return files;
-    }
-
-    @Override
-    public Directory getDirectory() {
-      return directory;
-    }
-
-    @Override
-    public long getVersion() {
-      return version;
-    }
-
-    @Override
-    public long getGeneration() {
-      return generation;
-    }
-
-    @Override
-    public Map<String,String> getUserData() {
-      return userData;
-    }
-
-    /**
-     * Called only be the deletion policy, to remove this
-     * commit point from the index.
-     */
-    @Override
-    public void delete() {
-      if (!deleted) {
-        deleted = true;
-        commitsToDelete.add(this);
-      }
-    }
-
-    @Override
-    public boolean isDeleted() {
-      return deleted;
-    }
-
-    public int compareTo(CommitPoint commit) {
-      if (gen < commit.gen) {
-        return -1;
-      } else if (gen > commit.gen) {
-        return 1;
-      } else {
-        return 0;
-      }
-    }
-  }
 }

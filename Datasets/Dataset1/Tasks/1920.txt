@@ -1,8 +1,8 @@
-public boolean score(Collector collector, int max, int firstDocID) throws IOException {
+public final class RAMOnlyPostingsFormat extends PostingsFormat {
 
-package org.apache.lucene.search;
+package org.apache.lucene.codecs.ramonly;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -20,181 +20,559 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.lucene.search.BooleanClause.Occur;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsConsumer;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.codecs.TermsConsumer;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IOUtils;
 
-/**
- * Expert: Common scoring functionality for different types of queries.
+/** Stores all postings data in RAM, but writes a small
+ *  token (header + single int) to identify which "slot" the
+ *  index is using in RAM HashMap.
  *
- * <p>
- * A <code>Scorer</code> iterates over documents matching a
- * query in increasing order of doc Id.
- * </p>
- * <p>
- * Document scores are computed using a given <code>Similarity</code>
- * implementation.
- * </p>
- *
- * <p><b>NOTE</b>: The values Float.Nan,
- * Float.NEGATIVE_INFINITY and Float.POSITIVE_INFINITY are
- * not valid scores.  Certain collectors (eg {@link
- * TopScoreDocCollector}) will not properly collect hits
- * with these scores.
- */
-public abstract class Scorer extends DocIdSetIterator {
-  private final Similarity similarity;
-  protected final Weight weight;
+ *  NOTE: this codec sorts terms by reverse-unicode-order! */
 
-  /** Constructs a Scorer.
-   * @param similarity The <code>Similarity</code> implementation used by this scorer.
-   */
-  protected Scorer(Similarity similarity) {
-    this(similarity, null);
-  }
-  
-  /**
-   * Constructs a Scorer
-   * @param similarity The <code>Similarity</code> implementation used by this scorer.
-   * @param weight The scorers <code>Weight</code>
-   */
-  protected Scorer(Similarity similarity, Weight weight) {
-    this.similarity = similarity;
-    this.weight = weight;
-  }
+public class RAMOnlyPostingsFormat extends PostingsFormat {
 
-  /** Returns the Similarity implementation used by this scorer. */
-  public Similarity getSimilarity() {
-    return this.similarity;
-  }
+  // For fun, test that we can override how terms are
+  // sorted, and basic things still work -- this comparator
+  // sorts in reversed unicode code point order:
+  private static final Comparator<BytesRef> reverseUnicodeComparator = new Comparator<BytesRef>() {
+      public int compare(BytesRef t1, BytesRef t2) {
+        byte[] b1 = t1.bytes;
+        byte[] b2 = t2.bytes;
+        int b1Stop;
+        int b1Upto = t1.offset;
+        int b2Upto = t2.offset;
+        if (t1.length < t2.length) {
+          b1Stop = t1.offset + t1.length;
+        } else {
+          b1Stop = t1.offset + t2.length;
+        }
+        while(b1Upto < b1Stop) {
+          final int bb1 = b1[b1Upto++] & 0xff;
+          final int bb2 = b2[b2Upto++] & 0xff;
+          if (bb1 != bb2) {
+            //System.out.println("cmp 1=" + t1 + " 2=" + t2 + " return " + (bb2-bb1));
+            return bb2 - bb1;
+          }
+        }
 
-  /** Scores and collects all matching documents.
-   * @param collector The collector to which all matching documents are passed.
-   */
-  public void score(Collector collector) throws IOException {
-    collector.setScorer(this);
-    int doc;
-    while ((doc = nextDoc()) != NO_MORE_DOCS) {
-      collector.collect(doc);
-    }
-  }
+        // One is prefix of another, or they are equal
+        return t2.length-t1.length;
+      }
 
-  /**
-   * Expert: Collects matching documents in a range. Hook for optimization.
-   * Note, <code>firstDocID</code> is added to ensure that {@link #nextDoc()}
-   * was called before this method.
-   * 
-   * @param collector
-   *          The collector to which all matching documents are passed.
-   * @param max
-   *          Do not score documents past this.
-   * @param firstDocID
-   *          The first document ID (ensures {@link #nextDoc()} is called before
-   *          this method.
-   * @return true if more matching documents may remain.
-   */
-  protected boolean score(Collector collector, int max, int firstDocID) throws IOException {
-    collector.setScorer(this);
-    int doc = firstDocID;
-    while (doc < max) {
-      collector.collect(doc);
-      doc = nextDoc();
-    }
-    return doc != NO_MORE_DOCS;
-  }
-  
-  /** Returns the score of the current document matching the query.
-   * Initially invalid, until {@link #nextDoc()} or {@link #advance(int)}
-   * is called the first time, or when called from within
-   * {@link Collector#collect}.
-   */
-  public abstract float score() throws IOException;
+      @Override
+      public boolean equals(Object other) {
+        return this == other;
+      }
+    };
 
-  /** Returns number of matches for the current document.
-   *  This returns a float (not int) because
-   *  SloppyPhraseScorer discounts its freq according to how
-   *  "sloppy" the match was.
-   *
-   * @lucene.experimental */
-  public float freq() throws IOException {
-    throw new UnsupportedOperationException(this + " does not implement freq()");
+  public RAMOnlyPostingsFormat() {
+    super("RAMOnly");
   }
-
-  /**
-   * A callback to gather information from a scorer and its sub-scorers. Each
-   * the top-level scorer as well as each of its sub-scorers are passed to
-   * either one of the visit methods depending on their boolean relationship in
-   * the query.
-   * @lucene.experimental
-   */
-  public static abstract class ScorerVisitor<P extends Query, C extends Query, S extends Scorer> {
-    /**
-     * Invoked for all optional scorer 
-     * 
-     * @param parent the parent query of the child query or <code>null</code> if the child is a top-level query
-     * @param child the query of the currently visited scorer
-     * @param scorer the current scorer
-     */
-    public void visitOptional(P parent, C child, S scorer) {}
     
-    /**
-     * Invoked for all required scorer 
-     * 
-     * @param parent the parent query of the child query or <code>null</code> if the child is a top-level query
-     * @param child the query of the currently visited scorer
-     * @param scorer the current scorer
-     */
-    public void visitRequired(P parent, C child, S scorer) {}
-    
-    /**
-     * Invoked for all prohibited scorer 
-     * 
-     * @param parent the parent query of the child query or <code>null</code> if the child is a top-level query
-     * @param child the query of the currently visited scorer
-     * @param scorer the current scorer
-     */
-    public void visitProhibited(P parent, C child, S scorer) {}
+  // Postings state:
+  static class RAMPostings extends FieldsProducer {
+    final Map<String,RAMField> fieldToTerms = new TreeMap<String,RAMField>();
+
+    @Override
+    public Terms terms(String field) {
+      return fieldToTerms.get(field);
+    }
+
+    @Override
+    public int size() {
+      return fieldToTerms.size();
+    }
+
+    @Override
+    public Iterator<String> iterator() {
+      return Collections.unmodifiableSet(fieldToTerms.keySet()).iterator();
+    }
+
+    @Override
+    public void close() {
+    }
   } 
 
-  /**
-   * Expert: call this to gather details for all sub-scorers for this query.
-   * This can be used, in conjunction with a custom {@link Collector} to gather
-   * details about how each sub-query matched the current hit.
-   * 
-   * @param visitor a callback executed for each sub-scorer
-   * @lucene.experimental
-   */
-  public void visitScorers(ScorerVisitor<Query, Query, Scorer> visitor) {
-    visitSubScorers(null, Occur.MUST/*must id default*/, visitor);
+  static class RAMField extends Terms {
+    final String field;
+    final SortedMap<String,RAMTerm> termToDocs = new TreeMap<String,RAMTerm>();
+    long sumTotalTermFreq;
+    long sumDocFreq;
+    int docCount;
+    final FieldInfo info;
+
+    RAMField(String field, FieldInfo info) {
+      this.field = field;
+      this.info = info;
+    }
+
+    @Override
+    public long size() {
+      return termToDocs.size();
+    }
+
+    @Override
+    public long getSumTotalTermFreq() {
+      return sumTotalTermFreq;
+    }
+      
+    @Override
+    public long getSumDocFreq() throws IOException {
+      return sumDocFreq;
+    }
+      
+    @Override
+    public int getDocCount() throws IOException {
+      return docCount;
+    }
+
+    @Override
+    public TermsEnum iterator(TermsEnum reuse) {
+      return new RAMTermsEnum(RAMOnlyPostingsFormat.RAMField.this);
+    }
+
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return reverseUnicodeComparator;
+    }
+
+    @Override
+    public boolean hasOffsets() {
+      return info.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+    }
+
+    @Override
+    public boolean hasPositions() {
+      return info.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+    }
+    
+    @Override
+    public boolean hasPayloads() {
+      return info.hasPayloads();
+    }
   }
 
-  /**
-   * {@link Scorer} subclasses should implement this method if the subclass
-   * itself contains multiple scorers to support gathering details for
-   * sub-scorers via {@link ScorerVisitor}
-   * <p>
-   * Note: this method will throw {@link UnsupportedOperationException} if no
-   * associated {@link Weight} instance is provided to
-   * {@link #Scorer(Similarity, Weight)}
-   * </p>
-   * 
-   * @lucene.experimental
-   */
-  protected void visitSubScorers(Query parent, Occur relationship,
-      ScorerVisitor<Query, Query, Scorer> visitor) {
-    if (weight == null)
-      throw new UnsupportedOperationException();
+  static class RAMTerm {
+    final String term;
+    long totalTermFreq;
+    final List<RAMDoc> docs = new ArrayList<RAMDoc>();
+    public RAMTerm(String term) {
+      this.term = term;
+    }
+  }
 
-    final Query q = weight.getQuery();
-    switch (relationship) {
-    case MUST:
-      visitor.visitRequired(parent, q, this);
-      break;
-    case MUST_NOT:
-      visitor.visitProhibited(parent, q, this);
-      break;
-    case SHOULD:
-      visitor.visitOptional(parent, q, this);
-      break;
+  static class RAMDoc {
+    final int docID;
+    final int[] positions;
+    byte[][] payloads;
+
+    public RAMDoc(int docID, int freq) {
+      this.docID = docID;
+      positions = new int[freq];
+    }
+  }
+
+  // Classes for writing to the postings state
+  private static class RAMFieldsConsumer extends FieldsConsumer {
+
+    private final RAMPostings postings;
+    private final RAMTermsConsumer termsConsumer = new RAMTermsConsumer();
+
+    public RAMFieldsConsumer(RAMPostings postings) {
+      this.postings = postings;
+    }
+
+    @Override
+    public TermsConsumer addField(FieldInfo field) {
+      if (field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
+        throw new UnsupportedOperationException("this codec cannot index offsets");
+      }
+      RAMField ramField = new RAMField(field.name, field);
+      postings.fieldToTerms.put(field.name, ramField);
+      termsConsumer.reset(ramField);
+      return termsConsumer;
+    }
+
+    @Override
+    public void close() {
+      // TODO: finalize stuff
+    }
+  }
+
+  private static class RAMTermsConsumer extends TermsConsumer {
+    private RAMField field;
+    private final RAMPostingsWriterImpl postingsWriter = new RAMPostingsWriterImpl();
+    RAMTerm current;
+      
+    void reset(RAMField field) {
+      this.field = field;
+    }
+      
+    @Override
+    public PostingsConsumer startTerm(BytesRef text) {
+      final String term = text.utf8ToString();
+      current = new RAMTerm(term);
+      postingsWriter.reset(current);
+      return postingsWriter;
+    }
+
+      
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+
+    @Override
+    public void finishTerm(BytesRef text, TermStats stats) {
+      assert stats.docFreq > 0;
+      assert stats.docFreq == current.docs.size();
+      current.totalTermFreq = stats.totalTermFreq;
+      field.termToDocs.put(current.term, current);
+    }
+
+    @Override
+    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) {
+      field.sumTotalTermFreq = sumTotalTermFreq;
+      field.sumDocFreq = sumDocFreq;
+      field.docCount = docCount;
+    }
+  }
+
+  static class RAMPostingsWriterImpl extends PostingsConsumer {
+    private RAMTerm term;
+    private RAMDoc current;
+    private int posUpto = 0;
+
+    public void reset(RAMTerm term) {
+      this.term = term;
+    }
+
+    @Override
+    public void startDoc(int docID, int freq) {
+      current = new RAMDoc(docID, freq);
+      term.docs.add(current);
+      posUpto = 0;
+    }
+
+    @Override
+    public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) {
+      assert startOffset == -1;
+      assert endOffset == -1;
+      current.positions[posUpto] = position;
+      if (payload != null && payload.length > 0) {
+        if (current.payloads == null) {
+          current.payloads = new byte[current.positions.length][];
+        }
+        byte[] bytes = current.payloads[posUpto] = new byte[payload.length];
+        System.arraycopy(payload.bytes, payload.offset, bytes, 0, payload.length);
+      }
+      posUpto++;
+    }
+
+    @Override
+    public void finishDoc() {
+      assert posUpto == current.positions.length;
+    }
+  }
+
+  static class RAMTermsEnum extends TermsEnum {
+    Iterator<String> it;
+    String current;
+    private final RAMField ramField;
+
+    public RAMTermsEnum(RAMField field) {
+      this.ramField = field;
+    }
+      
+    @Override
+    public Comparator<BytesRef> getComparator() {
+      return BytesRef.getUTF8SortedAsUnicodeComparator();
+    }
+
+    @Override
+    public BytesRef next() {
+      if (it == null) {
+        if (current == null) {
+          it = ramField.termToDocs.keySet().iterator();
+        } else {
+          it = ramField.termToDocs.tailMap(current).keySet().iterator();
+        }
+      }
+      if (it.hasNext()) {
+        current = it.next();
+        return new BytesRef(current);
+      } else {
+        return null;
+      }
+    }
+
+    @Override
+    public SeekStatus seekCeil(BytesRef term, boolean useCache) {
+      current = term.utf8ToString();
+      it = null;
+      if (ramField.termToDocs.containsKey(current)) {
+        return SeekStatus.FOUND;
+      } else {
+        if (current.compareTo(ramField.termToDocs.lastKey()) > 0) {
+          return SeekStatus.END;
+        } else {
+          return SeekStatus.NOT_FOUND;
+        }
+      }
+    }
+
+    @Override
+    public void seekExact(long ord) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long ord() {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public BytesRef term() {
+      // TODO: reuse BytesRef
+      return new BytesRef(current);
+    }
+
+    @Override
+    public int docFreq() {
+      return ramField.termToDocs.get(current).docs.size();
+    }
+
+    @Override
+    public long totalTermFreq() {
+      return ramField.termToDocs.get(current).totalTermFreq;
+    }
+
+    @Override
+    public DocsEnum docs(Bits liveDocs, DocsEnum reuse, int flags) {
+      return new RAMDocsEnum(ramField.termToDocs.get(current), liveDocs);
+    }
+
+    @Override
+    public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, int flags) {
+      return new RAMDocsAndPositionsEnum(ramField.termToDocs.get(current), liveDocs);
+    }
+  }
+
+  private static class RAMDocsEnum extends DocsEnum {
+    private final RAMTerm ramTerm;
+    private final Bits liveDocs;
+    private RAMDoc current;
+    int upto = -1;
+    int posUpto = 0;
+
+    public RAMDocsEnum(RAMTerm ramTerm, Bits liveDocs) {
+      this.ramTerm = ramTerm;
+      this.liveDocs = liveDocs;
+    }
+
+    @Override
+    public int advance(int targetDocID) {
+      do {
+        nextDoc();
+      } while (upto < ramTerm.docs.size() && current.docID < targetDocID);
+      return NO_MORE_DOCS;
+    }
+
+    // TODO: override bulk read, for better perf
+    @Override
+    public int nextDoc() {
+      while(true) {
+        upto++;
+        if (upto < ramTerm.docs.size()) {
+          current = ramTerm.docs.get(upto);
+          if (liveDocs == null || liveDocs.get(current.docID)) {
+            posUpto = 0;
+            return current.docID;
+          }
+        } else {
+          return NO_MORE_DOCS;
+        }
+      }
+    }
+
+    @Override
+    public int freq() throws IOException {
+      return current.positions.length;
+    }
+
+    @Override
+    public int docID() {
+      return current.docID;
+    }
+  }
+
+  private static class RAMDocsAndPositionsEnum extends DocsAndPositionsEnum {
+    private final RAMTerm ramTerm;
+    private final Bits liveDocs;
+    private RAMDoc current;
+    int upto = -1;
+    int posUpto = 0;
+
+    public RAMDocsAndPositionsEnum(RAMTerm ramTerm, Bits liveDocs) {
+      this.ramTerm = ramTerm;
+      this.liveDocs = liveDocs;
+    }
+
+    @Override
+    public int advance(int targetDocID) {
+      do {
+        nextDoc();
+      } while (upto < ramTerm.docs.size() && current.docID < targetDocID);
+      return NO_MORE_DOCS;
+    }
+
+    // TODO: override bulk read, for better perf
+    @Override
+    public int nextDoc() {
+      while(true) {
+        upto++;
+        if (upto < ramTerm.docs.size()) {
+          current = ramTerm.docs.get(upto);
+          if (liveDocs == null || liveDocs.get(current.docID)) {
+            posUpto = 0;
+            return current.docID;
+          }
+        } else {
+          return NO_MORE_DOCS;
+        }
+      }
+    }
+
+    @Override
+    public int freq() throws IOException {
+      return current.positions.length;
+    }
+
+    @Override
+    public int docID() {
+      return current.docID;
+    }
+
+    @Override
+    public int nextPosition() {
+      return current.positions[posUpto++];
+    }
+
+    @Override
+    public int startOffset() {
+      return -1;
+    }
+
+    @Override
+    public int endOffset() {
+      return -1;
+    }
+
+    @Override
+    public BytesRef getPayload() {
+      if (current.payloads != null && current.payloads[posUpto-1] != null) {
+        return new BytesRef(current.payloads[posUpto-1]);
+      } else {
+        return null;
+      }
+    }
+  }
+
+  // Holds all indexes created, keyed by the ID assigned in fieldsConsumer
+  private final Map<Integer,RAMPostings> state = new HashMap<Integer,RAMPostings>();
+
+  private final AtomicInteger nextID = new AtomicInteger();
+
+  private final String RAM_ONLY_NAME = "RAMOnly";
+  private final static int VERSION_START = 0;
+  private final static int VERSION_LATEST = VERSION_START;
+
+  private static final String ID_EXTENSION = "id";
+
+  @Override
+  public FieldsConsumer fieldsConsumer(SegmentWriteState writeState) throws IOException {
+    final int id = nextID.getAndIncrement();
+
+    // TODO -- ok to do this up front instead of
+    // on close....?  should be ok?
+    // Write our ID:
+    final String idFileName = IndexFileNames.segmentFileName(writeState.segmentInfo.name, writeState.segmentSuffix, ID_EXTENSION);
+    IndexOutput out = writeState.directory.createOutput(idFileName, writeState.context);
+    boolean success = false;
+    try {
+      CodecUtil.writeHeader(out, RAM_ONLY_NAME, VERSION_LATEST);
+      out.writeVInt(id);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(out);
+      } else {
+        IOUtils.close(out);
+      }
+    }
+    
+    final RAMPostings postings = new RAMPostings();
+    final RAMFieldsConsumer consumer = new RAMFieldsConsumer(postings);
+
+    synchronized(state) {
+      state.put(id, postings);
+    }
+    return consumer;
+  }
+
+  @Override
+  public FieldsProducer fieldsProducer(SegmentReadState readState)
+    throws IOException {
+
+    // Load our ID:
+    final String idFileName = IndexFileNames.segmentFileName(readState.segmentInfo.name, readState.segmentSuffix, ID_EXTENSION);
+    IndexInput in = readState.dir.openInput(idFileName, readState.context);
+    boolean success = false;
+    final int id;
+    try {
+      CodecUtil.checkHeader(in, RAM_ONLY_NAME, VERSION_START, VERSION_LATEST);
+      id = in.readVInt();
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(in);
+      } else {
+        IOUtils.close(in);
+      }
+    }
+    
+    synchronized(state) {
+      return state.get(id);
     }
   }
 }

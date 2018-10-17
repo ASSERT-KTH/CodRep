@@ -1,158 +1,196 @@
-stage = new Stage();;
+package org.elasticsearch.common.io.compression.lzf;
 
-/*******************************************************************************
- * Copyright 2011 See AUTHORS file.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- ******************************************************************************/
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.tests;
+package org.elasticsearch.util.io.compression.lzf;
 
-import com.badlogic.gdx.Gdx;
-import com.badlogic.gdx.graphics.GL20;
-import com.badlogic.gdx.graphics.OrthographicCamera;
-import com.badlogic.gdx.graphics.Texture;
-import com.badlogic.gdx.graphics.g2d.Batch;
-import com.badlogic.gdx.graphics.g2d.BitmapFont;
-import com.badlogic.gdx.graphics.g2d.SpriteBatch;
-import com.badlogic.gdx.graphics.g2d.TextureRegion;
-import com.badlogic.gdx.math.Rectangle;
-import com.badlogic.gdx.scenes.scene2d.Actor;
-import com.badlogic.gdx.scenes.scene2d.Stage;
-import com.badlogic.gdx.scenes.scene2d.ui.Image;
-import com.badlogic.gdx.scenes.scene2d.utils.Align;
-import com.badlogic.gdx.scenes.scene2d.utils.Cullable;
-import com.badlogic.gdx.tests.utils.GdxTest;
-import com.badlogic.gdx.tests.utils.OrthoCamController;
-import com.badlogic.gdx.utils.Array;
-import com.badlogic.gdx.utils.Scaling;
+/**
+ * Class that handles actual encoding of individual chunks.
+ * Resulting chunks can be compressed or non-compressed; compression
+ * is only used if it actually reduces chunk size (including overhead
+ * of additional header bytes)
+ * <p>
+ * Code adapted from H2 project (http://www.h2database.com) Java LZF implementation
+ * by Thomas (which itself was inspired by original C code by Marc A Lehmann)
+ */
+public class ChunkEncoder {
+    // Beyond certain point we won't be able to compress:
+    private static final int MIN_BLOCK_TO_COMPRESS = 16;
 
-/** This is a simple demonstration of how to perform VERY basic culling on hierarchies of stage actors that do not scale or rotate.
- * It is not a general solution as it assumes that actors and groups are only translated (moved, change their x/y coordinates).
- * NOTE: This has been obsoleted by {@link Cullable}.
- * 
- * @author mzechner */
-public class SimpleStageCullingTest extends GdxTest {
+    private static final int MIN_HASH_SIZE = 256;
+    // Not much point in bigger tables, with 8k window
+    private static final int MAX_HASH_SIZE = 16384;
 
-	/** We need to extend a base actor class so we can add the culling in the render method. We also add a method to get the stage
-	 * coordinates of the actor so we can cull it against the camera's view volume.
-	 * 
-	 * @author mzechner */
-	private class CullableActor extends Image {
-		/** the camera to test against **/
-		final OrthographicCamera camera;
-		/** whether we are visible or not, used for counting visible actors **/
-		boolean visible = false;
+    private static final int MAX_OFF = 1 << 13; // 8k
+    private static final int MAX_REF = (1 << 8) + (1 << 3); // 264
 
-		public CullableActor (String name, Texture texture, OrthographicCamera camera) {
-			super(new TextureRegion(texture));
-			setAlign(Align.center);
-			setScaling(Scaling.none);
-			this.camera = camera;
-		}
+    // // Encoding tables
 
-		public void draw (Batch batch, float parentAlpha) {
-			// if this actor is not within the view of the camera we don't draw it.
-			if (isCulled()) return;
+    /**
+     * Buffer in which encoded content is stored during processing
+     */
+    private final byte[] _encodeBuffer;
 
-			// otherwise we draw via the super class method
-			super.draw(batch, parentAlpha);
-		}
+    private final int[] _hashTable;
 
-		/** static helper Rectangles **/
-		Rectangle actorRect = new Rectangle();
-		Rectangle camRect = new Rectangle();
+    private final int _hashModulo;
 
-		private boolean isCulled () {
-			// we start by setting the stage coordinates to this
-			// actors coordinates which are relative to its parent
-			// Group.
-			float stageX = getX();
-			float stageY = getY();
+    /**
+     * @param totalLength Total encoded length; used for calculating size
+     *                    of hash table to use
+     */
+    public ChunkEncoder(int totalLength) {
+        int largestChunkLen = Math.max(totalLength, LZFChunk.MAX_CHUNK_LEN);
 
-			// now we go up the hierarchy and add all the parents'
-			// coordinates to this actors coordinates. Note that
-			// this assumes that neither this actor nor any of its
-			// parents are rotated or scaled!
-			Actor parent = this.getParent();
-			while (parent != null) {
-				stageX += parent.getX();
-				stageY += parent.getY();
-				parent = parent.getParent();
-			}
+        int hashLen = calcHashLen(largestChunkLen);
+        _hashTable = new int[hashLen];
+        _hashModulo = hashLen - 1;
+        // Ok, then, what's the worst case output buffer length?
+        // length indicator for each 32 literals, so:
+        int bufferLen = largestChunkLen + ((largestChunkLen + 31) >> 5);
+        _encodeBuffer = new byte[bufferLen];
+    }
 
-			// now we check if the rectangle of this actor in screen
-			// coordinates is in the rectangle spanned by the camera's
-			// view. This assumes that the camera has no zoom and is
-			// not rotated!
-			actorRect.set(stageX, stageY, getWidth(), getHeight());
-			camRect.set(camera.position.x - camera.viewportWidth / 2.0f, camera.position.y - camera.viewportHeight / 2.0f,
-				camera.viewportWidth, camera.viewportHeight);
-			visible = camRect.overlaps(actorRect);
-			return !visible;
-		}
-	}
+    /**
+     * Method for compressing (or not) individual chunks
+     */
+    public LZFChunk encodeChunk(byte[] data, int offset, int len) {
+        if (len >= MIN_BLOCK_TO_COMPRESS) {
+            /* If we have non-trivial block, and can compress it by at least
+             * 2 bytes (since header is 2 bytes longer), let's compress:
+             */
+            int compLen = tryCompress(data, offset, offset + len, _encodeBuffer, 0);
+            if (compLen < (len - 2)) { // nah; just return uncompressed
+                return LZFChunk.createCompressed(len, _encodeBuffer, 0, compLen);
+            }
+        }
+        // Otherwise leave uncompressed:
+        return LZFChunk.createNonCompressed(data, offset, len);
+    }
 
-	OrthoCamController camController;
-	Stage stage;
-	Texture texture;
-	SpriteBatch batch;
-	BitmapFont font;
+    private static int calcHashLen(int chunkSize) {
+        // in general try get hash table size of 2x input size
+        chunkSize += chunkSize;
+        // but no larger than max size:
+        if (chunkSize >= MAX_HASH_SIZE) {
+            return MAX_HASH_SIZE;
+        }
+        // otherwise just need to round up to nearest 2x
+        int hashLen = MIN_HASH_SIZE;
+        while (hashLen < chunkSize) {
+            hashLen += hashLen;
+        }
+        return hashLen;
+    }
 
-	@Override
-	public void create () {
-		// create a stage and a camera controller so we can pan the view.
-		stage = new Stage(480, 320, false);
-		camController = new OrthoCamController((OrthographicCamera)stage.getCamera()); // we know it's an ortho cam at this point!
-		Gdx.input.setInputProcessor(camController);
+    private int first(byte[] in, int inPos) {
+        return (in[inPos] << 8) + (in[inPos + 1] & 255);
+    }
 
-		// load a dummy texture
-		texture = new Texture(Gdx.files.internal("data/badlogicsmall.jpg"));
+    private static int next(int v, byte[] in, int inPos) {
+        return (v << 8) + (in[inPos + 2] & 255);
+    }
 
-		// populate the stage with some actors and groups.
-		for (int i = 0; i < 5000; i++) {
-			Actor img = new CullableActor("img" + i, texture, (OrthographicCamera)stage.getCamera());
-			img.setX((float)Math.random() * 480 * 10);
-			img.setY((float)Math.random() * 320 * 10);
-			stage.addActor(img);
-		}
 
-		// we also want to output the number of visible actors, so we need a SpriteBatch and a BitmapFont
-		batch = new SpriteBatch();
-		font = new BitmapFont(Gdx.files.internal("data/arial-15.fnt"), false);
-	}
+    private int hash(int h) {
+        // or 184117; but this seems to give better hashing?
+        return ((h * 57321) >> 9) & _hashModulo;
+        // original lzf-c.c used this:
+        //return (((h ^ (h << 5)) >> (24 - HLOG) - h*5) & _hashModulo;
+        // but that didn't seem to provide better matches
+    }
 
-	public void render () {
-		Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT);
-		stage.draw();
+    private int tryCompress(byte[] in, int inPos, int inEnd, byte[] out, int outPos) {
+        int literals = 0;
+        outPos++;
+        int hash = first(in, 0);
+        inEnd -= 4;
+        final int firstPos = inPos; // so that we won't have back references across block boundary
+        while (inPos < inEnd) {
+            byte p2 = in[inPos + 2];
+            // next
+            hash = (hash << 8) + (p2 & 255);
+            int off = hash(hash);
+            int ref = _hashTable[off];
+            _hashTable[off] = inPos;
+            if (ref < inPos
+                    && ref >= firstPos
+                    && (off = inPos - ref - 1) < MAX_OFF
+                    && in[ref + 2] == p2
+                    && in[ref + 1] == (byte) (hash >> 8)
+                    && in[ref] == (byte) (hash >> 16)) {
+                // match
+                int maxLen = inEnd - inPos + 2;
+                if (maxLen > MAX_REF) {
+                    maxLen = MAX_REF;
+                }
+                if (literals == 0) {
+                    outPos--;
+                } else {
+                    out[outPos - literals - 1] = (byte) (literals - 1);
+                    literals = 0;
+                }
+                int len = 3;
+                while (len < maxLen && in[ref + len] == in[inPos + len]) {
+                    len++;
+                }
+                len -= 2;
+                if (len < 7) {
+                    out[outPos++] = (byte) ((off >> 8) + (len << 5));
+                } else {
+                    out[outPos++] = (byte) ((off >> 8) + (7 << 5));
+                    out[outPos++] = (byte) (len - 7);
+                }
+                out[outPos++] = (byte) off;
+                outPos++;
+                inPos += len;
+                hash = first(in, inPos);
+                hash = next(hash, in, inPos);
+                _hashTable[hash(hash)] = inPos++;
+                hash = next(hash, in, inPos);
+                _hashTable[hash(hash)] = inPos++;
+            } else {
+                out[outPos++] = in[inPos++];
+                literals++;
+                if (literals == LZFChunk.MAX_LITERAL) {
+                    out[outPos - literals - 1] = (byte) (literals - 1);
+                    literals = 0;
+                    outPos++;
+                }
+            }
+        }
+        inEnd += 4;
+        while (inPos < inEnd) {
+            out[outPos++] = in[inPos++];
+            literals++;
+            if (literals == LZFChunk.MAX_LITERAL) {
+                out[outPos - literals - 1] = (byte) (literals - 1);
+                literals = 0;
+                outPos++;
+            }
+        }
+        out[outPos - literals - 1] = (byte) (literals - 1);
+        if (literals == 0) {
+            outPos--;
+        }
+        return outPos;
+    }
 
-		// check how many actors are visible.
-		Array<Actor> actors = stage.getActors();
-		int numVisible = 0;
-		for (int i = 0; i < actors.size; i++) {
-			numVisible += ((CullableActor)actors.get(i)).visible ? 1 : 0;
-		}
-
-		batch.begin();
-		font.draw(batch, "Visible: " + numVisible + ", fps: " + Gdx.graphics.getFramesPerSecond(), 20, 30);
-		batch.end();
-	}
-
-	@Override
-	public void dispose () {
-		stage.dispose();
-		texture.dispose();
-		batch.dispose();
-		font.dispose();
-	}
 }

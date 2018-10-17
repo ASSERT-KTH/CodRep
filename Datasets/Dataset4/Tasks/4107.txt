@@ -1,13 +1,13 @@
-indexRequest.source(request.content(), request.contentUnsafe());
+public List<String> simpleMatchToIndexNames(String pattern) {
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,140 +19,385 @@ indexRequest.source(request.content(), request.contentUnsafe());
  * under the License.
  */
 
-package org.elasticsearch.rest.action.index;
+package org.elasticsearch.index.query;
 
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.WriteConsistencyLevel;
-import org.elasticsearch.action.index.IndexRequest;
-import org.elasticsearch.action.index.IndexResponse;
-import org.elasticsearch.action.support.replication.ReplicationType;
-import org.elasticsearch.client.Client;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentBuilderString;
-import org.elasticsearch.index.VersionType;
-import org.elasticsearch.rest.*;
-import org.elasticsearch.rest.action.support.RestActions;
-import org.elasticsearch.rest.action.support.RestXContentBuilder;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Maps;
+import org.apache.lucene.queryparser.classic.MapperQueryParser;
+import org.apache.lucene.queryparser.classic.QueryParserSettings;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.similarities.Similarity;
+import org.elasticsearch.Version;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.ParseField;
+import org.elasticsearch.common.lucene.search.NoCacheFilter;
+import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.analysis.AnalysisService;
+import org.elasticsearch.index.cache.filter.support.CacheKeyFilter;
+import org.elasticsearch.index.cache.query.parser.QueryParserCache;
+import org.elasticsearch.index.engine.IndexEngine;
+import org.elasticsearch.index.cache.fixedbitset.FixedBitSetFilter;
+import org.elasticsearch.index.fielddata.IndexFieldData;
+import org.elasticsearch.index.mapper.FieldMapper;
+import org.elasticsearch.index.mapper.FieldMappers;
+import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.index.search.child.CustomQueryWrappingFilter;
+import org.elasticsearch.index.similarity.SimilarityService;
+import org.elasticsearch.script.ScriptService;
+import org.elasticsearch.search.internal.SearchContext;
+import org.elasticsearch.search.lookup.SearchLookup;
 
 import java.io.IOException;
-
-import static org.elasticsearch.rest.RestRequest.Method.POST;
-import static org.elasticsearch.rest.RestRequest.Method.PUT;
-import static org.elasticsearch.rest.RestStatus.*;
+import java.util.*;
 
 /**
  *
  */
-public class RestIndexAction extends BaseRestHandler {
+public class QueryParseContext {
 
-    @Inject
-    public RestIndexAction(Settings settings, Client client, RestController controller) {
-        super(settings, client);
-        controller.registerHandler(POST, "/{index}/{type}", this); // auto id creation
-        controller.registerHandler(PUT, "/{index}/{type}/{id}", this);
-        controller.registerHandler(POST, "/{index}/{type}/{id}", this);
-        controller.registerHandler(PUT, "/{index}/{type}/{id}/_create", new CreateHandler());
-        controller.registerHandler(POST, "/{index}/{type}/{id}/_create", new CreateHandler());
+    private static ThreadLocal<String[]> typesContext = new ThreadLocal<>();
+
+    public static void setTypes(String[] types) {
+        typesContext.set(types);
     }
 
-    final class CreateHandler implements RestHandler {
-        @Override
-        public void handleRequest(RestRequest request, RestChannel channel) {
-            request.params().put("op_type", "create");
-            RestIndexAction.this.handleRequest(request, channel);
-        }
+    public static String[] getTypes() {
+        return typesContext.get();
     }
 
-    @Override
-    public void handleRequest(final RestRequest request, final RestChannel channel) {
-        IndexRequest indexRequest = new IndexRequest(request.param("index"), request.param("type"), request.param("id"));
-        indexRequest.listenerThreaded(false);
-        indexRequest.operationThreaded(true);
-        indexRequest.routing(request.param("routing"));
-        indexRequest.parent(request.param("parent")); // order is important, set it after routing, so it will set the routing
-        indexRequest.timestamp(request.param("timestamp"));
-        if (request.hasParam("ttl")) {
-            indexRequest.ttl(request.paramAsTime("ttl", null).millis());
+    public static String[] setTypesWithPrevious(String[] types) {
+        String[] old = typesContext.get();
+        setTypes(types);
+        return old;
+    }
+
+    public static void removeTypes() {
+        typesContext.remove();
+    }
+
+    private final Index index;
+
+    private boolean propagateNoCache = false;
+
+    private boolean requireCustomQueryWrappingFilter = false;
+
+    final IndexQueryParserService indexQueryParser;
+
+    private final Map<String, Filter> namedFilters = Maps.newHashMap();
+
+    private final MapperQueryParser queryParser = new MapperQueryParser(this);
+
+    private XContentParser parser;
+
+    private EnumSet<ParseField.Flag> parseFlags = ParseField.EMPTY_FLAGS;
+
+    private final boolean disableFilterCaching;
+
+    private boolean allowUnmappedFields;
+
+    public QueryParseContext(Index index, IndexQueryParserService indexQueryParser) {
+        this(index, indexQueryParser, false);
+    }
+
+    public QueryParseContext(Index index, IndexQueryParserService indexQueryParser, boolean disableFilterCaching) {
+        this.index = index;
+        this.indexQueryParser = indexQueryParser;
+        this.propagateNoCache = disableFilterCaching;
+        this.disableFilterCaching = disableFilterCaching;
+    }
+
+    public void parseFlags(EnumSet<ParseField.Flag> parseFlags) {
+        this.parseFlags = parseFlags == null ? ParseField.EMPTY_FLAGS : parseFlags;
+    }
+
+    public EnumSet<ParseField.Flag> parseFlags() {
+        return parseFlags;
+    }
+
+    public void reset(XContentParser jp) {
+        allowUnmappedFields = indexQueryParser.defaultAllowUnmappedFields();
+        this.parseFlags = ParseField.EMPTY_FLAGS;
+        this.lookup = null;
+        this.parser = jp;
+        this.namedFilters.clear();
+        this.requireCustomQueryWrappingFilter = false;
+        this.propagateNoCache = false;
+    }
+
+    public Index index() {
+        return this.index;
+    }
+
+    public void parser(XContentParser parser) {
+        this.parser = parser;
+    }
+
+    public XContentParser parser() {
+        return parser;
+    }
+
+    public AnalysisService analysisService() {
+        return indexQueryParser.analysisService;
+    }
+
+    public ScriptService scriptService() {
+        return indexQueryParser.scriptService;
+    }
+
+    public MapperService mapperService() {
+        return indexQueryParser.mapperService;
+    }
+
+    public IndexEngine indexEngine() {
+        return indexQueryParser.indexEngine;
+    }
+
+    @Nullable
+    public SimilarityService similarityService() {
+        return indexQueryParser.similarityService;
+    }
+
+    public Similarity searchSimilarity() {
+        return indexQueryParser.similarityService != null ? indexQueryParser.similarityService.similarity() : null;
+    }
+
+    public QueryParserCache queryParserCache() {
+        return indexQueryParser.indexCache.queryParserCache();
+    }
+
+    public String defaultField() {
+        return indexQueryParser.defaultField();
+    }
+
+    public boolean queryStringLenient() {
+        return indexQueryParser.queryStringLenient();
+    }
+
+    public MapperQueryParser queryParser(QueryParserSettings settings) {
+        queryParser.reset(settings);
+        return queryParser;
+    }
+
+    public FixedBitSetFilter fixedBitSetFilter(Filter filter) {
+        return indexQueryParser.fixedBitSetFilterCache.getFixedBitSetFilter(filter);
+    }
+
+    public Filter cacheFilter(Filter filter, @Nullable CacheKeyFilter.Key cacheKey) {
+        if (filter == null) {
+            return null;
         }
-        indexRequest.source(request.contentByteArray(), request.contentByteArrayOffset(), request.contentLength(), request.contentUnsafe());
-        indexRequest.timeout(request.paramAsTime("timeout", IndexRequest.DEFAULT_TIMEOUT));
-        indexRequest.refresh(request.paramAsBoolean("refresh", indexRequest.refresh()));
-        indexRequest.version(RestActions.parseVersion(request));
-        indexRequest.versionType(VersionType.fromString(request.param("version_type"), indexRequest.versionType()));
-        indexRequest.percolate(request.param("percolate", null));
-        String sOpType = request.param("op_type");
-        if (sOpType != null) {
-            if ("index".equals(sOpType)) {
-                indexRequest.opType(IndexRequest.OpType.INDEX);
-            } else if ("create".equals(sOpType)) {
-                indexRequest.opType(IndexRequest.OpType.CREATE);
+        if (this.disableFilterCaching || this.propagateNoCache || filter instanceof NoCacheFilter) {
+            return filter;
+        }
+        if (cacheKey != null) {
+            filter = new CacheKeyFilter.Wrapper(filter, cacheKey);
+        }
+        return indexQueryParser.indexCache.filter().cache(filter);
+    }
+
+    public <IFD extends IndexFieldData<?>> IFD getForField(FieldMapper<?> mapper) {
+        return indexQueryParser.fieldDataService.getForField(mapper);
+    }
+
+    public void addNamedFilter(String name, Filter filter) {
+        namedFilters.put(name, filter);
+    }
+
+    public void addNamedQuery(String name, Query query) {
+        namedFilters.put(name, Queries.wrap(query, this));
+    }
+
+    public ImmutableMap<String, Filter> copyNamedFilters() {
+        if (namedFilters.isEmpty()) {
+            return ImmutableMap.of();
+        }
+        return ImmutableMap.copyOf(namedFilters);
+    }
+
+    @Nullable
+    public Query parseInnerQuery() throws IOException, QueryParsingException {
+        // move to START object
+        XContentParser.Token token;
+        if (parser.currentToken() != XContentParser.Token.START_OBJECT) {
+            token = parser.nextToken();
+            if (token != XContentParser.Token.START_OBJECT) {
+                throw new QueryParsingException(index, "[_na] query malformed, must start with start_object");
+            }
+        }
+        token = parser.nextToken();
+        if (token != XContentParser.Token.FIELD_NAME) {
+            throw new QueryParsingException(index, "[_na] query malformed, no field after start_object");
+        }
+        String queryName = parser.currentName();
+        // move to the next START_OBJECT
+        token = parser.nextToken();
+        if (token != XContentParser.Token.START_OBJECT && token != XContentParser.Token.START_ARRAY) {
+            throw new QueryParsingException(index, "[_na] query malformed, no field after start_object");
+        }
+
+        QueryParser queryParser = indexQueryParser.queryParser(queryName);
+        if (queryParser == null) {
+            throw new QueryParsingException(index, "No query registered for [" + queryName + "]");
+        }
+        Query result = queryParser.parse(this);
+        if (parser.currentToken() == XContentParser.Token.END_OBJECT || parser.currentToken() == XContentParser.Token.END_ARRAY) {
+            // if we are at END_OBJECT, move to the next one...
+            parser.nextToken();
+        }
+        if (CustomQueryWrappingFilter.shouldUseCustomQueryWrappingFilter(result)) {
+            requireCustomQueryWrappingFilter = true;
+            // If later on, either directly or indirectly this query gets wrapped in a query filter it must never
+            // get cached even if a filter higher up the chain is configured to do this. This will happen, because
+            // the result filter will be instance of NoCacheFilter (CustomQueryWrappingFilter) which will in
+            // #executeFilterParser() set propagateNoCache to true.
+        }
+        return result;
+    }
+
+    @Nullable
+    public Filter parseInnerFilter() throws IOException, QueryParsingException {
+        // move to START object
+        XContentParser.Token token;
+        if (parser.currentToken() != XContentParser.Token.START_OBJECT) {
+            token = parser.nextToken();
+            if (token != XContentParser.Token.START_OBJECT) {
+                throw new QueryParsingException(index, "[_na] filter malformed, must start with start_object");
+            }
+        }
+        token = parser.nextToken();
+        if (token != XContentParser.Token.FIELD_NAME) {
+            // empty filter
+            if (token == XContentParser.Token.END_OBJECT || token == XContentParser.Token.VALUE_NULL) {
+                return null;
+            }
+            throw new QueryParsingException(index, "[_na] filter malformed, no field after start_object");
+        }
+        String filterName = parser.currentName();
+        // move to the next START_OBJECT or START_ARRAY
+        token = parser.nextToken();
+        if (token != XContentParser.Token.START_OBJECT && token != XContentParser.Token.START_ARRAY) {
+            throw new QueryParsingException(index, "[_na] filter malformed, no field after start_object");
+        }
+
+        FilterParser filterParser = indexQueryParser.filterParser(filterName);
+        if (filterParser == null) {
+            throw new QueryParsingException(index, "No filter registered for [" + filterName + "]");
+        }
+        Filter result = executeFilterParser(filterParser);
+        if (parser.currentToken() == XContentParser.Token.END_OBJECT || parser.currentToken() == XContentParser.Token.END_ARRAY) {
+            // if we are at END_OBJECT, move to the next one...
+            parser.nextToken();
+        }
+        return result;
+    }
+
+    public Filter parseInnerFilter(String filterName) throws IOException, QueryParsingException {
+        FilterParser filterParser = indexQueryParser.filterParser(filterName);
+        if (filterParser == null) {
+            throw new QueryParsingException(index, "No filter registered for [" + filterName + "]");
+        }
+        return executeFilterParser(filterParser);
+    }
+
+    private Filter executeFilterParser(FilterParser filterParser) throws IOException {
+        final boolean propagateNoCache = this.propagateNoCache; // first safe the state that we need to restore
+        this.propagateNoCache = false; // parse the subfilter with caching, that's fine
+        Filter result = filterParser.parse(this);
+        // now make sure we set propagateNoCache to true if it is true already or if the result is
+        // an instance of NoCacheFilter or if we used to be true! all filters above will
+        // be not cached ie. wrappers of this filter!
+        this.propagateNoCache |= (result instanceof NoCacheFilter) || propagateNoCache;
+        return result;
+    }
+
+    public FieldMapper fieldMapper(String name) {
+        FieldMappers fieldMappers = indexQueryParser.mapperService.smartNameFieldMappers(name, getTypes());
+        if (fieldMappers == null) {
+            return null;
+        }
+        return fieldMappers.mapper();
+    }
+
+    public String indexName(String name) {
+        FieldMapper smartMapper = fieldMapper(name);
+        if (smartMapper == null) {
+            return name;
+        }
+        return smartMapper.names().indexName();
+    }
+
+    public Set<String> simpleMatchToIndexNames(String pattern) {
+        return indexQueryParser.mapperService.simpleMatchToIndexNames(pattern, getTypes());
+    }
+
+    public MapperService.SmartNameFieldMappers smartFieldMappers(String name) {
+        return failIfFieldMappingNotFound(name, indexQueryParser.mapperService.smartName(name, getTypes()));
+    }
+
+    public FieldMapper smartNameFieldMapper(String name) {
+        return failIfFieldMappingNotFound(name, indexQueryParser.mapperService.smartNameFieldMapper(name, getTypes()));
+    }
+
+    public MapperService.SmartNameObjectMapper smartObjectMapper(String name) {
+        return indexQueryParser.mapperService.smartNameObjectMapper(name, getTypes());
+    }
+
+    public void setAllowUnmappedFields(boolean allowUnmappedFields) {
+        this.allowUnmappedFields = allowUnmappedFields;
+    }
+
+    private <T> T failIfFieldMappingNotFound(String name, T fieldMapping) {
+        if (allowUnmappedFields) {
+            return fieldMapping;
+        } else {
+            Version indexCreatedVersion = indexQueryParser.getIndexCreatedVersion();
+            if (fieldMapping == null && indexCreatedVersion.onOrAfter(Version.V_1_4_0_Beta1)) {
+                throw new QueryParsingException(index, "Strict field resolution and no field mapping can be found for the field with name [" + name + "]");
             } else {
-                try {
-                    XContentBuilder builder = RestXContentBuilder.restContentBuilder(request);
-                    channel.sendResponse(new XContentRestResponse(request, BAD_REQUEST, builder.startObject().field("error", "opType [" + sOpType + "] not allowed, either [index] or [create] are allowed").endObject()));
-                } catch (IOException e1) {
-                    logger.warn("Failed to send response", e1);
-                    return;
-                }
+                return fieldMapping;
             }
         }
-        String replicationType = request.param("replication");
-        if (replicationType != null) {
-            indexRequest.replicationType(ReplicationType.fromString(replicationType));
-        }
-        String consistencyLevel = request.param("consistency");
-        if (consistencyLevel != null) {
-            indexRequest.consistencyLevel(WriteConsistencyLevel.fromString(consistencyLevel));
-        }
-        client.index(indexRequest, new ActionListener<IndexResponse>() {
-            @Override
-            public void onResponse(IndexResponse response) {
-                try {
-                    XContentBuilder builder = RestXContentBuilder.restContentBuilder(request);
-                    builder.startObject()
-                            .field(Fields.OK, true)
-                            .field(Fields._INDEX, response.index())
-                            .field(Fields._TYPE, response.type())
-                            .field(Fields._ID, response.id())
-                            .field(Fields._VERSION, response.version());
-                    if (response.matches() != null) {
-                        builder.startArray(Fields.MATCHES);
-                        for (String match : response.matches()) {
-                            builder.value(match);
-                        }
-                        builder.endArray();
-                    }
-                    builder.endObject();
-                    RestStatus status = OK;
-                    if (response.version() == 1) {
-                        status = CREATED;
-                    }
-                    channel.sendResponse(new XContentRestResponse(request, status, builder));
-                } catch (Exception e) {
-                    onFailure(e);
-                }
-            }
-
-            @Override
-            public void onFailure(Throwable e) {
-                try {
-                    channel.sendResponse(new XContentThrowableRestResponse(request, e));
-                } catch (IOException e1) {
-                    logger.error("Failed to send failure response", e1);
-                }
-            }
-        });
     }
 
-    static final class Fields {
-        static final XContentBuilderString OK = new XContentBuilderString("ok");
-        static final XContentBuilderString _INDEX = new XContentBuilderString("_index");
-        static final XContentBuilderString _TYPE = new XContentBuilderString("_type");
-        static final XContentBuilderString _ID = new XContentBuilderString("_id");
-        static final XContentBuilderString _VERSION = new XContentBuilderString("_version");
-        static final XContentBuilderString MATCHES = new XContentBuilderString("matches");
+    /**
+     * Returns the narrowed down explicit types, or, if not set, all types.
+     */
+    public Collection<String> queryTypes() {
+        String[] types = getTypes();
+        if (types == null || types.length == 0) {
+            return mapperService().types();
+        }
+        if (types.length == 1 && types[0].equals("_all")) {
+            return mapperService().types();
+        }
+        return Arrays.asList(types);
     }
 
+    private SearchLookup lookup = null;
+
+    public SearchLookup lookup() {
+        SearchContext current = SearchContext.current();
+        if (current != null) {
+            return current.lookup();
+        }
+        if (lookup == null) {
+            lookup = new SearchLookup(mapperService(), indexQueryParser.fieldDataService, null);
+        }
+        return lookup;
+    }
+
+    public long nowInMillis() {
+        SearchContext current = SearchContext.current();
+        if (current != null) {
+            return current.nowInMillis();
+        }
+        return System.currentTimeMillis();
+    }
+
+    public boolean requireCustomQueryWrappingFilter() {
+        return requireCustomQueryWrappingFilter;
+    }
 }

@@ -1,4 +1,4 @@
-newMapper = indexService.mapperService().parse(request.type(), new CompressedString(request.source()), existingMapper == null);
+private final CopyOnWriteArrayList<RestoreCompletionListener> listeners = new CopyOnWriteArrayList<>();
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,582 +18,772 @@ newMapper = indexService.mapperService().parse(request.type(), new CompressedStr
  * specific language governing permissions and limitations
  * under the License.
  */
+package org.elasticsearch.snapshots;
 
-package org.elasticsearch.cluster.metadata;
-
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.admin.indices.mapping.delete.DeleteMappingClusterStateUpdateRequest;
-import org.elasticsearch.action.admin.indices.mapping.put.PutMappingClusterStateUpdateRequest;
-import org.elasticsearch.cluster.AckedClusterStateUpdateTask;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.ProcessedClusterStateUpdateTask;
-import org.elasticsearch.cluster.ack.ClusterStateUpdateResponse;
-import org.elasticsearch.common.Priority;
-import org.elasticsearch.common.collect.Tuple;
+import com.carrotsearch.hppc.cursors.ObjectCursor;
+import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import org.elasticsearch.Version;
+import org.elasticsearch.action.support.IndicesOptions;
+import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.block.ClusterBlocks;
+import org.elasticsearch.cluster.metadata.*;
+import org.elasticsearch.cluster.metadata.RestoreMetaData.ShardRestoreStatus;
+import org.elasticsearch.cluster.routing.RestoreSource;
+import org.elasticsearch.cluster.routing.RoutingTable;
+import org.elasticsearch.cluster.routing.allocation.AllocationService;
+import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;
 import org.elasticsearch.common.component.AbstractComponent;
-import org.elasticsearch.common.compress.CompressedString;
 import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.mapper.DocumentMapper;
-import org.elasticsearch.index.mapper.MapperService;
-import org.elasticsearch.index.mapper.MergeMappingException;
-import org.elasticsearch.index.service.IndexService;
-import org.elasticsearch.indices.IndexMissingException;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.indices.InvalidTypeNameException;
-import org.elasticsearch.indices.TypeMissingException;
-import org.elasticsearch.percolator.PercolatorService;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.repositories.RepositoriesService;
+import org.elasticsearch.repositories.Repository;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
 
-import java.util.*;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
+import static com.google.common.collect.Lists.newArrayList;
 import static com.google.common.collect.Maps.newHashMap;
-import static org.elasticsearch.index.mapper.DocumentMapper.MergeFlags.mergeFlags;
+import static org.elasticsearch.cluster.metadata.MetaDataIndexStateService.INDEX_CLOSED_BLOCK;
 
 /**
- * Service responsible for submitting mapping changes
+ * Service responsible for restoring snapshots
+ * <p/>
+ * Restore operation is performed in several stages.
+ * <p/>
+ * First {@link #restoreSnapshot(RestoreRequest, RestoreSnapshotListener)}
+ * method reads information about snapshot and metadata from repository. In update cluster state task it checks restore
+ * preconditions, restores global state if needed, creates {@link RestoreMetaData} record with list of shards that needs
+ * to be restored and adds this shard to the routing table using {@link RoutingTable.Builder#addAsRestore(IndexMetaData, RestoreSource)}
+ * method.
+ * <p/>
+ * Individual shards are getting restored as part of normal recovery process in
+ * {@link org.elasticsearch.index.gateway.IndexShardGatewayService#recover(boolean, org.elasticsearch.index.gateway.IndexShardGatewayService.RecoveryListener)}
+ * method, which detects that shard should be restored from snapshot rather than recovered from gateway by looking
+ * at the {@link org.elasticsearch.cluster.routing.ShardRouting#restoreSource()} property. If this property is not null
+ * {@code recover} method uses {@link org.elasticsearch.index.snapshots.IndexShardSnapshotAndRestoreService#restore(org.elasticsearch.index.gateway.RecoveryStatus)}
+ * method to start shard restore process.
+ * <p/>
+ * At the end of the successful restore process {@code IndexShardSnapshotAndRestoreService} calls {@link #indexShardRestoreCompleted(SnapshotId, ShardId)},
+ * which updates {@link RestoreMetaData} in cluster state or removes it when all shards are completed. In case of
+ * restore failure a normal recovery fail-over process kicks in.
  */
-public class MetaDataMappingService extends AbstractComponent {
+public class RestoreService extends AbstractComponent implements ClusterStateListener {
 
-    private final ThreadPool threadPool;
     private final ClusterService clusterService;
-    private final IndicesService indicesService;
 
-    // the mutex protect all the refreshOrUpdate variables!
-    private final Object refreshOrUpdateMutex = new Object();
-    private final List<MappingTask> refreshOrUpdateQueue = new ArrayList<>();
-    private long refreshOrUpdateInsertOrder;
-    private long refreshOrUpdateProcessedInsertOrder;
+    private final RepositoriesService repositoriesService;
+
+    private final TransportService transportService;
+
+    private final AllocationService allocationService;
+
+    private final MetaDataCreateIndexService createIndexService;
+
+    private final CopyOnWriteArrayList<RestoreCompletionListener> listeners = new CopyOnWriteArrayList<RestoreCompletionListener>();
 
     @Inject
-    public MetaDataMappingService(Settings settings, ThreadPool threadPool, ClusterService clusterService, IndicesService indicesService) {
+    public RestoreService(Settings settings, ClusterService clusterService, RepositoriesService repositoriesService, TransportService transportService, AllocationService allocationService, MetaDataCreateIndexService createIndexService) {
         super(settings);
-        this.threadPool = threadPool;
         this.clusterService = clusterService;
-        this.indicesService = indicesService;
-    }
-
-    static class MappingTask {
-        final String index;
-        final String indexUUID;
-
-        MappingTask(String index, final String indexUUID) {
-            this.index = index;
-            this.indexUUID = indexUUID;
-        }
-    }
-
-    static class RefreshTask extends MappingTask {
-        final String[] types;
-
-        RefreshTask(String index, final String indexUUID, String[] types) {
-            super(index, indexUUID);
-            this.types = types;
-        }
-    }
-
-    static class UpdateTask extends MappingTask {
-        final String type;
-        final CompressedString mappingSource;
-        final long order; // -1 for unknown
-        final String nodeId; // null fr unknown
-        final ActionListener<ClusterStateUpdateResponse> listener;
-
-        UpdateTask(String index, String indexUUID, String type, CompressedString mappingSource, long order, String nodeId, ActionListener<ClusterStateUpdateResponse> listener) {
-            super(index, indexUUID);
-            this.type = type;
-            this.mappingSource = mappingSource;
-            this.order = order;
-            this.nodeId = nodeId;
-            this.listener = listener;
-        }
+        this.repositoriesService = repositoriesService;
+        this.transportService = transportService;
+        this.allocationService = allocationService;
+        this.createIndexService = createIndexService;
+        transportService.registerHandler(UpdateRestoreStateRequestHandler.ACTION, new UpdateRestoreStateRequestHandler());
+        clusterService.add(this);
     }
 
     /**
-     * Batch method to apply all the queued refresh or update operations. The idea is to try and batch as much
-     * as possible so we won't create the same index all the time for example for the updates on the same mapping
-     * and generate a single cluster change event out of all of those.
+     * Restores snapshot specified in the restore request.
+     *
+     * @param request  restore request
+     * @param listener restore listener
      */
-    Tuple<ClusterState, List<MappingTask>> executeRefreshOrUpdate(final ClusterState currentState, final long insertionOrder) throws Exception {
-        final List<MappingTask> allTasks = new ArrayList<>();
+    public void restoreSnapshot(final RestoreRequest request, final RestoreSnapshotListener listener) {
+        try {
+            // Read snapshot info and metadata from the repository
+            Repository repository = repositoriesService.repository(request.repository());
+            final SnapshotId snapshotId = new SnapshotId(request.repository(), request.name());
+            final Snapshot snapshot = repository.readSnapshot(snapshotId);
+            ImmutableList<String> filteredIndices = SnapshotUtils.filterIndices(snapshot.indices(), request.indices(), request.indicesOptions());
+            final MetaData metaData = repository.readSnapshotMetaData(snapshotId, filteredIndices);
 
-        synchronized (refreshOrUpdateMutex) {
-            if (refreshOrUpdateQueue.isEmpty()) {
-                return Tuple.tuple(currentState, allTasks);
+            // Make sure that we can restore from this snapshot
+            if (snapshot.state() != SnapshotState.SUCCESS) {
+                throw new SnapshotRestoreException(snapshotId, "unsupported snapshot state [" + snapshot.state() + "]");
+            }
+            if (Version.CURRENT.before(snapshot.version())) {
+                throw new SnapshotRestoreException(snapshotId, "incompatible snapshot version [" + snapshot.version() + "]");
             }
 
-            // we already processed this task in a bulk manner in a previous cluster event, simply ignore
-            // it so we will let other tasks get in and processed ones, we will handle the queued ones
-            // later on in a subsequent cluster state event
-            if (insertionOrder < refreshOrUpdateProcessedInsertOrder) {
-                return Tuple.tuple(currentState, allTasks);
-            }
-
-            allTasks.addAll(refreshOrUpdateQueue);
-            refreshOrUpdateQueue.clear();
-
-            refreshOrUpdateProcessedInsertOrder = refreshOrUpdateInsertOrder;
-        }
-
-        if (allTasks.isEmpty()) {
-            return Tuple.tuple(currentState, allTasks);
-        }
-
-        // break down to tasks per index, so we can optimize the on demand index service creation
-        // to only happen for the duration of a single index processing of its respective events
-        Map<String, List<MappingTask>> tasksPerIndex = Maps.newHashMap();
-        for (MappingTask task : allTasks) {
-            if (task.index == null) {
-                logger.debug("ignoring a mapping task of type [{}] with a null index.", task);
-            }
-            List<MappingTask> indexTasks = tasksPerIndex.get(task.index);
-            if (indexTasks == null) {
-                indexTasks = new ArrayList<>();
-                tasksPerIndex.put(task.index, indexTasks);
-            }
-            indexTasks.add(task);
-        }
-
-        boolean dirty = false;
-        MetaData.Builder mdBuilder = MetaData.builder(currentState.metaData());
-
-        for (Map.Entry<String, List<MappingTask>> entry : tasksPerIndex.entrySet()) {
-            String index = entry.getKey();
-            IndexMetaData indexMetaData = mdBuilder.get(index);
-            if (indexMetaData == null) {
-                // index got deleted on us, ignore...
-                logger.debug("[{}] ignoring tasks - index meta data doesn't exist", index);
-                continue;
-            }
-            // the tasks lists to iterate over, filled with the list of mapping tasks, trying to keep
-            // the latest (based on order) update mapping one per node
-            List<MappingTask> allIndexTasks = entry.getValue();
-            List<MappingTask> tasks = new ArrayList<>();
-            for (MappingTask task : allIndexTasks) {
-                if (!indexMetaData.isSameUUID(task.indexUUID)) {
-                    logger.debug("[{}] ignoring task [{}] - index meta data doesn't match task uuid", index, task);
-                    continue;
+            // Find list of indices that we need to restore
+            final Map<String, String> renamedIndices = newHashMap();
+            for (String index : filteredIndices) {
+                String renamedIndex = index;
+                if (request.renameReplacement() != null && request.renamePattern() != null) {
+                    renamedIndex = index.replaceAll(request.renamePattern(), request.renameReplacement());
                 }
-                boolean add = true;
-                // if its an update task, make sure we only process the latest ordered one per node
-                if (task instanceof UpdateTask) {
-                    UpdateTask uTask = (UpdateTask) task;
-                    // we can only do something to compare if we have the order && node
-                    if (uTask.order != -1 && uTask.nodeId != null) {
-                        for (int i = 0; i < tasks.size(); i++) {
-                            MappingTask existing = tasks.get(i);
-                            if (existing instanceof UpdateTask) {
-                                UpdateTask eTask = (UpdateTask) existing;
-                                if (eTask.type.equals(uTask.type)) {
-                                    // if we have the order, and the node id, then we can compare, and replace if applicable
-                                    if (eTask.order != -1 && eTask.nodeId != null) {
-                                        if (eTask.nodeId.equals(uTask.nodeId) && uTask.order > eTask.order) {
-                                            // a newer update task, we can replace so we execute it one!
-                                            tasks.set(i, uTask);
-                                            add = false;
-                                            break;
-                                        }
-                                    }
+                String previousIndex = renamedIndices.put(renamedIndex, index);
+                if (previousIndex != null) {
+                    throw new SnapshotRestoreException(snapshotId, "indices [" + index + "] and [" + previousIndex + "] are renamed into the same index [" + renamedIndex + "]");
+                }
+            }
+
+            // Now we can start the actual restore process by adding shards to be recovered in the cluster state
+            // and updating cluster metadata (global and index) as needed
+            clusterService.submitStateUpdateTask(request.cause(), new TimeoutClusterStateUpdateTask() {
+                RestoreInfo restoreInfo = null;
+
+                @Override
+                public ClusterState execute(ClusterState currentState) {
+                    // Check if another restore process is already running - cannot run two restore processes at the
+                    // same time
+                    RestoreMetaData restoreMetaData = currentState.metaData().custom(RestoreMetaData.TYPE);
+                    if (restoreMetaData != null && !restoreMetaData.entries().isEmpty()) {
+                        throw new ConcurrentSnapshotExecutionException(snapshotId, "Restore process is already running in this cluster");
+                    }
+
+                    // Updating cluster state
+                    MetaData.Builder mdBuilder = MetaData.builder(currentState.metaData());
+                    ClusterBlocks.Builder blocks = ClusterBlocks.builder().blocks(currentState.blocks());
+                    RoutingTable.Builder rtBuilder = RoutingTable.builder(currentState.routingTable());
+                    if (!metaData.indices().isEmpty()) {
+                        // We have some indices to restore
+                        ImmutableMap.Builder<ShardId, RestoreMetaData.ShardRestoreStatus> shards = ImmutableMap.builder();
+                        for (Map.Entry<String, String> indexEntry : renamedIndices.entrySet()) {
+                            String index = indexEntry.getValue();
+                            // Make sure that index was fully snapshotted - don't restore
+                            if (failed(snapshot, index)) {
+                                throw new SnapshotRestoreException(snapshotId, "index [" + index + "] wasn't fully snapshotted - cannot restore");
+                            }
+                            RestoreSource restoreSource = new RestoreSource(snapshotId, index);
+                            String renamedIndex = indexEntry.getKey();
+                            IndexMetaData snapshotIndexMetaData = metaData.index(index);
+                            // Check that the index is closed or doesn't exist
+                            IndexMetaData currentIndexMetaData = currentState.metaData().index(renamedIndex);
+                            if (currentIndexMetaData == null) {
+                                // Index doesn't exist - create it and start recovery
+                                // Make sure that the index we are about to create has a validate name
+                                createIndexService.validateIndexName(renamedIndex, currentState);
+                                IndexMetaData.Builder indexMdBuilder = IndexMetaData.builder(snapshotIndexMetaData).state(IndexMetaData.State.OPEN).index(renamedIndex);
+                                IndexMetaData updatedIndexMetaData = indexMdBuilder.build();
+                                rtBuilder.addAsNewRestore(updatedIndexMetaData, restoreSource);
+                                mdBuilder.put(updatedIndexMetaData, true);
+                            } else {
+                                // Index exist - checking that it's closed
+                                if (currentIndexMetaData.state() != IndexMetaData.State.CLOSE) {
+                                    // TODO: Enable restore for open indices
+                                    throw new SnapshotRestoreException(snapshotId, "cannot restore index [" + renamedIndex + "] because it's open");
+                                }
+                                // Make sure that the number of shards is the same. That's the only thing that we cannot change
+                                if (currentIndexMetaData.getNumberOfShards() != snapshotIndexMetaData.getNumberOfShards()) {
+                                    throw new SnapshotRestoreException(snapshotId, "cannot restore index [" + renamedIndex + "] with [" + currentIndexMetaData.getNumberOfShards() +
+                                            "] shard from snapshot with [" + snapshotIndexMetaData.getNumberOfShards() + "] shards");
+                                }
+                                // Index exists and it's closed - open it in metadata and start recovery
+                                IndexMetaData.Builder indexMdBuilder = IndexMetaData.builder(snapshotIndexMetaData).state(IndexMetaData.State.OPEN);
+                                indexMdBuilder.version(Math.max(snapshotIndexMetaData.version(), currentIndexMetaData.version() + 1));
+                                IndexMetaData updatedIndexMetaData = indexMdBuilder.index(renamedIndex).build();
+                                rtBuilder.addAsRestore(updatedIndexMetaData, restoreSource);
+                                blocks.removeIndexBlock(renamedIndex, INDEX_CLOSED_BLOCK);
+                                mdBuilder.put(updatedIndexMetaData, true);
+                            }
+                            for (int shard = 0; shard < snapshotIndexMetaData.getNumberOfShards(); shard++) {
+                                shards.put(new ShardId(renamedIndex, shard), new RestoreMetaData.ShardRestoreStatus(clusterService.state().nodes().localNodeId()));
+                            }
+                        }
+
+                        RestoreMetaData.Entry restoreEntry = new RestoreMetaData.Entry(snapshotId, RestoreMetaData.State.INIT, ImmutableList.copyOf(renamedIndices.keySet()), shards.build());
+                        mdBuilder.putCustom(RestoreMetaData.TYPE, new RestoreMetaData(restoreEntry));
+                    }
+
+                    // Restore global state if needed
+                    if (request.includeGlobalState()) {
+                        if (metaData.persistentSettings() != null) {
+                            mdBuilder.persistentSettings(metaData.persistentSettings());
+                        }
+                        if (metaData.templates() != null) {
+                            // TODO: Should all existing templates be deleted first?
+                            for (ObjectCursor<IndexTemplateMetaData> cursor : metaData.templates().values()) {
+                                mdBuilder.put(cursor.value);
+                            }
+                        }
+                        if (metaData.customs() != null) {
+                            for (ObjectObjectCursor<String, MetaData.Custom> cursor : metaData.customs()) {
+                                if (!RepositoriesMetaData.TYPE.equals(cursor.key)) {
+                                    // Don't restore repositories while we are working with them
+                                    // TODO: Should we restore them at the end?
+                                    mdBuilder.putCustom(cursor.key, cursor.value);
                                 }
                             }
                         }
                     }
-                }
 
-                if (add) {
-                    tasks.add(task);
-                }
-            }
-
-            // construct the actual index if needed, and make sure the relevant mappings are there
-            boolean removeIndex = false;
-            IndexService indexService = indicesService.indexService(index);
-            if (indexService == null) {
-                // we need to create the index here, and add the current mapping to it, so we can merge
-                indexService = indicesService.createIndex(indexMetaData.index(), indexMetaData.settings(), currentState.nodes().localNode().id());
-                removeIndex = true;
-                Set<String> typesToIntroduce = Sets.newHashSet();
-                for (MappingTask task : tasks) {
-                    if (task instanceof UpdateTask) {
-                        typesToIntroduce.add(((UpdateTask) task).type);
-                    } else if (task instanceof RefreshTask) {
-                        Collections.addAll(typesToIntroduce, ((RefreshTask) task).types);
+                    if (metaData.indices().isEmpty()) {
+                        // We don't have any indices to restore - we are done
+                        restoreInfo = new RestoreInfo(request.name(), ImmutableList.<String>of(), 0, 0);
                     }
-                }
-                for (String type : typesToIntroduce) {
-                    // only add the current relevant mapping (if exists)
-                    if (indexMetaData.mappings().containsKey(type)) {
-                        // don't apply the default mapping, it has been applied when the mapping was created
-                        indexService.mapperService().merge(type, indexMetaData.mappings().get(type).source(), false);
-                    }
-                }
-            }
 
-            IndexMetaData.Builder builder = IndexMetaData.builder(indexMetaData);
-            try {
-                boolean indexDirty = processIndexMappingTasks(tasks, indexService, builder);
-                if (indexDirty) {
-                    mdBuilder.put(builder);
-                    dirty = true;
+                    ClusterState updatedState = ClusterState.builder(currentState).metaData(mdBuilder).blocks(blocks).routingTable(rtBuilder).build();
+                    RoutingAllocation.Result routingResult = allocationService.reroute(ClusterState.builder(updatedState).routingTable(rtBuilder).build());
+                    return ClusterState.builder(updatedState).routingResult(routingResult).build();
                 }
-            } finally {
-                if (removeIndex) {
-                    indicesService.removeIndex(index, "created for mapping processing");
+
+                @Override
+                public void onFailure(String source, Throwable t) {
+                    logger.warn("[{}] failed to restore snapshot", t, snapshotId);
+                    listener.onFailure(t);
                 }
-            }
+
+                @Override
+                public TimeValue timeout() {
+                    return request.masterNodeTimeout();
+                }
+
+                @Override
+                public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                    listener.onResponse(restoreInfo);
+                }
+            });
+
+
+        } catch (Throwable e) {
+            logger.warn("[{}][{}] failed to restore snapshot", e, request.repository(), request.name());
+            listener.onFailure(e);
         }
-
-        if (!dirty) {
-            return Tuple.tuple(currentState, allTasks);
-        }
-        return Tuple.tuple(ClusterState.builder(currentState).metaData(mdBuilder).build(), allTasks);
-    }
-
-    private boolean processIndexMappingTasks(List<MappingTask> tasks, IndexService indexService, IndexMetaData.Builder builder) {
-        boolean dirty = false;
-        String index = indexService.index().name();
-        // keep track of what we already refreshed, no need to refresh it again...
-        Set<String> processedRefreshes = Sets.newHashSet();
-        for (MappingTask task : tasks) {
-            if (task instanceof RefreshTask) {
-                RefreshTask refreshTask = (RefreshTask) task;
-                try {
-                    List<String> updatedTypes = Lists.newArrayList();
-                    for (String type : refreshTask.types) {
-                        if (processedRefreshes.contains(type)) {
-                            continue;
-                        }
-                        DocumentMapper mapper = indexService.mapperService().documentMapper(type);
-                        if (mapper == null) {
-                            continue;
-                        }
-                        if (!mapper.mappingSource().equals(builder.mapping(type).source())) {
-                            updatedTypes.add(type);
-                            builder.putMapping(new MappingMetaData(mapper));
-                        }
-                        processedRefreshes.add(type);
-                    }
-
-                    if (updatedTypes.isEmpty()) {
-                        continue;
-                    }
-
-                    logger.warn("[{}] re-syncing mappings with cluster state for types [{}]", index, updatedTypes);
-                    dirty = true;
-                } catch (Throwable t) {
-                    logger.warn("[{}] failed to refresh-mapping in cluster state, types [{}]", index, refreshTask.types);
-                }
-            } else if (task instanceof UpdateTask) {
-                UpdateTask updateTask = (UpdateTask) task;
-                try {
-                    String type = updateTask.type;
-                    CompressedString mappingSource = updateTask.mappingSource;
-
-                    MappingMetaData mappingMetaData = builder.mapping(type);
-                    if (mappingMetaData != null && mappingMetaData.source().equals(mappingSource)) {
-                        logger.debug("[{}] update_mapping [{}] ignoring mapping update task as its source is equal to ours", index, updateTask.type);
-                        continue;
-                    }
-
-                    DocumentMapper updatedMapper = indexService.mapperService().merge(type, mappingSource, false);
-                    processedRefreshes.add(type);
-
-                    // if we end up with the same mapping as the original once, ignore
-                    if (mappingMetaData != null && mappingMetaData.source().equals(updatedMapper.mappingSource())) {
-                        logger.debug("[{}] update_mapping [{}] ignoring mapping update task as it results in the same source as what we have", index, updateTask.type);
-                        continue;
-                    }
-
-                    // build the updated mapping source
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("[{}] update_mapping [{}] (dynamic) with source [{}]", index, type, updatedMapper.mappingSource());
-                    } else if (logger.isInfoEnabled()) {
-                        logger.info("[{}] update_mapping [{}] (dynamic)", index, type);
-                    }
-
-                    builder.putMapping(new MappingMetaData(updatedMapper));
-                    dirty = true;
-                } catch (Throwable t) {
-                    logger.warn("[{}] failed to update-mapping in cluster state, type [{}]", index, updateTask.type);
-                }
-            } else {
-                logger.warn("illegal state, got wrong mapping task type [{}]", task);
-            }
-        }
-        return dirty;
     }
 
     /**
-     * Refreshes mappings if they are not the same between original and parsed version
+     * This method is used by {@link org.elasticsearch.index.snapshots.IndexShardSnapshotAndRestoreService} to notify
+     * {@code RestoreService} about shard restore completion.
+     *
+     * @param snapshotId snapshot id
+     * @param shardId    shard id
      */
-    public void refreshMapping(final String index, final String indexUUID, final String... types) {
-        final long insertOrder;
-        synchronized (refreshOrUpdateMutex) {
-            insertOrder = ++refreshOrUpdateInsertOrder;
-            refreshOrUpdateQueue.add(new RefreshTask(index, indexUUID, types));
+    public void indexShardRestoreCompleted(SnapshotId snapshotId, ShardId shardId) {
+        logger.trace("[{}] successfully restored shard  [{}]", snapshotId, shardId);
+        UpdateIndexShardRestoreStatusRequest request = new UpdateIndexShardRestoreStatusRequest(snapshotId, shardId,
+                new ShardRestoreStatus(clusterService.state().nodes().localNodeId(), RestoreMetaData.State.SUCCESS));
+        if (clusterService.state().nodes().localNodeMaster()) {
+            innerUpdateRestoreState(request);
+        } else {
+            transportService.sendRequest(clusterService.state().nodes().masterNode(),
+                    UpdateRestoreStateRequestHandler.ACTION, request, EmptyTransportResponseHandler.INSTANCE_SAME);
         }
-        clusterService.submitStateUpdateTask("refresh-mapping [" + index + "][" + Arrays.toString(types) + "]", Priority.HIGH, new ProcessedClusterStateUpdateTask() {
-            private volatile List<MappingTask> allTasks;
-
-            @Override
-            public void onFailure(String source, Throwable t) {
-                logger.warn("failure during [{}]", t, source);
-            }
-
-            @Override
-            public ClusterState execute(ClusterState currentState) throws Exception {
-                Tuple<ClusterState, List<MappingTask>> tuple = executeRefreshOrUpdate(currentState, insertOrder);
-                this.allTasks = tuple.v2();
-                return tuple.v1();
-            }
-
-            @Override
-            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
-                if (allTasks == null) {
-                    return;
-                }
-                for (Object task : allTasks) {
-                    if (task instanceof UpdateTask) {
-                        UpdateTask uTask = (UpdateTask) task;
-                        ClusterStateUpdateResponse response = new ClusterStateUpdateResponse(true);
-                        uTask.listener.onResponse(response);
-                    }
-                }
-            }
-        });
     }
 
-    public void updateMapping(final String index, final String indexUUID, final String type, final CompressedString mappingSource, final long order, final String nodeId, final ActionListener<ClusterStateUpdateResponse> listener) {
-        final long insertOrder;
-        synchronized (refreshOrUpdateMutex) {
-            insertOrder = ++refreshOrUpdateInsertOrder;
-            refreshOrUpdateQueue.add(new UpdateTask(index, indexUUID, type, mappingSource, order, nodeId, listener));
-        }
-        clusterService.submitStateUpdateTask("update-mapping [" + index + "][" + type + "] / node [" + nodeId + "], order [" + order + "]", Priority.HIGH, new ProcessedClusterStateUpdateTask() {
-            private volatile List<MappingTask> allTasks;
+    /**
+     * Updates shard restore record in the cluster state.
+     *
+     * @param request update shard status request
+     */
+    private void innerUpdateRestoreState(final UpdateIndexShardRestoreStatusRequest request) {
+        clusterService.submitStateUpdateTask("update snapshot state", new ProcessedClusterStateUpdateTask() {
 
-            public void onFailure(String source, Throwable t) {
-                listener.onFailure(t);
-            }
+            private boolean completed = true;
 
-            @Override
-            public ClusterState execute(final ClusterState currentState) throws Exception {
-                Tuple<ClusterState, List<MappingTask>> tuple = executeRefreshOrUpdate(currentState, insertOrder);
-                this.allTasks = tuple.v2();
-                return tuple.v1();
-            }
-
-            @Override
-            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
-                if (allTasks == null) {
-                    return;
-                }
-                for (Object task : allTasks) {
-                    if (task instanceof UpdateTask) {
-                        UpdateTask uTask = (UpdateTask) task;
-                        ClusterStateUpdateResponse response = new ClusterStateUpdateResponse(true);
-                        try {
-                            uTask.listener.onResponse(response);
-                        } catch (Throwable t) {
-                            logger.debug("failed ot ping back on response of mapping processing for task [{}]", t, uTask.listener);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    public void removeMapping(final DeleteMappingClusterStateUpdateRequest request, final ActionListener<ClusterStateUpdateResponse> listener) {
-        clusterService.submitStateUpdateTask("remove-mapping [" + Arrays.toString(request.types()) + "]", Priority.HIGH, new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(request, listener) {
-            @Override
-            protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
-                return new ClusterStateUpdateResponse(acknowledged);
-            }
+            private RestoreInfo restoreInfo = null;
 
             @Override
             public ClusterState execute(ClusterState currentState) {
-                if (request.indices().length == 0) {
-                    throw new IndexMissingException(new Index("_all"));
-                }
-
-                MetaData.Builder builder = MetaData.builder(currentState.metaData());
-                boolean changed = false;
-                String latestIndexWithout = null;
-                for (String indexName : request.indices()) {
-                    IndexMetaData indexMetaData = currentState.metaData().index(indexName);
-                    IndexMetaData.Builder indexBuilder = IndexMetaData.builder(indexMetaData);
-
-                    if (indexMetaData != null) {
-                        boolean isLatestIndexWithout = true;
-                        for (String type : request.types()) {
-                            if (indexMetaData.mappings().containsKey(type)) {
-                                indexBuilder.removeMapping(type);
-                                changed = true;
-                                isLatestIndexWithout = false;
+                MetaData metaData = currentState.metaData();
+                MetaData.Builder mdBuilder = MetaData.builder(currentState.metaData());
+                RestoreMetaData restore = metaData.custom(RestoreMetaData.TYPE);
+                if (restore != null) {
+                    boolean changed = false;
+                    ArrayList<RestoreMetaData.Entry> entries = newArrayList();
+                    for (RestoreMetaData.Entry entry : restore.entries()) {
+                        if (entry.snapshotId().equals(request.snapshotId())) {
+                            HashMap<ShardId, ShardRestoreStatus> shards = newHashMap(entry.shards());
+                            logger.trace("[{}] Updating shard [{}] with status [{}]", request.snapshotId(), request.shardId(), request.status().state());
+                            shards.put(request.shardId(), request.status());
+                            for (RestoreMetaData.ShardRestoreStatus status : shards.values()) {
+                                if (!status.state().completed()) {
+                                    completed = false;
+                                    break;
+                                }
                             }
+                            if (!completed) {
+                                entries.add(new RestoreMetaData.Entry(entry.snapshotId(), RestoreMetaData.State.STARTED, entry.indices(), ImmutableMap.copyOf(shards)));
+                            } else {
+                                logger.info("restore [{}] is done", request.snapshotId());
+                                int failedShards = 0;
+                                for (RestoreMetaData.ShardRestoreStatus status : shards.values()) {
+                                    if (status.state() == RestoreMetaData.State.FAILURE) {
+                                        failedShards++;
+                                    }
+                                }
+                                restoreInfo = new RestoreInfo(entry.snapshotId().getSnapshot(), entry.indices(), shards.size(), shards.size() - failedShards);
+                            }
+                            changed = true;
+                        } else {
+                            entries.add(entry);
                         }
-                        if (isLatestIndexWithout) {
-                            latestIndexWithout = indexMetaData.index();
-                        }
-
                     }
-                    builder.put(indexBuilder);
+                    if (changed) {
+                        restore = new RestoreMetaData(entries.toArray(new RestoreMetaData.Entry[entries.size()]));
+                        mdBuilder.putCustom(RestoreMetaData.TYPE, restore);
+                        return ClusterState.builder(currentState).metaData(mdBuilder).build();
+                    }
                 }
+                return currentState;
+            }
 
-                if (!changed) {
-                    throw new TypeMissingException(new Index(latestIndexWithout), request.types());
+            @Override
+            public void onFailure(String source, Throwable t) {
+                logger.warn("[{}][{}] failed to update snapshot status to [{}]", t, request.snapshotId(), request.shardId(), request.status());
+            }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                if (restoreInfo != null) {
+                    for (RestoreCompletionListener listener : listeners) {
+                        try {
+                            listener.onRestoreCompletion(request.snapshotId, restoreInfo);
+                        } catch (Throwable e) {
+                            logger.warn("failed to update snapshot status for [{}]", e, listener);
+                        }
+                    }
                 }
-
-                logger.info("[{}] remove_mapping [{}]", request.indices(), request.types());
-
-                return ClusterState.builder(currentState).metaData(builder).build();
             }
         });
     }
 
-    public void putMapping(final PutMappingClusterStateUpdateRequest request, final ActionListener<ClusterStateUpdateResponse> listener) {
+    /**
+     * Checks if any of the deleted indices are still recovering and fails recovery on the shards of these indices
+     *
+     * @param event cluster changed event
+     */
+    private void processDeletedIndices(ClusterChangedEvent event) {
+        MetaData metaData = event.state().metaData();
+        RestoreMetaData restore = metaData.custom(RestoreMetaData.TYPE);
+        if (restore == null) {
+            // Not restoring - nothing to do
+            return;
+        }
 
-        clusterService.submitStateUpdateTask("put-mapping [" + request.type() + "]", Priority.HIGH, new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(request, listener) {
-
-            @Override
-            protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
-                return new ClusterStateUpdateResponse(acknowledged);
-            }
-
-            @Override
-            public ClusterState execute(final ClusterState currentState) throws Exception {
-                List<String> indicesToClose = Lists.newArrayList();
-                try {
-                    for (String index : request.indices()) {
-                        if (!currentState.metaData().hasIndex(index)) {
-                            throw new IndexMissingException(new Index(index));
-                        }
-                    }
-
-                    // pre create indices here and add mappings to them so we can merge the mappings here if needed
-                    for (String index : request.indices()) {
-                        if (indicesService.hasIndex(index)) {
-                            continue;
-                        }
-                        final IndexMetaData indexMetaData = currentState.metaData().index(index);
-                        IndexService indexService = indicesService.createIndex(indexMetaData.index(), indexMetaData.settings(), clusterService.localNode().id());
-                        indicesToClose.add(indexMetaData.index());
-                        // make sure to add custom default mapping if exists
-                        if (indexMetaData.mappings().containsKey(MapperService.DEFAULT_MAPPING)) {
-                            indexService.mapperService().merge(MapperService.DEFAULT_MAPPING, indexMetaData.mappings().get(MapperService.DEFAULT_MAPPING).source(), false);
-                        }
-                        // only add the current relevant mapping (if exists)
-                        if (indexMetaData.mappings().containsKey(request.type())) {
-                            indexService.mapperService().merge(request.type(), indexMetaData.mappings().get(request.type()).source(), false);
-                        }
-                    }
-
-                    Map<String, DocumentMapper> newMappers = newHashMap();
-                    Map<String, DocumentMapper> existingMappers = newHashMap();
-                    for (String index : request.indices()) {
-                        IndexService indexService = indicesService.indexServiceSafe(index);
-                        // try and parse it (no need to add it here) so we can bail early in case of parsing exception
-                        DocumentMapper newMapper;
-                        DocumentMapper existingMapper = indexService.mapperService().documentMapper(request.type());
-                        if (MapperService.DEFAULT_MAPPING.equals(request.type())) {
-                            // _default_ types do not go through merging, but we do test the new settings. Also don't apply the old default
-                            newMapper = indexService.mapperService().parse(request.type(), new CompressedString(request.source()), false);
-                        } else {
-                            newMapper = indexService.mapperService().parse(request.type(), new CompressedString(request.source()));
-                            if (existingMapper != null) {
-                                // first, simulate
-                                DocumentMapper.MergeResult mergeResult = existingMapper.merge(newMapper, mergeFlags().simulate(true));
-                                // if we have conflicts, and we are not supposed to ignore them, throw an exception
-                                if (!request.ignoreConflicts() && mergeResult.hasConflicts()) {
-                                    throw new MergeMappingException(mergeResult.conflicts());
-                                }
+        if (!event.indicesDeleted().isEmpty()) {
+            // Some indices were deleted, let's make sure all indices that we are restoring still exist
+            for (RestoreMetaData.Entry entry : restore.entries()) {
+                List<ShardId> shardsToFail = null;
+                for (ImmutableMap.Entry<ShardId, ShardRestoreStatus> shard : entry.shards().entrySet()) {
+                    if (!shard.getValue().state().completed()) {
+                        if (!event.state().metaData().hasIndex(shard.getKey().getIndex())) {
+                            if (shardsToFail == null) {
+                                shardsToFail = newArrayList();
                             }
-                        }
-
-                        newMappers.put(index, newMapper);
-                        if (existingMapper != null) {
-                            existingMappers.put(index, existingMapper);
+                            shardsToFail.add(shard.getKey());
                         }
                     }
-
-                    String mappingType = request.type();
-                    if (mappingType == null) {
-                        mappingType = newMappers.values().iterator().next().type();
-                    } else if (!mappingType.equals(newMappers.values().iterator().next().type())) {
-                        throw new InvalidTypeNameException("Type name provided does not match type name within mapping definition");
-                    }
-                    if (!MapperService.DEFAULT_MAPPING.equals(mappingType) && !PercolatorService.TYPE_NAME.equals(mappingType) && mappingType.charAt(0) == '_') {
-                        throw new InvalidTypeNameException("Document mapping type name can't start with '_'");
-                    }
-
-                    final Map<String, MappingMetaData> mappings = newHashMap();
-                    for (Map.Entry<String, DocumentMapper> entry : newMappers.entrySet()) {
-                        String index = entry.getKey();
-                        // do the actual merge here on the master, and update the mapping source
-                        DocumentMapper newMapper = entry.getValue();
-                        IndexService indexService = indicesService.indexService(index);
-                        if (indexService == null) {
-                            continue;
-                        }
-
-                        CompressedString existingSource = null;
-                        if (existingMappers.containsKey(entry.getKey())) {
-                            existingSource = existingMappers.get(entry.getKey()).mappingSource();
-                        }
-                        DocumentMapper mergedMapper = indexService.mapperService().merge(newMapper.type(), newMapper.mappingSource(), false);
-                        CompressedString updatedSource = mergedMapper.mappingSource();
-
-                        if (existingSource != null) {
-                            if (existingSource.equals(updatedSource)) {
-                                // same source, no changes, ignore it
-                            } else {
-                                // use the merged mapping source
-                                mappings.put(index, new MappingMetaData(mergedMapper));
-                                if (logger.isDebugEnabled()) {
-                                    logger.debug("[{}] update_mapping [{}] with source [{}]", index, mergedMapper.type(), updatedSource);
-                                } else if (logger.isInfoEnabled()) {
-                                    logger.info("[{}] update_mapping [{}]", index, mergedMapper.type());
-                                }
-                            }
-                        } else {
-                            mappings.put(index, new MappingMetaData(mergedMapper));
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("[{}] create_mapping [{}] with source [{}]", index, newMapper.type(), updatedSource);
-                            } else if (logger.isInfoEnabled()) {
-                                logger.info("[{}] create_mapping [{}]", index, newMapper.type());
-                            }
-                        }
-                    }
-
-                    if (mappings.isEmpty()) {
-                        // no changes, return
-                        return currentState;
-                    }
-
-                    MetaData.Builder builder = MetaData.builder(currentState.metaData());
-                    for (String indexName : request.indices()) {
-                        IndexMetaData indexMetaData = currentState.metaData().index(indexName);
-                        if (indexMetaData == null) {
-                            throw new IndexMissingException(new Index(indexName));
-                        }
-                        MappingMetaData mappingMd = mappings.get(indexName);
-                        if (mappingMd != null) {
-                            builder.put(IndexMetaData.builder(indexMetaData).putMapping(mappingMd));
-                        }
-                    }
-
-                    return ClusterState.builder(currentState).metaData(builder).build();
-                } finally {
-                    for (String index : indicesToClose) {
-                        indicesService.removeIndex(index, "created for mapping processing");
+                }
+                if (shardsToFail != null) {
+                    for (ShardId shardId : shardsToFail) {
+                        logger.trace("[{}] failing running shard restore [{}]", entry.snapshotId(), shardId);
+                        innerUpdateRestoreState(new UpdateIndexShardRestoreStatusRequest(entry.snapshotId(), shardId, new ShardRestoreStatus(null, RestoreMetaData.State.FAILURE, "index was deleted")));
                     }
                 }
             }
-        });
+        }
+    }
+
+    private boolean failed(Snapshot snapshot, String index) {
+        for (SnapshotShardFailure failure : snapshot.shardFailures()) {
+            if (index.equals(failure.index())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean failed(Snapshot snapshot, String index, int shard) {
+        for (SnapshotShardFailure failure : snapshot.shardFailures()) {
+            if (index.equals(failure.index()) && shard == failure.shardId()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Adds restore completion listener
+     * <p/>
+     * This listener is called for each snapshot that finishes restore operation in the cluster. It's responsibility of
+     * the listener to decide if it's called for the appropriate snapshot or not.
+     *
+     * @param listener restore completion listener
+     */
+    public void addListener(RestoreCompletionListener listener) {
+        this.listeners.add(listener);
+    }
+
+    /**
+     * Removes restore completion listener
+     * <p/>
+     * This listener is called for each snapshot that finishes restore operation in the cluster.
+     *
+     * @param listener restore completion listener
+     */
+    public void removeListener(RestoreCompletionListener listener) {
+        this.listeners.remove(listener);
+    }
+
+    @Override
+    public void clusterChanged(ClusterChangedEvent event) {
+        try {
+            if (event.localNodeMaster()) {
+                processDeletedIndices(event);
+            }
+        } catch (Throwable t) {
+            logger.warn("Failed to update restore state ", t);
+        }
+    }
+
+    /**
+     * Checks if a repository is currently in use by one of the snapshots
+     *
+     * @param clusterState cluster state
+     * @param repository   repository id
+     * @return true if repository is currently in use by one of the running snapshots
+     */
+    public static boolean isRepositoryInUse(ClusterState clusterState, String repository) {
+        MetaData metaData = clusterState.metaData();
+        RestoreMetaData snapshots = metaData.custom(RestoreMetaData.TYPE);
+        if (snapshots != null) {
+            for (RestoreMetaData.Entry snapshot : snapshots.entries()) {
+                if (repository.equals(snapshot.snapshotId().getRepository())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Restore snapshot request
+     */
+    public static class RestoreRequest {
+
+        private String cause;
+
+        private String name;
+
+        private String repository;
+
+        private String[] indices;
+
+        private String renamePattern;
+
+        private String renameReplacement;
+
+        private IndicesOptions indicesOptions = IndicesOptions.strict();
+
+        private Settings settings;
+
+        private TimeValue masterNodeTimeout;
+
+        private boolean includeGlobalState = false;
+
+        /**
+         * Constructs new restore request
+         *
+         * @param cause      cause for restoring the snapshot
+         * @param repository repository name
+         * @param name       snapshot name
+         */
+        public RestoreRequest(String cause, String repository, String name) {
+            this.cause = cause;
+            this.name = name;
+            this.repository = repository;
+        }
+
+        /**
+         * Sets list of indices to restore
+         *
+         * @param indices list of indices
+         * @return this request
+         */
+        public RestoreRequest indices(String[] indices) {
+            this.indices = indices;
+            return this;
+        }
+
+        /**
+         * Sets indices options flags
+         *
+         * @param indicesOptions indices options flags
+         * @return this request
+         */
+        public RestoreRequest indicesOptions(IndicesOptions indicesOptions) {
+            this.indicesOptions = indicesOptions;
+            return this;
+        }
+
+        /**
+         * If true global cluster state will be restore as part of the restore operation
+         *
+         * @param includeGlobalState restore global state flag
+         * @return this request
+         */
+        public RestoreRequest includeGlobalState(boolean includeGlobalState) {
+            this.includeGlobalState = includeGlobalState;
+            return this;
+        }
+
+        /**
+         * Sets repository-specific restore settings
+         *
+         * @param settings restore settings
+         * @return this request
+         */
+        public RestoreRequest settings(Settings settings) {
+            this.settings = settings;
+            return this;
+        }
+
+        /**
+         * Sets master node timeout
+         * <p/>
+         * This timeout will affect only start of the restore process. Once restore process has started this timeout
+         * has no affect for the duration of restore.
+         *
+         * @param masterNodeTimeout master node timeout
+         * @return this request
+         */
+        public RestoreRequest masterNodeTimeout(TimeValue masterNodeTimeout) {
+            this.masterNodeTimeout = masterNodeTimeout;
+            return this;
+        }
+
+        /**
+         * Sets index rename pattern
+         *
+         * @param renamePattern rename pattern
+         * @return this request
+         */
+        public RestoreRequest renamePattern(String renamePattern) {
+            this.renamePattern = renamePattern;
+            return this;
+        }
+
+        /**
+         * Sets index rename replacement
+         *
+         * @param renameReplacement rename replacement
+         * @return this request
+         */
+        public RestoreRequest renameReplacement(String renameReplacement) {
+            this.renameReplacement = renameReplacement;
+            return this;
+        }
+
+        /**
+         * Returns restore operation cause
+         *
+         * @return restore operation cause
+         */
+        public String cause() {
+            return cause;
+        }
+
+        /**
+         * Returns snapshot name
+         *
+         * @return snapshot name
+         */
+        public String name() {
+            return name;
+        }
+
+        /**
+         * Returns repository name
+         *
+         * @return repository name
+         */
+        public String repository() {
+            return repository;
+        }
+
+        /**
+         * Return the list of indices to be restored
+         *
+         * @return the list of indices
+         */
+        public String[] indices() {
+            return indices;
+        }
+
+        /**
+         * Returns indices option flags
+         *
+         * @return indices options flags
+         */
+        public IndicesOptions indicesOptions() {
+            return indicesOptions;
+        }
+
+        /**
+         * Returns rename pattern
+         *
+         * @return rename pattern
+         */
+        public String renamePattern() {
+            return renamePattern;
+        }
+
+        /**
+         * Returns replacement pattern
+         *
+         * @return replacement pattern
+         */
+        public String renameReplacement() {
+            return renameReplacement;
+        }
+
+        /**
+         * Returns repository-specific restore settings
+         *
+         * @return restore settings
+         */
+        public Settings settings() {
+            return settings;
+        }
+
+        /**
+         * Returns true if global state should be restore during this restore operation
+         *
+         * @return restore global state flag
+         */
+        public boolean includeGlobalState() {
+            return includeGlobalState;
+        }
+
+        /**
+         * Return master node timeout
+         *
+         * @return master node timeout
+         */
+        public TimeValue masterNodeTimeout() {
+            return masterNodeTimeout;
+        }
+
+    }
+
+
+    /**
+     * This listener is called as soon as restore operation starts in the cluster.
+     * <p/>
+     * To receive notifications about  when operation ends in the cluster use {@link RestoreCompletionListener}
+     */
+    public static interface RestoreSnapshotListener {
+        /**
+         * Called when restore operations successfully starts in the cluster. Not null value of {@code snapshot} parameter
+         * means that restore operation didn't involve any shards and therefore has already completed.
+         *
+         * @param restoreInfo if restore operation finished, contains information about restore operation, null otherwise
+         */
+        void onResponse(RestoreInfo restoreInfo);
+
+        /**
+         * Called when restore operation failed to start
+         *
+         * @param t exception that prevented the restore operation to start
+         */
+        void onFailure(Throwable t);
+    }
+
+    /**
+     * This listener is called every time a snapshot is restored in the cluster
+     */
+    public static interface RestoreCompletionListener {
+        /**
+         * Called for every snapshot that is completed in the cluster
+         *
+         * @param snapshotId  snapshot id
+         * @param restoreInfo restore completion information
+         */
+        void onRestoreCompletion(SnapshotId snapshotId, RestoreInfo restoreInfo);
+    }
+
+    /**
+     * Internal class that is used to send notifications about finished shard restore operations to master node
+     */
+    private static class UpdateIndexShardRestoreStatusRequest extends TransportRequest {
+        private SnapshotId snapshotId;
+        private ShardId shardId;
+        private ShardRestoreStatus status;
+
+        private UpdateIndexShardRestoreStatusRequest() {
+
+        }
+
+        private UpdateIndexShardRestoreStatusRequest(SnapshotId snapshotId, ShardId shardId, ShardRestoreStatus status) {
+            this.snapshotId = snapshotId;
+            this.shardId = shardId;
+            this.status = status;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            snapshotId = SnapshotId.readSnapshotId(in);
+            shardId = ShardId.readShardId(in);
+            status = ShardRestoreStatus.readShardRestoreStatus(in);
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            snapshotId.writeTo(out);
+            shardId.writeTo(out);
+            status.writeTo(out);
+        }
+
+        public SnapshotId snapshotId() {
+            return snapshotId;
+        }
+
+        public ShardId shardId() {
+            return shardId;
+        }
+
+        public ShardRestoreStatus status() {
+            return status;
+        }
+    }
+
+    /**
+     * Internal class that is used to send notifications about finished shard restore operations to master node
+     */
+    private class UpdateRestoreStateRequestHandler extends BaseTransportRequestHandler<UpdateIndexShardRestoreStatusRequest> {
+
+        static final String ACTION = "cluster/snapshot/update_restore";
+
+        @Override
+        public UpdateIndexShardRestoreStatusRequest newInstance() {
+            return new UpdateIndexShardRestoreStatusRequest();
+        }
+
+        @Override
+        public void messageReceived(UpdateIndexShardRestoreStatusRequest request, final TransportChannel channel) throws Exception {
+            innerUpdateRestoreState(request);
+            channel.sendResponse(TransportResponse.Empty.INSTANCE);
+        }
+
+        @Override
+        public String executor() {
+            return ThreadPool.Names.SAME;
+        }
     }
 }

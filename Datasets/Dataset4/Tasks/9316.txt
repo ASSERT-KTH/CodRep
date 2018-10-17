@@ -1,589 +1,492 @@
-this.fileChunkSize = componentSettings.getAsSize("fileChunkSize", new SizeValue(100, SizeUnit.KB));
-
-/*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
-package org.elasticsearch.index.shard.recovery;
-
-import com.google.inject.Inject;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchInterruptedException;
-import org.elasticsearch.ExceptionsHelper;
-import org.elasticsearch.cluster.node.Node;
-import org.elasticsearch.index.deletionpolicy.SnapshotIndexCommit;
-import org.elasticsearch.index.engine.Engine;
-import org.elasticsearch.index.engine.RecoveryEngineException;
-import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.index.shard.*;
-import org.elasticsearch.index.shard.service.IndexShard;
-import org.elasticsearch.index.shard.service.InternalIndexShard;
-import org.elasticsearch.index.store.Store;
-import org.elasticsearch.index.translog.Translog;
-import org.elasticsearch.index.translog.memory.MemorySnapshot;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.*;
-import org.elasticsearch.util.SizeUnit;
-import org.elasticsearch.util.SizeValue;
-import org.elasticsearch.util.StopWatch;
-import org.elasticsearch.util.TimeValue;
-import org.elasticsearch.util.io.Streamable;
-import org.elasticsearch.util.io.VoidStreamable;
-import org.elasticsearch.util.settings.Settings;
-
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicReference;
-
-import static java.util.concurrent.TimeUnit.*;
-import static org.elasticsearch.util.concurrent.ConcurrentMaps.*;
-
-/**
- * @author kimchy (shay.banon)
- */
-public class RecoveryAction extends AbstractIndexShardComponent {
-
-    private final SizeValue fileChunkSize;
-
-    private final ThreadPool threadPool;
-
-    private final TransportService transportService;
-
-    private final InternalIndexShard indexShard;
-
-    private final Store store;
-
-    private final ConcurrentMap<String, IndexOutput> openIndexOutputs = newConcurrentMap();
-
-    private final String startTransportAction;
-
-    private final String fileChunkTransportAction;
-
-    private final String snapshotTransportAction;
-
-    private volatile boolean closed = false;
-
-    private volatile Thread sendStartRecoveryThread;
-
-    private volatile Thread receiveSnapshotRecoveryThread;
-
-    private volatile Thread sendSnapshotRecoveryThread;
-
-    private final CopyOnWriteArrayList<Future> sendFileChunksRecoveryFutures = new CopyOnWriteArrayList<Future>();
-
-    @Inject public RecoveryAction(ShardId shardId, @IndexSettings Settings indexSettings, ThreadPool threadPool, TransportService transportService, IndexShard indexShard, Store store) {
-        super(shardId, indexSettings);
-        this.threadPool = threadPool;
-        this.transportService = transportService;
-        this.indexShard = (InternalIndexShard) indexShard;
-        this.store = store;
-
-        startTransportAction = shardId.index().name() + "/" + shardId.id() + "/recovery/start";
-        transportService.registerHandler(startTransportAction, new StartRecoveryTransportRequestHandler());
-        fileChunkTransportAction = shardId.index().name() + "/" + shardId.id() + "/recovery/fileChunk";
-        transportService.registerHandler(fileChunkTransportAction, new FileChunkTransportRequestHandler());
-        snapshotTransportAction = shardId.index().name() + "/" + shardId.id() + "/recovery/snapshot";
-        transportService.registerHandler(snapshotTransportAction, new SnapshotTransportRequestHandler());
-
-        this.fileChunkSize = componentSettings.getAsSize("fileChunkSize", new SizeValue(16, SizeUnit.KB));
-        logger.trace("Recovery Action registered, using fileChunkSize[{}]", fileChunkSize);
-    }
-
-    public void close() {
-        closed = true;
-        transportService.removeHandler(startTransportAction);
-        transportService.removeHandler(fileChunkTransportAction);
-        transportService.removeHandler(snapshotTransportAction);
-
-        cleanOpenIndex();
-
-        // interrupt the startRecovery thread if its performing recovery
-        if (sendStartRecoveryThread != null) {
-            sendStartRecoveryThread.interrupt();
-        }
-        if (receiveSnapshotRecoveryThread != null) {
-            receiveSnapshotRecoveryThread.interrupt();
-        }
-        if (sendSnapshotRecoveryThread != null) {
-            sendSnapshotRecoveryThread.interrupt();
-        }
-        for (Future future : sendFileChunksRecoveryFutures) {
-            future.cancel(true);
-        }
-    }
-
-    public synchronized void startRecovery(Node node, Node targetNode, boolean markAsRelocated) throws ElasticSearchException {
-        sendStartRecoveryThread = Thread.currentThread();
-        try {
-            // mark the shard as recovering
-            IndexShardState preRecoveringState;
-            try {
-                preRecoveringState = indexShard.recovering();
-            } catch (IndexShardRecoveringException e) {
-                // that's fine, since we might be called concurrently, just ignore this, we are already recovering
-                throw new IgnoreRecoveryException("Already in recovering process", e);
-            } catch (IndexShardStartedException e) {
-                // that's fine, since we might be called concurrently, just ignore this, we are already started
-                throw new IgnoreRecoveryException("Already in recovering process", e);
-            } catch (IndexShardRelocatedException e) {
-                // that's fine, since we might be called concurrently, just ignore this, we are already relocated
-                throw new IgnoreRecoveryException("Already in recovering process", e);
-            } catch (IndexShardClosedException e) {
-                throw new IgnoreRecoveryException("Can't recover a closed shard.", e);
-            }
-            logger.debug("Starting recovery from {}", targetNode);
-            StopWatch stopWatch = new StopWatch().start();
-            try {
-                if (closed) {
-                    throw new IgnoreRecoveryException("Recovery closed");
-                }
-                RecoveryStatus recoveryStatus = transportService.submitRequest(targetNode, startTransportAction, new StartRecoveryRequest(node, markAsRelocated), new FutureTransportResponseHandler<RecoveryStatus>() {
-                    @Override public RecoveryStatus newInstance() {
-                        return new RecoveryStatus();
-                    }
-                }).txGet();
-                stopWatch.stop();
-                if (logger.isDebugEnabled()) {
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("Recovery completed from ").append(targetNode).append(", took [").append(stopWatch.totalTime()).append("]\n");
-                    sb.append("   Phase1: recovered [").append(recoveryStatus.phase1FileNames.size()).append("]")
-                            .append(" files with total size of [").append(new SizeValue(recoveryStatus.phase1TotalSize)).append("]")
-                            .append(", took [").append(new TimeValue(recoveryStatus.phase1Time, MILLISECONDS)).append("]")
-                            .append("\n");
-                    sb.append("   Phase2: recovered [").append(recoveryStatus.phase2Operations).append("]").append(" transaction log operations")
-                            .append(", took [").append(new TimeValue(recoveryStatus.phase2Time, MILLISECONDS)).append("]")
-                            .append("\n");
-                    sb.append("   Phase3: recovered [").append(recoveryStatus.phase3Operations).append("]").append(" transaction log operations")
-                            .append(", took [").append(new TimeValue(recoveryStatus.phase3Time, MILLISECONDS)).append("]");
-                    logger.debug(sb.toString());
-                }
-            } catch (RemoteTransportException e) {
-                if (closed) {
-                    throw new IgnoreRecoveryException("Recovery closed", e);
-                }
-                Throwable cause = ExceptionsHelper.unwrapCause(e);
-                if (cause instanceof ActionNotFoundTransportException || cause instanceof IndexShardNotStartedException) {
-                    // the remote shard has not yet registered the action or not started yet, we need to ignore this recovery attempt, and restore the state previous to recovering
-                    indexShard.restoreRecoveryState(preRecoveringState);
-                    throw new IgnoreRecoveryException("Ignoring recovery attempt, remote shard not started", e);
-                } else if (cause instanceof RecoveryEngineException) {
-                    // it might be wrapped
-                    if (cause.getCause() instanceof IgnoreRecoveryException) {
-                        throw (IgnoreRecoveryException) cause.getCause();
-                    }
-                } else if (cause instanceof IgnoreRecoveryException) {
-                    throw (IgnoreRecoveryException) cause;
-                }
-                throw new RecoveryFailedException(shardId, node, targetNode, e);
-            } catch (Exception e) {
-                if (closed) {
-                    throw new IgnoreRecoveryException("Recovery closed", e);
-                }
-                throw new RecoveryFailedException(shardId, node, targetNode, e);
-            }
-        } finally {
-            sendStartRecoveryThread = null;
-        }
-    }
-
-    private void cleanOpenIndex() {
-        for (IndexOutput indexOutput : openIndexOutputs.values()) {
-            try {
-                synchronized (indexOutput) {
-                    indexOutput.close();
-                }
-            } catch (Exception e) {
-                // ignore
-            }
-        }
-        openIndexOutputs.clear();
-    }
-
-    private static class StartRecoveryRequest implements Streamable {
-
-        private Node node;
-
-        private boolean markAsRelocated;
-
-        private StartRecoveryRequest() {
-        }
-
-        private StartRecoveryRequest(Node node, boolean markAsRelocated) {
-            this.node = node;
-            this.markAsRelocated = markAsRelocated;
-        }
-
-        @Override public void readFrom(DataInput in) throws IOException, ClassNotFoundException {
-            node = Node.readNode(in);
-            markAsRelocated = in.readBoolean();
-        }
-
-        @Override public void writeTo(DataOutput out) throws IOException {
-            node.writeTo(out);
-            out.writeBoolean(markAsRelocated);
-        }
-    }
-
-    private class StartRecoveryTransportRequestHandler extends BaseTransportRequestHandler<StartRecoveryRequest> {
-
-        @Override public StartRecoveryRequest newInstance() {
-            return new StartRecoveryRequest();
-        }
-
-        @Override public void messageReceived(final StartRecoveryRequest startRecoveryRequest, final TransportChannel channel) throws Exception {
-            logger.trace("Starting recovery to {}, markAsRelocated {}", startRecoveryRequest.node, startRecoveryRequest.markAsRelocated);
-            final Node node = startRecoveryRequest.node;
-            cleanOpenIndex();
-            final RecoveryStatus recoveryStatus = new RecoveryStatus();
-            indexShard.recover(new Engine.RecoveryHandler() {
-                @Override public void phase1(SnapshotIndexCommit snapshot) throws ElasticSearchException {
-                    long totalSize = 0;
-                    try {
-                        StopWatch stopWatch = new StopWatch().start();
-
-                        for (String name : snapshot.getFiles()) {
-                            IndexInput indexInput = store.directory().openInput(name);
-                            recoveryStatus.phase1FileNames.add(name);
-                            recoveryStatus.phase1FileSizes.add(indexInput.length());
-                            totalSize += indexInput.length();
-                            indexInput.close();
-                        }
-                        recoveryStatus.phase1TotalSize = totalSize;
-
-                        logger.trace("Recovery [phase1] to {}: recovering [{}] files with total size of [{}]", new Object[]{node, snapshot.getFiles().length, new SizeValue(totalSize)});
-
-                        final CountDownLatch latch = new CountDownLatch(snapshot.getFiles().length);
-                        final AtomicReference<Exception> lastException = new AtomicReference<Exception>();
-                        for (final String name : snapshot.getFiles()) {
-                            sendFileChunksRecoveryFutures.add(threadPool.submit(new Runnable() {
-                                @Override public void run() {
-                                    IndexInput indexInput = null;
-                                    try {
-                                        final int BUFFER_SIZE = (int) fileChunkSize.bytes();
-                                        byte[] buf = new byte[BUFFER_SIZE];
-                                        indexInput = store.directory().openInput(name);
-                                        long len = indexInput.length();
-                                        long readCount = 0;
-                                        while (readCount < len) {
-                                            int toRead = readCount + BUFFER_SIZE > len ? (int) (len - readCount) : BUFFER_SIZE;
-                                            long position = indexInput.getFilePointer();
-                                            indexInput.readBytes(buf, 0, toRead, false);
-                                            transportService.submitRequest(node, fileChunkTransportAction, new FileChunk(name, position, len, buf, toRead), VoidTransportResponseHandler.INSTANCE).txGet(30, SECONDS);
-                                            readCount += toRead;
-                                        }
-                                        indexInput.close();
-                                    } catch (Exception e) {
-                                        lastException.set(e);
-                                    } finally {
-                                        if (indexInput != null) {
-                                            try {
-                                                indexInput.close();
-                                            } catch (IOException e) {
-                                                // ignore
-                                            }
-                                        }
-                                        latch.countDown();
-                                    }
-                                }
-                            }));
-                        }
-
-                        latch.await();
-
-                        if (lastException.get() != null) {
-                            throw lastException.get();
-                        }
-
-                        stopWatch.stop();
-                        logger.trace("Recovery [phase1] to {}: took [{}]", node, stopWatch.totalTime());
-                        recoveryStatus.phase1Time = stopWatch.totalTime().millis();
-                    } catch (ElasticSearchInterruptedException e) {
-                        // we got interrupted since we are closing, ignore the recovery
-                        throw new IgnoreRecoveryException("Interrupted while recovering files");
-                    } catch (Throwable e) {
-                        throw new RecoverFilesRecoveryException(shardId, snapshot.getFiles().length, new SizeValue(totalSize), e);
-                    } finally {
-                        sendFileChunksRecoveryFutures.clear();
-                    }
-                }
-
-                @Override public void phase2(Translog.Snapshot snapshot) throws ElasticSearchException {
-                    sendSnapshotRecoveryThread = Thread.currentThread();
-                    try {
-                        if (closed) {
-                            throw new IndexShardClosedException(shardId);
-                        }
-                        logger.trace("Recovery [phase2] to {}: sending [{}] transaction log operations", node, snapshot.size());
-                        StopWatch stopWatch = new StopWatch().start();
-                        sendSnapshot(snapshot, false);
-                        stopWatch.stop();
-                        logger.trace("Recovery [phase2] to {}: took [{}]", node, stopWatch.totalTime());
-                        recoveryStatus.phase2Time = stopWatch.totalTime().millis();
-                        recoveryStatus.phase2Operations = snapshot.size();
-                    } catch (ElasticSearchInterruptedException e) {
-                        // we got interrupted since we are closing, ignore the recovery
-                        throw new IgnoreRecoveryException("Interrupted in phase 2 files");
-                    } finally {
-                        sendSnapshotRecoveryThread = null;
-                    }
-                }
-
-                @Override public void phase3(Translog.Snapshot snapshot) throws ElasticSearchException {
-                    sendSnapshotRecoveryThread = Thread.currentThread();
-                    try {
-                        if (closed) {
-                            throw new IndexShardClosedException(shardId);
-                        }
-                        logger.trace("Recovery [phase3] to {}: sending [{}] transaction log operations", node, snapshot.size());
-                        StopWatch stopWatch = new StopWatch().start();
-                        sendSnapshot(snapshot, true);
-                        if (startRecoveryRequest.markAsRelocated) {
-                            // TODO what happens if the recovery process fails afterwards, we need to mark this back to started
-                            try {
-                                indexShard.relocated();
-                            } catch (IllegalIndexShardStateException e) {
-                                // we can ignore this exception since, on the other node, when it moved to phase3
-                                // it will also send shard started, which might cause the index shard we work against
-                                // to move be closed by the time we get to the the relocated method
-                            }
-                        }
-                        stopWatch.stop();
-                        logger.trace("Recovery [phase3] to {}: took [{}]", node, stopWatch.totalTime());
-                        recoveryStatus.phase3Time = stopWatch.totalTime().millis();
-                        recoveryStatus.phase3Operations = snapshot.size();
-                    } catch (ElasticSearchInterruptedException e) {
-                        // we got interrupted since we are closing, ignore the recovery
-                        throw new IgnoreRecoveryException("Interrupted in phase 2 files");
-                    } finally {
-                        sendSnapshotRecoveryThread = null;
-                    }
-                }
-
-                private void sendSnapshot(Translog.Snapshot snapshot, boolean phase3) throws ElasticSearchException {
-                    MemorySnapshot memorySnapshot;
-                    if (snapshot instanceof MemorySnapshot) {
-                        memorySnapshot = (MemorySnapshot) snapshot;
-                    } else {
-                        memorySnapshot = new MemorySnapshot(snapshot);
-                    }
-                    transportService.submitRequest(node, snapshotTransportAction, new SnapshotWrapper(memorySnapshot, phase3), VoidTransportResponseHandler.INSTANCE).txGet();
-                }
-            });
-            channel.sendResponse(recoveryStatus);
-        }
-    }
-
-    private static class RecoveryStatus implements Streamable {
-
-        List<String> phase1FileNames = new ArrayList<String>();
-        List<Long> phase1FileSizes = new ArrayList<Long>();
-        long phase1TotalSize;
-        long phase1Time;
-
-        int phase2Operations;
-        long phase2Time;
-
-        int phase3Operations;
-        long phase3Time;
-
-        private RecoveryStatus() {
-        }
-
-        @Override public void readFrom(DataInput in) throws IOException, ClassNotFoundException {
-            int size = in.readInt();
-            phase1FileNames = new ArrayList<String>(size);
-            for (int i = 0; i < size; i++) {
-                phase1FileNames.add(in.readUTF());
-            }
-            size = in.readInt();
-            phase1FileSizes = new ArrayList<Long>(size);
-            for (int i = 0; i < size; i++) {
-                phase1FileSizes.add(in.readLong());
-            }
-            phase1TotalSize = in.readLong();
-            phase1Time = in.readLong();
-            phase2Operations = in.readInt();
-            phase2Time = in.readLong();
-            phase3Operations = in.readInt();
-            phase3Time = in.readLong();
-        }
-
-        @Override public void writeTo(DataOutput out) throws IOException {
-            out.writeInt(phase1FileNames.size());
-            for (String name : phase1FileNames) {
-                out.writeUTF(name);
-            }
-            out.writeInt(phase1FileSizes.size());
-            for (long size : phase1FileSizes) {
-                out.writeLong(size);
-            }
-            out.writeLong(phase1TotalSize);
-            out.writeLong(phase1Time);
-            out.writeInt(phase2Operations);
-            out.writeLong(phase2Time);
-            out.writeInt(phase3Operations);
-            out.writeLong(phase3Time);
-        }
-    }
-
-    private class SnapshotTransportRequestHandler extends BaseTransportRequestHandler<SnapshotWrapper> {
-
-        @Override public SnapshotWrapper newInstance() {
-            return new SnapshotWrapper();
-        }
-
-        @Override public void messageReceived(SnapshotWrapper snapshot, TransportChannel channel) throws Exception {
-            receiveSnapshotRecoveryThread = Thread.currentThread();
-            try {
-                if (closed) {
-                    throw new IndexShardClosedException(shardId);
-                }
-                if (!snapshot.phase3) {
-                    // clean open index outputs in any case (there should not be any open, we close then in the chunk)
-                    cleanOpenIndex();
-                }
-                indexShard.performRecovery(snapshot.snapshot, snapshot.phase3);
-                if (snapshot.phase3) {
-                    indexShard.refresh(new Engine.Refresh(true));
-                    // probably need to do more here...
-                }
-                channel.sendResponse(VoidStreamable.INSTANCE);
-            } finally {
-                receiveSnapshotRecoveryThread = null;
-            }
-        }
-    }
-
-    private static class SnapshotWrapper implements Streamable {
-
-        private MemorySnapshot snapshot;
-
-        private boolean phase3;
-
-        private SnapshotWrapper() {
-        }
-
-        private SnapshotWrapper(MemorySnapshot snapshot, boolean phase3) {
-            this.snapshot = snapshot;
-            this.phase3 = phase3;
-        }
-
-        @Override public void readFrom(DataInput in) throws IOException, ClassNotFoundException {
-            snapshot = new MemorySnapshot();
-            snapshot.readFrom(in);
-            phase3 = in.readBoolean();
-        }
-
-        @Override public void writeTo(DataOutput out) throws IOException {
-            snapshot.writeTo(out);
-            out.writeBoolean(phase3);
-        }
-    }
-
-    private class FileChunkTransportRequestHandler extends BaseTransportRequestHandler<FileChunk> {
-
-        @Override public FileChunk newInstance() {
-            return new FileChunk();
-        }
-
-        @Override public void messageReceived(FileChunk request, TransportChannel channel) throws Exception {
-            if (closed) {
-                throw new IndexShardClosedException(shardId);
-            }
-            IndexOutput indexOutput;
-            if (request.position == 0) {
-                // first request
-                indexOutput = openIndexOutputs.remove(request.name);
-                if (indexOutput != null) {
-                    try {
-                        indexOutput.close();
-                    } catch (IOException e) {
-                        // ignore
-                    }
-                }
-                indexOutput = store.directory().createOutput(request.name);
-                openIndexOutputs.put(request.name, indexOutput);
-            } else {
-                indexOutput = openIndexOutputs.get(request.name);
-            }
-            synchronized (indexOutput) {
-                try {
-                    indexOutput.writeBytes(request.content, request.content.length);
-                    if (indexOutput.getFilePointer() == request.length) {
-                        // we are done
-                        indexOutput.close();
-                        openIndexOutputs.remove(request.name);
-                    }
-                } catch (IOException e) {
-                    openIndexOutputs.remove(request.name);
-                    try {
-                        indexOutput.close();
-                    } catch (IOException e1) {
-                        // ignore
-                    }
-                }
-            }
-            channel.sendResponse(VoidStreamable.INSTANCE);
-        }
-    }
-
-    private static class FileChunk implements Streamable {
-        String name;
-        long position;
-        long length;
-        byte[] content;
-
-        transient int contentLength;
-
-        private FileChunk() {
-        }
-
-        private FileChunk(String name, long position, long length, byte[] content, int contentLength) {
-            this.name = name;
-            this.position = position;
-            this.length = length;
-            this.content = content;
-            this.contentLength = contentLength;
-        }
-
-        @Override public void readFrom(DataInput in) throws IOException, ClassNotFoundException {
-            name = in.readUTF();
-            position = in.readLong();
-            length = in.readLong();
-            content = new byte[in.readInt()];
-            in.readFully(content);
-        }
-
-        @Override public void writeTo(DataOutput out) throws IOException {
-            out.writeUTF(name);
-            out.writeLong(position);
-            out.writeLong(length);
-            out.writeInt(contentLength);
-            out.write(content, 0, contentLength);
-        }
-    }
+if (!valid) throw new GdxRuntimeException("Array#iterator() cannot be used nested.");
+
+/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.utils;
+
+import com.badlogic.gdx.math.MathUtils;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+/** A resizable, ordered or unordered array of objects. If unordered, this class avoids a memory copy when removing elements (the
+ * last element is moved to the removed element's position).
+ * @author Nathan Sweet */
+public class Array<T> implements Iterable<T> {
+	/** Provides direct access to the underlying array. If the Array's generic type is not Object, this field may only be accessed
+	 * if the {@link Array#Array(boolean, int, Class)} constructor was used. */
+	public T[] items;
+
+	public int size;
+	public boolean ordered;
+
+	private ArrayIterator iterator1, iterator2;
+	private Predicate.PredicateIterable<T> predicateIterable;
+
+	/** Creates an ordered array with a capacity of 16. */
+	public Array () {
+		this(true, 16);
+	}
+
+	/** Creates an ordered array with the specified capacity. */
+	public Array (int capacity) {
+		this(true, capacity);
+	}
+
+	/** @param ordered If false, methods that remove elements may change the order of other elements in the array, which avoids a
+	 *           memory copy.
+	 * @param capacity Any elements added beyond this will cause the backing array to be grown. */
+	public Array (boolean ordered, int capacity) {
+		this.ordered = ordered;
+		items = (T[])new Object[capacity];
+	}
+
+	/** Creates a new array with {@link #items} of the specified type.
+	 * @param ordered If false, methods that remove elements may change the order of other elements in the array, which avoids a
+	 *           memory copy.
+	 * @param capacity Any elements added beyond this will cause the backing array to be grown. */
+	public Array (boolean ordered, int capacity, Class<T> arrayType) {
+		this.ordered = ordered;
+		items = (T[])java.lang.reflect.Array.newInstance(arrayType, capacity);
+	}
+
+	/** Creates an ordered array with {@link #items} of the specified type and a capacity of 16. */
+	public Array (Class<T> arrayType) {
+		this(true, 16, arrayType);
+	}
+
+	/** Creates a new array containing the elements in the specified array. The new array will have the same type of backing array
+	 * and will be ordered if the specified array is ordered. The capacity is set to the number of elements, so any subsequent
+	 * elements added will cause the backing array to be grown. */
+	public Array (Array array) {
+		this(array.ordered, array.size, (Class<T>)array.items.getClass().getComponentType());
+		size = array.size;
+		System.arraycopy(array.items, 0, items, 0, size);
+	}
+
+	/** Creates a new ordered array containing the elements in the specified array. The new array will have the same type of backing
+	 * array. The capacity is set to the number of elements, so any subsequent elements added will cause the backing array to be
+	 * grown. */
+	public Array (T[] array) {
+		this(true, array);
+	}
+
+	/** Creates a new array containing the elements in the specified array. The new array will have the same type of backing array.
+	 * The capacity is set to the number of elements, so any subsequent elements added will cause the backing array to be grown.
+	 * @param ordered If false, methods that remove elements may change the order of other elements in the array, which avoids a
+	 *           memory copy. */
+	public Array (boolean ordered, T[] array) {
+		this(ordered, array.length, (Class)array.getClass().getComponentType());
+		size = array.length;
+		System.arraycopy(array, 0, items, 0, size);
+	}
+
+	public void add (T value) {
+		T[] items = this.items;
+		if (size == items.length) items = resize(Math.max(8, (int)(size * 1.75f)));
+		items[size++] = value;
+	}
+
+	public void addAll (Array array) {
+		addAll(array, 0, array.size);
+	}
+
+	public void addAll (Array array, int offset, int length) {
+		if (offset + length > array.size)
+			throw new IllegalArgumentException("offset + length must be <= size: " + offset + " + " + length + " <= " + array.size);
+		addAll((T[])array.items, offset, length);
+	}
+
+	public void addAll (T[] array) {
+		addAll(array, 0, array.length);
+	}
+
+	public void addAll (T[] array, int offset, int length) {
+		T[] items = this.items;
+		int sizeNeeded = size + length;
+		if (sizeNeeded > items.length) items = resize(Math.max(8, (int)(sizeNeeded * 1.75f)));
+		System.arraycopy(array, offset, items, size, length);
+		size += length;
+	}
+
+	public T get (int index) {
+		if (index >= size) throw new IndexOutOfBoundsException(String.valueOf(index));
+		return items[index];
+	}
+
+	public void set (int index, T value) {
+		if (index >= size) throw new IndexOutOfBoundsException(String.valueOf(index));
+		items[index] = value;
+	}
+
+	public void insert (int index, T value) {
+		if (index > size) throw new IndexOutOfBoundsException(String.valueOf(index));
+		T[] items = this.items;
+		if (size == items.length) items = resize(Math.max(8, (int)(size * 1.75f)));
+		if (ordered)
+			System.arraycopy(items, index, items, index + 1, size - index);
+		else
+			items[size] = items[index];
+		size++;
+		items[index] = value;
+	}
+
+	public void swap (int first, int second) {
+		if (first >= size) throw new IndexOutOfBoundsException(String.valueOf(first));
+		if (second >= size) throw new IndexOutOfBoundsException(String.valueOf(second));
+		T[] items = this.items;
+		T firstValue = items[first];
+		items[first] = items[second];
+		items[second] = firstValue;
+	}
+
+	/** Returns if this array contains value.
+	 * @param identity If true, == comparison will be used. If false, .equals() comparison will be used.
+	 * @return true if array contains value, false if it doesn't */
+	public boolean contains (T value, boolean identity) {
+		T[] items = this.items;
+		int i = size - 1;
+		if (identity || value == null) {
+			while (i >= 0)
+				if (items[i--] == value) return true;
+		} else {
+			while (i >= 0)
+				if (value.equals(items[i--])) return true;
+		}
+		return false;
+	}
+
+	/** Returns an index of first occurrence of value in array or -1 if no such value exists
+	 * @param identity If true, == comparison will be used. If false, .equals() comparison will be used.
+	 * @return An index of first occurrence of value in array or -1 if no such value exists */
+	public int indexOf (T value, boolean identity) {
+		T[] items = this.items;
+		if (identity || value == null) {
+			for (int i = 0, n = size; i < n; i++)
+				if (items[i] == value) return i;
+		} else {
+			for (int i = 0, n = size; i < n; i++)
+				if (value.equals(items[i])) return i;
+		}
+		return -1;
+	}
+
+	/** Returns an index of last occurrence of value in array or -1 if no such value exists. Search is started from the end of an
+	 * array.
+	 * @param identity If true, == comparison will be used. If false, .equals() comparison will be used.
+	 * @return An index of last occurrence of value in array or -1 if no such value exists */
+	public int lastIndexOf (T value, boolean identity) {
+		T[] items = this.items;
+		if (identity || value == null) {
+			for (int i = size - 1; i >= 0; i--)
+				if (items[i] == value) return i;
+		} else {
+			for (int i = size - 1; i >= 0; i--)
+				if (value.equals(items[i])) return i;
+		}
+		return -1;
+	}
+
+	/** Removes value from an array if it exists.
+	 * @param identity If true, == comparison will be used. If false, .equals() comparison will be used.
+	 * @return true if value was found and removed, false otherwise */
+	public boolean removeValue (T value, boolean identity) {
+		T[] items = this.items;
+		if (identity || value == null) {
+			for (int i = 0, n = size; i < n; i++) {
+				if (items[i] == value) {
+					removeIndex(i);
+					return true;
+				}
+			}
+		} else {
+			for (int i = 0, n = size; i < n; i++) {
+				if (value.equals(items[i])) {
+					removeIndex(i);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/** Removes and returns the item at the specified index. */
+	public T removeIndex (int index) {
+		if (index >= size) throw new IndexOutOfBoundsException(String.valueOf(index));
+		T[] items = this.items;
+		T value = (T)items[index];
+		size--;
+		if (ordered)
+			System.arraycopy(items, index + 1, items, index, size - index);
+		else
+			items[index] = items[size];
+		items[size] = null;
+		return value;
+	}
+
+	/** Removes from this array all of elements contained in the specified array.
+	 * @param identity True to use ==, false to use .equals().
+	 * @return true if this array was modified. */
+	public boolean removeAll (Array<T> array, boolean identity) {
+		int size = this.size;
+		int startSize = size;
+		T[] items = this.items;
+		if (identity) {
+			for (int i = 0, n = array.size; i < n; i++) {
+				T item = array.get(i);
+				for (int ii = 0; ii < size; ii++) {
+					if (item.equals(items[ii])) {
+						removeIndex(ii);
+						size--;
+						break;
+					}
+				}
+			}
+		} else {
+			for (int i = 0, n = array.size; i < n; i++) {
+				T item = array.get(i);
+				for (int ii = 0; ii < size; ii++) {
+					if (item == items[ii]) {
+						removeIndex(ii);
+						size--;
+						break;
+					}
+				}
+			}
+		}
+		return size != startSize;
+	}
+
+	/** Removes and returns the last item. */
+	public T pop () {
+		--size;
+		T item = items[size];
+		items[size] = null;
+		return item;
+	}
+
+	/** Returns the last item. */
+	public T peek () {
+		return items[size - 1];
+	}
+
+	/** Returns the first item. */
+	public T first () {
+		if (size == 0) throw new IllegalStateException("Array is empty.");
+		return items[0];
+	}
+
+	public void clear () {
+		T[] items = this.items;
+		for (int i = 0, n = size; i < n; i++)
+			items[i] = null;
+		size = 0;
+	}
+
+	/** Reduces the size of the backing array to the size of the actual items. This is useful to release memory when many items have
+	 * been removed, or if it is known that more items will not be added. */
+	public void shrink () {
+		resize(size);
+	}
+
+	/** Increases the size of the backing array to acommodate the specified number of additional items. Useful before adding many
+	 * items to avoid multiple backing array resizes.
+	 * @return {@link #items} */
+	public T[] ensureCapacity (int additionalCapacity) {
+		int sizeNeeded = size + additionalCapacity;
+		if (sizeNeeded >= items.length) resize(Math.max(8, sizeNeeded));
+		return items;
+	}
+
+	/** Creates a new backing array with the specified size containing the current items. */
+	protected T[] resize (int newSize) {
+		T[] items = this.items;
+		T[] newItems = (T[])java.lang.reflect.Array.newInstance(items.getClass().getComponentType(), newSize);
+		System.arraycopy(items, 0, newItems, 0, Math.min(size, newItems.length));
+		this.items = newItems;
+		return newItems;
+	}
+
+	/** Sorts this array. The array elements must implement {@link Comparable}. This method is not thread safe (uses
+	 * {@link Sort#instance()}). */
+	public void sort () {
+		Sort.instance().sort(items, 0, size);
+	}
+
+	/** Sorts the array. This method is not thread safe (uses {@link Sort#instance()}). */
+	public void sort (Comparator<T> comparator) {
+		Sort.instance().sort(items, comparator, 0, size);
+	}
+
+	public void reverse () {
+		for (int i = 0, lastIndex = size - 1, n = size / 2; i < n; i++) {
+			int ii = lastIndex - i;
+			T temp = items[i];
+			items[i] = items[ii];
+			items[ii] = temp;
+		}
+	}
+
+	public void shuffle () {
+		for (int i = size - 1; i >= 0; i--) {
+			int ii = MathUtils.random(i);
+			T temp = items[i];
+			items[i] = items[ii];
+			items[ii] = temp;
+		}
+	}
+
+	/** Returns an iterator for the items in the array. Remove is supported. Note that the same iterator instance is returned each
+	 * time this method is called. Use the {@link ArrayIterator} constructor for nested or multithreaded iteration. */
+	public Iterator<T> iterator () {
+		if (iterator1 == null) {
+			iterator1 = new ArrayIterator(this);
+			iterator2 = new ArrayIterator(this);
+		}
+		if (!iterator1.valid) {
+			iterator1.index = 0;
+			iterator1.valid = true;
+			iterator2.valid = false;
+			return iterator1;
+		}
+		iterator2.index = 0;
+		iterator2.valid = true;
+		iterator1.valid = false;
+		return iterator2;
+	}
+
+	/** Returns an iterable for the selected items in the array. Remove is supported, but not between hasNext() and next(). Note
+	 * that the same iteratable instance is returned each time this method is called. Use the {@link Predicate.PredicateIterable}
+	 * constructor for nested or multithreaded iteration. */
+	public Iterable<T> select (Predicate<T> predicate) {
+		if (predicateIterable == null)
+			predicateIterable = new Predicate.PredicateIterable<T>(this, predicate);
+		else
+			predicateIterable.set(this, predicate);
+		return predicateIterable;
+	}
+
+	/** Reduces the size of the array to the specified size. If the array is already smaller than the specified size, no action is
+	 * taken. */
+	public void truncate (int newSize) {
+		if (size <= newSize) return;
+		for (int i = newSize; i < size; i++)
+			items[i] = null;
+		size = newSize;
+	}
+
+	/** Returns a random item from the array, or null if the array is empty. */
+	public T random () {
+		if (size == 0) return null;
+		return items[MathUtils.random(0, size - 1)];
+	}
+
+	public T[] toArray () {
+		return (T[])toArray(items.getClass().getComponentType());
+	}
+
+	public <V> V[] toArray (Class<V> type) {
+		V[] result = (V[])java.lang.reflect.Array.newInstance(type, size);
+		System.arraycopy(items, 0, result, 0, size);
+		return result;
+	}
+
+	public boolean equals (Object object) {
+		if (object == this) return true;
+		if (!(object instanceof Array)) return false;
+		Array array = (Array)object;
+		int n = size;
+		if (n != array.size) return false;
+		Object[] items1 = this.items;
+		Object[] items2 = array.items;
+		for (int i = 0; i < n; i++) {
+			Object o1 = items1[i];
+			Object o2 = items2[i];
+			if (!(o1 == null ? o2 == null : o1.equals(o2))) return false;
+		}
+		return true;
+	}
+
+	public String toString () {
+		if (size == 0) return "[]";
+		T[] items = this.items;
+		StringBuilder buffer = new StringBuilder(32);
+		buffer.append('[');
+		buffer.append(items[0]);
+		for (int i = 1; i < size; i++) {
+			buffer.append(", ");
+			buffer.append(items[i]);
+		}
+		buffer.append(']');
+		return buffer.toString();
+	}
+
+	public String toString (String separator) {
+		if (size == 0) return "";
+		T[] items = this.items;
+		StringBuilder buffer = new StringBuilder(32);
+		buffer.append(items[0]);
+		for (int i = 1; i < size; i++) {
+			buffer.append(separator);
+			buffer.append(items[i]);
+		}
+		return buffer.toString();
+	}
+
+	static public class ArrayIterator<T> implements Iterator<T> {
+		private final Array<T> array;
+		int index;
+		boolean valid = true;
+
+		public ArrayIterator (Array<T> array) {
+			this.array = array;
+		}
+
+		public boolean hasNext () {
+			return index < array.size;
+		}
+
+		public T next () {
+			if (index >= array.size) throw new NoSuchElementException(String.valueOf(index));
+			if (!valid) throw new GdxRuntimeException("#iterator() cannot be used nested.");
+			return array.items[index++];
+		}
+
+		public void remove () {
+			index--;
+			array.removeIndex(index);
+		}
+
+		public void reset () {
+			index = 0;
+		}
+	}
+
+	static public class ArrayIterable<T> implements Iterable<T> {
+		private ArrayIterator<T> iterator;
+
+		public ArrayIterable (Array<T> array) {
+			iterator = new ArrayIterator<T>(array);
+		}
+
+		@Override
+		public Iterator<T> iterator () {
+			iterator.reset();
+			return iterator;
+		}
+	}
 }

@@ -1,4 +1,4 @@
-logger.info("[partial_cluster_shutdown]: done shutting down [{}]", ((Object) nodesIds));
+import org.elasticsearch.util.inject.Inject;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,240 +19,251 @@ logger.info("[partial_cluster_shutdown]: done shutting down [{}]", ((Object) nod
  * under the License.
  */
 
-package org.elasticsearch.action.admin.cluster.node.shutdown;
+package org.elasticsearch.action.search.type;
 
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchIllegalStateException;
-import org.elasticsearch.action.Actions;
-import org.elasticsearch.action.TransportActions;
-import org.elasticsearch.action.support.master.TransportMasterNodeOperationAction;
-import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.search.*;
 import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.common.collect.Sets;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.io.stream.VoidStreamable;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.node.Node;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.search.SearchShardTarget;
+import org.elasticsearch.search.action.SearchServiceListener;
+import org.elasticsearch.search.action.SearchServiceTransportAction;
+import org.elasticsearch.search.controller.SearchPhaseController;
+import org.elasticsearch.search.controller.ShardDoc;
+import org.elasticsearch.search.fetch.FetchSearchRequest;
+import org.elasticsearch.search.fetch.FetchSearchResult;
+import org.elasticsearch.search.internal.InternalSearchResponse;
+import org.elasticsearch.search.query.QuerySearchResult;
+import org.elasticsearch.search.query.QuerySearchResultProvider;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.*;
+import org.elasticsearch.util.Tuple;
+import org.elasticsearch.util.component.AbstractComponent;
+import org.elasticsearch.util.guice.inject.Inject;
+import org.elasticsearch.util.settings.Settings;
+import org.elasticsearch.util.trove.ExtTIntArrayList;
 
-import java.util.Set;
-import java.util.concurrent.CountDownLatch;
+import java.util.Collection;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.elasticsearch.action.search.type.TransportSearchHelper.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class TransportNodesShutdownAction extends TransportMasterNodeOperationAction<NodesShutdownRequest, NodesShutdownResponse> {
+public class TransportSearchScrollQueryThenFetchAction extends AbstractComponent {
 
-    private final Node node;
+    private final ThreadPool threadPool;
 
-    private final ClusterName clusterName;
+    private final ClusterService clusterService;
 
-    private final boolean disabled;
+    private final SearchServiceTransportAction searchService;
 
-    private final TimeValue delay;
+    private final SearchPhaseController searchPhaseController;
 
-    @Inject public TransportNodesShutdownAction(Settings settings, TransportService transportService, ClusterService clusterService, ThreadPool threadPool,
-                                                Node node, ClusterName clusterName) {
-        super(settings, transportService, clusterService, threadPool);
-        this.node = node;
-        this.clusterName = clusterName;
-        this.disabled = componentSettings.getAsBoolean("disabled", false);
-        this.delay = componentSettings.getAsTime("delay", TimeValue.timeValueMillis(200));
+    private final TransportSearchCache searchCache;
 
-        this.transportService.registerHandler(NodeShutdownRequestHandler.ACTION, new NodeShutdownRequestHandler());
+    @Inject public TransportSearchScrollQueryThenFetchAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
+                                                             TransportSearchCache searchCache,
+                                                             SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.clusterService = clusterService;
+        this.searchCache = searchCache;
+        this.searchService = searchService;
+        this.searchPhaseController = searchPhaseController;
     }
 
-    @Override protected String transportAction() {
-        return TransportActions.Admin.Cluster.Node.SHUTDOWN;
+    public void execute(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
+        new AsyncAction(request, scrollId, listener).start();
     }
 
-    @Override protected NodesShutdownRequest newRequest() {
-        return new NodesShutdownRequest();
-    }
+    private class AsyncAction {
 
-    @Override protected NodesShutdownResponse newResponse() {
-        return new NodesShutdownResponse();
-    }
+        private final SearchScrollRequest request;
 
-    @Override protected void processBeforeDelegationToMaster(NodesShutdownRequest request, ClusterState state) {
-        String[] nodesIds = request.nodesIds;
-        if (nodesIds != null) {
-            for (int i = 0; i < nodesIds.length; i++) {
-                // replace the _local one, since it looses its meaning when going over to the master...
-                if ("_local".equals(nodesIds[i])) {
-                    nodesIds[i] = state.nodes().localNodeId();
+        private final ActionListener<SearchResponse> listener;
+
+        private final ParsedScrollId scrollId;
+
+        private final DiscoveryNodes nodes;
+
+        protected final Collection<ShardSearchFailure> shardFailures = searchCache.obtainShardFailures();
+
+        private final Map<SearchShardTarget, QuerySearchResultProvider> queryResults = searchCache.obtainQueryResults();
+
+        private final Map<SearchShardTarget, FetchSearchResult> fetchResults = searchCache.obtainFetchResults();
+
+        private volatile ShardDoc[] sortedShardList;
+
+        private final AtomicInteger successfulOps;
+
+        private AsyncAction(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
+            this.request = request;
+            this.listener = listener;
+            this.scrollId = scrollId;
+            this.nodes = clusterService.state().nodes();
+            this.successfulOps = new AtomicInteger(scrollId.values().length);
+        }
+
+        public void start() {
+            if (scrollId.values().length == 0) {
+                invokeListener(new SearchPhaseExecutionException("query", "no nodes to search on", null));
+            }
+            final AtomicInteger counter = new AtomicInteger(scrollId.values().length);
+
+            int localOperations = 0;
+            for (Tuple<String, Long> target : scrollId.values()) {
+                DiscoveryNode node = nodes.get(target.v1());
+                if (node != null) {
+                    if (nodes.localNodeId().equals(node.id())) {
+                        localOperations++;
+                    } else {
+                        executeQueryPhase(counter, node, target.v2());
+                    }
+                } else {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Node [" + target.v1() + "] not available for scroll request [" + scrollId.source() + "]");
+                    }
+                    successfulOps.decrementAndGet();
+                    if (counter.decrementAndGet() == 0) {
+                        executeFetchPhase();
+                    }
                 }
             }
-        }
-    }
 
-    @Override protected NodesShutdownResponse masterOperation(final NodesShutdownRequest request, final ClusterState state) throws ElasticSearchException {
-        if (disabled) {
-            throw new ElasticSearchIllegalStateException("Shutdown is disabled");
-        }
-        Set<DiscoveryNode> nodes = Sets.newHashSet();
-        if (Actions.isAllNodes(request.nodesIds)) {
-            logger.info("[cluster_shutdown]: requested, shutting down in [{}]", request.delay);
-            nodes.addAll(state.nodes().nodes().values());
-            Thread t = new Thread(new Runnable() {
-                @Override public void run() {
-                    try {
-                        Thread.sleep(request.delay.millis());
-                    } catch (InterruptedException e) {
-                        // ignore
-                    }
-                    // first, stop the cluster service
-                    logger.trace("[cluster_shutdown]: stopping the cluster service so no re-routing will occur");
-                    clusterService.stop();
-
-                    final CountDownLatch latch = new CountDownLatch(state.nodes().size());
-                    for (final DiscoveryNode node : state.nodes()) {
-                        if (node.id().equals(state.nodes().masterNodeId())) {
-                            // don't shutdown the master yet...
-                            latch.countDown();
-                        } else {
-                            logger.trace("[cluster_shutdown]: sending shutdown request to [{}]", node);
-                            transportService.sendRequest(node, NodeShutdownRequestHandler.ACTION, VoidStreamable.INSTANCE, new VoidTransportResponseHandler() {
-                                @Override public void handleResponse(VoidStreamable response) {
-                                    logger.trace("[cluster_shutdown]: received shutdown response from [{}]", node);
-                                    latch.countDown();
+            if (localOperations > 0) {
+                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
+                    threadPool.execute(new Runnable() {
+                        @Override public void run() {
+                            for (Tuple<String, Long> target : scrollId.values()) {
+                                DiscoveryNode node = nodes.get(target.v1());
+                                if (node != null && nodes.localNodeId().equals(node.id())) {
+                                    executeQueryPhase(counter, node, target.v2());
                                 }
-
-                                @Override public void handleException(RemoteTransportException exp) {
-                                    logger.warn("[cluster_shutdown]: received failed shutdown response from [{}]", exp, node);
-                                    latch.countDown();
-                                }
-                            });
-                        }
-                    }
-                    try {
-                        latch.await();
-                    } catch (InterruptedException e) {
-                        // ignore
-                    }
-                    logger.info("[cluster_shutdown]: done shutting down all nodes except master, proceeding to master");
-
-                    // now, kill the master
-                    logger.trace("[cluster_shutdown]: shutting down the master [{}]", state.nodes().masterNode());
-                    transportService.sendRequest(state.nodes().masterNode(), NodeShutdownRequestHandler.ACTION, VoidStreamable.INSTANCE, new VoidTransportResponseHandler() {
-                        @Override public void handleResponse(VoidStreamable response) {
-                            logger.trace("[cluster_shutdown]: received shutdown response from master");
-                        }
-
-                        @Override public void handleException(RemoteTransportException exp) {
-                            logger.warn("[cluster_shutdown]: received failed shutdown response master", exp);
+                            }
                         }
                     });
-                }
-            });
-            t.start();
-        } else {
-            final String[] nodesIds = Actions.buildNodesIds(state.nodes(), request.nodesIds);
-            logger.info("[partial_cluster_shutdown]: requested, shutting down [{}] in [{}]", nodesIds, request.delay);
-
-            for (String nodeId : nodesIds) {
-                final DiscoveryNode node = state.nodes().get(nodeId);
-                if (node != null) {
-                    nodes.add(node);
+                } else {
+                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
+                    for (final Tuple<String, Long> target : scrollId.values()) {
+                        final DiscoveryNode node = nodes.get(target.v1());
+                        if (node != null && nodes.localNodeId().equals(node.id())) {
+                            if (localAsync) {
+                                threadPool.execute(new Runnable() {
+                                    @Override public void run() {
+                                        executeQueryPhase(counter, node, target.v2());
+                                    }
+                                });
+                            } else {
+                                executeQueryPhase(counter, node, target.v2());
+                            }
+                        }
+                    }
                 }
             }
+        }
 
-            Thread t = new Thread(new Runnable() {
-                @Override public void run() {
-                    try {
-                        Thread.sleep(request.delay.millis());
-                    } catch (InterruptedException e) {
-                        // ignore
+        private void executeQueryPhase(final AtomicInteger counter, DiscoveryNode node, long searchId) {
+            searchService.sendExecuteQuery(node, internalScrollSearchRequest(searchId, request), new SearchServiceListener<QuerySearchResult>() {
+                @Override public void onResult(QuerySearchResult result) {
+                    queryResults.put(result.shardTarget(), result);
+                    if (counter.decrementAndGet() == 0) {
+                        executeFetchPhase();
                     }
+                }
 
-                    final CountDownLatch latch = new CountDownLatch(nodesIds.length);
-                    for (String nodeId : nodesIds) {
-                        final DiscoveryNode node = state.nodes().get(nodeId);
-                        if (node == null) {
-                            logger.warn("[partial_cluster_shutdown]: no node to shutdown for node_id [{}]", nodeId);
-                            latch.countDown();
-                            continue;
-                        }
-
-                        logger.trace("[partial_cluster_shutdown]: sending shutdown request to [{}]", node);
-                        transportService.sendRequest(node, NodeShutdownRequestHandler.ACTION, VoidStreamable.INSTANCE, new VoidTransportResponseHandler() {
-                            @Override public void handleResponse(VoidStreamable response) {
-                                logger.trace("[partial_cluster_shutdown]: received shutdown response from [{}]", node);
-                                latch.countDown();
-                            }
-
-                            @Override public void handleException(RemoteTransportException exp) {
-                                logger.warn("[partial_cluster_shutdown]: received failed shutdown response from [{}]", exp, node);
-                                latch.countDown();
-                            }
-                        });
+                @Override public void onFailure(Throwable t) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Failed to execute query phase", t);
                     }
-
-                    try {
-                        latch.await();
-                    } catch (InterruptedException e) {
-                        // ignore
+                    shardFailures.add(new ShardSearchFailure(t));
+                    successfulOps.decrementAndGet();
+                    if (counter.decrementAndGet() == 0) {
+                        executeFetchPhase();
                     }
-
-                    logger.info("[partial_cluster_shutdown]: done shutting down [{}]", nodesIds);
                 }
             });
-            t.start();
-        }
-        return new NodesShutdownResponse(clusterName, nodes.toArray(new DiscoveryNode[nodes.size()]));
-    }
-
-    private class NodeShutdownRequestHandler extends BaseTransportRequestHandler<VoidStreamable> {
-
-        static final String ACTION = "/cluster/nodes/shutdown/node";
-
-        @Override public VoidStreamable newInstance() {
-            return VoidStreamable.INSTANCE;
         }
 
-        @Override public void messageReceived(VoidStreamable request, TransportChannel channel) throws Exception {
-            if (disabled) {
-                throw new ElasticSearchIllegalStateException("Shutdown is disabled");
+        private void executeFetchPhase() {
+            sortedShardList = searchPhaseController.sortDocs(queryResults.values());
+            Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad = searchPhaseController.docIdsToLoad(sortedShardList);
+
+            if (docIdsToLoad.isEmpty()) {
+                finishHim();
             }
-            logger.info("shutting down in [{}]", delay);
-            Thread t = new Thread(new Runnable() {
-                @Override public void run() {
-                    try {
-                        Thread.sleep(delay.millis());
-                    } catch (InterruptedException e) {
-                        // ignore
-                    }
-                    boolean shutdownWithWrapper = false;
-                    if (System.getProperty("elasticsearch-service") != null) {
-                        try {
-                            Class wrapperManager = settings.getClassLoader().loadClass("org.tanukisoftware.wrapper.WrapperManager");
-                            logger.info("initiating requested shutdown (using service)");
-                            wrapperManager.getMethod("stopAndReturn", int.class).invoke(null, 0);
-                            shutdownWithWrapper = true;
-                        } catch (Throwable e) {
-                            e.printStackTrace();
-                        }
-                    }
-                    if (!shutdownWithWrapper) {
-                        logger.info("initiating requested shutdown...");
-                        try {
-                            node.close();
-                        } catch (Exception e) {
-                            logger.warn("Failed to shutdown", e);
-                        } finally {
-                            // make sure we initiate the shutdown hooks, so the Bootstrap#main thread will exit
-                            System.exit(0);
-                        }
-                    }
-                }
-            });
-            t.start();
 
-            channel.sendResponse(VoidStreamable.INSTANCE);
+            final AtomicInteger counter = new AtomicInteger(docIdsToLoad.size());
+
+            for (Map.Entry<SearchShardTarget, ExtTIntArrayList> entry : docIdsToLoad.entrySet()) {
+                SearchShardTarget shardTarget = entry.getKey();
+                ExtTIntArrayList docIds = entry.getValue();
+                FetchSearchRequest fetchSearchRequest = new FetchSearchRequest(queryResults.get(shardTarget).id(), docIds);
+                DiscoveryNode node = nodes.get(shardTarget.nodeId());
+                searchService.sendExecuteFetch(node, fetchSearchRequest, new SearchServiceListener<FetchSearchResult>() {
+                    @Override public void onResult(FetchSearchResult result) {
+                        fetchResults.put(result.shardTarget(), result);
+                        if (counter.decrementAndGet() == 0) {
+                            finishHim();
+                        }
+                    }
+
+                    @Override public void onFailure(Throwable t) {
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("Failed to execute fetch phase", t);
+                        }
+                        successfulOps.decrementAndGet();
+                        if (counter.decrementAndGet() == 0) {
+                            finishHim();
+                        }
+                    }
+                });
+            }
+        }
+
+        private void finishHim() {
+            try {
+                innerFinishHim();
+            } catch (Exception e) {
+                invokeListener(new ReduceSearchPhaseException("fetch", "", e, buildShardFailures(shardFailures, searchCache)));
+            }
+        }
+
+        private void innerFinishHim() {
+            InternalSearchResponse internalResponse = searchPhaseController.merge(sortedShardList, queryResults, fetchResults);
+            String scrollId = null;
+            if (request.scroll() != null) {
+                scrollId = request.scrollId();
+            }
+            invokeListener(new SearchResponse(internalResponse, scrollId, this.scrollId.values().length, successfulOps.get(), buildShardFailures(shardFailures, searchCache)));
+            searchCache.releaseQueryResults(queryResults);
+            searchCache.releaseFetchResults(fetchResults);
+        }
+
+        protected void invokeListener(final SearchResponse response) {
+            if (request.listenerThreaded()) {
+                threadPool.execute(new Runnable() {
+                    @Override public void run() {
+                        listener.onResponse(response);
+                    }
+                });
+            } else {
+                listener.onResponse(response);
+            }
+        }
+
+        protected void invokeListener(final Throwable t) {
+            if (request.listenerThreaded()) {
+                threadPool.execute(new Runnable() {
+                    @Override public void run() {
+                        listener.onFailure(t);
+                    }
+                });
+            } else {
+                listener.onFailure(t);
+            }
         }
     }
 }

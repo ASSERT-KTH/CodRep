@@ -1,4 +1,4 @@
-strategy = ManagementClientChannelStrategy.create(setup, this, clientConfiguration.getCallbackHandler(), clientConfiguration.getSaslOptions(), clientConfiguration.getSSLContext());
+log.error(MESSAGES.methodInvocationFailed(t.getLocalizedMessage()), t);
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -21,85 +21,145 @@ strategy = ManagementClientChannelStrategy.create(setup, this, clientConfigurati
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
+package org.jboss.as.webservices.invocation;
 
-package org.jboss.as.controller.client.impl;
+import static org.jboss.as.webservices.WSMessages.MESSAGES;
+import static org.jboss.as.webservices.metadata.model.EJBEndpoint.EJB_COMPONENT_VIEW_NAME;
+import static org.jboss.as.webservices.util.ASHelper.getMSCService;
 
-import static org.jboss.as.controller.client.ControllerClientMessages.MESSAGES;
+import java.lang.reflect.Method;
+import java.util.Collection;
 
-import java.io.IOException;
-
-import org.jboss.as.controller.client.ModelControllerClient;
-import org.jboss.as.controller.client.ModelControllerClientConfiguration;
-import org.jboss.as.protocol.ProtocolChannelClient;
-import org.jboss.as.protocol.mgmt.ManagementClientChannelStrategy;
-import org.jboss.remoting3.Channel;
-import org.jboss.remoting3.Endpoint;
-import org.jboss.remoting3.Remoting;
-import org.jboss.remoting3.remote.RemoteConnectionProviderFactory;
-import org.xnio.OptionMap;
-import org.xnio.Options;
-
+import org.jboss.as.ee.component.Component;
+import org.jboss.as.ee.component.ComponentView;
+import org.jboss.as.naming.ManagedReference;
+import org.jboss.invocation.InterceptorContext;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.ws.common.invocation.AbstractInvocationHandler;
+import org.jboss.wsf.spi.deployment.Endpoint;
+import org.jboss.wsf.spi.invocation.Invocation;
 
 /**
- * {@link ModelControllerClient} based on a Remoting {@link Endpoint}.
+ * Invocation abstraction for both EJB3 and  EJB21 endpoints.
  *
- * @author Brian Stansberry (c) 2011 Red Hat Inc.
+ * @author <a href="mailto:ropalka@redhat.com">Richard Opalka</a>
  */
-public class RemotingModelControllerClient extends AbstractModelControllerClient {
+abstract class AbstractInvocationHandlerEJB extends AbstractInvocationHandler {
 
-    private Endpoint endpoint;
-    private ManagementClientChannelStrategy strategy;
-    private boolean closed;
+   /** EJB component view name */
+   private ServiceName ejbComponentViewName;
 
-    private final ModelControllerClientConfiguration clientConfiguration;
+   /** EJB component view */
+   private volatile ComponentView ejbComponentView;
+   private volatile ManagedReference reference;
 
-    public RemotingModelControllerClient(final ModelControllerClientConfiguration configuration) {
-        super(configuration.getExecutor());
-        this.clientConfiguration = configuration;
-    }
+   /**
+    * Initializes EJB component name.
+    *
+    * @param endpoint web service endpoint
+    */
+   public void init(final Endpoint endpoint) {
+       ejbComponentViewName = (ServiceName) endpoint.getProperty(EJB_COMPONENT_VIEW_NAME);
+       if (ejbComponentViewName == null) throw MESSAGES.missingEjbComponentViewName();
+   }
 
-    @Override
-    public void close() throws IOException {
-        synchronized (this) {
-            closed = true;
-            if (endpoint != null) {
-                endpoint.close();
-                endpoint = null;
+   /**
+    * Gets EJB container lazily.
+    *
+    * @return EJB container
+    */
+   private ComponentView getComponentView() {
+       //we need to check both, otherwise it is possible for
+       //ejbComponentView to be initialized before reference
+      if (ejbComponentView == null || reference == null) {
+         synchronized(this) {
+            if (ejbComponentView == null) {
+               ejbComponentView = getMSCService(ejbComponentViewName, ComponentView.class);
+               if (ejbComponentView == null) {
+                  throw MESSAGES.cannotFindEjbView(ejbComponentViewName);
+               }
+                try {
+                    reference = ejbComponentView.createInstance();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
             }
-            if (strategy != null) {
-                strategy.close();
-                strategy = null;
-            }
-            super.shutdownNow();
-        }
-    }
+         }
+      }
+      return ejbComponentView;
+   }
 
-    protected synchronized Channel getChannel() throws IOException {
-        if (closed) {
-            throw MESSAGES.objectIsClosed( ModelControllerClient.class.getSimpleName());
-        }
-        if (strategy == null) {
-            try {
-                final ProtocolChannelClient.Configuration configuration = ProtocolConfigurationFactory.create(clientConfiguration);
+   /**
+    * Invokes EJB endpoint.
+    *
+    * @param endpoint EJB endpoint
+    * @param wsInvocation web service invocation
+    * @throws Exception if any error occurs
+    */
+   public void invoke(final Endpoint endpoint, final Invocation wsInvocation) throws Exception {
+      try {
+         // prepare for invocation
+         onBeforeInvocation(wsInvocation);
+         // prepare invocation data
+         final ComponentView componentView = getComponentView();
+         final Method method = getEJBMethod(wsInvocation.getJavaMethod(), componentView.getViewMethods());
+         final InterceptorContext context = new InterceptorContext();
+         prepareForInvocation(context, wsInvocation);
+         context.setMethod(method);
+         context.setParameters(wsInvocation.getArgs());
+         context.setTarget(reference.getInstance());
+         context.putPrivateData(Component.class, componentView.getComponent());
+         context.putPrivateData(ComponentView.class, componentView);
+          // invoke method
+         final Object retObj = componentView.invoke(context);
+         // set return value
+         wsInvocation.setReturnValue(retObj);
+      }
+      catch (Throwable t) {
+         log.error("Method invocation failed with exception: " + t.getMessage(), t);
+         handleInvocationException(t);
+      }
+      finally {
+         onAfterInvocation(wsInvocation);
+      }
+   }
 
-                // TODO move the endpoint creation somewhere else?
-                endpoint = Remoting.createEndpoint("management-client", OptionMap.EMPTY);
-                endpoint.addConnectionProvider("remote", new RemoteConnectionProviderFactory(), OptionMap.EMPTY);
+   /**
+    * Translates SEI method to EJB view method.
+    *
+    * @param seiMethod SEI method
+    * @param viewMethods EJB view methods
+    * @return matching EJB view method
+    */
+   private Method getEJBMethod(final Method seiMethod, final Collection<Method> viewMethods) {
+       for (final Method viewMethod : viewMethods) {
+           if (matches(seiMethod, viewMethod)) {
+               return viewMethod;
+           }
+       }
+       throw new IllegalStateException();
+   }
 
-                configuration.setEndpoint(endpoint);
-                configuration.setEndpointName("management-client");
+   /**
+    * Compares two methods if they are identical.
+    *
+    * @param seiMethod reference method
+    * @param viewMethod target method
+    * @return true if they match, false otherwise
+    */
+   private boolean matches(final Method seiMethod, final Method viewMethod) {
+       if (!seiMethod.getName().equals(viewMethod.getName())) return false;
+       final Class<?>[] sourceParams = seiMethod.getParameterTypes();
+       final Class<?>[] targetParams = viewMethod.getParameterTypes();
+       if (sourceParams.length != targetParams.length) return false;
+       for (int i = 0; i < sourceParams.length; i++) {
+           if (!sourceParams[i].equals(targetParams[i])) return false;
+       }
+       return true;
+   }
 
-                final ProtocolChannelClient setup = ProtocolChannelClient.create(configuration);
-                strategy = ManagementClientChannelStrategy.create(setup, this, clientConfiguration.getCallbackHandler(), clientConfiguration.getSaslOptions());
-            } catch (IOException e) {
-                throw e;
-            } catch (RuntimeException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
-        return strategy.getChannel();
-    }
+   protected void prepareForInvocation(final InterceptorContext context, final Invocation wsInvocation) {
+       // does nothing
+   }
 
 }

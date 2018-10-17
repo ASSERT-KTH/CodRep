@@ -1,4 +1,4 @@
-AbstractCompactedRow compactedRow = controller.getCompactedRow(new ArrayList<SSTableIdentityIterator>(rows));
+if (shouldPurge && purged != null && purged.metadata().getDefaultValidator().isCommutative())
 
 package org.apache.cassandra.db.compaction;
 /*
@@ -23,185 +23,191 @@ package org.apache.cassandra.db.compaction;
  */
 
 
-import java.io.Closeable;
+import java.io.DataOutput;
+import java.io.IOError;
 import java.io.IOException;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import com.google.common.base.Predicates;
+import com.google.common.collect.Iterators;
 import org.apache.commons.collections.iterators.CollatingIterator;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.io.sstable.SSTableScanner;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.IIterableColumns;
 import org.apache.cassandra.utils.ReducingIterator;
 
-public class CompactionIterator extends ReducingIterator<SSTableIdentityIterator, AbstractCompactedRow>
-implements Closeable, CompactionInfo.Holder
+/**
+ * LazilyCompactedRow only computes the row bloom filter and column index in memory
+ * (at construction time); it does this by reading one column at a time from each
+ * of the rows being compacted, and merging them as it does so.  So the most we have
+ * in memory at a time is the bloom filter, the index, and one column from each
+ * pre-compaction row.
+ *
+ * When write() or update() is called, a second pass is made over the pre-compaction
+ * rows to write the merged columns or update the hash, again with at most one column
+ * from each row deserialized at a time.
+ */
+public class LazilyCompactedRow extends AbstractCompactedRow implements IIterableColumns
 {
-    private static Logger logger = LoggerFactory.getLogger(CompactionIterator.class);
+    private final List<SSTableIdentityIterator> rows;
+    private final CompactionController controller;
+    private final boolean shouldPurge;
+    private final DataOutputBuffer headerBuffer;
+    private ColumnFamily emptyColumnFamily;
+    private LazyColumnIterator iter;
+    private int columnCount;
+    private long columnSerializedSize;
 
-    public static final int FILE_BUFFER_SIZE = 1024 * 1024;
-
-    protected final List<SSTableIdentityIterator> rows = new ArrayList<SSTableIdentityIterator>();
-    protected final CompactionType type;
-    protected final CompactionController controller;
-
-    private long totalBytes;
-    private long bytesRead;
-    private long row;
-
-    // the bytes that had been compacted the last time we delayed to throttle,
-    // and the time in milliseconds when we last throttled
-    private long bytesAtLastDelay;
-    private long timeAtLastDelay;
-
-    // current target bytes to compact per millisecond
-    private int targetBytesPerMS = -1;
-
-    public CompactionIterator(CompactionType type, Iterable<SSTableReader> sstables, CompactionController controller) throws IOException
+    public LazilyCompactedRow(CompactionController controller, List<SSTableIdentityIterator> rows)
     {
-        this(type, getCollatingIterator(sstables), controller);
-    }
-
-    @SuppressWarnings("unchecked")
-    protected CompactionIterator(CompactionType type, Iterator iter, CompactionController controller)
-    {
-        super(iter);
-        this.type = type;
+        super(rows.get(0).getKey());
         this.controller = controller;
-        row = 0;
-        totalBytes = bytesRead = 0;
-        for (SSTableScanner scanner : getScanners())
+        this.shouldPurge = controller.shouldPurge(key);
+        this.rows = new ArrayList<SSTableIdentityIterator>(rows);
+
+        for (SSTableIdentityIterator row : rows)
         {
-            totalBytes += scanner.getFileLength();
+            ColumnFamily cf = row.getColumnFamily();
+
+            if (emptyColumnFamily == null)
+                emptyColumnFamily = cf;
+            else
+                emptyColumnFamily.delete(cf);
+        }
+
+        // initialize row header so isEmpty can be called
+        headerBuffer = new DataOutputBuffer();
+        ColumnIndexer.serialize(this, headerBuffer);
+        // reach into iterator used by ColumnIndexer to get column count and size
+        columnCount = iter.size;
+        columnSerializedSize = iter.serializedSize;
+        iter = null;
+    }
+
+    public void write(DataOutput out) throws IOException
+    {
+        DataOutputBuffer clockOut = new DataOutputBuffer();
+        ColumnFamily.serializer().serializeCFInfo(emptyColumnFamily, clockOut);
+
+        long dataSize = headerBuffer.getLength() + clockOut.getLength() + columnSerializedSize;
+        assert dataSize > 0;
+        out.writeLong(dataSize);
+        out.write(headerBuffer.getData(), 0, headerBuffer.getLength());
+        out.write(clockOut.getData(), 0, clockOut.getLength());
+        out.writeInt(columnCount);
+
+        Iterator<IColumn> iter = iterator();
+        while (iter.hasNext())
+        {
+            IColumn column = iter.next();
+            emptyColumnFamily.getColumnSerializer().serialize(column, out);
         }
     }
 
-    @SuppressWarnings("unchecked")
-    protected static CollatingIterator getCollatingIterator(Iterable<SSTableReader> sstables) throws IOException
+    public void update(MessageDigest digest)
     {
-        // TODO CollatingIterator iter = FBUtilities.<SSTableIdentityIterator>getCollatingIterator();
-        CollatingIterator iter = FBUtilities.getCollatingIterator();
-        for (SSTableReader sstable : sstables)
-        {
-            iter.addIterator(sstable.getDirectScanner(FILE_BUFFER_SIZE));
-        }
-        return iter;
-    }
-
-    public CompactionInfo getCompactionInfo()
-    {
-        return new CompactionInfo(controller.getKeyspace(),
-                                  controller.getColumnFamily(),
-                                  type,
-                                  bytesRead,
-                                  totalBytes);
-    }
-
-    @Override
-    protected boolean isEqual(SSTableIdentityIterator o1, SSTableIdentityIterator o2)
-    {
-        return o1.getKey().equals(o2.getKey());
-    }
-
-    public void reduce(SSTableIdentityIterator current)
-    {
-        rows.add(current);
-    }
-
-    protected AbstractCompactedRow getReduced()
-    {
-        assert rows.size() > 0;
+        // no special-case for rows.size == 1, we're actually skipping some bytes here so just
+        // blindly updating everything wouldn't be correct
+        DataOutputBuffer out = new DataOutputBuffer();
 
         try
         {
-            AbstractCompactedRow compactedRow = controller.getCompactedRow(rows);
-            if (compactedRow.isEmpty())
+            ColumnFamily.serializer().serializeCFInfo(emptyColumnFamily, out);
+            out.writeInt(columnCount);
+            digest.update(out.getData(), 0, out.getLength());
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+
+        Iterator<IColumn> iter = iterator();
+        while (iter.hasNext())
+        {
+            iter.next().updateDigest(digest);
+        }
+    }
+
+    public boolean isEmpty()
+    {
+        boolean cfIrrelevant = ColumnFamilyStore.removeDeletedCF(emptyColumnFamily, controller.gcBefore) == null;
+        return cfIrrelevant && columnCount == 0;
+    }
+
+    public int getEstimatedColumnCount()
+    {
+        int n = 0;
+        for (SSTableIdentityIterator row : rows)
+            n += row.columnCount;
+        return n;
+    }
+
+    public AbstractType getComparator()
+    {
+        return emptyColumnFamily.getComparator();
+    }
+
+    public Iterator<IColumn> iterator()
+    {
+        for (SSTableIdentityIterator row : rows)
+        {
+            row.reset();
+        }
+        iter = new LazyColumnIterator(new CollatingIterator(getComparator().columnComparator, rows));
+        return Iterators.filter(iter, Predicates.notNull());
+    }
+
+    public int columnCount()
+    {
+        return columnCount;
+    }
+
+    private class LazyColumnIterator extends ReducingIterator<IColumn, IColumn>
+    {
+        ColumnFamily container = emptyColumnFamily.cloneMeShallow();
+        long serializedSize = 4; // int for column count
+        int size = 0;
+
+        public LazyColumnIterator(Iterator<IColumn> source)
+        {
+            super(source);
+        }
+
+        @Override
+        protected boolean isEqual(IColumn o1, IColumn o2)
+        {
+            return o1.name().equals(o2.name());
+        }
+
+        public void reduce(IColumn current)
+        {
+            container.addColumn(current);
+        }
+
+        protected IColumn getReduced()
+        {
+            assert container != null;
+            IColumn reduced = container.iterator().next();
+            ColumnFamily purged = shouldPurge ? ColumnFamilyStore.removeDeleted(container, controller.gcBefore) : container;
+            if (purged != null && purged.metadata().getDefaultValidator().isCommutative())
             {
-                controller.invalidateCachedRow(compactedRow.key);
+                CounterColumn.removeOldShards(purged, controller.gcBefore);
+            }
+            if (purged == null || !purged.iterator().hasNext())
+            {
+                container.clear();
                 return null;
             }
-
-            // If the raw is cached, we call removeDeleted on it to have/ coherent query returns. However it would look
-            // like some deleted columns lived longer than gc_grace + compaction. This can also free up big amount of
-            // memory on long running instances
-            controller.removeDeletedInCache(compactedRow.key);
-
-            return compactedRow;
+            container.clear();
+            serializedSize += reduced.serializedSize();
+            size++;
+            return reduced;
         }
-        finally
-        {
-            rows.clear();
-            if ((row++ % controller.getThrottleResolution()) == 0)
-            {
-                bytesRead = 0;
-                for (SSTableScanner scanner : getScanners())
-                    bytesRead += scanner.getFilePointer();
-                throttle();
-            }
-        }
-    }
-
-    private void throttle()
-    {
-        if (DatabaseDescriptor.getCompactionThroughputMbPerSec() < 1 || StorageService.instance.isBootstrapMode())
-            // throttling disabled
-            return;
-        int totalBytesPerMS = DatabaseDescriptor.getCompactionThroughputMbPerSec() * 1024 * 1024 / 1000;
-
-        // bytes compacted and time passed since last delay
-        long bytesSinceLast = bytesRead - bytesAtLastDelay;
-        long msSinceLast = System.currentTimeMillis() - timeAtLastDelay;
-
-        // determine the current target
-        int newTarget = totalBytesPerMS /
-            Math.max(1, CompactionManager.instance.getActiveCompactions());
-        if (newTarget != targetBytesPerMS)
-            logger.debug("{} now compacting at {} bytes/ms.", this, newTarget);
-        targetBytesPerMS = newTarget;
-
-        // the excess bytes that were compacted in this period
-        long excessBytes = bytesSinceLast - msSinceLast * targetBytesPerMS;
-
-        // the time to delay to recap the deficit
-        long timeToDelay = excessBytes / Math.max(1, targetBytesPerMS);
-        if (timeToDelay > 0)
-        {
-            if (logger.isTraceEnabled())
-                logger.trace(String.format("Compacted %d bytes in %d ms: throttling for %d ms",
-                                           bytesSinceLast, msSinceLast, timeToDelay));
-            try
-            {
-                Thread.sleep(timeToDelay);
-            }
-            catch (InterruptedException e)
-            {
-                throw new AssertionError(e);
-            }
-        }
-        bytesAtLastDelay = bytesRead;
-        timeAtLastDelay = System.currentTimeMillis();
-    }
-
-    public void close() throws IOException
-    {
-        FileUtils.close(getScanners());
-    }
-
-    protected Iterable<SSTableScanner> getScanners()
-    {
-        return ((CollatingIterator)source).getIterators();
-    }
-
-    public String toString()
-    {
-        return this.getCompactionInfo().toString();
     }
 }

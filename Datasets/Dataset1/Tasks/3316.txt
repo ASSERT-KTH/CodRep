@@ -1,4 +1,4 @@
-ByteBuffer.wrap(org.apache.cassandra.db.migration.avro.KsDef.SCHEMA$.toString().getBytes(UTF_8)),
+logger.warn("setting live ratio to maximum of 64 instead of {}", newRatio);
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -8,9 +8,9 @@ ByteBuffer.wrap(org.apache.cassandra.db.migration.avro.KsDef.SCHEMA$.toString().
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * <p/>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p/>
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,310 +18,387 @@ ByteBuffer.wrap(org.apache.cassandra.db.migration.avro.KsDef.SCHEMA$.toString().
  * limitations under the License.
  */
 
-package org.apache.cassandra.db.migration;
+package org.apache.cassandra.db;
 
+import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Collection;
-import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.KSMetaData;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.io.SerDeUtils;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.db.columniterator.IColumnIterator;
+import org.apache.cassandra.db.columniterator.SimpleAbstractColumnIterator;
+import org.apache.cassandra.db.commitlog.ReplayPosition;
+import org.apache.cassandra.db.filter.AbstractColumnIterator;
+import org.apache.cassandra.db.filter.NamesQueryFilter;
+import org.apache.cassandra.db.filter.SliceQueryFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.sstable.SSTableWriter;
+import org.apache.cassandra.utils.WrappedRunnable;
+import org.github.jamm.MemoryMeter;
 
-import static com.google.common.base.Charsets.UTF_8;
-
-/**
- * A migration represents a single metadata mutation (cf dropped, added, etc.).  Migrations can be applied locally, or
- * serialized and sent to another machine where it can be applied there. Each migration has a version represented by
- * a TimeUUID that can be used to look up both the Migration itself (see getLocalMigrations) as well as a serialization
- * of the Keyspace definition that was modified.
- * 
- * There are three parts to a migration (think of it as a schema update):
- * 1. data is written to the schema cf.
- * 2. the migration is serialized to the migrations cf.
- * 3. updated models are applied to the cassandra instance.
- * 
- * Since steps 1, 2 and 3 are not committed atomically, care should be taken to ensure that a node/cluster is reasonably
- * quiescent with regard to the keyspace or columnfamily whose schema is being modified.
- * 
- * Each class that extends Migration is required to implement a no arg constructor, which will be used to inflate the
- * object from it's serialized form.
- */
-public abstract class Migration
+public class Memtable implements Comparable<Memtable>, IFlushable
 {
-    protected static final Logger logger = LoggerFactory.getLogger(Migration.class);
-    
-    public static final String NAME_VALIDATOR_REGEX = "\\w+";
-    public static final String MIGRATIONS_CF = "Migrations";
-    public static final String SCHEMA_CF = "Schema";
-    public static final ByteBuffer MIGRATIONS_KEY = ByteBufferUtil.bytes("Migrations Key");
-    public static final ByteBuffer LAST_MIGRATION_KEY = ByteBufferUtil.bytes("Last Migration");
-    
-    protected RowMutation rm;
-    protected UUID newVersion;
-    protected UUID lastVersion;
-    
-    // this doesn't follow the serialized migration around.
-    protected transient boolean clientMode;
-    
-    /** Subclasses must have a matching constructor */
-    protected Migration() { /* pass */ }
+    private static final Logger logger = LoggerFactory.getLogger(Memtable.class);
 
-    Migration(UUID newVersion, UUID lastVersion)
-    {
-        this.newVersion = newVersion;
-        this.lastVersion = lastVersion;
-        clientMode = StorageService.instance.isClientMode();
-    }
-    
-    // block compactions and flushing.
-    protected final void acquireLocks()
-    {
-        CompactionManager.instance.getCompactionLock().lock();
-        Table.getFlushLock().lock();
-    }
-    
-    protected final void releaseLocks()
-    {
-        Table.getFlushLock().unlock();
-        CompactionManager.instance.getCompactionLock().unlock();
-    }
+    // size in memory can never be less than serialized size
+    private static final double MIN_SANE_LIVE_RATIO = 1.0;
+    // max liveratio seen w/ 1-byte columns on a 64-bit jvm was 19. If it gets higher than 64 something is probably broken.
+    private static final double MAX_SANE_LIVE_RATIO = 64.0;
+    private static final MemoryMeter meter = new MemoryMeter();
 
-    /** override this to perform logic before writing the migration or applying it.  defaults to nothing. */
-    public void beforeApplyModels() {}
-    
-    /** apply changes */
-    public final void apply() throws IOException, ConfigurationException
+    // we're careful to only allow one count to run at a time because counting is slow
+    // (can be minutes, for a large memtable and a busy server), so we could keep memtables
+    // alive after they're flushed and would otherwise be GC'd.
+    private static final ExecutorService meterExecutor = new ThreadPoolExecutor(1, 1, Integer.MAX_VALUE, TimeUnit.MILLISECONDS, new SynchronousQueue<Runnable>())
     {
-        // ensure migration is serial. don't apply unless the previous version matches.
-        if (!DatabaseDescriptor.getDefsVersion().equals(lastVersion))
-            throw new ConfigurationException("Previous version mismatch. cannot apply.");
-        // write to schema
-        assert rm != null;
-        if (!clientMode)
-            rm.apply();
-
-        beforeApplyModels();
-        
-        // write migration.
-        if (!clientMode)
+        @Override
+        protected void afterExecute(Runnable r, Throwable t)
         {
-            long now = System.currentTimeMillis();
-            ByteBuffer buf = serialize();
-            RowMutation migration = new RowMutation(Table.SYSTEM_TABLE, MIGRATIONS_KEY);
-            migration.add(new QueryPath(MIGRATIONS_CF, null, ByteBuffer.wrap(UUIDGen.decompose(newVersion))), buf, now);
-            migration.apply();
-            
-            // note that we're storing this in the system table, which is not replicated
-            logger.debug("Applying migration " + newVersion.toString());
-            migration = new RowMutation(Table.SYSTEM_TABLE, LAST_MIGRATION_KEY);
-            migration.add(new QueryPath(SCHEMA_CF, null, LAST_MIGRATION_KEY), ByteBuffer.wrap(UUIDGen.decompose(newVersion)), now);
-            migration.apply();
-
-            // if we fail here, there will be schema changes in the CL that will get replayed *AFTER* the schema is loaded.
-            // CassandraDaemon checks for this condition (the stored version will be greater than the loaded version)
-            // and calls MigrationManager.applyMigrations(loaded version, stored version).
-        
-            // flush changes out of memtables so we don't need to rely on the commit log.
-            ColumnFamilyStore[] schemaStores = new ColumnFamilyStore[] {
-                Table.open(Table.SYSTEM_TABLE).getColumnFamilyStore(Migration.MIGRATIONS_CF),
-                Table.open(Table.SYSTEM_TABLE).getColumnFamilyStore(Migration.SCHEMA_CF)
-            };
-            List<Future> flushes = new ArrayList<Future>();
-            for (ColumnFamilyStore cfs : schemaStores)
-                flushes.add(cfs.forceFlush());
-            for (Future f : flushes)
-            {
-                if (f == null)
-                    // applying the migration triggered a flush independently
-                    continue;
-                try
-                {
-                    f.get();
-                }
-                catch (ExecutionException e)
-                {
-                    throw new IOException(e);
-                }
-                catch (InterruptedException e)
-                {
-                    throw new IOException(e);
-                }
-            }
+            super.afterExecute(r, t);
+            DebuggableThreadPoolExecutor.logExceptionsAfterExecute(r, t);
         }
-        
-        applyModels(); 
-    }
-    
-    public final void announce()
+    };
+
+    private volatile boolean isFrozen;
+    private final AtomicLong currentThroughput = new AtomicLong(0);
+    private final AtomicLong currentOperations = new AtomicLong(0);
+
+    private final long creationTime;
+    private final ConcurrentNavigableMap<DecoratedKey, ColumnFamily> columnFamilies = new ConcurrentSkipListMap<DecoratedKey, ColumnFamily>();
+    public final ColumnFamilyStore cfs;
+
+    private final long THRESHOLD;
+    private final long THRESHOLD_COUNT;
+    volatile static Memtable activelyMeasuring;
+
+    public Memtable(ColumnFamilyStore cfs)
     {
-        if (StorageService.instance.isClientMode())
-            return;
-        
-        // immediate notification for esiting nodes.
-        MigrationManager.announce(newVersion, Gossiper.instance.getLiveMembers());
-    }
-    
-    public static UUID getLastMigrationId()
-    {
-        DecoratedKey dkey = StorageService.getPartitioner().decorateKey(LAST_MIGRATION_KEY);
-        Table defs = Table.open(Table.SYSTEM_TABLE);
-        ColumnFamilyStore cfStore = defs.getColumnFamilyStore(SCHEMA_CF);
-        QueryFilter filter = QueryFilter.getNamesFilter(dkey, new QueryPath(SCHEMA_CF), LAST_MIGRATION_KEY);
-        ColumnFamily cf = cfStore.getColumnFamily(filter);
-        if (cf == null || cf.getColumnNames().size() == 0)
-            return null;
-        else
-            return UUIDGen.getUUID(cf.getColumn(LAST_MIGRATION_KEY).value());
-    }
-    
-    /** keep in mind that applyLive might happen on another machine */
-    abstract void applyModels() throws IOException;
-    
-    /** Deflate this Migration into an Avro object. */
-    public abstract void subdeflate(org.apache.cassandra.db.migration.avro.Migration mi);
-    
-    /** Inflate this Migration from an Avro object: called after the required no-arg constructor. */
-    public abstract void subinflate(org.apache.cassandra.db.migration.avro.Migration mi);
-    
-    public UUID getVersion()
-    {
-        return newVersion;
+        this.cfs = cfs;
+        creationTime = System.currentTimeMillis();
+        THRESHOLD = cfs.getMemtableThroughputInMB() * 1024L * 1024L;
+        THRESHOLD_COUNT = (long) (cfs.getMemtableOperationsInMillions() * 1024 * 1024);
     }
 
     /**
-     * Definitions are serialized as a row with a UUID key, with a magical column named DEFINITION_SCHEMA_COLUMN_NAME
-     * (containing the Avro Schema) and a column per keyspace. Each keyspace column contains a avro.KsDef object
-     * encoded with the Avro schema.
+     * Compares two Memtable based on creation time.
+     * @param rhs Memtable to compare to.
+     * @return a negative integer, zero, or a positive integer as this object
+     * is less than, equal to, or greater than the specified object.
      */
-    static RowMutation makeDefinitionMutation(KSMetaData add, KSMetaData remove, UUID versionId) throws IOException
+    public int compareTo(Memtable rhs)
     {
-        // collect all keyspaces, while removing 'remove' and adding 'add'
-        List<KSMetaData> ksms = new ArrayList<KSMetaData>();
-        for (String tableName : DatabaseDescriptor.getNonSystemTables())
-        {
-            if (remove != null && remove.name.equals(tableName) || add != null && add.name.equals(tableName))
-                continue;
-            ksms.add(DatabaseDescriptor.getTableDefinition(tableName));
-        }
-        if (add != null)
-            ksms.add(add);
-
-        // wrap in mutation
-        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, toUTF8Bytes(versionId));
-        long now = System.currentTimeMillis();
-        // add a column for each keyspace
-        for (KSMetaData ksm : ksms)
-            rm.add(new QueryPath(SCHEMA_CF, null, ByteBuffer.wrap(ksm.name.getBytes(UTF_8))), SerDeUtils.serialize(ksm.deflate()), now);
-        // add the schema
-        rm.add(new QueryPath(SCHEMA_CF,
-                             null,
-                             DefsTable.DEFINITION_SCHEMA_COLUMN_NAME),
-                             ByteBuffer.wrap(org.apache.cassandra.avro.KsDef.SCHEMA$.toString().getBytes(UTF_8)),
-                             now);
-        return rm;
+    	long diff = creationTime - rhs.creationTime;
+    	if ( diff > 0 )
+    		return 1;
+    	else if ( diff < 0 )
+    		return -1;
+    	else
+    		return 0;
     }
-        
-    public ByteBuffer serialize() throws IOException
+
+    public long getLiveSize()
     {
-        // super deflate
-        org.apache.cassandra.db.migration.avro.Migration mi = new org.apache.cassandra.db.migration.avro.Migration();
-        mi.old_version = new org.apache.cassandra.utils.avro.UUID();
-        mi.old_version.bytes(UUIDGen.decompose(lastVersion));
-        mi.new_version = new org.apache.cassandra.utils.avro.UUID();
-        mi.new_version.bytes(UUIDGen.decompose(newVersion));
-        mi.classname = new org.apache.avro.util.Utf8(this.getClass().getName());
-        // TODO: Avro RowMutation serialization?
-        DataOutputBuffer dob = new DataOutputBuffer();
+        // 25% fudge factor
+        return (long) (currentThroughput.get() * cfs.liveRatio * 1.25);
+    }
+
+    public long getSerializedSize()
+    {
+        return currentThroughput.get();
+    }
+
+    public long getOperations()
+    {
+        return currentOperations.get();
+    }
+
+    boolean isThresholdViolated()
+    {
+        return currentThroughput.get() >= this.THRESHOLD || currentOperations.get() >= this.THRESHOLD_COUNT;
+    }
+
+    boolean isFrozen()
+    {
+        return isFrozen;
+    }
+
+    void freeze()
+    {
+        isFrozen = true;
+    }
+
+    /**
+     * Should only be called by ColumnFamilyStore.apply.  NOT a public API.
+     * (CFS handles locking to avoid submitting an op
+     *  to a flushing memtable.  Any other way is unsafe.)
+    */
+    void put(DecoratedKey key, ColumnFamily columnFamily)
+    {
+        assert !isFrozen; // not 100% foolproof but hell, it's an assert
+        resolve(key, columnFamily);
+    }
+
+    public void updateLiveRatio()
+    {
+        if (!MemoryMeter.isInitialized())
+        {
+            // hack for openjdk.  we log a warning about this in the startup script too.
+            logger.warn("MemoryMeter uninitialized (jamm not specified as java agent); assuming liveRatio of 10.0.  Usually this means cassandra-env.sh disabled jamm because you are using a buggy JRE; upgrade to the Sun JRE instead");
+            cfs.liveRatio = 10.0;
+            return;
+        }
+
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                activelyMeasuring = Memtable.this;
+
+                long start = System.currentTimeMillis();
+                // ConcurrentSkipListMap has cycles, so measureDeep will have to track a reference to EACH object it visits.
+                // So to reduce the memory overhead of doing a measurement, we break it up to row-at-a-time.
+                long deepSize = meter.measure(columnFamilies);
+                int objects = 0;
+                for (Map.Entry<DecoratedKey, ColumnFamily> entry : columnFamilies.entrySet())
+                {
+                    deepSize += meter.measureDeep(entry.getKey()) + meter.measureDeep(entry.getValue());
+                    objects += entry.getValue().getColumnCount();
+                }
+                double newRatio = (double) deepSize / currentThroughput.get();
+
+                if (newRatio < MIN_SANE_LIVE_RATIO)
+                {
+                    logger.warn("setting live ratio to minimum of 1.0 instead of {}", newRatio);
+                    newRatio = MIN_SANE_LIVE_RATIO;
+                }
+                if (newRatio > MAX_SANE_LIVE_RATIO)
+                {
+                    logger.warn("setting live ratio to maximum of 64 instead of {}, newRatio");
+                    newRatio = MAX_SANE_LIVE_RATIO;
+                }
+                cfs.liveRatio = Math.max(cfs.liveRatio, newRatio);
+
+                logger.info("{} liveRatio is {} (just-counted was {}).  calculation took {}ms for {} columns",
+                            new Object[]{ cfs, cfs.liveRatio, newRatio, System.currentTimeMillis() - start, objects });
+                activelyMeasuring = null;
+            }
+        };
+
         try
         {
-            RowMutation.serializer().serialize(rm, dob);
+            meterExecutor.submit(runnable);
         }
-        catch (IOException e)
+        catch (RejectedExecutionException e)
         {
-            throw new RuntimeException(e);
+            logger.debug("Meter thread is busy; skipping liveRatio update for {}", cfs);
         }
-        mi.row_mutation = ByteBuffer.wrap(dob.asByteArray());
-
-        // sub deflate
-        this.subdeflate(mi);
-
-        // serialize
-        return SerDeUtils.serializeWithSchema(mi);
     }
 
-    public static Migration deserialize(ByteBuffer bytes) throws IOException
+    private void resolve(DecoratedKey key, ColumnFamily cf)
     {
-        // deserialize
-        org.apache.cassandra.db.migration.avro.Migration mi = SerDeUtils.deserializeWithSchema(bytes, new org.apache.cassandra.db.migration.avro.Migration());
+        currentThroughput.addAndGet(cf.size());
+        currentOperations.addAndGet((cf.getColumnCount() == 0)
+                                    ? cf.isMarkedForDelete() ? 1 : 0
+                                    : cf.getColumnCount());
 
-        // create an instance of the migration subclass
-        Migration migration;
-        try
-        {
-            Class migrationClass = Class.forName(mi.classname.toString());
-            Constructor migrationConstructor = migrationClass.getDeclaredConstructor();
-            migrationConstructor.setAccessible(true);
-            migration = (Migration)migrationConstructor.newInstance();
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException("Invalid migration class: " + mi.classname.toString(), e);
-        }
-        
-        // super inflate
-        migration.lastVersion = UUIDGen.getUUID(ByteBuffer.wrap(mi.old_version.bytes()));
-        migration.newVersion = UUIDGen.getUUID(ByteBuffer.wrap(mi.new_version.bytes()));
-        try
-        {
-            migration.rm = RowMutation.serializer().deserialize(SerDeUtils.createDataInputStream(mi.row_mutation));
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        // sub inflate
-        migration.subinflate(mi);
-        return migration;
+        ColumnFamily oldCf = columnFamilies.putIfAbsent(key, cf);
+        if (oldCf == null)
+            return;
+
+        oldCf.resolve(cf);
     }
-    
-    /** load serialized migrations. */
-    public static Collection<IColumn> getLocalMigrations(UUID start, UUID end)
+
+    // for debugging
+    public String contents()
     {
-        DecoratedKey dkey = StorageService.getPartitioner().decorateKey(MIGRATIONS_KEY);
-        Table defs = Table.open(Table.SYSTEM_TABLE);
-        ColumnFamilyStore cfStore = defs.getColumnFamilyStore(Migration.MIGRATIONS_CF);
-        QueryFilter filter = QueryFilter.getSliceFilter(dkey, new QueryPath(MIGRATIONS_CF), ByteBuffer.wrap(UUIDGen.decompose(start)), ByteBuffer.wrap(UUIDGen.decompose(end)), false, 1000);   
-        ColumnFamily cf = cfStore.getColumnFamily(filter);
-        return cf.getSortedColumns();
+        StringBuilder builder = new StringBuilder();
+        builder.append("{");
+        for (Map.Entry<DecoratedKey, ColumnFamily> entry : columnFamilies.entrySet())
+        {
+            builder.append(entry.getKey()).append(": ").append(entry.getValue()).append(", ");
+        }
+        builder.append("}");
+        return builder.toString();
     }
-    
-    public static ByteBuffer toUTF8Bytes(UUID version)
+
+
+    private SSTableReader writeSortedContents(ReplayPosition context) throws IOException
     {
-        return ByteBuffer.wrap(version.toString().getBytes(UTF_8));
+        logger.info("Writing " + this);
+
+        long keySize = 0;
+        for (DecoratedKey key : columnFamilies.keySet())
+            keySize += key.key.remaining();
+        long estimatedSize = (long) ((keySize // index entries
+                                      + keySize // keys in data file
+                                      + currentThroughput.get()) // data
+                                     * 1.2); // bloom filter and row index overhead
+        SSTableWriter writer = cfs.createFlushWriter(columnFamilies.size(), estimatedSize, context);
+
+        // (we can't clear out the map as-we-go to free up memory,
+        //  since the memtable is being used for queries in the "pending flush" category)
+        for (Map.Entry<DecoratedKey, ColumnFamily> entry : columnFamilies.entrySet())
+            writer.append(entry.getKey(), entry.getValue());
+
+        SSTableReader ssTable = writer.closeAndOpenReader();
+        logger.info(String.format("Completed flushing %s (%d bytes)",
+                                  ssTable.getFilename(), new File(ssTable.getFilename()).length()));
+        return ssTable;
     }
-    
-    public static boolean isLegalName(String s)
+
+    public void flushAndSignal(final CountDownLatch latch, ExecutorService sorter, final ExecutorService writer, final ReplayPosition context)
     {
-        return s.matches(Migration.NAME_VALIDATOR_REGEX);
+        writer.execute(new WrappedRunnable()
+        {
+            public void runMayThrow() throws IOException
+            {
+                cfs.flushLock.lock();
+                try
+                {
+                    if (!cfs.isDropped())
+                    {
+                        SSTableReader sstable = writeSortedContents(context);
+                        cfs.replaceFlushed(Memtable.this, sstable);
+                    }
+                }
+                finally
+                {
+                    cfs.flushLock.unlock();
+                }
+                latch.countDown();
+            }
+        });
+    }
+
+    public String toString()
+    {
+        return String.format("Memtable-%s@%s(%s/%s serialized/live bytes, %s ops)",
+                             cfs.getColumnFamilyName(), hashCode(), currentThroughput, getLiveSize(), currentOperations);
+    }
+
+    /**
+     * @param startWith Include data in the result from and including this key and to the end of the memtable
+     * @return An iterator of entries with the data from the start key 
+     */
+    public Iterator<Map.Entry<DecoratedKey, ColumnFamily>> getEntryIterator(DecoratedKey startWith)
+    {
+        return columnFamilies.tailMap(startWith).entrySet().iterator();
+    }
+
+    public boolean isClean()
+    {
+        return columnFamilies.isEmpty();
+    }
+
+    public String getTableName()
+    {
+        return cfs.table.name;
+    }
+
+    /**
+     * obtain an iterator of columns in this memtable in the specified order starting from a given column.
+     */
+    public static IColumnIterator getSliceIterator(final DecoratedKey key, final ColumnFamily cf, SliceQueryFilter filter, AbstractType typeComparator)
+    {
+        assert cf != null;
+        final boolean isSuper = cf.isSuper();
+        final Collection<IColumn> filteredColumns = filter.reversed ? cf.getReverseSortedColumns() : cf.getSortedColumns();
+
+        // ok to not have subcolumnComparator since we won't be adding columns to this object
+        IColumn startColumn = isSuper ? new SuperColumn(filter.start, (AbstractType)null) :  new Column(filter.start);
+        Comparator<IColumn> comparator = filter.getColumnComparator(typeComparator);
+
+        final PeekingIterator<IColumn> filteredIter = Iterators.peekingIterator(filteredColumns.iterator());
+        if (!filter.reversed || filter.start.remaining() != 0)
+        {
+            while (filteredIter.hasNext() && comparator.compare(filteredIter.peek(), startColumn) < 0)
+            {
+                filteredIter.next();
+            }
+        }
+
+        return new AbstractColumnIterator()
+        {
+            public ColumnFamily getColumnFamily()
+            {
+                return cf;
+            }
+
+            public DecoratedKey getKey()
+            {
+                return key;
+            }
+
+            public boolean hasNext()
+            {
+                return filteredIter.hasNext();
+            }
+
+            public IColumn next()
+            {
+                return filteredIter.next();                
+            }
+        };
+    }
+
+    public static IColumnIterator getNamesIterator(final DecoratedKey key, final ColumnFamily cf, final NamesQueryFilter filter)
+    {
+        assert cf != null;
+        final boolean isStandard = !cf.isSuper();
+
+        return new SimpleAbstractColumnIterator()
+        {
+            private Iterator<ByteBuffer> iter = filter.columns.iterator();
+
+            public ColumnFamily getColumnFamily()
+            {
+                return cf;
+            }
+
+            public DecoratedKey getKey()
+            {
+                return key;
+            }
+
+            protected IColumn computeNext()
+            {
+                while (iter.hasNext())
+                {
+                    ByteBuffer current = iter.next();
+                    IColumn column = cf.getColumn(current);
+                    if (column != null)
+                        // clone supercolumns so caller can freely removeDeleted or otherwise mutate it
+                        return isStandard ? column : ((SuperColumn)column).cloneMe();
+                }
+                return endOfData();
+            }
+        };
+    }
+
+    public ColumnFamily getColumnFamily(DecoratedKey key)
+    {
+        return columnFamilies.get(key);
+    }
+
+    void clearUnsafe()
+    {
+        columnFamilies.clear();
+    }
+
+    public boolean isExpired()
+    {
+        return System.currentTimeMillis() > creationTime + cfs.getMemtableFlushAfterMins() * 60 * 1000L;
     }
 }

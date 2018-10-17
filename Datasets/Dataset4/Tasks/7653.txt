@@ -1,15 +1,15 @@
-ensureYellow();
+public int freq() throws IOException {
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -18,100 +18,276 @@ ensureYellow();
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.search.functionscore;
 
-import org.elasticsearch.action.index.IndexRequestBuilder;
-import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.common.geo.GeoPoint;
-import org.elasticsearch.common.lucene.search.function.FieldValueFactorFunction;
-import org.elasticsearch.test.ElasticsearchBackwardsCompatIntegrationTest;
-import org.junit.Test;
+package org.elasticsearch.index.search.child;
+
+import gnu.trove.map.hash.TObjectFloatHashMap;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.*;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.ToStringUtils;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.common.CacheRecycler;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.bytes.HashedBytesArray;
+import org.elasticsearch.common.lucene.search.NoopCollector;
+import org.elasticsearch.index.cache.id.IdReaderTypeCache;
+import org.elasticsearch.search.internal.ScopePhase;
+import org.elasticsearch.search.internal.SearchContext;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
-
-import static org.elasticsearch.client.Requests.searchRequest;
-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
-import static org.elasticsearch.index.query.FilterBuilders.termFilter;
-import static org.elasticsearch.index.query.QueryBuilders.functionScoreQuery;
-import static org.elasticsearch.index.query.functionscore.ScoreFunctionBuilders.*;
-import static org.elasticsearch.search.builder.SearchSourceBuilder.searchSource;
-import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.*;
+import java.util.Set;
 
 /**
+ * A query implementation that executes the wrapped parent query and
+ * connects the matching parent docs to the related child documents
+ * using the {@link IdReaderTypeCache}.
  */
-public class FunctionScoreBackwardCompatibilityTests extends ElasticsearchBackwardsCompatIntegrationTest {
+public class ParentQuery extends Query implements ScopePhase.CollectorPhase {
 
-    /**
-     * Simple upgrade test for function score
-     */
-    @Test
-    public void testSimpleFunctionScoreParsingWorks() throws IOException, ExecutionException, InterruptedException {
+    private final SearchContext searchContext;
+    private final Query parentQuery;
+    private final String parentType;
+    private final Filter childrenFilter;
+    private final List<String> childTypes;
+    private final String scope;
 
-        assertAcked(prepareCreate("test").addMapping(
-                "type1",
-                jsonBuilder().startObject()
-                        .startObject("type1")
-                        .startObject("properties")
-                        .startObject("text")
-                        .field("type", "string")
-                        .endObject()
-                        .startObject("loc")
-                        .field("type", "geo_point")
-                        .endObject()
-                        .startObject("popularity")
-                        .field("type", "float")
-                        .endObject()
-                        .endObject()
-                        .endObject()
-                        .endObject()));
-        ensureYellow();
+    private TObjectFloatHashMap<HashedBytesArray> uidToScore;
 
-        int numDocs = 10;
-        String[] ids = new String[numDocs];
-        List<IndexRequestBuilder> indexBuilders = new ArrayList<>();
-        for (int i = 0; i < numDocs; i++) {
-            String id = Integer.toString(i);
-            indexBuilders.add(client().prepareIndex()
-                    .setType("type1").setId(id).setIndex("test")
-                    .setSource(
-                            jsonBuilder().startObject()
-                                    .field("text", "value")
-                                    .startObject("loc")
-                                    .field("lat", 10 + i)
-                                    .field("lon", 20)
-                                    .endObject()
-                                    .field("popularity", 2.71828)
-                                    .endObject()));
-            ids[i] = id;
-        }
-        indexRandom(true, indexBuilders);
-        checkFunctionScoreStillWorks(ids);
-        logClusterState();
-        boolean upgraded;
-        int upgradedNodesCounter = 1;
-        do {
-            logger.debug("function_score bwc: upgrading {}st node", upgradedNodesCounter++);
-            upgraded = backwardsCluster().upgradeOneNode();
-            ensureGreen();
-            logClusterState();
-            checkFunctionScoreStillWorks(ids);
-        } while (upgraded);
-        logger.debug("done function_score while upgrading");
+    public ParentQuery(SearchContext searchContext, Query parentQuery, String parentType, List<String> childTypes, Filter childrenFilter, String scope) {
+        this.searchContext = searchContext;
+        this.parentQuery = parentQuery;
+        this.parentType = parentType;
+        this.childTypes = childTypes;
+        this.childrenFilter = childrenFilter;
+        this.scope = scope;
     }
 
-    private void checkFunctionScoreStillWorks(String... ids) throws ExecutionException, InterruptedException, IOException {
-        SearchResponse response = client().search(
-                searchRequest().source(
-                        searchSource().query(
-                                functionScoreQuery(termFilter("text", "value"))
-                                        .add(gaussDecayFunction("loc", new GeoPoint(10, 20), "1000km"))
-                                        .add(fieldValueFactorFunction("popularity").modifier(FieldValueFactorFunction.Modifier.LN))
-                                        .add(scriptFunction("_index['text']['value'].tf()"))
-                        ))).actionGet();
-        assertSearchResponse(response);
-        assertOrderedSearchHits(response, ids);
+    private ParentQuery(ParentQuery unwritten, Query rewrittenParentQuery) {
+        this.searchContext = unwritten.searchContext;
+        this.parentQuery = rewrittenParentQuery;
+        this.parentType = unwritten.parentType;
+        this.childrenFilter = unwritten.childrenFilter;
+        this.childTypes = unwritten.childTypes;
+        this.scope = unwritten.scope;
+
+        this.uidToScore = unwritten.uidToScore;
+    }
+
+    @Override
+    public boolean requiresProcessing() {
+        return uidToScore == null;
+    }
+
+    @Override
+    public Collector collector() {
+        uidToScore = CacheRecycler.popObjectFloatMap();
+        return new ParentUidCollector(uidToScore, searchContext, parentType);
+    }
+
+    @Override
+    public void processCollector(Collector collector) {
+        // Do nothing, we already have the references to the parent scores.
+    }
+
+    @Override
+    public String scope() {
+        return scope;
+    }
+
+    @Override
+    public void clear() {
+        if (uidToScore != null) {
+            CacheRecycler.pushObjectFloatMap(uidToScore);
+        }
+        uidToScore = null;
+    }
+
+    @Override
+    public Query query() {
+        return parentQuery;
+    }
+
+    @Override
+    public String toString(String field) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("ParentQuery[").append(parentType).append("/").append(childTypes)
+                .append("](").append(parentQuery.toString(field)).append(')')
+                .append(ToStringUtils.boost(getBoost()));
+        return sb.toString();
+    }
+
+    @Override
+    public Query rewrite(IndexReader reader) throws IOException {
+        Query rewrittenChildQuery = parentQuery.rewrite(reader);
+        if (rewrittenChildQuery == parentQuery) {
+            return this;
+        }
+        ParentQuery rewrite = new ParentQuery(this, rewrittenChildQuery);
+        int index = searchContext.scopePhases().indexOf(this);
+        searchContext.scopePhases().set(index, rewrite);
+        return rewrite;
+    }
+
+    @Override
+    public void extractTerms(Set<Term> terms) {
+        parentQuery.extractTerms(terms);
+    }
+
+    @Override
+    public Weight createWeight(IndexSearcher searcher) throws IOException {
+        if (uidToScore == null) {
+            throw new ElasticSearchIllegalStateException("has_parent query hasn't executed properly");
+        }
+        return new ChildWeight(parentQuery.createWeight(searcher));
+    }
+
+    static class ParentUidCollector extends NoopCollector {
+
+        final TObjectFloatHashMap<HashedBytesArray> uidToScore;
+        final SearchContext searchContext;
+        final String parentType;
+
+        Scorer scorer;
+        IdReaderTypeCache typeCache;
+
+        ParentUidCollector(TObjectFloatHashMap<HashedBytesArray> uidToScore, SearchContext searchContext, String parentType) {
+            this.uidToScore = uidToScore;
+            this.searchContext = searchContext;
+            this.parentType = parentType;
+        }
+
+        @Override
+        public void collect(int doc) throws IOException {
+            if (typeCache == null) {
+                return;
+            }
+
+            HashedBytesArray parentUid = typeCache.idByDoc(doc);
+            uidToScore.put(parentUid, scorer.score());
+        }
+
+        @Override
+        public void setScorer(Scorer scorer) throws IOException {
+            this.scorer = scorer;
+        }
+
+        @Override
+        public void setNextReader(AtomicReaderContext context) throws IOException {
+            typeCache = searchContext.idCache().reader(context.reader()).type(parentType);
+        }
+    }
+
+    class ChildWeight extends Weight {
+
+        private final Weight parentWeight;
+
+        ChildWeight(Weight parentWeight) {
+            this.parentWeight = parentWeight;
+        }
+
+        @Override
+        public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
+            return new Explanation(getBoost(), "not implemented yet...");
+        }
+
+        @Override
+        public Query getQuery() {
+            return ParentQuery.this;
+        }
+
+        @Override
+        public float getValueForNormalization() throws IOException {
+            float sum = parentWeight.getValueForNormalization();
+            sum *= getBoost() * getBoost();
+            return sum;
+        }
+
+        @Override
+        public void normalize(float norm, float topLevelBoost) {
+        }
+
+        @Override
+        public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder, boolean topScorer, Bits acceptDocs) throws IOException {
+            DocIdSet childrenDocSet = childrenFilter.getDocIdSet(context, acceptDocs);
+            if (childrenDocSet == null || childrenDocSet == DocIdSet.EMPTY_DOCIDSET) {
+                return null;
+            }
+            IdReaderTypeCache idTypeCache = searchContext.idCache().reader(context.reader()).type(parentType);
+            return new ChildScorer(this, uidToScore, childrenDocSet.iterator(), idTypeCache);
+        }
+    }
+
+    static class ChildScorer extends Scorer {
+
+        final TObjectFloatHashMap<HashedBytesArray> uidToScore;
+        final DocIdSetIterator childrenIterator;
+        final IdReaderTypeCache typeCache;
+
+        int currentChildDoc = -1;
+        float currentScore;
+
+        ChildScorer(Weight weight, TObjectFloatHashMap<HashedBytesArray> uidToScore, DocIdSetIterator childrenIterator, IdReaderTypeCache typeCache) {
+            super(weight);
+            this.uidToScore = uidToScore;
+            this.childrenIterator = childrenIterator;
+            this.typeCache = typeCache;
+        }
+
+        @Override
+        public float score() throws IOException {
+            return currentScore;
+        }
+
+        @Override
+        public float freq() throws IOException {
+            // We don't have the original child query hit info here...
+            // But the freq of the children could be collector and returned here, but makes this Scorer more expensive.
+            return 1;
+        }
+
+        @Override
+        public int docID() {
+            return currentChildDoc;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            while (true) {
+                currentChildDoc = childrenIterator.nextDoc();
+                if (currentChildDoc == DocIdSetIterator.NO_MORE_DOCS) {
+                    return currentChildDoc;
+                }
+
+                BytesReference uid = typeCache.parentIdByDoc(currentChildDoc);
+                if (uid == null) {
+                    continue;
+                }
+                currentScore = uidToScore.get(uid);
+                if (Float.compare(currentScore, 0) != 0) {
+                    return currentChildDoc;
+                }
+            }
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            currentChildDoc = childrenIterator.advance(target);
+            if (currentChildDoc == DocIdSetIterator.NO_MORE_DOCS) {
+                return currentChildDoc;
+            }
+            BytesReference uid = typeCache.idByDoc(currentChildDoc);
+            if (uid == null) {
+                return nextDoc();
+            }
+            currentScore = uidToScore.get(uid);
+            if (Float.compare(currentScore, 0) == 0) {
+                return nextDoc();
+            }
+            return currentChildDoc;
+        }
     }
 }

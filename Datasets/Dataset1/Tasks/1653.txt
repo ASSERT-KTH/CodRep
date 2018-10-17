@@ -1,4 +1,4 @@
-String value = ByteBufferUtil.string(column.value());
+byte[] body = response.getMessageBody();
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,210 +18,169 @@ String value = ByteBufferUtil.string(column.value());
  * limitations under the License.
  */
 
+package org.apache.cassandra.service;
+
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
-import org.apache.cassandra.avro.Column;
-import org.apache.cassandra.avro.ColumnOrSuperColumn;
-import org.apache.cassandra.avro.Mutation;
-import org.apache.cassandra.hadoop.ColumnFamilyOutputFormat;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadResponse;
+import org.apache.cassandra.db.Row;
+import org.apache.cassandra.io.DataInputBuffer;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.Cachetable;
+import org.apache.cassandra.utils.ICacheExpungeHook;
+import org.apache.cassandra.utils.ICachetable;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
 
-import org.apache.cassandra.db.IColumn;
-import org.apache.cassandra.hadoop.ColumnFamilyInputFormat;
-import org.apache.cassandra.hadoop.ConfigHelper;
-import org.apache.cassandra.thrift.SlicePredicate;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.conf.Configured;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.mapreduce.Job;
-import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.hadoop.mapreduce.Reducer;
-import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
-import org.apache.hadoop.util.Tool;
-import org.apache.hadoop.util.ToolRunner;
 
-/**
- * This counts the occurrences of words in ColumnFamily Standard1, that has a single column (that we care about)
- * "text" containing a sequence of words.
- *
- * For each word, we output the total number of occurrences across all texts.
- */
-public class WordCount extends Configured implements Tool
+class ConsistencyManager implements Runnable
 {
-    private static final Logger logger = LoggerFactory.getLogger(WordCount.class);
-
-    static final String KEYSPACE = "Keyspace1";
-    static final String COLUMN_FAMILY = "Standard1";
-
-    static final String OUTPUT_REDUCER_VAR = "output_reducer";
-    static final String OUTPUT_COLUMN_FAMILY = "Standard2";
-    private static final String OUTPUT_PATH_PREFIX = "/tmp/word_count";
-
-    private static final String CONF_COLUMN_NAME = "columnname";
-
-    public static void main(String[] args) throws Exception
-    {
-        // Let ToolRunner handle generic command-line options
-        ToolRunner.run(new Configuration(), new WordCount(), args);
-        System.exit(0);
-    }
-
-    public static class TokenizerMapper extends Mapper<byte[], SortedMap<byte[], IColumn>, Text, IntWritable>
-    {
-        private final static IntWritable one = new IntWritable(1);
-        private Text word = new Text();
-        private String columnName;
-
-        public void map(byte[] key, SortedMap<byte[], IColumn> columns, Context context) throws IOException, InterruptedException
-        {
-            IColumn column = columns.get(columnName.getBytes());
-            if (column == null)
-                return;
-            String value = ByteBufferUtil.string(column.value(), Charsets.UTF_8);
-            logger.debug("read " + key + ":" + value + " from " + context.getInputSplit());
-
-            StringTokenizer itr = new StringTokenizer(value);
-            while (itr.hasMoreTokens())
-            {
-                word.set(itr.nextToken());
-                context.write(word, one);
-            }
-        }
-
-        protected void setup(org.apache.hadoop.mapreduce.Mapper.Context context)
-            throws IOException, InterruptedException
-        {
-            this.columnName = context.getConfiguration().get(CONF_COLUMN_NAME);
-        }
+	private static Logger logger_ = Logger.getLogger(ConsistencyManager.class);
+	
+	class DigestResponseHandler implements IAsyncCallback
+	{
+		List<Message> responses_ = new ArrayList<Message>();
+		
+		public void response(Message msg)
+		{
+			logger_.debug("Received reponse : " + msg.toString());
+			responses_.add(msg);
+			if ( responses_.size() == ConsistencyManager.this.replicas_.size() )
+				handleDigestResponses();
+		}
         
+        public void attachContext(Object o)
+        {
+            throw new UnsupportedOperationException("This operation is not currently supported.");
+        }
+		
+		private void handleDigestResponses()
+		{
+			DataInputBuffer bufIn = new DataInputBuffer();
+			logger_.debug("Handle Digest reponses");
+			for( Message response : responses_ )
+			{
+				byte[] body = (byte[])response.getMessageBody()[0];            
+	            bufIn.reset(body, body.length);
+	            try
+	            {	               
+	                ReadResponse result = ReadResponse.serializer().deserialize(bufIn);
+	                byte[] digest = result.digest();
+	                if( !Arrays.equals(row_.digest(), digest) )
+					{
+	                	doReadRepair();
+	                	break;
+					}
+	            }
+	            catch( IOException ex )
+	            {
+	            	logger_.info(LogUtil.throwableToString(ex));
+	            }
+			}
+		}
+		
+		private void doReadRepair() throws IOException
+		{
+			IResponseResolver<Row> readResponseResolver = new ReadResponseResolver();
+            /* Add the local storage endpoint to the replicas_ list */
+            replicas_.add(StorageService.getLocalStorageEndPoint());
+			IAsyncCallback responseHandler = new DataRepairHandler(ConsistencyManager.this.replicas_.size(), readResponseResolver);	
+			String table = DatabaseDescriptor.getTables().get(0);
+            ReadCommand readCommand = constructReadMessage(false);
+			// ReadMessage readMessage = new ReadMessage(table, row_.key(), columnFamily_);
+            Message message = readCommand.makeReadMessage();
+			MessagingService.getMessagingInstance().sendRR(message, replicas_.toArray( new EndPoint[0] ), responseHandler);			
+		}
+	}
+	
+	class DataRepairHandler implements IAsyncCallback, ICacheExpungeHook<String, String>
+	{
+		private List<Message> responses_ = new ArrayList<Message>();
+		private IResponseResolver<Row> readResponseResolver_;
+		private int majority_;
+		
+		DataRepairHandler(int responseCount, IResponseResolver<Row> readResponseResolver)
+		{
+			readResponseResolver_ = readResponseResolver;
+			majority_ = (responseCount >> 1) + 1;  
+		}
+		
+		public void response(Message message)
+		{
+			logger_.debug("Received responses in DataRepairHandler : " + message.toString());
+			responses_.add(message);
+			if ( responses_.size() == majority_ )
+			{
+				String messageId = message.getMessageId();
+				readRepairTable_.put(messageId, messageId, this);				
+			}
+		}
+        
+        public void attachContext(Object o)
+        {
+            throw new UnsupportedOperationException("This operation is not currently supported.");
+        }
+		
+		public void callMe(String key, String value)
+		{
+			handleResponses();
+		}
+		
+		private void handleResponses()
+		{
+			try
+			{
+				readResponseResolver_.resolve(new ArrayList<Message>(responses_));
+			}
+			catch ( DigestMismatchException ex )
+			{
+				logger_.info("We should not be coming here under any circumstances ...");
+				logger_.info(LogUtil.throwableToString(ex));
+			}
+		}
+	}
+
+	private static long scheduledTimeMillis_ = 600;
+	private static ICachetable<String, String> readRepairTable_ = new Cachetable<String, String>(scheduledTimeMillis_);
+	private final Row row_;
+	protected final List<EndPoint> replicas_;
+	private final ReadCommand readCommand_;
+
+    public ConsistencyManager(Row row, List<EndPoint> replicas, ReadCommand readCommand)
+    {
+        row_ = row;
+        replicas_ = replicas;
+        readCommand_ = readCommand;
     }
 
-    public static class ReducerToFilesystem extends Reducer<Text, IntWritable, Text, IntWritable>
+	public void run()
+	{
+		logger_.debug(" Run the consistency checks for " + readCommand_.getColumnFamilyName());		
+        ReadCommand readCommandDigestOnly = constructReadMessage(true);
+		try
+		{
+			Message messageDigestOnly = readCommandDigestOnly.makeReadMessage();
+			IAsyncCallback digestResponseHandler = new DigestResponseHandler();
+			MessagingService.getMessagingInstance().sendRR(messageDigestOnly, replicas_.toArray(new EndPoint[replicas_.size()]), digestResponseHandler);
+		}
+		catch ( IOException ex )
+		{
+			logger_.info(LogUtil.throwableToString(ex));
+		}
+	}
+    
+    private ReadCommand constructReadMessage(boolean isDigestQuery)
     {
-        private IntWritable result = new IntWritable();
-
-        public void reduce(Text key, Iterable<IntWritable> values, Context context) throws IOException, InterruptedException
-        {
-            int sum = 0;
-            for (IntWritable val : values)
-            {
-                sum += val.get();
-            }
-
-            result.set(sum);
-            context.write(key, result);
-        }
-    }
-
-    public static class ReducerToCassandra extends Reducer<Text, IntWritable, ByteBuffer, List<Mutation>>
-    {
-        private List<Mutation> results = new ArrayList<Mutation>();
-        private String columnName;
-
-        public void reduce(Text key, Iterable<IntWritable> values, Context context) throws IOException, InterruptedException
-        {
-            int sum = 0;
-            for (IntWritable val : values)
-            {
-                sum += val.get();
-            }
-
-            results.add(getMutation(key, sum));
-            context.write(ByteBuffer.wrap(columnName.getBytes()), results);
-            results.clear();
-        }
-
-        protected void setup(org.apache.hadoop.mapreduce.Reducer.Context context)
-            throws IOException, InterruptedException
-        {
-            this.columnName = context.getConfiguration().get(CONF_COLUMN_NAME);
-        }
-
-        private static Mutation getMutation(Text key, int sum)
-        {
-            Mutation m = new Mutation();
-            m.column_or_supercolumn = getCoSC(key, sum);
-            return m;
-        }
-
-        private static ColumnOrSuperColumn getCoSC(Text key, int sum)
-        {
-            // Have to convert both the key and the sum to ByteBuffers
-            // for the generalized output format
-            ByteBuffer name = ByteBuffer.wrap(key.getBytes());
-            ByteBuffer value = ByteBuffer.wrap(String.valueOf(sum).getBytes());
-
-            Column c = new Column();
-            c.name = name;
-            c.value = value;
-            c.timestamp = System.currentTimeMillis() * 1000;
-            c.ttl = 0;
-            ColumnOrSuperColumn cosc = new ColumnOrSuperColumn();
-            cosc.column = c;
-            return cosc;
-        }
-    }
-
-    public int run(String[] args) throws Exception
-    {
-        String outputReducerType = "filesystem";
-        if (args != null && args[0].startsWith(OUTPUT_REDUCER_VAR))
-        {
-            String[] s = args[0].split("=");
-            if (s != null && s.length == 2)
-                outputReducerType = s[1];
-        }
-        logger.info("output reducer type: " + outputReducerType);
-
-        for (int i = 0; i < WordCountSetup.TEST_COUNT; i++)
-        {
-            String columnName = "text" + i;
-            getConf().set(CONF_COLUMN_NAME, columnName);
-
-            Job job = new Job(getConf(), "wordcount");
-            job.setJarByClass(WordCount.class);
-            job.setMapperClass(TokenizerMapper.class);
-
-            if (outputReducerType.equalsIgnoreCase("filesystem"))
-            {
-                job.setCombinerClass(ReducerToFilesystem.class);
-                job.setReducerClass(ReducerToFilesystem.class);
-                job.setOutputKeyClass(Text.class);
-                job.setOutputValueClass(IntWritable.class);
-                FileOutputFormat.setOutputPath(job, new Path(OUTPUT_PATH_PREFIX + i));
-            }
-            else
-            {
-                job.setReducerClass(ReducerToCassandra.class);
-
-                job.setMapOutputKeyClass(Text.class);
-                job.setMapOutputValueClass(IntWritable.class);
-                job.setOutputKeyClass(ByteBuffer.class);
-                job.setOutputValueClass(List.class);
-
-                job.setOutputFormatClass(ColumnFamilyOutputFormat.class);
-                
-                ConfigHelper.setOutputColumnFamily(job.getConfiguration(), KEYSPACE, OUTPUT_COLUMN_FAMILY);
-            }
-
-            job.setInputFormatClass(ColumnFamilyInputFormat.class);
-
-
-            ConfigHelper.setRpcPort(job.getConfiguration(), "9160");
-            ConfigHelper.setInitialAddress(job.getConfiguration(), "localhost");
-            ConfigHelper.setPartitioner(job.getConfiguration(), "org.apache.cassandra.dht.RandomPartitioner");
-            ConfigHelper.setInputColumnFamily(job.getConfiguration(), KEYSPACE, COLUMN_FAMILY);
-            SlicePredicate predicate = new SlicePredicate().setColumn_names(Arrays.asList(ByteBuffer.wrap(columnName.getBytes())));
-            ConfigHelper.setInputSlicePredicate(job.getConfiguration(), predicate);
-
-            job.waitForCompletion(true);
-        }
-        return 0;
+        ReadCommand readCommand = readCommand_.copy();
+        readCommand.setDigestQuery(isDigestQuery);
+        return readCommand;
     }
 }

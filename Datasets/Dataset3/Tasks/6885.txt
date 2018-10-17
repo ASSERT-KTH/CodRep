@@ -1,4 +1,4 @@
-final ServiceTarget target = updateContext.getServiceTarget().subTarget();
+MARSHALLER_FACTORY = Marshalling.getMarshallerFactory("river", ModuleClassLoader.forModuleName("org.jboss.marshalling.jboss-marshalling-river"));
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,79 +22,144 @@ final ServiceTarget target = updateContext.getServiceTarget().subTarget();
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.model;
+package org.jboss.as.server.manager;
 
-import java.util.concurrent.TimeUnit;
+import org.jboss.as.model.Domain;
+import org.jboss.logging.Logger;
+import org.jboss.marshalling.Marshaller;
+import org.jboss.marshalling.MarshallerFactory;
+import org.jboss.marshalling.Marshalling;
+import org.jboss.marshalling.MarshallingConfiguration;
+import org.jboss.marshalling.ModularClassTable;
+import org.jboss.marshalling.Unmarshaller;
+import org.jboss.modules.ModuleClassLoader;
+import org.jboss.modules.ModuleLoadException;
 
-import org.jboss.as.deployment.scanner.DeploymentScannerService;
-import org.jboss.msc.service.ServiceTarget;
+import java.io.Closeable;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * Update adding a new {@code DeploymentRepositoryElement} to a {@code ServerModel}.
+ * Protocol used by domain controller clients.  
  *
- * @author Emanuel Muckenhuber
+ * @author John E. Bailey
  */
-public class ServerDeploymentRepositoryAdd extends AbstractServerModelUpdate<Void> {
+public class DomainControllerClientProtocol {
+    private static final Logger log = Logger.getLogger("org.jboss.as.server.manager");
 
-    private static final long serialVersionUID = -1611269698053636197L;
-    private static final String DEFAULT_NAME = "default";
+    private static final MarshallerFactory MARSHALLER_FACTORY;
+    private static final MarshallingConfiguration CONFIG;
 
-    private final String path;
-    private String name;
-    private String relativeTo;
-    private int interval = 0;
-    private boolean enabled = true;
-
-    public ServerDeploymentRepositoryAdd(String path, int interval, boolean enabled) {
-        super(false, true);
-        this.path = path;
-        this.interval = interval;
-        this.enabled = enabled;
-    }
-
-    public String getName() {
-        return name;
-    }
-    public void setName(String name) {
-        this.name = name;
-    }
-    public String getRelativePath() {
-        return relativeTo;
-    }
-    public void setRelativeTo(String relativePath) {
-        this.relativeTo = relativePath;
-    }
-
-    /** {@inheritDoc} */
-    @Override
-    protected void applyUpdate(ServerModel element) throws UpdateFailedException {
-        final String repositoryName = repositoryName();
-        if(! element.addDeploymentRepository(repositoryName)) {
-            throw new UpdateFailedException("duplicate deployment repository " + repositoryName);
+    static {
+        try {
+            MARSHALLER_FACTORY = Marshalling.getMarshallerFactory("river", ModuleClassLoader.forModuleName("org.jboss.marshalling:jboss-marshalling-river"));
+        } catch (ModuleLoadException e) {
+            throw new RuntimeException(e);
         }
-        final DeploymentRepositoryElement repository = element.getDeploymentRepository(repositoryName);
-        repository.setInterval(interval);
-        repository.setEnabled(enabled);
-        repository.setPath(path);
-        repository.setRelativeTo(relativeTo);
+        final MarshallingConfiguration config = new MarshallingConfiguration();
+        config.setClassTable(ModularClassTable.getInstance());
+        CONFIG = config;
     }
 
-    /** {@inheritDoc} */
-    @Override
-    public AbstractServerModelUpdate<?> getCompensatingUpdate(ServerModel original) {
-        return new ServerDeploymentRepositoryRemove(repositoryName());
+    /**
+     * Outgoing commands to be sent to the domain controller.
+     */
+    enum OutgoingCommand {
+        REGISTER((byte) 0) {
+            protected void doExecute(final DomainControllerClientService domainControllerClientService, final Marshaller marshaller) throws Exception {
+                marshaller.writeObject(domainControllerClientService.serverManager.getHostConfig());
+            }
+        },
+        UNREGISTER(Byte.MAX_VALUE) {
+            protected void doExecute(final DomainControllerClientService domainControllerClientService, final Marshaller marshaller) throws Exception {
+            }
+        },;
+
+        final Byte command;
+
+        OutgoingCommand(final Byte command) {
+            this.command = command;
+        }
+
+        public void execute(final DomainControllerClientService domainControllerClientService, final OutputStream outputStream) throws Exception {
+            Marshaller marshaller = null;
+            try {
+                marshaller = MARSHALLER_FACTORY.createMarshaller(CONFIG);
+                marshaller.start(Marshalling.createByteOutput(outputStream));
+                marshaller.writeByte(command);
+                doExecute(domainControllerClientService, marshaller);
+                marshaller.finish();
+            } finally {
+                safeClose(marshaller);
+            }
+        }
+
+        protected abstract void doExecute(final DomainControllerClientService domainControllerClientService, final Marshaller marshaller) throws Exception;
     }
 
-    /** {@inheritDoc} */
-    @Override
-    public <P> void applyUpdate(UpdateContext updateContext, UpdateResultHandler<? super Void,P> resultHandler, P param) {
-        final ServiceTarget target = updateContext.getBatchBuilder().subTarget();
-        target.addListener(new UpdateResultHandler.ServiceStartListener<P>(resultHandler, param));
-        DeploymentScannerService.addService(target, repositoryName(), relativeTo, path, interval, TimeUnit.MILLISECONDS, enabled);
+    /**
+     * Incoming commands received from the domain controller.
+     */
+    enum IncomingCommand {
+        REGISTRATION_RESPONSE((byte) 0) {
+            protected void execute(final DomainControllerClientService domainControllerClientService, final Unmarshaller unmarshaller) throws Exception {
+                log.info("Registered with domain controller");
+            }
+        },
+        DOMAIN_UPDATE((byte) 1) {
+            protected void execute(final DomainControllerClientService domainControllerClientService, final Unmarshaller unmarshaller) throws Exception {
+                log.info("Received domain update from domain controller");
+                final Domain domain = unmarshaller.readObject(Domain.class);
+                domainControllerClientService.serverManager.setDomain(domain);
+            }
+        },;
+
+        final Byte command;
+
+        IncomingCommand(final Byte command) {
+            this.command = command;
+        }
+
+        public static void processNext(final DomainControllerClientService domainControllerClientService, final InputStream inputStream) throws Exception {
+            Unmarshaller unmarshaller = null;
+            try {
+                unmarshaller = MARSHALLER_FACTORY.createUnmarshaller(CONFIG);
+                unmarshaller.start(Marshalling.createByteInput(inputStream));
+
+                final byte commandByte = unmarshaller.readByte();
+                final IncomingCommand command = IncomingCommand.commandFor(commandByte);
+                if (command == null) {
+                    throw new RuntimeException("Invalid command byte received: " + commandByte);
+                }
+                command.execute(domainControllerClientService, unmarshaller);
+                unmarshaller.finish();
+            } finally {
+                safeClose(unmarshaller);
+            }
+        }
+
+        protected abstract void execute(final DomainControllerClientService domainControllerClientService, final Unmarshaller unmarshaller) throws Exception;
+
+        static Map<Byte, IncomingCommand> COMMANDS = new HashMap<Byte, IncomingCommand>();
+
+        static {
+            for (IncomingCommand command : values()) {
+                COMMANDS.put(command.command, command);
+            }
+        }
+
+        static IncomingCommand commandFor(final byte commandByte) {
+            return COMMANDS.get(Byte.valueOf(commandByte));
+        }
     }
 
-    private String repositoryName() {
-        return name != null ? name : DEFAULT_NAME;
+    private static void safeClose(final Closeable closeable) {
+        if (closeable != null) try {
+            closeable.close();
+        } catch (Throwable ignored) {
+            // todo: log me
+        }
     }
-
 }

@@ -1,4 +1,4 @@
-String file = "/" + couchDb + "/_changes?feed=continuous&include_docs=true&heartbeat=10000";
+this.reuseAddress = componentSettings.getAsBoolean("reuse_address", null);
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,303 +19,540 @@ String file = "/" + couchDb + "/_changes?feed=continuous&include_docs=true&heart
  * under the License.
  */
 
-package org.elasticsearch.river.couchdb;
+package org.elasticsearch.transport.netty;
 
-import org.elasticsearch.ExceptionsHelper;
-import org.elasticsearch.action.bulk.BulkResponse;
-import org.elasticsearch.action.get.GetResponse;
-import org.elasticsearch.client.Client;
-import org.elasticsearch.client.action.bulk.BulkRequestBuilder;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.util.concurrent.EsExecutors;
-import org.elasticsearch.common.util.concurrent.jsr166y.LinkedTransferQueue;
-import org.elasticsearch.common.util.concurrent.jsr166y.TransferQueue;
-import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.common.xcontent.support.XContentMapValues;
-import org.elasticsearch.indices.IndexAlreadyExistsException;
-import org.elasticsearch.river.*;
+import com.google.common.collect.Lists;
+import com.google.inject.Inject;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
+import org.elasticsearch.util.SizeValue;
+import org.elasticsearch.util.TimeValue;
+import org.elasticsearch.util.component.AbstractLifecycleComponent;
+import org.elasticsearch.util.io.stream.BytesStreamOutput;
+import org.elasticsearch.util.io.stream.HandlesStreamOutput;
+import org.elasticsearch.util.io.stream.Streamable;
+import org.elasticsearch.util.settings.Settings;
+import org.elasticsearch.util.transport.BoundTransportAddress;
+import org.elasticsearch.util.transport.InetSocketTransportAddress;
+import org.elasticsearch.util.transport.PortsRange;
+import org.elasticsearch.util.transport.TransportAddress;
+import org.jboss.netty.bootstrap.ClientBootstrap;
+import org.jboss.netty.bootstrap.ServerBootstrap;
+import org.jboss.netty.buffer.ChannelBuffer;
+import org.jboss.netty.buffer.ChannelBuffers;
+import org.jboss.netty.channel.*;
+import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
+import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
+import org.jboss.netty.logging.InternalLogger;
+import org.jboss.netty.logging.InternalLoggerFactory;
+import org.jboss.netty.logging.Slf4JLoggerFactory;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.util.Map;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
-import static org.elasticsearch.client.Requests.*;
-import static org.elasticsearch.common.xcontent.XContentFactory.*;
+import static org.elasticsearch.transport.Transport.Helper.*;
+import static org.elasticsearch.util.TimeValue.*;
+import static org.elasticsearch.util.concurrent.ConcurrentMaps.*;
+import static org.elasticsearch.util.concurrent.DynamicExecutors.*;
+import static org.elasticsearch.util.io.HostResolver.*;
+import static org.elasticsearch.util.settings.ImmutableSettings.Builder.*;
+import static org.elasticsearch.util.transport.NetworkExceptionHelper.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class CouchdbRiver extends AbstractRiverComponent implements River {
+public class NettyTransport extends AbstractLifecycleComponent<Transport> implements Transport {
 
-    private final Client client;
-
-    private final String riverIndexName;
-
-    private final String couchHost;
-    private final int couchPort;
-    private final String couchDb;
-    private final String couchFilter;
-
-    private final String indexName;
-    private final String typeName;
-    private final int bulkSize;
-    private final TimeValue bulkTimeout;
-
-    private volatile Thread slurperThread;
-    private volatile Thread indexerThread;
-    private volatile boolean closed;
-
-    private final TransferQueue<String> stream = new LinkedTransferQueue<String>();
-
-    @Inject public CouchdbRiver(RiverName riverName, RiverSettings settings, @RiverIndexName String riverIndexName, Client client) {
-        super(riverName, settings);
-        this.riverIndexName = riverIndexName;
-        this.client = client;
-
-        if (settings.settings().containsKey("couchdb")) {
-            Map<String, Object> couchSettings = (Map<String, Object>) settings.settings().get("couchdb");
-            couchHost = XContentMapValues.nodeStringValue(couchSettings.get("host"), "localhost");
-            couchPort = XContentMapValues.nodeIntegerValue(couchSettings.get("port"), 5984);
-            couchDb = XContentMapValues.nodeStringValue(couchSettings.get("db"), riverName.name());
-            couchFilter = XContentMapValues.nodeStringValue(couchSettings.get("filter"), null);
-        } else {
-            couchHost = "localhost";
-            couchPort = 5984;
-            couchDb = "db";
-            couchFilter = null;
-        }
-
-        if (settings.settings().containsKey("index")) {
-            Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
-            indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), couchDb);
-            typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), couchDb);
-            bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
-            if (indexSettings.containsKey("bulk_timeout")) {
-                bulkTimeout = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(indexSettings.get("bulk_timeout"), "10ms"), TimeValue.timeValueMillis(10));
-            } else {
-                bulkTimeout = TimeValue.timeValueMillis(10);
+    static {
+        InternalLoggerFactory.setDefaultFactory(new Slf4JLoggerFactory() {
+            @Override public InternalLogger newInstance(String name) {
+                return super.newInstance(name.replace("org.jboss.netty.", "netty."));
             }
-        } else {
-            indexName = couchDb;
-            typeName = couchDb;
-            bulkSize = 100;
-            bulkTimeout = TimeValue.timeValueMillis(10);
-        }
+        });
     }
 
-    @Override public void start() {
-        logger.info("starting couchdb stream: host [{}], port [{}], filter [{}], db [{}], indexing to [{}]/[{}]", couchHost, couchPort, couchFilter, couchDb, indexName, typeName);
-        try {
-            client.admin().indices().prepareCreate(indexName).execute().actionGet();
-        } catch (Exception e) {
-            if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
-                // that's fine
-            } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
-                // ok, not recovered yet..., lets start indexing and hope we recover by the first bulk
-                // TODO: a smarter logic can be to register for cluster event listener here, and only start sampling when the block is removed...
-            } else {
-                logger.warn("failed to create index [{}], disabling river...", e, indexName);
-                return;
-            }
-        }
+    final int workerCount;
 
-        slurperThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "couchdb_river_slurper").newThread(new Slurper());
-        indexerThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "couchdb_river_indexer").newThread(new Indexer());
-        indexerThread.start();
-        slurperThread.start();
+    final String port;
+
+    final String bindHost;
+
+    final String publishHost;
+
+    final TimeValue connectTimeout;
+
+    final int connectionsPerNode;
+
+    final int connectRetries;
+
+    final Boolean tcpNoDelay;
+
+    final Boolean tcpKeepAlive;
+
+    final Boolean reuseAddress;
+
+    final SizeValue tcpSendBufferSize;
+
+    final SizeValue tcpReceiveBufferSize;
+
+    private final ThreadPool threadPool;
+
+    private volatile OpenChannelsHandler serverOpenChannels;
+
+    private volatile ClientBootstrap clientBootstrap;
+
+    private volatile ServerBootstrap serverBootstrap;
+
+    // node id to actual channel
+    final ConcurrentMap<String, NodeConnections> clientChannels = newConcurrentMap();
+
+
+    private volatile Channel serverChannel;
+
+    private volatile TransportServiceAdapter transportServiceAdapter;
+
+    private volatile BoundTransportAddress boundAddress;
+
+    public NettyTransport(ThreadPool threadPool) {
+        this(EMPTY_SETTINGS, threadPool);
     }
 
-    @Override public void close() {
-        if (closed) {
+    @Inject public NettyTransport(Settings settings, ThreadPool threadPool) {
+        super(settings);
+        this.threadPool = threadPool;
+
+        this.workerCount = componentSettings.getAsInt("worker_count", Runtime.getRuntime().availableProcessors());
+        this.port = componentSettings.get("port", "9300-9400");
+        this.bindHost = componentSettings.get("bind_host");
+        this.connectionsPerNode = componentSettings.getAsInt("connections_per_node", 5);
+        this.publishHost = componentSettings.get("publish_host");
+        this.connectTimeout = componentSettings.getAsTime("connect_timeout", timeValueSeconds(1));
+        this.connectRetries = componentSettings.getAsInt("connect_retries", 2);
+        this.tcpNoDelay = componentSettings.getAsBoolean("tcp_no_delay", true);
+        this.tcpKeepAlive = componentSettings.getAsBoolean("tcp_keep_alive", null);
+        this.reuseAddress = componentSettings.getAsBoolean("reuse_address", true);
+        this.tcpSendBufferSize = componentSettings.getAsSize("tcp_send_buffer_size", null);
+        this.tcpReceiveBufferSize = componentSettings.getAsSize("tcp_receive_buffer_size", null);
+    }
+
+    public Settings settings() {
+        return this.settings;
+    }
+
+    @Override public void transportServiceAdapter(TransportServiceAdapter service) {
+        this.transportServiceAdapter = service;
+    }
+
+    TransportServiceAdapter transportServiceAdapter() {
+        return transportServiceAdapter;
+    }
+
+    ThreadPool threadPool() {
+        return threadPool;
+    }
+
+    @Override protected void doStart() throws ElasticSearchException {
+        clientBootstrap = new ClientBootstrap(new NioClientSocketChannelFactory(
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "transportClientBoss")),
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "transportClientIoWorker")),
+                workerCount));
+        ChannelPipelineFactory clientPipelineFactory = new ChannelPipelineFactory() {
+            @Override public ChannelPipeline getPipeline() throws Exception {
+                ChannelPipeline pipeline = Channels.pipeline();
+                pipeline.addLast("decoder", new SizeHeaderFrameDecoder());
+                pipeline.addLast("dispatcher", new MessageChannelHandler(NettyTransport.this, logger));
+                return pipeline;
+            }
+        };
+        clientBootstrap.setPipelineFactory(clientPipelineFactory);
+        clientBootstrap.setOption("connectTimeoutMillis", connectTimeout.millis());
+        if (tcpNoDelay != null) {
+            clientBootstrap.setOption("tcpNoDelay", tcpNoDelay);
+        }
+        if (tcpKeepAlive != null) {
+            clientBootstrap.setOption("keepAlive", tcpKeepAlive);
+        }
+        if (tcpSendBufferSize != null) {
+            clientBootstrap.setOption("sendBufferSize", tcpSendBufferSize.bytes());
+        }
+        if (tcpReceiveBufferSize != null) {
+            clientBootstrap.setOption("receiveBufferSize", tcpReceiveBufferSize.bytes());
+        }
+        if (reuseAddress != null) {
+            clientBootstrap.setOption("reuseAddress", reuseAddress);
+        }
+
+        if (!settings.getAsBoolean("network.server", true)) {
             return;
         }
-        logger.info("closing couchdb stream river");
-        slurperThread.interrupt();
-        indexerThread.interrupt();
-        closed = true;
-    }
 
-    private String processLine(String s, BulkRequestBuilder bulk) {
-        Map<String, Object> map = null;
+        serverOpenChannels = new OpenChannelsHandler();
+        serverBootstrap = new ServerBootstrap(new NioServerSocketChannelFactory(
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "transportServerBoss")),
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "transportServerIoWorker")),
+                workerCount));
+        ChannelPipelineFactory serverPipelineFactory = new ChannelPipelineFactory() {
+            @Override public ChannelPipeline getPipeline() throws Exception {
+                ChannelPipeline pipeline = Channels.pipeline();
+                pipeline.addLast("openChannels", serverOpenChannels);
+                pipeline.addLast("decoder", new SizeHeaderFrameDecoder());
+                pipeline.addLast("dispatcher", new MessageChannelHandler(NettyTransport.this, logger));
+                return pipeline;
+            }
+        };
+        serverBootstrap.setPipelineFactory(serverPipelineFactory);
+        if (tcpNoDelay != null) {
+            serverBootstrap.setOption("child.tcpNoDelay", tcpNoDelay);
+        }
+        if (tcpKeepAlive != null) {
+            serverBootstrap.setOption("child.keepAlive", tcpKeepAlive);
+        }
+        if (tcpSendBufferSize != null) {
+            serverBootstrap.setOption("child.sendBufferSize", tcpSendBufferSize.bytes());
+        }
+        if (tcpReceiveBufferSize != null) {
+            serverBootstrap.setOption("child.receiveBufferSize", tcpReceiveBufferSize.bytes());
+        }
+        if (reuseAddress != null) {
+            serverBootstrap.setOption("reuseAddress", reuseAddress);
+            serverBootstrap.setOption("child.reuseAddress", reuseAddress);
+        }
+
+        // Bind and start to accept incoming connections.
+        InetAddress hostAddressX;
         try {
-            map = XContentFactory.xContent(XContentType.JSON).createParser(s).mapAndClose();
+            hostAddressX = resultBindHostAddress(bindHost, settings);
         } catch (IOException e) {
-            logger.warn("failed to parse {}", e, s);
-            return null;
+            throw new BindTransportException("Failed to resolve host [" + bindHost + "]", e);
         }
-        if (map.containsKey("error")) {
-            logger.warn("received error {}", s);
-            return null;
+        final InetAddress hostAddress = hostAddressX;
+
+        PortsRange portsRange = new PortsRange(port);
+        final AtomicReference<Exception> lastException = new AtomicReference<Exception>();
+        boolean success = portsRange.iterate(new PortsRange.PortCallback() {
+            @Override public boolean onPortNumber(int portNumber) {
+                try {
+                    serverChannel = serverBootstrap.bind(new InetSocketAddress(hostAddress, portNumber));
+                } catch (Exception e) {
+                    lastException.set(e);
+                    return false;
+                }
+                return true;
+            }
+        });
+        if (!success) {
+            throw new BindTransportException("Failed to bind to [" + port + "]", lastException.get());
         }
-        String seq = map.get("seq").toString();
-        String id = map.get("id").toString();
-        if (map.containsKey("delete") && map.get("deleted").equals("true")) {
-            bulk.add(deleteRequest(indexName).type(typeName).id(id));
-        } else if (map.containsKey("doc")) {
-            Map<String, Object> doc = (Map<String, Object>) map.get("doc");
-            bulk.add(indexRequest(indexName).type(typeName).id(id).source(doc));
-        } else {
-            logger.warn("ignoring unknown change {}", s);
+
+        logger.debug("Bound to address [{}]", serverChannel.getLocalAddress());
+
+        InetSocketAddress boundAddress = (InetSocketAddress) serverChannel.getLocalAddress();
+        InetSocketAddress publishAddress;
+        try {
+            InetAddress publishAddressX = resultPublishHostAddress(publishHost, settings);
+            if (publishAddressX == null) {
+                // if its 0.0.0.0, we can't publish that.., default to the local ip address
+                if (boundAddress.getAddress().isAnyLocalAddress()) {
+                    publishAddress = new InetSocketAddress(resultPublishHostAddress(publishHost, settings, LOCAL_IP), boundAddress.getPort());
+                } else {
+                    publishAddress = boundAddress;
+                }
+            } else {
+                publishAddress = new InetSocketAddress(publishAddressX, boundAddress.getPort());
+            }
+        } catch (Exception e) {
+            throw new BindTransportException("Failed to resolve publish address", e);
         }
-        return seq;
+        this.boundAddress = new BoundTransportAddress(new InetSocketTransportAddress(boundAddress), new InetSocketTransportAddress(publishAddress));
     }
 
-    private class Indexer implements Runnable {
-        @Override public void run() {
-            while (true) {
-                if (closed) {
-                    return;
-                }
-                String s = null;
-                try {
-                    s = stream.take();
-                } catch (InterruptedException e) {
-                    if (closed) {
-                        return;
-                    }
-                    continue;
-                }
-                BulkRequestBuilder bulk = client.prepareBulk();
-                String lastSeq = null;
-                String lineSeq = processLine(s, bulk);
-                if (lineSeq != null) {
-                    lastSeq = lineSeq;
-                }
+    @Override protected void doStop() throws ElasticSearchException {
+        if (serverChannel != null) {
+            try {
+                serverChannel.close().awaitUninterruptibly();
+            } finally {
+                serverChannel = null;
+            }
+        }
 
-                // spin a bit to see if we can get some more changes
-                try {
-                    while ((s = stream.poll(bulkTimeout.millis(), TimeUnit.MILLISECONDS)) != null) {
-                        lineSeq = processLine(s, bulk);
-                        if (lineSeq != null) {
-                            lastSeq = lineSeq;
-                        }
+        if (serverOpenChannels != null) {
+            serverOpenChannels.close();
+            serverOpenChannels = null;
+        }
 
-                        if (bulk.numberOfActions() >= bulkSize) {
-                            break;
-                        }
-                    }
-                } catch (InterruptedException e) {
-                    if (closed) {
-                        return;
-                    }
-                }
+        if (serverBootstrap != null) {
+            serverBootstrap.releaseExternalResources();
+            serverBootstrap = null;
+        }
 
-                if (lastSeq != null) {
+        for (Iterator<NodeConnections> it = clientChannels.values().iterator(); it.hasNext();) {
+            NodeConnections nodeConnections = it.next();
+            it.remove();
+            nodeConnections.close();
+        }
+
+        if (clientBootstrap != null) {
+            // HACK, make sure we try and close open client channels also after
+            // we releaseExternalResources, they seem to hang when there are open client channels
+            ScheduledFuture<?> scheduledFuture = threadPool.schedule(new Runnable() {
+                @Override public void run() {
                     try {
-                        bulk.add(indexRequest(riverIndexName).type(riverName.name()).id("_seq")
-                                .source(jsonBuilder().startObject().startObject("couchdb").field("last_seq", lastSeq).endObject().endObject()));
-                    } catch (IOException e) {
-                        logger.warn("failed to add last_seq entry to bulk indexing");
+                        for (Iterator<NodeConnections> it = clientChannels.values().iterator(); it.hasNext();) {
+                            NodeConnections nodeConnections = it.next();
+                            it.remove();
+                            nodeConnections.close();
+                        }
+                    } catch (Exception e) {
+                        // ignore
                     }
                 }
+            }, 500, TimeUnit.MILLISECONDS);
+            clientBootstrap.releaseExternalResources();
+            scheduledFuture.cancel(false);
+            clientBootstrap = null;
+        }
+    }
 
-                try {
-                    BulkResponse response = bulk.execute().actionGet();
-                    if (response.hasFailures()) {
-                        // TODO write to exception queue?
-                        logger.warn("failed to execute" + response.buildFailureMessage());
+    @Override protected void doClose() throws ElasticSearchException {
+    }
+
+    @Override public boolean addressSupported(Class<? extends TransportAddress> address) {
+        return InetSocketTransportAddress.class.equals(address);
+    }
+
+    @Override public BoundTransportAddress boundAddress() {
+        return this.boundAddress;
+    }
+
+    void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e) throws Exception {
+        if (!lifecycle.started()) {
+            // ignore
+        }
+        if (isCloseConnectionException(e.getCause()) || isConnectException(e.getCause())) {
+            if (logger.isTraceEnabled()) {
+                logger.trace("(Ignoring) Exception caught on netty layer [" + ctx.getChannel() + "]", e.getCause());
+            }
+        } else {
+            logger.warn("Exception caught on netty layer [" + ctx.getChannel() + "]", e.getCause());
+        }
+    }
+
+    TransportAddress wrapAddress(SocketAddress socketAddress) {
+        return new InetSocketTransportAddress((InetSocketAddress) socketAddress);
+    }
+
+    private static final byte[] LENGTH_PLACEHOLDER = new byte[4];
+
+    @Override public <T extends Streamable> void sendRequest(DiscoveryNode node, long requestId, String action,
+                                                             Streamable streamable, final TransportResponseHandler<T> handler) throws IOException, TransportException {
+
+        Channel targetChannel = nodeChannel(node);
+
+        HandlesStreamOutput stream = BytesStreamOutput.Cached.cachedHandles();
+        stream.writeBytes(LENGTH_PLACEHOLDER); // fake size
+
+        stream.writeLong(requestId);
+        byte status = 0;
+        status = setRequest(status);
+        stream.writeByte(status); // 0 for request, 1 for response.
+
+        stream.writeUTF(action);
+        streamable.writeTo(stream);
+
+        byte[] data = ((BytesStreamOutput) stream.wrappedOut()).copiedByteArray();
+        ChannelBuffer buffer = ChannelBuffers.wrappedBuffer(data);
+
+        int size = buffer.writerIndex() - 4;
+        if (size == 0) {
+            handler.handleException(new RemoteTransportException("", new FailedCommunicationException("Trying to send a stream with 0 size")));
+        }
+        buffer.setInt(0, size); // update real size.
+        ChannelFuture channelFuture = targetChannel.write(buffer);
+        // TODO do we need this listener?
+//        channelFuture.addListener(new ChannelFutureListener() {
+//            @Override public void operationComplete(ChannelFuture future) throws Exception {
+//                if (!future.isSuccess()) {
+//                    // maybe add back the retry?
+//                    handler.handleException(new RemoteTransportException("", new FailedCommunicationException("Error sending request", future.getCause())));
+//                }
+//            }
+//        });
+    }
+
+    @Override public void nodesAdded(Iterable<DiscoveryNode> nodes) {
+        if (!lifecycle.started()) {
+            throw new ElasticSearchIllegalStateException("Can't add nodes to a stopped transport");
+        }
+        for (DiscoveryNode node : nodes) {
+            try {
+                nodeChannel(node);
+            } catch (Exception e) {
+                logger.warn("Failed to connect to discovered node [" + node + "]", e);
+            }
+        }
+    }
+
+    @Override public void nodesRemoved(Iterable<DiscoveryNode> nodes) {
+        for (DiscoveryNode node : nodes) {
+            NodeConnections nodeConnections = clientChannels.remove(node.id());
+            if (nodeConnections != null) {
+                nodeConnections.close();
+            }
+        }
+    }
+
+    private Channel nodeChannel(DiscoveryNode node) throws ConnectTransportException {
+        if (node == null) {
+            throw new ConnectTransportException(node, "Can't connect to a null node");
+        }
+        NodeConnections nodeConnections = clientChannels.get(node.id());
+        if (nodeConnections != null) {
+            return nodeConnections.channel();
+        }
+        synchronized (this) {
+            // recheck here, within the sync block (we cache connections, so we don't care about this single sync block)
+            nodeConnections = clientChannels.get(node.id());
+            if (nodeConnections != null) {
+                return nodeConnections.channel();
+            }
+            // build connection(s) to the node
+            ArrayList<Channel> channels = new ArrayList<Channel>();
+            Throwable lastConnectException = null;
+            for (int connectionIndex = 0; connectionIndex < connectionsPerNode; connectionIndex++) {
+                for (int i = 1; i <= connectRetries; i++) {
+                    if (!lifecycle.started()) {
+                        for (Channel channel1 : channels) {
+                            channel1.close().awaitUninterruptibly();
+                        }
+                        throw new ConnectTransportException(node, "Can't connect when the transport is stopped");
                     }
-                } catch (Exception e) {
-                    logger.warn("failed to execute bulk", e);
+                    InetSocketAddress address = ((InetSocketTransportAddress) node.address()).address();
+                    ChannelFuture channelFuture = clientBootstrap.connect(address);
+                    channelFuture.awaitUninterruptibly((long) (connectTimeout.millis() * 1.25));
+                    if (!channelFuture.isSuccess()) {
+                        // we failed to connect, check if we need to bail or retry
+                        if (i == connectRetries && connectionIndex == 0) {
+                            lastConnectException = channelFuture.getCause();
+                            if (connectionIndex == 0) {
+                                throw new ConnectTransportException(node, "connectTimeout[" + connectTimeout + "], connectRetries[" + connectRetries + "]", lastConnectException);
+                            } else {
+                                // break out of the retry loop, try another connection
+                                break;
+                            }
+                        } else {
+                            logger.trace("Retry #[" + i + "], connect to [" + node + "]");
+                            try {
+                                channelFuture.getChannel().close();
+                            } catch (Exception e) {
+                                // ignore
+                            }
+                            continue;
+                        }
+                    }
+                    // we got a connection, add it to our connections
+                    Channel channel = channelFuture.getChannel();
+                    if (!lifecycle.started()) {
+                        channel.close();
+                        for (Channel channel1 : channels) {
+                            channel1.close().awaitUninterruptibly();
+                        }
+                        throw new ConnectTransportException(node, "Can't connect when the transport is stopped");
+                    }
+                    channel.getCloseFuture().addListener(new ChannelCloseListener(node.id()));
+                    channels.add(channel);
+                    break;
+                }
+            }
+            if (channels.isEmpty()) {
+                if (lastConnectException != null) {
+                    throw new ConnectTransportException(node, "connectTimeout[" + connectTimeout + "], connectRetries[" + connectRetries + "]", lastConnectException);
+                }
+                throw new ConnectTransportException(node, "connectTimeout[" + connectTimeout + "], connectRetries[" + connectRetries + "], reason unknown");
+            }
+            if (logger.isDebugEnabled()) {
+                logger.debug("Connected to node[{}], number_of_connections[{}]", node, channels.size());
+            }
+            clientChannels.put(node.id(), new NodeConnections(channels.toArray(new Channel[channels.size()])));
+        }
+
+        return clientChannels.get(node.id()).channel();
+    }
+
+    private static class NodeConnections {
+
+        private final AtomicInteger counter = new AtomicInteger();
+
+        private volatile Channel[] channels;
+
+        private volatile boolean closed = false;
+
+        private NodeConnections(Channel[] channels) {
+            this.channels = channels;
+        }
+
+        private Channel channel() {
+            return channels[Math.abs(counter.incrementAndGet()) % channels.length];
+        }
+
+        private void channelClosed(Channel closedChannel) {
+            List<Channel> updated = Lists.newArrayList();
+            for (Channel channel : channels) {
+                if (!channel.getId().equals(closedChannel.getId())) {
+                    updated.add(channel);
+                }
+            }
+            this.channels = updated.toArray(new Channel[updated.size()]);
+        }
+
+        private int numberOfChannels() {
+            return channels.length;
+        }
+
+        private synchronized void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            Channel[] channelsToClose = channels;
+            channels = new Channel[0];
+            for (Channel channel : channelsToClose) {
+                if (channel.isOpen()) {
+                    channel.close().awaitUninterruptibly();
                 }
             }
         }
     }
 
+    private class ChannelCloseListener implements ChannelFutureListener {
 
-    private class Slurper implements Runnable {
-        @Override public void run() {
+        private final String nodeId;
 
-            while (true) {
-                if (closed) {
-                    return;
-                }
+        private ChannelCloseListener(String nodeId) {
+            this.nodeId = nodeId;
+        }
 
-                String lastSeq = null;
-                try {
-                    client.admin().indices().prepareRefresh(riverIndexName).execute().actionGet();
-                    GetResponse lastSeqGetResponse = client.prepareGet(riverIndexName, riverName().name(), "_seq").execute().actionGet();
-                    if (lastSeqGetResponse.exists()) {
-                        Map<String, Object> couchdbState = (Map<String, Object>) lastSeqGetResponse.sourceAsMap().get("couchdb");
-                        if (couchdbState != null) {
-                            lastSeq = couchdbState.get("last_seq").toString();
-                        }
-                    }
-                } catch (Exception e) {
-                    logger.warn("failed to get last_seq, throttling....", e);
-                    try {
-                        Thread.sleep(5000);
-                        continue;
-                    } catch (InterruptedException e1) {
-                        if (closed) {
-                            return;
-                        }
-                    }
-                }
-
-                String file = "/" + couchDb + "/_changes?feed=continuous&include_docs=true&&heartbeat=10000";
-                if (couchFilter != null) {
-                    file = file + "&filter=" + couchFilter;
-                }
-                if (lastSeq != null) {
-                    file = file + "&since=" + lastSeq;
-                }
-
-                HttpURLConnection connection = null;
-                InputStream is = null;
-                try {
-                    URL url = new URL("http", couchHost, couchPort, file);
-                    connection = (HttpURLConnection) url.openConnection();
-                    connection.setDoInput(true);
-                    connection.setUseCaches(false);
-                    is = connection.getInputStream();
-
-                    final BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        if (line.length() == 0) {
-                            logger.trace("[couchdb] heartbeat");
-                            continue;
-                        }
-                        if (logger.isTraceEnabled()) {
-                            logger.trace("[couchdb] {}", line);
-                        }
-                        stream.add(line);
-                    }
-                } catch (Exception e) {
-                    if (is != null) {
-                        try {
-                            is.close();
-                        } catch (IOException e1) {
-                            // ignore
-                        }
-                    }
-                    if (connection != null) {
-                        try {
-                            connection.disconnect();
-                        } catch (Exception e1) {
-                            // ignore
-                        }
-                    }
-                    if (closed) {
-                        return;
-                    }
-                    logger.warn("failed to read from _changes, throttling....", e);
-                    try {
-                        Thread.sleep(5000);
-                    } catch (InterruptedException e1) {
-                        if (closed) {
-                            return;
-                        }
-                    }
+        @Override public void operationComplete(ChannelFuture future) throws Exception {
+            final NodeConnections nodeConnections = clientChannels.get(nodeId);
+            if (nodeConnections != null) {
+                nodeConnections.channelClosed(future.getChannel());
+                if (nodeConnections.numberOfChannels() == 0) {
+                    // all the channels in the node connections are closed, remove it from
+                    // our client channels
+                    clientChannels.remove(nodeId);
                 }
             }
         }

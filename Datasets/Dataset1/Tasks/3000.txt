@@ -1,4 +1,6 @@
-Parameters params = new Parameters(job.get("bayes.parameters", ""));
+s += " " + numTermDeletes.get() + " deleted terms (unique count=" + terms.size() + ") terms=" + terms.keySet();
+
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,94 +19,145 @@ Parameters params = new Parameters(job.get("bayes.parameters", ""));
  * limitations under the License.
  */
 
-package org.apache.mahout.classifier.bayes.mapreduce.bayes;
-
-import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.hadoop.io.DefaultStringifier;
-import org.apache.hadoop.io.DoubleWritable;
-import org.apache.hadoop.mapred.JobConf;
-import org.apache.hadoop.mapred.MapReduceBase;
-import org.apache.hadoop.mapred.Mapper;
-import org.apache.hadoop.mapred.OutputCollector;
-import org.apache.hadoop.mapred.Reporter;
-import org.apache.hadoop.util.GenericsUtil;
-import org.apache.mahout.classifier.bayes.mapreduce.common.BayesConstants;
-import org.apache.mahout.common.Parameters;
-import org.apache.mahout.common.StringTuple;
-import org.apache.mahout.math.map.OpenObjectDoubleHashMap;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.util.RamUsageEstimator;
 
-/**
- * Mapper for Calculating the ThetaNormalizer for a label in Naive Bayes Algorithm
- * 
- */
-public class BayesThetaNormalizerMapper extends MapReduceBase implements
-    Mapper<StringTuple,DoubleWritable,StringTuple,DoubleWritable> {
-  
-  private static final Logger log = LoggerFactory.getLogger(BayesThetaNormalizerMapper.class);
-  
-  private final OpenObjectDoubleHashMap<String> labelWeightSum = new OpenObjectDoubleHashMap<String>();
-  private double sigmaJSigmaK;
-  private double vocabCount;
-  private double alphaI = 1.0;
-  
-  /**
-   * We need to calculate the thetaNormalization factor of each label
-   * 
-   * @param key
-   *          The label,feature pair
-   * @param value
-   *          The tfIdf of the pair
-   */
-  @Override
-  public void map(StringTuple key,
-                  DoubleWritable value,
-                  OutputCollector<StringTuple,DoubleWritable> output,
-                  Reporter reporter) throws IOException {
-    
-    String label = key.stringAt(1);
-    
-    reporter.setStatus("Bayes Theta Normalizer Mapper: " + label);
-    
-    double weight = Math.log((value.get() + alphaI) / (labelWeightSum.get(label) + vocabCount));
-    StringTuple thetaNormalizerTuple = new StringTuple(BayesConstants.LABEL_THETA_NORMALIZER);
-    thetaNormalizerTuple.add(label);
-    output.collect(thetaNormalizerTuple, new DoubleWritable(weight));
+/* Holds buffered deletes, by docID, term or query for a
+ * single segment. This is used to hold buffered pending
+ * deletes against the to-be-flushed segment.  Once the
+ * deletes are pushed (on flush in DocumentsWriter), these
+ * deletes are converted to a FrozenDeletes instance. */
+
+// NOTE: we are sync'd by BufferedDeletes, ie, all access to
+// instances of this class is via sync'd methods on
+// BufferedDeletes
+
+class BufferedDeletes {
+
+  /* Rough logic: HashMap has an array[Entry] w/ varying
+     load factor (say 2 * POINTER).  Entry is object w/ Term
+     key, Integer val, int hash, Entry next
+     (OBJ_HEADER + 3*POINTER + INT).  Term is object w/
+     String field and String text (OBJ_HEADER + 2*POINTER).
+     Term's field is String (OBJ_HEADER + 4*INT + POINTER +
+     OBJ_HEADER + string.length*CHAR).
+     Term's text is String (OBJ_HEADER + 4*INT + POINTER +
+     OBJ_HEADER + string.length*CHAR).  Integer is
+     OBJ_HEADER + INT. */
+  final static int BYTES_PER_DEL_TERM = 9*RamUsageEstimator.NUM_BYTES_OBJECT_REF + 7*RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + 10*RamUsageEstimator.NUM_BYTES_INT;
+
+  /* Rough logic: del docIDs are List<Integer>.  Say list
+     allocates ~2X size (2*POINTER).  Integer is OBJ_HEADER
+     + int */
+  final static int BYTES_PER_DEL_DOCID = 2*RamUsageEstimator.NUM_BYTES_OBJECT_REF + RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + RamUsageEstimator.NUM_BYTES_INT;
+
+  /* Rough logic: HashMap has an array[Entry] w/ varying
+     load factor (say 2 * POINTER).  Entry is object w/
+     Query key, Integer val, int hash, Entry next
+     (OBJ_HEADER + 3*POINTER + INT).  Query we often
+     undercount (say 24 bytes).  Integer is OBJ_HEADER + INT. */
+  final static int BYTES_PER_DEL_QUERY = 5*RamUsageEstimator.NUM_BYTES_OBJECT_REF + 2*RamUsageEstimator.NUM_BYTES_OBJECT_HEADER + 2*RamUsageEstimator.NUM_BYTES_INT + 24;
+
+  final AtomicInteger numTermDeletes = new AtomicInteger();
+  final Map<Term,Integer> terms = new HashMap<Term,Integer>();
+  final Map<Query,Integer> queries = new HashMap<Query,Integer>();
+  final List<Integer> docIDs = new ArrayList<Integer>();
+
+  public static final Integer MAX_INT = Integer.valueOf(Integer.MAX_VALUE);
+
+  final AtomicLong bytesUsed;
+
+  private final static boolean VERBOSE_DELETES = false;
+
+  long gen;
+  public BufferedDeletes() {
+    this(new AtomicLong());
   }
-  
+
+  BufferedDeletes(AtomicLong bytesUsed) {
+    assert bytesUsed != null;
+    this.bytesUsed = bytesUsed;
+  }
+
   @Override
-  public void configure(JobConf job) {
-    try {
-      labelWeightSum.clear();
-      Map<String,Double> labelWeightSumTemp = new HashMap<String,Double>();
-      
-      DefaultStringifier<Map<String,Double>> mapStringifier = new DefaultStringifier<Map<String,Double>>(job,
-          GenericsUtil.getClass(labelWeightSumTemp));
-      
-      String labelWeightSumString = job.get("cnaivebayes.sigma_k", mapStringifier.toString(labelWeightSumTemp));
-      labelWeightSumTemp = mapStringifier.fromString(labelWeightSumString);
-      for (Map.Entry<String, Double> stringDoubleEntry : labelWeightSumTemp.entrySet()) {
-        this.labelWeightSum.put(stringDoubleEntry.getKey(), stringDoubleEntry.getValue());
+  public String toString() {
+    if (VERBOSE_DELETES) {
+      return "gen=" + gen + " numTerms=" + numTermDeletes + ", terms=" + terms
+        + ", queries=" + queries + ", docIDs=" + docIDs + ", bytesUsed="
+        + bytesUsed;
+    } else {
+      String s = "gen=" + gen;
+      if (numTermDeletes.get() != 0) {
+        s += " " + numTermDeletes.get() + " deleted terms (unique count=" + terms.size() + ")";
       }
-      DefaultStringifier<Double> stringifier = new DefaultStringifier<Double>(job, GenericsUtil
-          .getClass(sigmaJSigmaK));
-      String sigmaJSigmaKString = job.get("cnaivebayes.sigma_jSigma_k", stringifier.toString(sigmaJSigmaK));
-      sigmaJSigmaK = stringifier.fromString(sigmaJSigmaKString);
-      
-      String vocabCountString = stringifier.toString(vocabCount);
-      vocabCountString = job.get("cnaivebayes.vocabCount", vocabCountString);
-      vocabCount = stringifier.fromString(vocabCountString);
-      
-      Parameters params = Parameters.fromString(job.get("bayes.parameters", ""));
-      alphaI = Double.valueOf(params.get("alpha_i", "1.0"));
-      
-    } catch (IOException ex) {
-      log.warn(ex.toString(), ex);
+      if (queries.size() != 0) {
+        s += " " + queries.size() + " deleted queries";
+      }
+      if (docIDs.size() != 0) {
+        s += " " + docIDs.size() + " deleted docIDs";
+      }
+      if (bytesUsed.get() != 0) {
+        s += " bytesUsed=" + bytesUsed.get();
+      }
+
+      return s;
     }
   }
+
+  public void addQuery(Query query, int docIDUpto) {
+    Integer current = queries.put(query, docIDUpto);
+    // increment bytes used only if the query wasn't added so far.
+    if (current == null) {
+      bytesUsed.addAndGet(BYTES_PER_DEL_QUERY);
+    }
+  }
+
+  public void addDocID(int docID) {
+    docIDs.add(Integer.valueOf(docID));
+    bytesUsed.addAndGet(BYTES_PER_DEL_DOCID);
+  }
+
+  public void addTerm(Term term, int docIDUpto) {
+    Integer current = terms.get(term);
+    if (current != null && docIDUpto < current) {
+      // Only record the new number if it's greater than the
+      // current one.  This is important because if multiple
+      // threads are replacing the same doc at nearly the
+      // same time, it's possible that one thread that got a
+      // higher docID is scheduled before the other
+      // threads.  If we blindly replace than we can
+      // incorrectly get both docs indexed.
+      return;
+    }
+
+    terms.put(term, Integer.valueOf(docIDUpto));
+    numTermDeletes.incrementAndGet();
+    if (current == null) {
+      bytesUsed.addAndGet(BYTES_PER_DEL_TERM + term.bytes.length + (RamUsageEstimator.NUM_BYTES_CHAR * term.field().length()));
+    }
+  }
+ 
+  void clear() {
+    terms.clear();
+    queries.clear();
+    docIDs.clear();
+    numTermDeletes.set(0);
+    bytesUsed.set(0);
+  }
   
+  void clearDocIDs() {
+    bytesUsed.addAndGet(-docIDs.size()*BYTES_PER_DEL_DOCID);
+    docIDs.clear();
+  }
+  
+  boolean any() {
+    return terms.size() > 0 || docIDs.size() > 0 || queries.size() > 0;
+  }
 }

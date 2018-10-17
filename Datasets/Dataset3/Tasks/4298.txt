@@ -1,8 +1,8 @@
-private static void usage() {
+import org.wildfly.security.manager.GetAccessControlContextAction;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2010, Red Hat, Inc., and individual contributors
+ * Copyright 2013, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,344 +22,147 @@ private static void usage() {
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.process;
+package org.wildfly.mod_cluster.undertow;
 
-import static org.jboss.as.process.ProcessMessages.MESSAGES;
+import io.undertow.servlet.api.Deployment;
 
-import java.io.File;
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.security.AccessController;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
-import java.util.logging.Handler;
-import java.util.logging.Logger;
+import java.util.concurrent.TimeUnit;
 
-import javax.net.ServerSocketFactory;
-
-import org.jboss.as.process.protocol.ProtocolServer;
-import org.jboss.as.version.ProductConfig;
-import org.jboss.as.version.Version;
-import org.jboss.logging.MDC;
-import org.jboss.logmanager.handlers.ConsoleHandler;
-import org.jboss.modules.Module;
+import org.jboss.logging.Logger;
+import org.jboss.modcluster.container.Connector;
+import org.jboss.modcluster.container.ContainerEventHandler;
+import org.jboss.modcluster.container.Context;
+import org.jboss.modcluster.container.Engine;
+import org.jboss.modcluster.container.Server;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.Value;
 import org.jboss.threads.JBossThreadFactory;
+import org.wildfly.extension.undertow.ListenerService;
+import org.wildfly.extension.undertow.Host;
+import org.wildfly.extension.undertow.UndertowEventListener;
+import org.wildfly.extension.undertow.UndertowService;
+import org.wildfly.security.manager.action.GetAccessControlContextAction;
 
 /**
- * The main entry point for the process controller.
+ * Service exposing an Undertow subsystem adapter to mod_cluster's ContainerEventHandler.
  *
- * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
+ * @author Paul Ferraro
  */
-public final class Main {
+public class UndertowEventHandlerAdapter implements UndertowEventListener, Service<Void>, Runnable {
+    private static final Logger log = Logger.getLogger(UndertowEventHandlerAdapter.class);
 
-    public static String getVersionString() {
-        return Version.AS_VERSION;
+    @SuppressWarnings("rawtypes")
+    private final Value<ListenerService> listener;
+    private final Value<UndertowService> service;
+    private final Value<ContainerEventHandler> eventHandler;
+    private volatile ScheduledExecutorService executor;
+    private volatile Server server;
+    private volatile Connector connector;
+
+    public UndertowEventHandlerAdapter(Value<ContainerEventHandler> eventHandler, Value<UndertowService> service, @SuppressWarnings("rawtypes") Value<ListenerService> listener) {
+        this.eventHandler = eventHandler;
+        this.service = service;
+        this.listener = listener;
     }
 
-    public static void usage() {
-        CommandLineArgumentUsageImpl.printUsage(System.out);
+    @Override
+    public Void getValue() {
+        return null;
     }
 
-    private Main() {
+    @Override
+    public void start(StartContext context) {
+        UndertowService service = this.service.getValue();
+        ContainerEventHandler eventHandler = this.eventHandler.getValue();
+        this.connector = new UndertowConnector(this.listener.getValue());
+        this.server = new UndertowServer(service, connector);
+
+        // Register ourselves as a listener to the container events
+        service.registerListener(this);
+
+        // Initialize mod_cluster and start it now
+        eventHandler.init(this.server);
+        eventHandler.start(this.server);
+
+        // Start the periodic STATUS thread
+        ThreadGroup group = new ThreadGroup(UndertowEventHandlerAdapter.class.getSimpleName());
+        ThreadFactory factory = new JBossThreadFactory(group, Boolean.FALSE, null, "%G - %t", null, null, AccessController.doPrivileged(GetAccessControlContextAction.getInstance()));
+        this.executor = Executors.newScheduledThreadPool(1, factory);
+        // TODO make interval configurable
+        this.executor.scheduleWithFixedDelay(this, 0, 10, TimeUnit.SECONDS);
     }
 
-    public static final String HOST_CONTROLLER_PROCESS_NAME = "Host Controller";
-    public static final String HOST_CONTROLLER_MODULE = "org.jboss.as.host-controller";
+    @Override
+    public void stop(StopContext context) {
+        this.executor.shutdown();
 
-    public static void main(String[] args) throws IOException {
+        ContainerEventHandler eventHandler = this.eventHandler.getValue();
+        eventHandler.stop(this.server);
 
-        start(args);
+        this.service.getValue().unregisterListener(this);
     }
 
-    public static ProcessController start(String[] args) throws IOException {
-        MDC.put("process", "process controller");
+    private Context createContext(Deployment deployment, Host host) {
+        return new UndertowContext(deployment, new UndertowHost(host, new UndertowEngine(host.getServer().getValue(), this.service.getValue(), this.connector)));
+    }
 
-        String javaHome = SecurityActions.getSystemProperty("java.home", ".");
-        String jvmName = javaHome + "/bin/java";
-        String jbossHome = SecurityActions.getSystemProperty("jboss.home.dir", ".");
-        String modulePath = null;
-        String bootJar = null;
-        String bootModule = HOST_CONTROLLER_MODULE;
-        final PCSocketConfig pcSocketConfig = new PCSocketConfig();
+    @Override
+    public void onDeploymentStart(Deployment deployment, Host host) {
+        Context context = this.createContext(deployment, host);
+        this.eventHandler.getValue().add(context);
 
-        String currentWorkingDir = SecurityActions.getSystemProperty("user.dir");
+        // TODO break into onDeploymentAdd once implemented in Undertow
+        this.eventHandler.getValue().start(context);
+    }
 
-        final List<String> javaOptions = new ArrayList<String>();
-        final List<String> smOptions = new ArrayList<String>();
+    @Override
+    public void onDeploymentStop(Deployment deployment, Host host) {
+        Context context = this.createContext(deployment, host);
+        this.eventHandler.getValue().stop(context);
 
-        // target module is always SM
-        // -mp is my module path
-        // -jar is jboss-modules.jar in jboss-home
-        // log config should be fixed loc
+        // TODO break into onDeploymentRemove once implemented in Undertow
+        this.eventHandler.getValue().remove(context);
+    }
 
-        OUT: for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
-            if ("-jvm".equals(arg)) {
-                jvmName = args[++i];
-            } else if ("-jboss-home".equals(arg)) {
-                jbossHome = args[++i];
-            } else if ("-mp".equals(arg)) {
-                modulePath = args[++i];
-            } else if ("-jar".equals(arg)) {
-                bootJar = args[++i];
-            } else if ("--".equals(arg)) {
-                for (i++; i < args.length; i++) {
-                    arg = args[i];
-                    if ("--".equals(arg)) {
-                        for (i++; i < args.length; i++) {
-                            arg = args[i];
-                            if (handleHelpOrVersion(arg, jbossHome)) {
-                                return null;
-                            } else if (pcSocketConfig.processPCSocketConfigArgument(arg, args, i)) {
-                                if (pcSocketConfig.isParseFailed()) {
-                                    return null;
-                                }
-                                i += pcSocketConfig.getArgIncrement();
-                            } else if (arg.startsWith("-D" + CommandLineConstants.PREFER_IPV4_STACK + "=")) {
-                                // AS7-5409 set the property for this process and pass it to HC via javaOptions
-                                String val = parseValue(arg, "-D" + CommandLineConstants.PREFER_IPV4_STACK);
-                                SecurityActions.setSystemProperty(CommandLineConstants.PREFER_IPV4_STACK, val);
-                                addJavaOption(arg, javaOptions);
-                            } else if (arg.startsWith("-D" + CommandLineConstants.PREFER_IPV6_ADDRESSES + "=")) {
-                                // AS7-5409 set the property for this process and pass it to HC via javaOptions
-                                String val = parseValue(arg, "-D" + CommandLineConstants.PREFER_IPV6_ADDRESSES);
-                                SecurityActions.setSystemProperty(CommandLineConstants.PREFER_IPV6_ADDRESSES, val);
-                                addJavaOption(arg, javaOptions);
+    @Override
+    public void onShutdown() {
+        // Do nothing
+    }
 
-                            } else {
-                                addJavaOption(arg, smOptions);
-                            }
-                        }
-                        break OUT;
-                    } else if (handleHelpOrVersion(arg, jbossHome)) {
-                        // This would normally come in via the nested if ("--".equals(arg)) case above, but in case someone tweaks the
-                        // script to set it directly, we've handled it
-                        return null;
-                    } else if (pcSocketConfig.processPCSocketConfigArgument(arg, args, i)) {
-                        // This would normally come in via the nested if ("--".equals(arg)) case above, but in case someone tweaks the
-                        // script to set it directly, we've handled it
-                        if (pcSocketConfig.isParseFailed()) {
-                            return null;
-                        }
-                        i += pcSocketConfig.getArgIncrement();
-                    } else {
-                        addJavaOption(arg, javaOptions);
-                    }
-                }
-                break OUT;
-            } else if (handleHelpOrVersion(arg, jbossHome)) {
-                // This would normally come in via the if ("--".equals(arg)) cases above, but in case someone tweaks the
-                // script to set it directly, we've handled it)
-                return null;
-            } else if (pcSocketConfig.processPCSocketConfigArgument(arg, args, i)) {
-                // This would normally come in via the if ("--".equals(arg)) cases above, but in case someone tweaks the
-                // script to set it directly, we've handled it
-                if (pcSocketConfig.isParseFailed()) {
-                    return null;
-                }
-                i += pcSocketConfig.getArgIncrement();
-            } else {
-                throw MESSAGES.invalidOption(arg);
+    @Override
+    public void onHostStart(Host host) {
+        // Do nothing
+    }
+
+    @Override
+    public void onHostStop(Host host) {
+        // Do nothing
+    }
+
+    @Override
+    public void onServerStart(org.wildfly.extension.undertow.Server server) {
+        // Do nothing
+    }
+
+    @Override
+    public void onServerStop(org.wildfly.extension.undertow.Server server) {
+        // Do nothing
+    }
+
+    @Override
+    public void run() {
+        try {
+            for (Engine engine : this.server.getEngines()) {
+                this.eventHandler.getValue().status(engine);
             }
-        }
-        if (modulePath == null) {
-            // if "-mp" (i.e. module path) wasn't part of the command line args, then check the system property.
-            // if system property not set, then default to JBOSS_HOME/modules
-            // TODO: jboss-modules setting module.path is not a reliable API; log a WARN or something if we get here
-            modulePath = SecurityActions.getSystemProperty("module.path", jbossHome + File.separator + "modules");
-        }
-        if (bootJar == null) {
-            // if "-jar" wasn't part of the command line args, then default to JBOSS_HOME/jboss-modules.jar
-            bootJar = jbossHome + File.separator + "jboss-modules.jar";
-        }
-
-
-        Handler consoleHandler = null;
-
-        final Logger rootLogger = Logger.getLogger("");
-        for (Handler handler : rootLogger.getHandlers()) {
-            if (handler instanceof ConsoleHandler) {
-                if (consoleHandler != null) {
-                    // duplicate handlers
-                    rootLogger.removeHandler(handler);
-                } else {
-                    consoleHandler = handler;
-                    ((ConsoleHandler)consoleHandler).setWriter(new SynchronizedWriter(System.out));
-                }
-            }
-        }
-
-        final ProtocolServer.Configuration configuration = new ProtocolServer.Configuration();
-        InetAddress pcInetAddress = InetAddress.getByName(pcSocketConfig.getBindAddress());
-        InetSocketAddress pcInetSocketAddress = new InetSocketAddress(pcInetAddress, pcSocketConfig.getBindPort());
-        configuration.setBindAddress(pcInetSocketAddress);
-        configuration.setSocketFactory(ServerSocketFactory.getDefault());
-        final ThreadFactory threadFactory = new JBossThreadFactory(new ThreadGroup("ProcessController-threads"), Boolean.FALSE, null, "%G - %t", null, null, AccessController.getContext());
-        configuration.setThreadFactory(threadFactory);
-        configuration.setReadExecutor(Executors.newCachedThreadPool(threadFactory));
-
-        final ProcessController processController = new ProcessController(configuration, System.out, System.err);
-        final InetSocketAddress boundAddress = processController.getServer().getBoundAddress();
-
-        final List<String> initialCommand = new ArrayList<String>();
-        initialCommand.add(jvmName);
-        initialCommand.add("-D[" + HOST_CONTROLLER_PROCESS_NAME + "]");
-        initialCommand.addAll(javaOptions);
-        initialCommand.add("-jar");
-        initialCommand.add(bootJar);
-        initialCommand.add("-mp");
-        initialCommand.add(modulePath);
-        initialCommand.add(bootModule);
-        initialCommand.add("-mp");  // Repeat the module path so HostController's Main sees it
-        initialCommand.add(modulePath);
-        initialCommand.add(CommandLineConstants.PROCESS_CONTROLLER_BIND_ADDR);
-        initialCommand.add(boundAddress.getAddress().getHostAddress());
-        initialCommand.add(CommandLineConstants.PROCESS_CONTROLLER_BIND_PORT);
-        initialCommand.add(Integer.toString(boundAddress.getPort()));
-        initialCommand.addAll(smOptions);
-        initialCommand.add("-D" + "jboss.home.dir=" + jbossHome);
-
-        processController.addProcess(HOST_CONTROLLER_PROCESS_NAME, initialCommand, Collections.<String, String>emptyMap(), currentWorkingDir, true, true);
-        processController.startProcess(HOST_CONTROLLER_PROCESS_NAME);
-
-        final Thread shutdownThread = new Thread(new Runnable() {
-            public void run() {
-                processController.shutdown();
-            }
-        }, "Shutdown thread");
-        shutdownThread.setDaemon(false);
-        Runtime.getRuntime().addShutdownHook(shutdownThread);
-
-        return processController;
-    }
-
-    private static String parseValue(final String arg, final String key) {
-        String value = null;
-        int splitPos = key.length();
-        if (arg.length() <= splitPos + 1 || arg.charAt(splitPos) != '=') {
-            System.out.println(MESSAGES.noArgValue(key));
-            usage();
-        } else {
-            value = arg.substring(splitPos + 1);
-        }
-        return value;
-    }
-
-    private static void addJavaOption(String option, List<String> javaOptions) {
-
-        // Remove any existing -D options that this one replaces
-        if (option.startsWith("-D")) {
-            String key;
-            int splitPos = option.indexOf('=');
-            if (splitPos < 0) {
-                key = option;
-            } else {
-                key = option.substring(0, splitPos);
-            }
-            for (Iterator<String> iter = javaOptions.iterator(); iter.hasNext();) {
-                String existingOp = iter.next();
-                if (existingOp.equals(key) || (existingOp.startsWith(key) && existingOp.indexOf('=') == key.length())) {
-                    iter.remove();
-                }
-            }
-        }
-
-        javaOptions.add(option);
-    }
-
-    private static boolean handleHelpOrVersion(String arg, String jbossHome) {
-        if (CommandLineConstants.HELP.equals(arg) || CommandLineConstants.SHORT_HELP.equals(arg)
-            || CommandLineConstants.OLD_HELP.equals(arg)) {
-            usage();
-            return true;
-        } else if (CommandLineConstants.VERSION.equals(arg) || CommandLineConstants.SHORT_VERSION.equals(arg)
-                || CommandLineConstants.OLD_VERSION.equals(arg) || CommandLineConstants.OLD_SHORT_VERSION.equals(arg)) {
-            System.out.println(new ProductConfig(Module.getBootModuleLoader(), jbossHome, null).getPrettyVersionString());
-            return true;
-        }
-        return false;
-    }
-
-    private static class PCSocketConfig {
-        private String bindAddress;
-        private int bindPort = 0;
-        private int argIncrement = 0;
-        private boolean parseFailed;
-
-        private PCSocketConfig() {
-        }
-
-        private String getBindAddress() {
-            if (bindAddress != null) {
-                return bindAddress;
-            } else {
-                boolean v4Stack = Boolean.valueOf(SecurityActions.getSystemProperty(CommandLineConstants.PREFER_IPV4_STACK, "false"));
-                boolean useV6 = !v4Stack && Boolean.valueOf(SecurityActions.getSystemProperty(CommandLineConstants.PREFER_IPV6_ADDRESSES, "false"));
-                return useV6 ? "::1" : "127.0.0.1";
-            }
-        }
-
-        private int getBindPort() {
-            return bindPort;
-        }
-
-        private int getArgIncrement() {
-            return argIncrement;
-        }
-
-        private boolean isParseFailed() {
-            return parseFailed;
-        }
-
-        private boolean processPCSocketConfigArgument(final String arg, final String[] args, final int index) {
-            boolean isPCSocketArg = true;
-
-            argIncrement = 0;
-
-            if (CommandLineConstants.PROCESS_CONTROLLER_BIND_ADDR.equals(arg) || CommandLineConstants.OLD_PROCESS_CONTROLLER_BIND_ADDR.equals(arg)) {
-                bindAddress = args[index +1];
-                argIncrement = 1;
-            } else if (arg.startsWith(CommandLineConstants.PROCESS_CONTROLLER_BIND_ADDR)) {
-                String addr = parseValue(arg, CommandLineConstants.PROCESS_CONTROLLER_BIND_ADDR);
-                if (addr == null) {
-                    parseFailed = true;
-                } else {
-                    bindAddress = addr;
-                }
-            } else if (arg.startsWith(CommandLineConstants.OLD_PROCESS_CONTROLLER_BIND_ADDR)) {
-                String addr = parseValue(arg, CommandLineConstants.OLD_PROCESS_CONTROLLER_BIND_ADDR);
-                if (addr == null) {
-                    parseFailed = true;
-                } else {
-                    bindAddress = addr;
-                }
-            } else if (CommandLineConstants.PROCESS_CONTROLLER_BIND_PORT.equals(arg) || CommandLineConstants.OLD_PROCESS_CONTROLLER_BIND_PORT.equals(arg)) {
-                bindPort = Integer.parseInt(args[index + 1]);
-                argIncrement = 1;
-            } else if (arg.startsWith(CommandLineConstants.PROCESS_CONTROLLER_BIND_PORT)) {
-                String port = parseValue(arg, CommandLineConstants.PROCESS_CONTROLLER_BIND_PORT);
-                if (port == null) {
-                    parseFailed = true;
-                } else {
-                    bindPort = Integer.parseInt(port);
-                }
-            } else if (arg.startsWith(CommandLineConstants.OLD_PROCESS_CONTROLLER_BIND_PORT)) {
-                String port = parseValue(arg, CommandLineConstants.OLD_PROCESS_CONTROLLER_BIND_PORT);
-                if (port == null) {
-                    parseFailed = true;
-                } else {
-                    bindPort = Integer.parseInt(port);
-                }
-            } else {
-                isPCSocketArg = false;
-            }
-
-            return isPCSocketArg;
+        } catch (Throwable e) {
+            log.error(e.getMessage(), e);
         }
     }
 }

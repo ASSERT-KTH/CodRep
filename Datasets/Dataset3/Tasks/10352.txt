@@ -1,4 +1,4 @@
-import org.jboss.as.ejb3.EjbLogger;
+componentsForViewName = applicationDescription.getComponentsForViewName(typeName, deploymentRoot.getRoot());
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,93 +22,166 @@ import org.jboss.as.ejb3.EjbLogger;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.ejb3.remote.protocol.versionone;
+package org.jboss.as.ejb3.deployment.processors;
 
-import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
 
-import javax.resource.spi.XATerminator;
-import javax.transaction.Transaction;
-import javax.transaction.TransactionManager;
+import org.jboss.as.ee.component.ComponentView;
+import org.jboss.as.ee.component.EEApplicationDescription;
+import org.jboss.as.ee.component.EEModuleDescription;
+import org.jboss.as.ee.component.InjectionSource;
+import org.jboss.as.ee.component.ViewDescription;
+import org.jboss.as.ee.component.ViewManagedReferenceFactory;
+import org.jboss.as.ejb3.EjbMessages;
+import org.jboss.as.ejb3.component.EJBComponentDescription;
+import org.jboss.as.ejb3.component.EJBViewDescription;
+import org.jboss.as.ejb3.component.MethodIntf;
+import org.jboss.as.ejb3.remote.RemoteViewManagedReferenceFactory;
+import org.jboss.as.naming.ManagedReferenceFactory;
+import org.jboss.as.server.deployment.Attachments;
+import org.jboss.as.server.deployment.DeploymentPhaseContext;
+import org.jboss.as.server.deployment.DeploymentUnit;
+import org.jboss.as.server.deployment.DeploymentUnitProcessingException;
+import org.jboss.as.server.deployment.module.ResourceRoot;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.ServiceBuilder;
+import org.jboss.msc.service.ServiceName;
 
-import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinateTransaction;
-import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinationManager;
-import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.XATerminatorImple;
-import org.jboss.as.ejb3.logging.EjbLogger;
-import org.jboss.as.ejb3.remote.EJBRemoteTransactionsRepository;
-import org.jboss.ejb.client.XidTransactionID;
-import org.jboss.marshalling.MarshallerFactory;
-import org.xnio.IoUtils;
-
+import static org.jboss.as.ee.component.Attachments.EE_APPLICATION_DESCRIPTION;
 
 /**
- * @author Jaikiran Pai
+ * Implementation of {@link InjectionSource} responsible for finding a specific bean instance with a bean name and interface.
+ *
+ * @author John Bailey
+ * @author Stuart Douglas
  */
-abstract class XidTransactionManagementTask implements Runnable {
+public class EjbInjectionSource extends InjectionSource {
+    private final String beanName;
+    private final String typeName;
+    private final String bindingName;
+    private final DeploymentUnit deploymentUnit;
+    private volatile String error = null;
+    private volatile ServiceName resolvedViewName;
+    private volatile RemoteViewManagedReferenceFactory remoteFactory;
+    private volatile boolean resolved = false;
 
-    protected final short invocationId;
-    protected final ChannelAssociation channelAssociation;
-    protected final EJBRemoteTransactionsRepository transactionsRepository;
-    protected final XidTransactionID xidTransactionID;
-    protected final MarshallerFactory marshallerFactory;
-    protected final TransactionRequestHandler transactionRequestHandler;
-
-    XidTransactionManagementTask(final TransactionRequestHandler txRequestHandler, final EJBRemoteTransactionsRepository transactionsRepository,
-                                 final MarshallerFactory marshallerFactory, final XidTransactionID xidTransactionID,
-                                 final ChannelAssociation channelAssociation, final short invocationId) {
-
-        this.transactionRequestHandler = txRequestHandler;
-        this.channelAssociation = channelAssociation;
-        this.marshallerFactory = marshallerFactory;
-        this.invocationId = invocationId;
-        this.transactionsRepository = transactionsRepository;
-        this.xidTransactionID = xidTransactionID;
+    public EjbInjectionSource(final String beanName, final String typeName, final String bindingName, final DeploymentUnit deploymentUnit) {
+        this.beanName = beanName;
+        this.typeName = typeName;
+        this.bindingName = bindingName;
+        this.deploymentUnit = deploymentUnit;
     }
 
-    @Override
-    public void run() {
-        try {
-            this.manageTransaction();
-        } catch (Throwable t) {
-            try {
-                EjbLogger.ROOT_LOGGER.errorDuringTransactionManagement(t, this.xidTransactionID);
-                // write out a failure message to the channel to let the client know that
-                // the transaction operation failed
-                transactionRequestHandler.writeException(this.channelAssociation, this.marshallerFactory, this.invocationId, t, null);
-            } catch (IOException e) {
-                EjbLogger.ROOT_LOGGER.couldNotWriteOutToChannel(e);
-                // close the channel
-                IoUtils.safeClose(this.channelAssociation.getChannel());
+    public EjbInjectionSource(final String typeName, final String bindingName, final DeploymentUnit deploymentUnit) {
+        this.bindingName = bindingName;
+        this.deploymentUnit = deploymentUnit;
+        this.beanName = null;
+        this.typeName = typeName;
+    }
+
+    public void getResourceValue(final ResolutionContext resolutionContext, final ServiceBuilder<?> serviceBuilder, final DeploymentPhaseContext phaseContext, final Injector<ManagedReferenceFactory> injector) throws DeploymentUnitProcessingException {
+        resolve();
+
+        if (error != null) {
+            throw new DeploymentUnitProcessingException(error);
+        }
+
+        if (remoteFactory != null) {
+            //because we are using the ejb: lookup namespace we do not need a dependency
+            injector.inject(remoteFactory);
+        } else {
+            serviceBuilder.addDependency(resolvedViewName, ComponentView.class, new ViewManagedReferenceFactory.Injector(injector));
+        }
+    }
+
+    /**
+     * Checks if this ejb injection has been resolved yet, and if not resolves it.
+     */
+    private void resolve() {
+        if (!resolved) {
+            synchronized (this) {
+                if (!resolved) {
+
+                    final Set<ViewDescription> views = getViews();
+
+                    final Set<EJBViewDescription> ejbsForViewName = new HashSet<EJBViewDescription>();
+                    for (final ViewDescription view : views) {
+                        if (view instanceof EJBViewDescription) {
+                            ejbsForViewName.add((EJBViewDescription) view);
+                        }
+                    }
+
+
+                    if (ejbsForViewName.isEmpty()) {
+                        if (beanName == null) {
+                            error = EjbMessages.MESSAGES.ejbNotFound(typeName, bindingName);
+                        } else {
+                            error = EjbMessages.MESSAGES.ejbNotFound(typeName, beanName, bindingName);
+                        }
+                    } else if (ejbsForViewName.size() > 1) {
+                        if (beanName == null) {
+                            error = EjbMessages.MESSAGES.moreThanOneEjbFound(typeName, bindingName, ejbsForViewName);
+                        } else {
+                            error = EjbMessages.MESSAGES.moreThanOneEjbFound(typeName, beanName, bindingName, ejbsForViewName);
+                        }
+                        error = "More than 1 component found for type '" + typeName + "' and bean name " + beanName + " for binding " + bindingName;
+                    } else {
+                        final EJBViewDescription description = ejbsForViewName.iterator().next();
+                        final EJBViewDescription ejbViewDescription = (EJBViewDescription) description;
+                        //for remote interfaces we do not want to use a normal binding
+                        //we need to bind the remote proxy factory into JNDI instead to get the correct behaviour
+
+                        if (ejbViewDescription.getMethodIntf() == MethodIntf.REMOTE || ejbViewDescription.getMethodIntf() == MethodIntf.HOME) {
+                            final EJBComponentDescription componentDescription = (EJBComponentDescription) description.getComponentDescription();
+                            final EEModuleDescription moduleDescription = componentDescription.getModuleDescription();
+                            final String earApplicationName = moduleDescription.getEarApplicationName();
+                            remoteFactory = new RemoteViewManagedReferenceFactory(earApplicationName, moduleDescription.getModuleName(), moduleDescription.getDistinctName(), componentDescription.getComponentName(), description.getViewClassName(), componentDescription.isStateful());
+                        }
+                        final ServiceName serviceName = description.getServiceName();
+                        resolvedViewName = serviceName;
+                    }
+                    resolved = true;
+                }
             }
-            return;
-        }
-
-        try {
-            // write out invocation success message to the channel
-            transactionRequestHandler.writeTxInvocationResponseMessage(this.channelAssociation, this.invocationId);
-        } catch (IOException e) {
-            EjbLogger.ROOT_LOGGER.couldNotWriteInvocationSuccessMessage(e);
-            // close the channel
-            IoUtils.safeClose(this.channelAssociation.getChannel());
         }
     }
 
-    protected abstract void manageTransaction() throws Throwable;
-
-    protected void resumeTransaction(final Transaction transaction) throws Exception {
-        final TransactionManager transactionManager = this.transactionsRepository.getTransactionManager();
-        transactionManager.resume(transaction);
+    private Set<ViewDescription> getViews() {
+        final EEApplicationDescription applicationDescription = deploymentUnit.getAttachment(EE_APPLICATION_DESCRIPTION);
+        final ResourceRoot deploymentRoot = deploymentUnit.getAttachment(Attachments.DEPLOYMENT_ROOT);
+        final Set<ViewDescription> componentsForViewName;
+        if (beanName != null) {
+            componentsForViewName = applicationDescription.getComponents(beanName, typeName, deploymentRoot.getRoot());
+        } else {
+            componentsForViewName = applicationDescription.getComponentsForViewName(typeName);
+        }
+        return componentsForViewName;
     }
 
-    protected SubordinateTransaction tryRecoveryForImportedTransaction() throws Exception {
-        final XATerminator xaTerminator = SubordinationManager.getXATerminator();
-        if (xaTerminator instanceof XATerminatorImple) {
-            EjbLogger.ROOT_LOGGER.debug("Trying to recover an imported transaction for Xid " + this.xidTransactionID.getXid());
-            // We intentionally pass null for Xid since passing the specific Xid doesn't seem to work for some reason.
-            // As for null for parentNodeName, we do that intentionally since we aren't aware of the parent node on which
-            // the transaction originated
-            ((XATerminatorImple) xaTerminator).doRecover(null, null);
+    public boolean equals(Object o) {
+        if (this == o)
+            return true;
+
+        if (!(o instanceof EjbInjectionSource))
+            return false;
+
+        resolve();
+
+        if (error != null) {
+            //we can't do a real equals comparison in this case, so just return false
+            return false;
         }
-        // now that recovery has been completed via the XATerminator, it's possible that the subordinate tx will have been loaded
-        return SubordinationManager.getTransactionImporter().getImportedTransaction(this.xidTransactionID.getXid());
+
+        final EjbInjectionSource other = (EjbInjectionSource) o;
+        return eq(typeName, other.typeName) && eq(resolvedViewName, other.resolvedViewName);
+    }
+
+    public int hashCode() {
+        return typeName.hashCode();
+    }
+
+    private static boolean eq(Object a, Object b) {
+        return a == b || (a != null && a.equals(b));
     }
 }

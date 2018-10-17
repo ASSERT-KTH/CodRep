@@ -1,4 +1,4 @@
-acceptMatch((String) names[i], containerPath, separator, null/*no pattern*/, requestor, participant, scope, progressMonitor); // AndPatterns cannot provide the decoded result
+int result = change.generateDelta(delta, true/*add classpath change*/);
 
 /*******************************************************************************
  * Copyright (c) 2000, 2008 IBM Corporation and others.
@@ -10,77 +10,93 @@ acceptMatch((String) names[i], containerPath, separator, null/*no pattern*/, req
  * Contributors:
  *     IBM Corporation - initial API and implementation
  *******************************************************************************/
-package org.eclipse.jdt.internal.core.search.matching;
+package org.eclipse.jdt.internal.core;
 
-import java.io.IOException;
+import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.jobs.ISchedulingRule;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.JavaModelException;
 
-import org.eclipse.core.runtime.IProgressMonitor;
-import org.eclipse.core.runtime.OperationCanceledException;
-import org.eclipse.jdt.core.search.*;
-import org.eclipse.jdt.internal.compiler.util.SimpleSet;
-import org.eclipse.jdt.internal.core.index.*;
-import org.eclipse.jdt.internal.core.search.IndexQueryRequestor;
-
-/**
- * Query the index multiple times and do an 'and' on the results.
+/*
+ * Abstract class for operations that change the classpath
  */
-public abstract class IntersectingPattern extends JavaSearchPattern {
+public abstract class ChangeClasspathOperation extends JavaModelOperation {
 
-public IntersectingPattern(int patternKind, int matchRule) {
-	super(patternKind, matchRule);
-}
-public void findIndexMatches(Index index, IndexQueryRequestor requestor, SearchParticipant participant, IJavaSearchScope scope, IProgressMonitor progressMonitor) throws IOException {
-	if (progressMonitor != null && progressMonitor.isCanceled()) throw new OperationCanceledException();
+	protected boolean canChangeResources;
 
-	resetQuery();
-	SimpleSet intersectedNames = null;
-	try {
-		index.startQuery();
-		do {
-			SearchPattern pattern = currentPattern();
-			EntryResult[] entries = pattern.queryIn(index);
-			if (entries == null) return;
-
-			SearchPattern decodedResult = pattern.getBlankPattern();
-			SimpleSet newIntersectedNames = new SimpleSet(3);
-			for (int i = 0, l = entries.length; i < l; i++) {
-				if (progressMonitor != null && progressMonitor.isCanceled()) throw new OperationCanceledException();
-
-				EntryResult entry = entries[i];
-				decodedResult.decodeIndexKey(entry.getWord());
-				if (pattern.matchesDecodedKey(decodedResult)) {
-					String[] names = entry.getDocumentNames(index);
-					if (intersectedNames != null) {
-						for (int j = 0, n = names.length; j < n; j++)
-							if (intersectedNames.includes(names[j]))
-								newIntersectedNames.add(names[j]);
-					} else {
-						for (int j = 0, n = names.length; j < n; j++)
-							newIntersectedNames.add(names[j]);
-					}
-				}
-			}
-
-			if (newIntersectedNames.elementSize == 0) return;
-			intersectedNames = newIntersectedNames;
-		} while (hasNextQuery());
-	} finally {
-		index.stopQuery();
+	public ChangeClasspathOperation(IJavaElement[] elements, boolean canChangeResources) {
+		super(elements);
+		this.canChangeResources = canChangeResources;
 	}
 
-	String containerPath = index.containerPath;
-	char separator = index.separator;
-	Object[] names = intersectedNames.values;
-	for (int i = 0, l = names.length; i < l; i++)
-		if (names[i] != null)
-			acceptMatch((String) names[i], containerPath, separator, null/*no pattern*/, requestor, participant, scope); // AndPatterns cannot provide the decoded result
-}
-/**
- * Returns whether another query must be done.
- */
-protected abstract boolean hasNextQuery();
-/**
- * Resets the query and prepares this pattern to be queried.
- */
-protected abstract void resetQuery();
+	protected boolean canModifyRoots() {
+		// changing the classpath can modify roots
+		return true;
+	}
+
+	/*
+	 * The resolved classpath of the given project may have changed:
+	 * - generate a delta
+	 * - trigger indexing
+	 * - update project references
+	 * - create resolved classpath markers
+	 */
+	protected void classpathChanged(ClasspathChange change) throws JavaModelException {
+		// reset the project's caches early since some clients rely on the project's caches being up-to-date when run inside an IWorkspaceRunnable
+		// (see https://bugs.eclipse.org/bugs/show_bug.cgi?id=212769#c5 )
+		JavaProject project = change.project;
+		project.resetCaches();
+
+		if (this.canChangeResources) {
+			// workaround for https://bugs.eclipse.org/bugs/show_bug.cgi?id=177922
+			if (isTopLevelOperation() && !ResourcesPlugin.getWorkspace().isTreeLocked()) {
+				new ClasspathValidation(project).validate();
+			}
+
+			// delta, indexing and classpath markers are going to be created by the delta processor
+			// while handling the resource change (either .classpath change, or project touched)
+
+			// however ensure project references are updated
+			// since some clients rely on the project references when run inside an IWorkspaceRunnable
+			new ProjectReferenceChange(project, change.oldResolvedClasspath).updateProjectReferencesIfNecessary();
+
+			// and ensure that external folders are updated as well
+			new ExternalFolderChange(project, change.oldResolvedClasspath).updateExternalFoldersIfNecessary(true/*refresh if external linked folder already exists*/, null);
+
+		} else {
+			DeltaProcessingState state = JavaModelManager.getDeltaState();
+			JavaElementDelta delta = new JavaElementDelta(getJavaModel());
+			int result = change.generateDelta(delta);
+			if ((result & ClasspathChange.HAS_DELTA) != 0) {
+				// create delta
+				addDelta(delta);
+
+				// need to recompute root infos
+				state.rootsAreStale = true;
+
+				// ensure indexes are updated
+				change.requestIndexing();
+
+				// ensure classpath is validated on next build
+				state.addClasspathValidation(project);
+			}
+			if ((result & ClasspathChange.HAS_PROJECT_CHANGE) != 0) {
+				// ensure project references are updated on next build
+				state.addProjectReferenceChange(project, change.oldResolvedClasspath);
+			}
+			if ((result & ClasspathChange.HAS_LIBRARY_CHANGE) != 0) {
+				// ensure external folders are updated on next build
+				state.addExternalFolderChange(project, change.oldResolvedClasspath);
+			}
+		}
+	}
+
+	protected ISchedulingRule getSchedulingRule() {
+		return null; // no lock taken while changing classpath
+	}
+
+	public boolean isReadOnly() {
+		return !this.canChangeResources;
+	}
+
 }

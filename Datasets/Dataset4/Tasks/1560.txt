@@ -1,10 +1,10 @@
-String dynamicMappingLocation = componentSettings.get("dynamic_mapping_location");
+shardsIts = clusterService.operationRouting().searchShards(clusterState, request.indices(), concreteIndices, routingMap, request.preference());
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
+ * Licensed to ElasticSearch and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
+ * regarding copyright ownership. ElasticSearch licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,444 +19,341 @@ String dynamicMappingLocation = componentSettings.get("dynamic_mapping_location"
  * under the License.
  */
 
-package org.elasticsearch.index.mapper;
+package org.elasticsearch.action.search.type;
 
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.UnmodifiableIterator;
-import com.google.inject.Inject;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.TokenStream;
-import org.elasticsearch.env.Environment;
-import org.elasticsearch.env.FailedToResolveConfigException;
-import org.elasticsearch.index.AbstractIndexComponent;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.IndexLifecycle;
-import org.elasticsearch.index.analysis.AnalysisService;
-import org.elasticsearch.index.mapper.json.JsonDocumentMapperParser;
-import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.util.Nullable;
-import org.elasticsearch.util.concurrent.ThreadSafe;
-import org.elasticsearch.util.io.Streams;
-import org.elasticsearch.util.settings.Settings;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.search.*;
+import org.elasticsearch.action.support.TransportAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.GroupShardsIterator;
+import org.elasticsearch.cluster.routing.ShardIterator;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.trove.ExtTIntArrayList;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.search.SearchPhaseResult;
+import org.elasticsearch.search.SearchShardTarget;
+import org.elasticsearch.search.action.SearchServiceListener;
+import org.elasticsearch.search.action.SearchServiceTransportAction;
+import org.elasticsearch.search.controller.SearchPhaseController;
+import org.elasticsearch.search.controller.ShardDoc;
+import org.elasticsearch.search.internal.ShardSearchRequest;
+import org.elasticsearch.search.query.QuerySearchResultProvider;
+import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.Reader;
-import java.net.MalformedURLException;
-import java.net.URL;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.elasticsearch.util.MapBuilder.*;
+import static org.elasticsearch.action.search.type.TransportSearchHelper.internalSearchRequest;
 
 /**
- * @author kimchy (Shay Banon)
+ *
  */
-@IndexLifecycle
-@ThreadSafe
-public class MapperService extends AbstractIndexComponent implements Iterable<DocumentMapper> {
+public abstract class TransportSearchTypeAction extends TransportAction<SearchRequest, SearchResponse> {
 
-    /**
-     * Will create types automatically if they do not exists in the repo yet
-     */
-    private final boolean dynamic;
+    protected final ClusterService clusterService;
 
-    private final String dynamicMappingLocation;
+    protected final SearchServiceTransportAction searchService;
 
-    private final URL dynamicMappingUrl;
+    protected final SearchPhaseController searchPhaseController;
 
-    private final ClassLoader indexClassLoader;
+    protected final TransportSearchCache searchCache;
 
-    private final String dynamicMappingSource;
+    public TransportSearchTypeAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
+                                     TransportSearchCache searchCache, SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
+        super(settings, threadPool);
+        this.clusterService = clusterService;
+        this.searchCache = searchCache;
+        this.searchService = searchService;
+        this.searchPhaseController = searchPhaseController;
+    }
 
-    private volatile ImmutableMap<String, DocumentMapper> mappers = ImmutableMap.of();
+    protected abstract class BaseAsyncAction<FirstResult extends SearchPhaseResult> {
 
-    private final Object mutex = new Object();
+        protected final ActionListener<SearchResponse> listener;
 
-    private volatile ImmutableMap<String, FieldMappers> nameFieldMappers = ImmutableMap.of();
-    private volatile ImmutableMap<String, FieldMappers> indexNameFieldMappers = ImmutableMap.of();
-    private volatile ImmutableMap<String, FieldMappers> fullNameFieldMappers = ImmutableMap.of();
-    private volatile FieldMappers idFieldMappers = new FieldMappers();
-    private volatile FieldMappers typeFieldMappers = new FieldMappers();
-    private volatile FieldMappers uidFieldMappers = new FieldMappers();
-    private volatile FieldMappers sourceFieldMappers = new FieldMappers();
+        private final GroupShardsIterator shardsIts;
 
-    // for now, just use the json one. Can work on it more to support custom ones
-    private final DocumentMapperParser documentParser;
+        protected final SearchRequest request;
 
-    private final InternalFieldMapperListener fieldMapperListener = new InternalFieldMapperListener();
+        protected final ClusterState clusterState;
+        protected final DiscoveryNodes nodes;
 
-    private final SmartIndexNameSearchAnalyzer searchAnalyzer;
+        protected final int expectedSuccessfulOps;
 
-    @Inject public MapperService(Index index, @IndexSettings Settings indexSettings, Environment environment, AnalysisService analysisService) {
-        super(index, indexSettings);
-        this.documentParser = new JsonDocumentMapperParser(analysisService);
-        this.searchAnalyzer = new SmartIndexNameSearchAnalyzer(analysisService.defaultSearchAnalyzer());
-        this.indexClassLoader = indexSettings.getClassLoader();
+        private final int expectedTotalOps;
 
-        this.dynamic = componentSettings.getAsBoolean("dynamic", true);
-        String dynamicMappingLocation = componentSettings.get("dynamicMappingLocation");
-        URL dynamicMappingUrl;
-        if (dynamicMappingLocation == null) {
-            try {
-                dynamicMappingUrl = environment.resolveConfig("dynamic-mapping.json");
-            } catch (FailedToResolveConfigException e) {
-                // not there, default to the built in one
-                dynamicMappingUrl = indexClassLoader.getResource("org/elasticsearch/index/mapper/json/dynamic-mapping.json");
+        protected final AtomicInteger successulOps = new AtomicInteger();
+
+        private final AtomicInteger totalOps = new AtomicInteger();
+
+        private volatile Queue<ShardSearchFailure> shardFailures;
+
+        protected volatile ShardDoc[] sortedShardList;
+
+        protected final long startTime = System.currentTimeMillis();
+
+        protected BaseAsyncAction(SearchRequest request, ActionListener<SearchResponse> listener) {
+            this.request = request;
+            this.listener = listener;
+
+            this.clusterState = clusterService.state();
+            nodes = clusterState.nodes();
+
+            clusterState.blocks().globalBlockedRaiseException(ClusterBlockLevel.READ);
+
+            String[] concreteIndices = clusterState.metaData().concreteIndices(request.indices(), request.ignoreIndices(), true);
+
+            for (String index : concreteIndices) {
+                clusterState.blocks().indexBlockedRaiseException(ClusterBlockLevel.READ, index);
             }
-        } else {
-            try {
-                dynamicMappingUrl = environment.resolveConfig(dynamicMappingLocation);
-            } catch (FailedToResolveConfigException e) {
-                // not there, default to the built in one
+
+            Map<String, Set<String>> routingMap = clusterState.metaData().resolveSearchRouting(request.routing(), request.indices());
+
+            shardsIts = clusterService.operationRouting().searchShards(clusterState, request.indices(), concreteIndices, request.queryHint(), routingMap, request.preference());
+            expectedSuccessfulOps = shardsIts.size();
+            // we need to add 1 for non active partition, since we count it in the total!
+            expectedTotalOps = shardsIts.totalSizeWith1ForEmpty();
+
+            if (expectedSuccessfulOps == 0) {
+                // not search shards to search on...
+                throw new SearchPhaseExecutionException("initial", "No indices / shards to search on, requested indices are " + Arrays.toString(request.indices()), buildShardFailures());
+            }
+        }
+
+        public void start() {
+            request.beforeStart();
+            // count the local operations, and perform the non local ones
+            int localOperations = 0;
+            for (final ShardIterator shardIt : shardsIts) {
+                final ShardRouting shard = shardIt.firstOrNull();
+                if (shard != null) {
+                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                        localOperations++;
+                    } else {
+                        // do the remote operation here, the localAsync flag is not relevant
+                        performFirstPhase(shardIt);
+                    }
+                } else {
+                    // really, no shards active in this group
+                    onFirstPhaseResult(null, shardIt, null);
+                }
+            }
+            // we have local operations, perform them now
+            if (localOperations > 0) {
+                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
+                    request.beforeLocalFork();
+                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            for (final ShardIterator shardIt : shardsIts) {
+                                final ShardRouting shard = shardIt.firstOrNull();
+                                if (shard != null) {
+                                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                                        performFirstPhase(shardIt);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
+                    if (localAsync) {
+                        request.beforeLocalFork();
+                    }
+                    for (final ShardIterator shardIt : shardsIts) {
+                        final ShardRouting shard = shardIt.firstOrNull();
+                        if (shard != null) {
+                            if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                                if (localAsync) {
+                                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            performFirstPhase(shardIt);
+                                        }
+                                    });
+                                } else {
+                                    performFirstPhase(shardIt);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        void performFirstPhase(final ShardIterator shardIt) {
+            performFirstPhase(shardIt, shardIt.nextOrNull());
+        }
+
+        void performFirstPhase(final ShardIterator shardIt, final ShardRouting shard) {
+            if (shard == null) {
+                // no more active shards... (we should not really get here, but just for safety)
+                onFirstPhaseResult(null, shardIt, null);
+            } else {
+                DiscoveryNode node = nodes.get(shard.currentNodeId());
+                if (node == null) {
+                    onFirstPhaseResult(shard, shardIt, null);
+                } else {
+                    String[] filteringAliases = clusterState.metaData().filteringAliases(shard.index(), request.indices());
+                    sendExecuteFirstPhase(node, internalSearchRequest(shard, shardsIts.size(), request, filteringAliases, startTime), new SearchServiceListener<FirstResult>() {
+                        @Override
+                        public void onResult(FirstResult result) {
+                            onFirstPhaseResult(shard, result, shardIt);
+                        }
+
+                        @Override
+                        public void onFailure(Throwable t) {
+                            onFirstPhaseResult(shard, shardIt, t);
+                        }
+                    });
+                }
+            }
+        }
+
+        void onFirstPhaseResult(ShardRouting shard, FirstResult result, ShardIterator shardIt) {
+            result.shardTarget(new SearchShardTarget(shard.currentNodeId(), shard.index(), shard.id()));
+            processFirstPhaseResult(shard, result);
+            // increment all the "future" shards to update the total ops since we some may work and some may not...
+            // and when that happens, we break on total ops, so we must maintain them
+            int xTotalOps = totalOps.addAndGet(shardIt.remaining() + 1);
+            successulOps.incrementAndGet();
+            if (xTotalOps == expectedTotalOps) {
                 try {
-                    dynamicMappingUrl = new File(dynamicMappingLocation).toURI().toURL();
-                } catch (MalformedURLException e1) {
-                    throw new FailedToResolveConfigException("Failed to resolve dynamic mapping location [" + dynamicMappingLocation + "]");
+                    moveToSecondPhase();
+                } catch (Exception e) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "] while moving to second phase", e);
+                    }
+                    listener.onFailure(new ReduceSearchPhaseException(firstPhaseName(), "", e, buildShardFailures()));
                 }
             }
         }
-        this.dynamicMappingUrl = dynamicMappingUrl;
-        if (dynamicMappingLocation == null) {
-            this.dynamicMappingLocation = dynamicMappingUrl.toExternalForm();
-        } else {
-            this.dynamicMappingLocation = dynamicMappingLocation;
-        }
 
-        if (dynamic) {
-            try {
-                dynamicMappingSource = Streams.copyToString(new InputStreamReader(dynamicMappingUrl.openStream(), "UTF-8"));
-            } catch (IOException e) {
-                throw new MapperException("Failed to load default mapping source from [" + dynamicMappingLocation + "]", e);
-            }
-        } else {
-            dynamicMappingSource = null;
-        }
-        logger.debug("Using dynamic [{}] with location [{}] and source [{}]", new Object[]{dynamic, dynamicMappingLocation, dynamicMappingSource});
-    }
-
-    @Override public UnmodifiableIterator<DocumentMapper> iterator() {
-        return mappers.values().iterator();
-    }
-
-    public DocumentMapper type(String type) {
-        DocumentMapper mapper = mappers.get(type);
-        if (mapper != null) {
-            return mapper;
-        }
-        if (!dynamic) {
-            return null;
-        }
-        // go ahead and dynamically create it
-        synchronized (mutex) {
-            mapper = mappers.get(type);
-            if (mapper != null) {
-                return mapper;
-            }
-            add(type, dynamicMappingSource);
-            return mappers.get(type);
-        }
-    }
-
-    public DocumentMapperParser documentMapperParser() {
-        return this.documentParser;
-    }
-
-    public void add(String type, String mappingSource) {
-        add(documentParser.parse(type, mappingSource));
-    }
-
-    public void add(String mappingSource) throws MapperParsingException {
-        add(documentParser.parse(mappingSource));
-    }
-
-    /**
-     * Just parses and returns the mapper without adding it.
-     */
-    public DocumentMapper parse(String mappingType, String mappingSource) throws MapperParsingException {
-        return documentParser.parse(mappingType, mappingSource);
-    }
-
-    public boolean hasMapping(String mappingType) {
-        return mappers.containsKey(mappingType);
-    }
-
-    public DocumentMapper documentMapper(String type) {
-        return mappers.get(type);
-    }
-
-    public FieldMappers idFieldMappers() {
-        return this.idFieldMappers;
-    }
-
-    public FieldMappers typeFieldMappers() {
-        return this.typeFieldMappers;
-    }
-
-    public FieldMappers sourceFieldMappers() {
-        return this.sourceFieldMappers;
-    }
-
-    public FieldMappers uidFieldMappers() {
-        return this.uidFieldMappers;
-    }
-
-    /**
-     * Returns {@link FieldMappers} for all the {@link FieldMapper}s that are registered
-     * under the given name across all the different {@link DocumentMapper} types.
-     *
-     * @param name The name to return all the {@link FieldMappers} for across all {@link DocumentMapper}s.
-     * @return All the {@link FieldMappers} for across all {@link DocumentMapper}s
-     */
-    public FieldMappers name(String name) {
-        return nameFieldMappers.get(name);
-    }
-
-    /**
-     * Returns {@link FieldMappers} for all the {@link FieldMapper}s that are registered
-     * under the given indexName across all the different {@link DocumentMapper} types.
-     *
-     * @param indexName The indexName to return all the {@link FieldMappers} for across all {@link DocumentMapper}s.
-     * @return All the {@link FieldMappers} across all {@link DocumentMapper}s for the given indexName.
-     */
-    public FieldMappers indexName(String indexName) {
-        return indexNameFieldMappers.get(indexName);
-    }
-
-    /**
-     * Returns the {@link FieldMappers} of all the {@link FieldMapper}s that are
-     * registered under the give fullName across all the different {@link DocumentMapper} types.
-     *
-     * @param fullName The full name
-     * @return All teh {@link FieldMappers} across all the {@link DocumentMapper}s for the given fullName.
-     */
-    public FieldMappers fullName(String fullName) {
-        return fullNameFieldMappers.get(fullName);
-    }
-
-    /**
-     * Same as {@link #smartNameFieldMappers(String)} but returns the first field mapper for it. Returns
-     * <tt>null</tt> if there is none.
-     */
-    public FieldMapper smartNameFieldMapper(String smartName) {
-        FieldMappers fieldMappers = smartNameFieldMappers(smartName);
-        if (fieldMappers != null) {
-            return fieldMappers.mapper();
-        }
-        return null;
-    }
-
-    /**
-     * Same as {@link #smartName(String)}, except it returns just the field mappers.
-     */
-    public FieldMappers smartNameFieldMappers(String smartName) {
-        int dotIndex = smartName.indexOf('.');
-        if (dotIndex != -1) {
-            String possibleType = smartName.substring(0, dotIndex);
-            DocumentMapper possibleDocMapper = mappers.get(possibleType);
-            if (possibleDocMapper != null) {
-                String possibleName = smartName.substring(dotIndex + 1);
-                FieldMappers mappers = possibleDocMapper.mappers().smartName(possibleName);
-                if (mappers != null) {
-                    return mappers;
+        void onFirstPhaseResult(@Nullable ShardRouting shard, final ShardIterator shardIt, Throwable t) {
+            if (totalOps.incrementAndGet() == expectedTotalOps) {
+                // e is null when there is no next active....
+                if (logger.isDebugEnabled()) {
+                    if (t != null) {
+                        if (shard != null) {
+                            logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
+                        } else {
+                            logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+                        }
+                    }
                 }
-            }
-        }
-        FieldMappers mappers = fullName(smartName);
-        if (mappers != null) {
-            return mappers;
-        }
-        return indexName(smartName);
-    }
-
-    /**
-     * Returns smart field mappers based on a smart name. A smart name is one that can optioannly be prefixed
-     * with a type (and then a '.'). If it is, then the {@link MapperService.SmartNameFieldMappers}
-     * will have the doc mapper set.
-     *
-     * <p>It also (without the optional type prefix) try and find the {@link FieldMappers} for the specific
-     * name. It will first try to find it based on the full name (with the dots if its a compound name). If
-     * it is not found, will try and find it based on the indexName (which can be controlled in the mapping).
-     *
-     * <p>If nothing is found, returns null.
-     */
-    public SmartNameFieldMappers smartName(String smartName) {
-        int dotIndex = smartName.indexOf('.');
-        if (dotIndex != -1) {
-            String possibleType = smartName.substring(0, dotIndex);
-            DocumentMapper possibleDocMapper = mappers.get(possibleType);
-            if (possibleDocMapper != null) {
-                String possibleName = smartName.substring(dotIndex + 1);
-                FieldMappers mappers = possibleDocMapper.mappers().smartName(possibleName);
-                if (mappers != null) {
-                    return new SmartNameFieldMappers(mappers, possibleDocMapper);
-                }
-            }
-        }
-        FieldMappers fieldMappers = fullName(smartName);
-        if (fieldMappers != null) {
-            return new SmartNameFieldMappers(fieldMappers, null);
-        }
-        fieldMappers = indexName(smartName);
-        if (fieldMappers != null) {
-            return new SmartNameFieldMappers(fieldMappers, null);
-        }
-        return null;
-    }
-
-    public void add(DocumentMapper mapper) {
-        synchronized (mutex) {
-            if (mapper.type().charAt(0) == '_') {
-                throw new InvalidTypeNameException("Document mapping type name can't start with '_'");
-            }
-            mappers = newMapBuilder(mappers).put(mapper.type(), mapper).immutableMap();
-            mapper.addFieldMapperListener(fieldMapperListener, true);
-        }
-    }
-
-    public Analyzer searchAnalyzer() {
-        return this.searchAnalyzer;
-    }
-
-    public static class SmartNameFieldMappers {
-        private final FieldMappers fieldMappers;
-        private final DocumentMapper docMapper;
-
-        public SmartNameFieldMappers(FieldMappers fieldMappers, @Nullable DocumentMapper docMapper) {
-            this.fieldMappers = fieldMappers;
-            this.docMapper = docMapper;
-        }
-
-        /**
-         * Has at least one mapper for the field.
-         */
-        public boolean hasMapper() {
-            return !fieldMappers.isEmpty();
-        }
-
-        /**
-         * The first mapper for the smart named field.
-         */
-        public FieldMapper mapper() {
-            return fieldMappers.mapper();
-        }
-
-        /**
-         * All the field mappers for the smart name field.
-         */
-        public FieldMappers fieldMappers() {
-            return fieldMappers;
-        }
-
-        /**
-         * If the smart name was a typed field, with a type that we resolved, will return
-         * <tt>true</tt>.
-         */
-        public boolean hasDocMapper() {
-            return docMapper != null;
-        }
-
-        /**
-         * If the smart name was a typed field, with a type that we resolved, will return
-         * the document mapper for it.
-         */
-        public DocumentMapper docMapper() {
-            return docMapper;
-        }
-    }
-
-    private class SmartIndexNameSearchAnalyzer extends Analyzer {
-
-        private final Analyzer defaultAnalyzer;
-
-        private SmartIndexNameSearchAnalyzer(Analyzer defaultAnalyzer) {
-            this.defaultAnalyzer = defaultAnalyzer;
-        }
-
-        @Override public TokenStream tokenStream(String fieldName, Reader reader) {
-            int dotIndex = fieldName.indexOf('.');
-            if (dotIndex != -1) {
-                String possibleType = fieldName.substring(0, dotIndex);
-                DocumentMapper possibleDocMapper = mappers.get(possibleType);
-                if (possibleDocMapper != null) {
-                    return possibleDocMapper.mappers().searchAnalyzer().tokenStream(fieldName, reader);
-                }
-            }
-            FieldMappers mappers = fullNameFieldMappers.get(fieldName);
-            if (mappers != null && mappers.mapper() != null && mappers.mapper().searchAnalyzer() != null) {
-                return mappers.mapper().searchAnalyzer().tokenStream(fieldName, reader);
-            }
-
-            mappers = indexNameFieldMappers.get(fieldName);
-            if (mappers != null && mappers.mapper() != null && mappers.mapper().searchAnalyzer() != null) {
-                return mappers.mapper().searchAnalyzer().tokenStream(fieldName, reader);
-            }
-            return defaultAnalyzer.tokenStream(fieldName, reader);
-        }
-
-        @Override public TokenStream reusableTokenStream(String fieldName, Reader reader) throws IOException {
-            int dotIndex = fieldName.indexOf('.');
-            if (dotIndex != -1) {
-                String possibleType = fieldName.substring(0, dotIndex);
-                DocumentMapper possibleDocMapper = mappers.get(possibleType);
-                if (possibleDocMapper != null) {
-                    return possibleDocMapper.mappers().searchAnalyzer().reusableTokenStream(fieldName, reader);
-                }
-            }
-            FieldMappers mappers = fullNameFieldMappers.get(fieldName);
-            if (mappers != null && mappers.mapper() != null && mappers.mapper().searchAnalyzer() != null) {
-                return mappers.mapper().searchAnalyzer().reusableTokenStream(fieldName, reader);
-            }
-
-            mappers = indexNameFieldMappers.get(fieldName);
-            if (mappers != null && mappers.mapper() != null && mappers.mapper().searchAnalyzer() != null) {
-                return mappers.mapper().searchAnalyzer().reusableTokenStream(fieldName, reader);
-            }
-            return defaultAnalyzer.reusableTokenStream(fieldName, reader);
-        }
-    }
-
-    private class InternalFieldMapperListener implements FieldMapperListener {
-        @Override public void fieldMapper(FieldMapper fieldMapper) {
-            synchronized (mutex) {
-                if (fieldMapper instanceof IdFieldMapper) {
-                    idFieldMappers = idFieldMappers.concat(fieldMapper);
-                }
-                if (fieldMapper instanceof TypeFieldMapper) {
-                    typeFieldMappers = typeFieldMappers.concat(fieldMapper);
-                }
-                if (fieldMapper instanceof SourceFieldMapper) {
-                    sourceFieldMappers = sourceFieldMappers.concat(fieldMapper);
-                }
-                if (fieldMapper instanceof UidFieldMapper) {
-                    uidFieldMappers = uidFieldMappers.concat(fieldMapper);
-                }
-
-
-                FieldMappers mappers = nameFieldMappers.get(fieldMapper.names().name());
-                if (mappers == null) {
-                    mappers = new FieldMappers(fieldMapper);
+                // no more shards, add a failure
+                if (t == null) {
+                    // no active shards
+                    addShardFailure(new ShardSearchFailure("No active shards", new SearchShardTarget(null, shardIt.shardId().index().name(), shardIt.shardId().id())));
                 } else {
-                    mappers = mappers.concat(fieldMapper);
+                    addShardFailure(new ShardSearchFailure(t));
                 }
-
-                nameFieldMappers = newMapBuilder(nameFieldMappers).put(fieldMapper.names().name(), mappers).immutableMap();
-
-                mappers = indexNameFieldMappers.get(fieldMapper.names().indexName());
-                if (mappers == null) {
-                    mappers = new FieldMappers(fieldMapper);
+                if (successulOps.get() == 0) {
+                    // no successful ops, raise an exception
+                    listener.onFailure(new SearchPhaseExecutionException(firstPhaseName(), "total failure", buildShardFailures()));
                 } else {
-                    mappers = mappers.concat(fieldMapper);
+                    try {
+                        moveToSecondPhase();
+                    } catch (Exception e) {
+                        listener.onFailure(new ReduceSearchPhaseException(firstPhaseName(), "", e, buildShardFailures()));
+                    }
                 }
-                indexNameFieldMappers = newMapBuilder(indexNameFieldMappers).put(fieldMapper.names().indexName(), mappers).immutableMap();
-
-                mappers = fullNameFieldMappers.get(fieldMapper.names().indexName());
-                if (mappers == null) {
-                    mappers = new FieldMappers(fieldMapper);
+            } else {
+                ShardRouting nextShard = shardIt.nextOrNull();
+                if (nextShard != null) {
+                    // trace log this exception
+                    if (logger.isTraceEnabled()) {
+                        if (t != null) {
+                            if (shard != null) {
+                                logger.trace(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
+                            } else {
+                                logger.trace(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+                            }
+                        }
+                    }
+                    performFirstPhase(shardIt, nextShard);
                 } else {
-                    mappers = mappers.concat(fieldMapper);
+                    // no more shards active, add a failure
+                    // e is null when there is no next active....
+                    if (logger.isDebugEnabled()) {
+                        if (t != null) {
+                            if (shard != null) {
+                                logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
+                            } else {
+                                logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+                            }
+                        }
+                    }
+                    if (t == null) {
+                        // no active shards
+                        addShardFailure(new ShardSearchFailure("No active shards", new SearchShardTarget(null, shardIt.shardId().index().name(), shardIt.shardId().id())));
+                    } else {
+                        addShardFailure(new ShardSearchFailure(t));
+                    }
                 }
-                fullNameFieldMappers = newMapBuilder(fullNameFieldMappers).put(fieldMapper.names().fullName(), mappers).immutableMap();
             }
         }
+
+        /**
+         * Builds how long it took to execute the search.
+         */
+        protected final long buildTookInMillis() {
+            return System.currentTimeMillis() - startTime;
+        }
+
+        protected final ShardSearchFailure[] buildShardFailures() {
+            Queue<ShardSearchFailure> localFailures = shardFailures;
+            if (localFailures == null) {
+                return ShardSearchFailure.EMPTY_ARRAY;
+            }
+            return localFailures.toArray(ShardSearchFailure.EMPTY_ARRAY);
+        }
+
+        // we do our best to return the shard failures, but its ok if its not fully concurrently safe
+        // we simply try and return as much as possible
+        protected final void addShardFailure(ShardSearchFailure failure) {
+            if (shardFailures == null) {
+                shardFailures = ConcurrentCollections.newQueue();
+            }
+            shardFailures.add(failure);
+        }
+
+        /**
+         * Releases shard targets that are not used in the docsIdsToLoad.
+         */
+        protected void releaseIrrelevantSearchContexts(Map<SearchShardTarget, QuerySearchResultProvider> queryResults,
+                                                       Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad) {
+            if (docIdsToLoad == null) {
+                return;
+            }
+            // we only release search context that we did not fetch from if we are not scrolling
+            if (request.scroll() == null) {
+                for (Map.Entry<SearchShardTarget, QuerySearchResultProvider> entry : queryResults.entrySet()) {
+                    if (!docIdsToLoad.containsKey(entry.getKey())) {
+                        DiscoveryNode node = nodes.get(entry.getKey().nodeId());
+                        if (node != null) { // should not happen (==null) but safeguard anyhow
+                            searchService.sendFreeContext(node, entry.getValue().id(), request);
+                        }
+                    }
+                }
+            }
+        }
+
+        protected abstract void sendExecuteFirstPhase(DiscoveryNode node, ShardSearchRequest request, SearchServiceListener<FirstResult> listener);
+
+        protected abstract void processFirstPhaseResult(ShardRouting shard, FirstResult result);
+
+        protected abstract void moveToSecondPhase() throws Exception;
+
+        protected abstract String firstPhaseName();
     }
 }

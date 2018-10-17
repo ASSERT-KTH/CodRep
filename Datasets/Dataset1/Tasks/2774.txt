@@ -1,6 +1,6 @@
-adminRequestParser = new SolrRequestParsers(new Config(null,"solr",new ByteArrayInputStream("<root/>".getBytes("UTF-8")),"") );
+String s = getStringFromContext("fetchMailsSince", null);
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -16,388 +16,600 @@ adminRequestParser = new SolrRequestParsers(new Config(null,"solr",new ByteArray
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.solr.handler.dataimport;
 
-package org.apache.solr.servlet;
+import com.sun.mail.imap.IMAPMessage;
 
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.StringWriter;
-import java.io.ByteArrayInputStream;
-import java.util.Map;
-import java.util.WeakHashMap;
+import org.apache.tika.Tika;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaMetadataKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.servlet.Filter;
-import javax.servlet.FilterChain;
-import javax.servlet.FilterConfig;
-import javax.servlet.ServletException;
-import javax.servlet.ServletRequest;
-import javax.servlet.ServletResponse;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.core.*;
-import org.apache.solr.request.*;
-import org.apache.solr.response.BinaryQueryResponseWriter;
-import org.apache.solr.response.QueryResponseWriter;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.servlet.cache.HttpCacheHeaderUtil;
-import org.apache.solr.servlet.cache.Method;
+import javax.mail.*;
+import javax.mail.internet.AddressException;
+import javax.mail.internet.ContentType;
+import javax.mail.internet.InternetAddress;
+import javax.mail.internet.MimeMessage;
+import javax.mail.search.AndTerm;
+import javax.mail.search.ComparisonTerm;
+import javax.mail.search.ReceivedDateTerm;
+import javax.mail.search.SearchTerm;
+import java.io.InputStream;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.*;
 
 /**
- * This filter looks at the incoming URL maps them to handlers defined in solrconfig.xml
+ * An {@link EntityProcessor} instance which can index emails along with their attachments from POP3 or IMAP sources. Refer to
+ * <a href="http://wiki.apache.org/solr/DataImportHandler">http://wiki.apache.org/solr/DataImportHandler</a> for more
+ * details. <b>This API is experimental and subject to change</b>
  *
- * @since solr 1.2
+ *
+ * @since solr 1.4
  */
-public class SolrDispatchFilter implements Filter
-{
-  final Logger log = LoggerFactory.getLogger(SolrDispatchFilter.class);
+public class MailEntityProcessor extends EntityProcessorBase {
 
-  protected CoreContainer cores;
-  protected String pathPrefix = null; // strip this from the beginning of a path
-  protected String abortErrorMessage = null;
-  protected String solrConfigFilename = null;
-  protected final Map<SolrConfig, SolrRequestParsers> parsers = new WeakHashMap<SolrConfig, SolrRequestParsers>();
-  protected final SolrRequestParsers adminRequestParser;
-
-  public SolrDispatchFilter() {
-    try {
-      adminRequestParser = new SolrRequestParsers(new Config(null,"solr",new ByteArrayInputStream("<root/>".getBytes()),"") );
-    } catch (Exception e) {
-      //unlikely
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,e);
-    }
+  public static interface CustomFilter {
+    public SearchTerm getCustomSearch(Folder folder);
   }
 
-  public void init(FilterConfig config) throws ServletException
-  {
-    log.info("SolrDispatchFilter.init()");
+  @Override
+  public void init(Context context) {
+    super.init(context);
+    // set attributes using  XXX getXXXFromContext(attribute, defualtValue);
+    // applies variable resolver and return default if value is not found or null
+    // REQUIRED : connection and folder info
+    user = getStringFromContext("user", null);
+    password = getStringFromContext("password", null);
+    host = getStringFromContext("host", null);
+    protocol = getStringFromContext("protocol", null);
+    folderNames = getStringFromContext("folders", null);
+    // validate
+    if (host == null || protocol == null || user == null || password == null
+            || folderNames == null)
+      throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+              "'user|password|protocol|host|folders' are required attributes");
 
-    boolean abortOnConfigurationError = true;
-    CoreContainer.Initializer init = createInitializer();
-    try {
-      // web.xml configuration
-      this.pathPrefix = config.getInitParameter( "path-prefix" );
-      init.setSolrConfigFilename(config.getInitParameter("solrconfig-filename"));
-
-      this.cores = init.initialize();
-      abortOnConfigurationError = init.isAbortOnConfigurationError();
-      log.info("user.dir=" + System.getProperty("user.dir"));
+    //OPTIONAL : have defaults and are optional
+    recurse = getBoolFromContext("recurse", true);
+    String excludes = getStringFromContext("exclude", "");
+    if (excludes != null && !excludes.trim().equals("")) {
+      exclude = Arrays.asList(excludes.split(","));
     }
-    catch( Throwable t ) {
-      // catch this so our filter still works
-      log.error( "Could not start Solr. Check solr/home property", t);
-      SolrConfig.severeErrors.add( t );
-      SolrCore.log( t );
+    String includes = getStringFromContext("include", "");
+    if (includes != null && !includes.trim().equals("")) {
+      include = Arrays.asList(includes.split(","));
     }
-
-    // Optionally abort if we found a sever error
-    if( abortOnConfigurationError && SolrConfig.severeErrors.size() > 0 ) {
-      StringWriter sw = new StringWriter();
-      PrintWriter out = new PrintWriter( sw );
-      out.println( "Severe errors in solr configuration.\n" );
-      out.println( "Check your log files for more detailed information on what may be wrong.\n" );
-      out.println( "If you want solr to continue after configuration errors, change: \n");
-      out.println( " <abortOnConfigurationError>false</abortOnConfigurationError>\n" );
-      out.println( "in "+init.getSolrConfigFilename()+"\n" );
-
-      for( Throwable t : SolrConfig.severeErrors ) {
-        out.println( "-------------------------------------------------------------" );
-        t.printStackTrace( out );
-      }
-      out.flush();
-
-      // Servlet containers behave slightly differently if you throw an exception during 
-      // initialization.  Resin will display that error for every page, jetty prints it in
-      // the logs, but continues normally.  (We will see a 404 rather then the real error)
-      // rather then leave the behavior undefined, lets cache the error and spit it out 
-      // for every request.
-      abortErrorMessage = sw.toString();
-      //throw new ServletException( abortErrorMessage );
-    }
-
-    log.info("SolrDispatchFilter.init() done");
-  }
-
-  /** Method to override to change how CoreContainer initialization is performed. */
-  protected CoreContainer.Initializer createInitializer() {
-    return new CoreContainer.Initializer();
-  }
-  
-  public void destroy() {
-    if (cores != null) {
-      cores.shutdown();
-      cores = null;
-    }    
-  }
-
-  public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
-    if( abortErrorMessage != null ) {
-      ((HttpServletResponse)response).sendError( 500, abortErrorMessage );
-      return;
-    }
-
-    if( request instanceof HttpServletRequest) {
-      HttpServletRequest req = (HttpServletRequest)request;
-      HttpServletResponse resp = (HttpServletResponse)response;
-      SolrRequestHandler handler = null;
-      SolrQueryRequest solrReq = null;
-      SolrCore core = null;
-      String corename = "";
+    batchSize = getIntFromContext("batchSize", 20);
+    customFilter = getStringFromContext("customFilter", "");
+    String s = getStringFromContext("fetchMailsSince", "");
+    if (s != null)
       try {
-        // put the core container in request attribute
-        req.setAttribute("org.apache.solr.CoreContainer", cores);
-        String path = req.getServletPath();
-        if( req.getPathInfo() != null ) {
-          // this lets you handle /update/commit when /update is a servlet
-          path += req.getPathInfo();
-        }
-        if( pathPrefix != null && path.startsWith( pathPrefix ) ) {
-          path = path.substring( pathPrefix.length() );
-        }
-        // check for management path
-        String alternate = cores.getManagementPath();
-        if (alternate != null && path.startsWith(alternate)) {
-          path = path.substring(0, alternate.length());
-        }
-        // unused feature ?
-        int idx = path.indexOf( ':' );
-        if( idx > 0 ) {
-          // save the portion after the ':' for a 'handler' path parameter
-          path = path.substring( 0, idx );
-        }
-
-        // Check for the core admin page
-        if( path.equals( cores.getAdminPath() ) ) {
-          handler = cores.getMultiCoreHandler();
-          solrReq =  adminRequestParser.parse(null,path, req);
-          handleAdminRequest(req, response, handler, solrReq);
-          return;
-        }
-        else {
-          //otherwise, we should find a core from the path
-          idx = path.indexOf( "/", 1 );
-          if( idx > 1 ) {
-            // try to get the corename as a request parameter first
-            corename = path.substring( 1, idx );
-            core = cores.getCore(corename);
-            if (core != null) {
-              path = path.substring( idx );
-            }
-          }
-          if (core == null) {
-            corename = "";
-            core = cores.getCore("");
-          }
-        }
-
-        // With a valid core...
-        if( core != null ) {
-          final SolrConfig config = core.getSolrConfig();
-          // get or create/cache the parser for the core
-          SolrRequestParsers parser = null;
-          parser = parsers.get(config);
-          if( parser == null ) {
-            parser = new SolrRequestParsers(config);
-            parsers.put(config, parser );
-          }
-
-          // Determine the handler from the url path if not set
-          // (we might already have selected the cores handler)
-          if( handler == null && path.length() > 1 ) { // don't match "" or "/" as valid path
-            handler = core.getRequestHandler( path );
-            // no handler yet but allowed to handle select; let's check
-            if( handler == null && parser.isHandleSelect() ) {
-              if( "/select".equals( path ) || "/select/".equals( path ) ) {
-                solrReq = parser.parse( core, path, req );
-                String qt = solrReq.getParams().get( CommonParams.QT );
-                handler = core.getRequestHandler( qt );
-                if( handler == null ) {
-                  throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "unknown handler: "+qt);
-                }
-              }
-            }
-          }
-
-          // With a valid handler and a valid core...
-          if( handler != null ) {
-            // if not a /select, create the request
-            if( solrReq == null ) {
-              solrReq = parser.parse( core, path, req );
-            }
-
-            final Method reqMethod = Method.getMethod(req.getMethod());
-            HttpCacheHeaderUtil.setCacheControlHeader(config, resp, reqMethod);
-            // unless we have been explicitly told not to, do cache validation
-            // if we fail cache validation, execute the query
-            if (config.getHttpCachingConfig().isNever304() ||
-                !HttpCacheHeaderUtil.doCacheHeaderValidation(solrReq, req, reqMethod, resp)) {
-                SolrQueryResponse solrRsp = new SolrQueryResponse();
-                /* even for HEAD requests, we need to execute the handler to
-                 * ensure we don't get an error (and to make sure the correct
-                 * QueryResponseWriter is selected and we get the correct
-                 * Content-Type)
-                 */
-                this.execute( req, handler, solrReq, solrRsp );
-                HttpCacheHeaderUtil.checkHttpCachingVeto(solrRsp, resp, reqMethod);
-              // add info to http headers
-              //TODO: See SOLR-232 and SOLR-267.  
-                /*try {
-                  NamedList solrRspHeader = solrRsp.getResponseHeader();
-                 for (int i=0; i<solrRspHeader.size(); i++) {
-                   ((javax.servlet.http.HttpServletResponse) response).addHeader(("Solr-" + solrRspHeader.getName(i)), String.valueOf(solrRspHeader.getVal(i)));
-                 }
-                } catch (ClassCastException cce) {
-                  log.log(Level.WARNING, "exception adding response header log information", cce);
-                }*/
-               QueryResponseWriter responseWriter = core.getQueryResponseWriter(solrReq);
-              writeResponse(solrRsp, response, responseWriter, solrReq, reqMethod);
-            }
-            return; // we are done with a valid handler
-          }
-          // otherwise (we have a core), let's ensure the core is in the SolrCore request attribute so
-          // a servlet/jsp can retrieve it
-          else {
-            req.setAttribute("org.apache.solr.SolrCore", core);
-            // Modify the request so each core gets its own /admin
-            if( path.startsWith( "/admin" ) ) {
-              req.getRequestDispatcher( pathPrefix == null ? path : pathPrefix + path ).forward( request, response );
-              return;
-            }
-          }
-        }
-        log.debug("no handler or core retrieved for " + path + ", follow through...");
-      } 
-      catch (Throwable ex) {
-        sendError( (HttpServletResponse)response, ex );
-        return;
-      } 
-      finally {
-        if( solrReq != null ) {
-          solrReq.close();
-        }
-        if (core != null) {
-          core.close();
-        }
+        fetchMailsSince = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").parse(s);
+      } catch (ParseException e) {
+        throw new DataImportHandlerException(DataImportHandlerException.SEVERE, "Invalid value for fetchMailSince: " + s, e);
       }
-    }
 
-    // Otherwise let the webapp handle the request
-    chain.doFilter(request, response);
+    fetchSize = getIntFromContext("fetchSize", 32 * 1024);
+    cTimeout = getIntFromContext("connectTimeout", 30 * 1000);
+    rTimeout = getIntFromContext("readTimeout", 60 * 1000);
+    processAttachment = getBoolFromContext(
+              getStringFromContext("processAttachment",null) == null ? "processAttachement":"processAttachment"
+            , true);
+
+    tika = new Tika();
+    
+    logConfig();
   }
 
-  private void handleAdminRequest(HttpServletRequest req, ServletResponse response, SolrRequestHandler handler,
-                                  SolrQueryRequest solrReq) throws IOException {
-    SolrQueryResponse solrResp = new SolrQueryResponse();
-    final NamedList<Object> responseHeader = new SimpleOrderedMap<Object>();
-    solrResp.add("responseHeader", responseHeader);
-    NamedList toLog = solrResp.getToLog();
-    toLog.add("webapp", req.getContextPath());
-    toLog.add("path", solrReq.getContext().get("path"));
-    toLog.add("params", "{" + solrReq.getParamString() + "}");
-    handler.handleRequest(solrReq, solrResp);
-    SolrCore.setResponseHeaderValues(handler, solrReq, solrResp);
-    StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < toLog.size(); i++) {
-      String name = toLog.getName(i);
-      Object val = toLog.getVal(i);
-      sb.append(name).append("=").append(val).append(" ");
-    }
-    QueryResponseWriter respWriter = SolrCore.DEFAULT_RESPONSE_WRITERS.get(solrReq.getParams().get(CommonParams.WT));
-    if (respWriter == null) respWriter = SolrCore.DEFAULT_RESPONSE_WRITERS.get("standard");
-    writeResponse(solrResp, response, respWriter, solrReq, Method.getMethod(req.getMethod()));
+  @Override
+  public Map<String, Object> nextRow() {
+    Message mail;
+    Map<String, Object> row = null;
+    do {
+      // try till there is a valid document or folders get exhausted.
+      // when mail == NULL, it means end of processing
+      mail = getNextMail();
+      if (mail != null)
+        row = getDocumentFromMail(mail);
+    } while (row == null && mail != null);    
+    return row;
   }
 
-  private void writeResponse(SolrQueryResponse solrRsp, ServletResponse response,
-                             QueryResponseWriter responseWriter, SolrQueryRequest solrReq, Method reqMethod)
-          throws IOException {
-    if (solrRsp.getException() != null) {
-      sendError((HttpServletResponse) response, solrRsp.getException());
+  private Message getNextMail() {
+    if (!connected) {
+      if (!connectToMailBox())
+        return null;
+      connected = true;
+    }
+    if (folderIter == null) {
+      createFilters();
+      folderIter = new FolderIterator(mailbox);
+    }
+    // get next message from the folder
+    // if folder is exhausted get next folder
+    // loop till a valid mail or all folders exhausted.
+    while (msgIter == null || !msgIter.hasNext()) {
+      Folder next = folderIter.hasNext() ? folderIter.next() : null;
+      if (next == null) {
+        return null;
+      }
+      msgIter = new MessageIterator(next, batchSize);
+    }
+    return msgIter.next();
+  }
+
+  private Map<String, Object> getDocumentFromMail(Message mail) {
+    Map<String, Object> row = new HashMap<String, Object>();
+    try {
+      addPartToDocument(mail, row, true);
+      return row;
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  public void addPartToDocument(Part part, Map<String, Object> row, boolean outerMost) throws Exception {
+    if (part instanceof Message) {
+      addEnvelopToDocument(part, row);
+    }
+
+    String ct = part.getContentType();
+    ContentType ctype = new ContentType(ct);
+    if (part.isMimeType("multipart/*")) {
+      Multipart mp = (Multipart) part.getContent();
+      int count = mp.getCount();
+      if (part.isMimeType("multipart/alternative"))
+        count = 1;
+      for (int i = 0; i < count; i++)
+        addPartToDocument(mp.getBodyPart(i), row, false);
+    } else if (part.isMimeType("message/rfc822")) {
+      addPartToDocument((Part) part.getContent(), row, false);
     } else {
-      // Now write it out
-      final String ct = responseWriter.getContentType(solrReq, solrRsp);
-      // don't call setContentType on null
-      if (null != ct) response.setContentType(ct); 
-      if (Method.HEAD != reqMethod) {
-        if (responseWriter instanceof BinaryQueryResponseWriter) {
-          BinaryQueryResponseWriter binWriter = (BinaryQueryResponseWriter) responseWriter;
-          binWriter.write(response.getOutputStream(), solrReq, solrRsp);
-        } else {
-          PrintWriter out = response.getWriter();
-          responseWriter.write(out, solrReq, solrRsp);
+      String disp = part.getDisposition();
+      if (!processAttachment || (disp != null && disp.equalsIgnoreCase(Part.ATTACHMENT)))        return;
+      InputStream is = part.getInputStream();
+      String fileName = part.getFileName();
+      Metadata md = new Metadata();
+      md.set(HttpHeaders.CONTENT_TYPE, ctype.getBaseType().toLowerCase(Locale.ENGLISH));
+      md.set(TikaMetadataKeys.RESOURCE_NAME_KEY, fileName);
+      String content = tika.parseToString(is, md);
+      if (disp != null && disp.equalsIgnoreCase(Part.ATTACHMENT)) {
+        if (row.get(ATTACHMENT) == null)
+          row.put(ATTACHMENT, new ArrayList<String>());
+        List<String> contents = (List<String>) row.get(ATTACHMENT);
+        contents.add(content);
+        row.put(ATTACHMENT, contents);
+        if (row.get(ATTACHMENT_NAMES) == null)
+          row.put(ATTACHMENT_NAMES, new ArrayList<String>());
+        List<String> names = (List<String>) row.get(ATTACHMENT_NAMES);
+        names.add(fileName);
+        row.put(ATTACHMENT_NAMES, names);
+      } else {
+        if (row.get(CONTENT) == null)
+          row.put(CONTENT, new ArrayList<String>());
+        List<String> contents = (List<String>) row.get(CONTENT);
+        contents.add(content);
+        row.put(CONTENT, contents);
+      }
+    }
+  }
 
+  private void addEnvelopToDocument(Part part, Map<String, Object> row) throws MessagingException {
+    MimeMessage mail = (MimeMessage) part;
+    Address[] adresses;
+    if ((adresses = mail.getFrom()) != null && adresses.length > 0)
+      row.put(FROM, adresses[0].toString());
+
+    List<String> to = new ArrayList<String>();
+    if ((adresses = mail.getRecipients(Message.RecipientType.TO)) != null)
+      addAddressToList(adresses, to);
+    if ((adresses = mail.getRecipients(Message.RecipientType.CC)) != null)
+      addAddressToList(adresses, to);
+    if ((adresses = mail.getRecipients(Message.RecipientType.BCC)) != null)
+      addAddressToList(adresses, to);
+    if (to.size() > 0)
+      row.put(TO_CC_BCC, to);
+
+    row.put(MESSAGE_ID, mail.getMessageID());
+    row.put(SUBJECT, mail.getSubject());
+
+    Date d = mail.getSentDate();
+    if (d != null) {
+      row.put(SENT_DATE, d);
+    }
+
+    List<String> flags = new ArrayList<String>();
+    for (Flags.Flag flag : mail.getFlags().getSystemFlags()) {
+      if (flag == Flags.Flag.ANSWERED)
+        flags.add(FLAG_ANSWERED);
+      else if (flag == Flags.Flag.DELETED)
+        flags.add(FLAG_DELETED);
+      else if (flag == Flags.Flag.DRAFT)
+        flags.add(FLAG_DRAFT);
+      else if (flag == Flags.Flag.FLAGGED)
+        flags.add(FLAG_FLAGGED);
+      else if (flag == Flags.Flag.RECENT)
+        flags.add(FLAG_RECENT);
+      else if (flag == Flags.Flag.SEEN)
+        flags.add(FLAG_SEEN);
+    }
+    flags.addAll(Arrays.asList(mail.getFlags().getUserFlags()));
+    row.put(FLAGS, flags);
+
+    String[] hdrs = mail.getHeader("X-Mailer");
+    if (hdrs != null)
+      row.put(XMAILER, hdrs[0]);
+  }
+
+
+  private void addAddressToList(Address[] adresses, List<String> to) throws AddressException {
+    for (Address address : adresses) {
+      to.add(address.toString());
+      InternetAddress ia = (InternetAddress) address;
+      if (ia.isGroup()) {
+        InternetAddress[] group = ia.getGroup(false);
+        for (InternetAddress member : group)
+          to.add(member.toString());
+      }
+    }
+  }
+
+  private boolean connectToMailBox() {
+    try {
+      Properties props = new Properties();
+      props.setProperty("mail.store.protocol", protocol);
+      props.setProperty("mail.imap.fetchsize", "" + fetchSize);
+      props.setProperty("mail.imap.timeout", "" + rTimeout);
+      props.setProperty("mail.imap.connectiontimeout", "" + cTimeout);
+      Session session = Session.getDefaultInstance(props, null);
+      mailbox = session.getStore(protocol);
+      mailbox.connect(host, user, password);
+      LOG.info("Connected to mailbox");
+      return true;
+    } catch (MessagingException e) {
+      throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+              "Connection failed", e);
+    }
+  }
+
+  private void createFilters() {
+    if (fetchMailsSince != null) {
+      filters.add(new MailsSinceLastCheckFilter(fetchMailsSince));
+    }
+    if (customFilter != null && !customFilter.equals("")) {
+      try {
+        Class cf = Class.forName(customFilter);
+        Object obj = cf.newInstance();
+        if (obj instanceof CustomFilter) {
+          filters.add((CustomFilter) obj);
+        }
+      } catch (Exception e) {
+        throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+                "Custom filter could not be created", e);
+      }
+    }
+  }
+
+  private void logConfig() {
+    if (!LOG.isInfoEnabled()) return;
+    StringBuffer config = new StringBuffer();
+    config.append("user : ").append(user).append(System.getProperty("line.separator"));
+    config.append("pwd : ").append(password).append(System.getProperty("line.separator"));
+    config.append("protocol : ").append(protocol).append(System.getProperty("line.separator"));
+    config.append("host : ").append(host).append(System.getProperty("line.separator"));
+    config.append("folders : ").append(folderNames).append(System.getProperty("line.separator"));
+    config.append("recurse : ").append(recurse).append(System.getProperty("line.separator"));
+    config.append("exclude : ").append(exclude.toString()).append(System.getProperty("line.separator"));
+    config.append("include : ").append(include.toString()).append(System.getProperty("line.separator"));
+    config.append("batchSize : ").append(batchSize).append(System.getProperty("line.separator"));
+    config.append("fetchSize : ").append(fetchSize).append(System.getProperty("line.separator"));
+    config.append("read timeout : ").append(rTimeout).append(System.getProperty("line.separator"));
+    config.append("conection timeout : ").append(cTimeout).append(System.getProperty("line.separator"));
+    config.append("custom filter : ").append(customFilter).append(System.getProperty("line.separator"));
+    config.append("fetch mail since : ").append(fetchMailsSince).append(System.getProperty("line.separator"));
+    LOG.info(config.toString());
+  }
+
+  class FolderIterator implements Iterator<Folder> {
+    private Store mailbox;
+    private List<String> topLevelFolders;
+    private List<Folder> folders = null;
+    private Folder lastFolder = null;
+
+    public FolderIterator(Store mailBox) {
+      this.mailbox = mailBox;
+      folders = new ArrayList<Folder>();
+      getTopLevelFolders(mailBox);
+    }
+
+    public boolean hasNext() {
+      return !folders.isEmpty();
+    }
+
+    public Folder next() {
+      try {
+        boolean hasMessages = false;
+        Folder next;
+        do {
+          if (lastFolder != null) {
+            lastFolder.close(false);
+            lastFolder = null;
+          }
+          if (folders.isEmpty()) {
+            mailbox.close();
+            return null;
+          }
+          next = folders.remove(0);
+          if (next != null) {
+            String fullName = next.getFullName();
+            if (!excludeFolder(fullName)) {
+              hasMessages = (next.getType() & Folder.HOLDS_MESSAGES) != 0;
+              next.open(Folder.READ_ONLY);
+              lastFolder = next;
+              LOG.info("Opened folder : " + fullName);
+            }
+            if (recurse && ((next.getType() & Folder.HOLDS_FOLDERS) != 0)) {
+              Folder[] children = next.list();
+              LOG.info("Added its children to list  : ");
+              for (int i = children.length - 1; i >= 0; i--) {
+                folders.add(0, children[i]);
+                LOG.info("child name : " + children[i].getFullName());
+              }
+              if (children.length == 0)
+                LOG.info("NO children : ");
+            }
+          }
+        }
+        while (!hasMessages);
+        return next;
+      } catch (MessagingException e) {
+        //throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+        //        "Folder open failed", e);
+      }
+      return null;
+    }
+
+    public void remove() {
+      throw new UnsupportedOperationException("Its read only mode...");
+    }
+
+    private void getTopLevelFolders(Store mailBox) {
+      if (folderNames != null)
+        topLevelFolders = Arrays.asList(folderNames.split(","));
+      for (int i = 0; topLevelFolders != null && i < topLevelFolders.size(); i++) {
+        try {
+          folders.add(mailbox.getFolder(topLevelFolders.get(i)));
+        } catch (MessagingException e) {
+          // skip bad ones unless its the last one and still no good folder
+          if (folders.size() == 0 && i == topLevelFolders.size() - 1)
+            throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+                    "Folder retreival failed");
         }
       }
-      //else http HEAD request, nothing to write out, waited this long just to get ContentType
-    }
-  }
-
-  protected void execute( HttpServletRequest req, SolrRequestHandler handler, SolrQueryRequest sreq, SolrQueryResponse rsp) {
-    // a custom filter could add more stuff to the request before passing it on.
-    // for example: sreq.getContext().put( "HttpServletRequest", req );
-    // used for logging query stats in SolrCore.execute()
-    sreq.getContext().put( "webapp", req.getContextPath() );
-    sreq.getCore().execute( handler, sreq, rsp );
-  }
-
-  protected void sendError(HttpServletResponse res, Throwable ex) throws IOException {
-    int code=500;
-    String trace = "";
-    if( ex instanceof SolrException ) {
-      code = ((SolrException)ex).code();
-    }
-
-    // For any regular code, don't include the stack trace
-    if( code == 500 || code < 100 ) {
-      StringWriter sw = new StringWriter();
-      ex.printStackTrace(new PrintWriter(sw));
-      trace = "\n\n"+sw.toString();
-
-      SolrException.logOnce(log,null,ex );
-
-      // non standard codes have undefined results with various servers
-      if( code < 100 ) {
-        log.warn( "invalid return code: "+code );
-        code = 500;
+      if (topLevelFolders == null || topLevelFolders.size() == 0) {
+        try {
+          folders.add(mailBox.getDefaultFolder());
+        } catch (MessagingException e) {
+          throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+                  "Folder retreival failed");
+        }
       }
     }
-    res.sendError( code, ex.getMessage() + trace );
+
+    private boolean excludeFolder(String name) {
+      for (String s : exclude) {
+        if (name.matches(s))
+          return true;
+      }
+      for (String s : include) {
+        if (name.matches(s))
+          return false;
+      }
+      return include.size() > 0;
+    }
   }
 
-  //---------------------------------------------------------------------
-  //---------------------------------------------------------------------
+  class MessageIterator implements Iterator<Message> {
+    private Folder folder;
+    private Message[] messagesInCurBatch;
+    private int current = 0;
+    private int currentBatch = 0;
+    private int batchSize = 0;
+    private int totalInFolder = 0;
+    private boolean doBatching = true;
 
-  /**
-   * Set the prefix for all paths.  This is useful if you want to apply the
-   * filter to something other then /*, perhaps because you are merging this
-   * filter into a larger web application.
-   *
-   * For example, if web.xml specifies:
-   *
-   * <filter-mapping>
-   *  <filter-name>SolrRequestFilter</filter-name>
-   *  <url-pattern>/xxx/*</url-pattern>
-   * </filter-mapping>
-   *
-   * Make sure to set the PathPrefix to "/xxx" either with this function
-   * or in web.xml.
-   *
-   * <init-param>
-   *  <param-name>path-prefix</param-name>
-   *  <param-value>/xxx</param-value>
-   * </init-param>
-   *
-   */
-  public void setPathPrefix(String pathPrefix) {
-    this.pathPrefix = pathPrefix;
+    public MessageIterator(Folder folder, int batchSize) {
+      try {
+        this.folder = folder;
+        this.batchSize = batchSize;
+        SearchTerm st = getSearchTerm();
+        if (st != null) {
+          doBatching = false;
+          messagesInCurBatch = folder.search(st);
+          totalInFolder = messagesInCurBatch.length;
+          folder.fetch(messagesInCurBatch, fp);
+          current = 0;
+          LOG.info("Total messages : " + totalInFolder);
+          LOG.info("Search criteria applied. Batching disabled");
+        } else {
+          totalInFolder = folder.getMessageCount();
+          LOG.info("Total messages : " + totalInFolder);
+          getNextBatch(batchSize, folder);
+        }
+      } catch (MessagingException e) {
+        throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+                "Message retreival failed", e);
+      }
+    }
+
+    private void getNextBatch(int batchSize, Folder folder) throws MessagingException {
+      // after each batch invalidate cache
+      if (messagesInCurBatch != null) {
+        for (Message m : messagesInCurBatch) {
+          if (m instanceof IMAPMessage)
+            ((IMAPMessage) m).invalidateHeaders();
+        }
+      }
+      int lastMsg = (currentBatch + 1) * batchSize;
+      lastMsg = lastMsg > totalInFolder ? totalInFolder : lastMsg;
+      messagesInCurBatch = folder.getMessages(currentBatch * batchSize + 1, lastMsg);
+      folder.fetch(messagesInCurBatch, fp);
+      current = 0;
+      currentBatch++;
+      LOG.info("Current Batch  : " + currentBatch);
+      LOG.info("Messages in this batch  : " + messagesInCurBatch.length);
+    }
+
+    public boolean hasNext() {
+      boolean hasMore = current < messagesInCurBatch.length;
+      if (!hasMore && doBatching
+              && currentBatch * batchSize < totalInFolder) {
+        // try next batch
+        try {
+          getNextBatch(batchSize, folder);
+          hasMore = current < messagesInCurBatch.length;
+        } catch (MessagingException e) {
+          throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
+                  "Message retreival failed", e);
+        }
+      }
+      return hasMore;
+    }
+
+    public Message next() {
+      return hasNext() ? messagesInCurBatch[current++] : null;
+    }
+
+    public void remove() {
+      throw new UnsupportedOperationException("Its read only mode...");
+    }
+
+    private SearchTerm getSearchTerm() {
+      if (filters.size() == 0)
+        return null;
+      if (filters.size() == 1)
+        return filters.get(0).getCustomSearch(folder);
+      SearchTerm last = filters.get(0).getCustomSearch(folder);
+      for (int i = 1; i < filters.size(); i++) {
+        CustomFilter filter = filters.get(i);
+        SearchTerm st = filter.getCustomSearch(folder);
+        if (st != null) {
+          last = new AndTerm(last, st);
+        }
+      }
+      return last;
+    }
   }
 
-  public String getPathPrefix() {
-    return pathPrefix;
+  class MailsSinceLastCheckFilter implements CustomFilter {
+
+    private Date since;
+
+    public MailsSinceLastCheckFilter(Date date) {
+      since = date;
+    }
+
+    public SearchTerm getCustomSearch(Folder folder) {
+      return new ReceivedDateTerm(ComparisonTerm.GE, since);
+    }
+  }
+
+  // user settings stored in member variables
+  private String user;
+  private String password;
+  private String host;
+  private String protocol;
+
+  private String folderNames;
+  private List<String> exclude = new ArrayList<String>();
+  private List<String> include = new ArrayList<String>();
+  private boolean recurse;
+
+  private int batchSize;
+  private int fetchSize;
+  private int cTimeout;
+  private int rTimeout;
+
+  private Date fetchMailsSince;
+  private String customFilter;
+
+  private boolean processAttachment = true;
+
+  private Tika tika;
+  
+  // holds the current state
+  private Store mailbox;
+  private boolean connected = false;
+  private FolderIterator folderIter;
+  private MessageIterator msgIter;
+  private List<CustomFilter> filters = new ArrayList<CustomFilter>();
+  private static FetchProfile fp = new FetchProfile();
+  private static final Logger LOG = LoggerFactory.getLogger(DataImporter.class);
+
+  // diagnostics
+  private int rowCount = 0;
+
+  static {
+    fp.add(FetchProfile.Item.ENVELOPE);
+    fp.add(FetchProfile.Item.FLAGS);
+    fp.add("X-Mailer");
+  }
+
+  // Fields To Index
+  // single valued
+  private static final String MESSAGE_ID = "messageId";
+  private static final String SUBJECT = "subject";
+  private static final String FROM = "from";
+  private static final String SENT_DATE = "sentDate";
+  private static final String XMAILER = "xMailer";
+  // multi valued
+  private static final String TO_CC_BCC = "allTo";
+  private static final String FLAGS = "flags";
+  private static final String CONTENT = "content";
+  private static final String ATTACHMENT = "attachment";
+  private static final String ATTACHMENT_NAMES = "attachmentNames";
+  // flag values
+  private static final String FLAG_ANSWERED = "answered";
+  private static final String FLAG_DELETED = "deleted";
+  private static final String FLAG_DRAFT = "draft";
+  private static final String FLAG_FLAGGED = "flagged";
+  private static final String FLAG_RECENT = "recent";
+  private static final String FLAG_SEEN = "seen";
+
+  private int getIntFromContext(String prop, int ifNull) {
+    int v = ifNull;
+    try {
+      String val = context.getEntityAttribute(prop);
+      if (val != null) {
+        val = context.replaceTokens(val);
+        v = Integer.valueOf(val);
+      }
+    } catch (NumberFormatException e) {
+      //do nothing
+    }
+    return v;
+  }
+
+  private boolean getBoolFromContext(String prop, boolean ifNull) {
+    boolean v = ifNull;
+    String val = context.getEntityAttribute(prop);
+    if (val != null) {
+      val = context.replaceTokens(val);
+      v = Boolean.valueOf(val);
+    }
+    return v;
+  }
+
+  private String getStringFromContext(String prop, String ifNull) {
+    String v = ifNull;
+    String val = context.getEntityAttribute(prop);
+    if (val != null) {
+      val = context.replaceTokens(val);
+      v = val;
+    }
+    return v;
   }
 }

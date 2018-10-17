@@ -1,4 +1,4 @@
-import org.elasticsearch.index.field.data.FieldData;
+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -9,7 +9,7 @@ import org.elasticsearch.index.field.data.FieldData;
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -19,223 +19,377 @@ import org.elasticsearch.index.field.data.FieldData;
  * under the License.
  */
 
-package org.elasticsearch.index.mapper.xcontent;
+package org.elasticsearch.percolator;
 
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.search.*;
-import org.apache.lucene.util.NumericUtils;
-import org.elasticsearch.index.analysis.NamedAnalyzer;
-import org.elasticsearch.index.analysis.NumericDateAnalyzer;
-import org.elasticsearch.index.field.FieldData;
-import org.elasticsearch.index.mapper.MapperParsingException;
-import org.elasticsearch.util.Numbers;
-import org.elasticsearch.util.Strings;
-import org.elasticsearch.util.joda.FormatDateTimeFormatter;
-import org.elasticsearch.util.joda.Joda;
-import org.elasticsearch.util.xcontent.XContentParser;
-import org.elasticsearch.util.xcontent.builder.XContentBuilder;
+import org.elasticsearch.action.delete.DeleteResponse;
+import org.elasticsearch.action.index.IndexResponse;
+import org.elasticsearch.action.percolate.PercolateResponse;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.settings.ImmutableSettings;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.test.AbstractIntegrationTest;
+import org.junit.Test;
 
-import java.io.IOException;
-import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
-import static org.elasticsearch.index.mapper.xcontent.XContentMapperBuilders.*;
-import static org.elasticsearch.index.mapper.xcontent.XContentTypeParsers.*;
+import static org.elasticsearch.index.query.QueryBuilders.boolQuery;
+import static org.elasticsearch.index.query.QueryBuilders.termQuery;
+import static org.elasticsearch.percolator.PercolatorTests.convertFromTextArray;
+import static org.elasticsearch.test.hamcrest.ElasticSearchAssertions.assertNoFailures;
+import static org.hamcrest.Matchers.*;
+
 
 /**
- * @author kimchy (shay.banon)
+ *
  */
-public class XContentDateFieldMapper extends XContentNumberFieldMapper<Long> {
+public class ConcurrentPercolatorTests extends AbstractIntegrationTest {
 
-    public static final String CONTENT_TYPE = "date";
+    @Test
+    public void testSimpleConcurrentPercolator() throws Exception {
+        client().admin().indices().prepareCreate("index").setSettings(
+                ImmutableSettings.settingsBuilder()
+                        .put("index.number_of_shards", 1)
+                        .put("index.number_of_replicas", 0)
+                        .build()
+        ).execute().actionGet();
+        ensureGreen();
 
-    public static class Defaults extends XContentNumberFieldMapper.Defaults {
-        public static final FormatDateTimeFormatter DATE_TIME_FORMATTER = Joda.forPattern("dateOptionalTime");
+        final BytesReference onlyField1 = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                .field("field1", 1)
+                .endObject().endObject().bytes();
+        final BytesReference onlyField2 = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                .field("field2", "value")
+                .endObject().endObject().bytes();
+        final BytesReference bothFields = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                .field("field1", 1)
+                .field("field2", "value")
+                .endObject().endObject().bytes();
 
-        public static final String NULL_VALUE = null;
-    }
 
-    public static class Builder extends XContentNumberFieldMapper.Builder<Builder, XContentDateFieldMapper> {
+        // We need to index a document / define mapping, otherwise field1 doesn't get reconized as number field.
+        // If we don't do this, then 'test2' percolate query gets parsed as a TermQuery and not a RangeQuery.
+        // The percolate api doesn't parse the doc if no queries have registered, so it can't lazily create a mapping
+        client().prepareIndex("index", "type", "1").setSource(XContentFactory.jsonBuilder().startObject()
+                .field("field1", 1)
+                .field("field2", "value")
+                .endObject()).execute().actionGet();
 
-        protected String nullValue = Defaults.NULL_VALUE;
+        client().prepareIndex("index", "_percolator", "test1")
+                .setSource(XContentFactory.jsonBuilder().startObject().field("query", termQuery("field2", "value")).endObject())
+                .execute().actionGet();
+        client().prepareIndex("index", "_percolator", "test2")
+                .setSource(XContentFactory.jsonBuilder().startObject().field("query", termQuery("field1", 1)).endObject())
+                .execute().actionGet();
 
-        protected FormatDateTimeFormatter dateTimeFormatter = Defaults.DATE_TIME_FORMATTER;
+        final CountDownLatch start = new CountDownLatch(1);
+        final AtomicBoolean stop = new AtomicBoolean(false);
+        final AtomicInteger counts = new AtomicInteger(0);
+        final AtomicBoolean assertionFailure = new AtomicBoolean(false);
+        Thread[] threads = new Thread[5];
 
-        public Builder(String name) {
-            super(name);
-            builder = this;
-        }
+        for (int i = 0; i < threads.length; i++) {
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        start.await();
+                        while (!stop.get()) {
+                            int count = counts.incrementAndGet();
+                            if ((count > 10000)) {
+                                stop.set(true);
+                            }
+                            PercolateResponse percolate;
+                            if (count % 3 == 0) {
+                                percolate = client().preparePercolate().setIndices("index").setDocumentType("type")
+                                        .setSource(bothFields)
+                                        .execute().actionGet();
+                                assertThat(percolate.getMatches(), arrayWithSize(2));
+                                assertThat(convertFromTextArray(percolate.getMatches(), "index"), arrayContainingInAnyOrder("test1", "test2"));
+                            } else if (count % 3 == 1) {
+                                percolate = client().preparePercolate().setIndices("index").setDocumentType("type")
+                                        .setSource(onlyField2)
+                                        .execute().actionGet();
+                                assertThat(percolate.getMatches(), arrayWithSize(1));
+                                assertThat(convertFromTextArray(percolate.getMatches(), "index"), arrayContaining("test1"));
+                            } else {
+                                percolate = client().preparePercolate().setIndices("index").setDocumentType("type")
+                                        .setSource(onlyField1)
+                                        .execute().actionGet();
+                                assertThat(percolate.getMatches(), arrayWithSize(1));
+                                assertThat(convertFromTextArray(percolate.getMatches(), "index"), arrayContaining("test2"));
+                            }
+                        }
 
-        public Builder nullValue(String nullValue) {
-            this.nullValue = nullValue;
-            return this;
-        }
-
-        public Builder dateTimeFormatter(FormatDateTimeFormatter dateTimeFormatter) {
-            this.dateTimeFormatter = dateTimeFormatter;
-            return this;
-        }
-
-        @Override public XContentDateFieldMapper build(BuilderContext context) {
-            XContentDateFieldMapper fieldMapper = new XContentDateFieldMapper(buildNames(context), dateTimeFormatter,
-                    precisionStep, index, store, boost, omitNorms, omitTermFreqAndPositions, nullValue);
-            fieldMapper.includeInAll(includeInAll);
-            return fieldMapper;
-        }
-    }
-
-    public static class TypeParser implements XContentTypeParser {
-        @Override public XContentMapper.Builder parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
-            XContentDateFieldMapper.Builder builder = dateField(name);
-            parseNumberField(builder, name, node, parserContext);
-            for (Map.Entry<String, Object> entry : node.entrySet()) {
-                String propName = Strings.toUnderscoreCase(entry.getKey());
-                Object propNode = entry.getValue();
-                if (propName.equals("null_value")) {
-                    builder.nullValue(propNode.toString());
-                } else if (propName.equals("format")) {
-                    builder.dateTimeFormatter(parseDateTimeFormatter(propName, propNode));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (AssertionError e) {
+                        assertionFailure.set(true);
+                        Thread.currentThread().interrupt();
+                    }
                 }
+            };
+            threads[i] = new Thread(r);
+            threads[i].start();
+        }
+
+        start.countDown();
+        for (Thread thread : threads) {
+            thread.join();
+        }
+
+        assertThat(assertionFailure.get(), equalTo(false));
+    }
+
+    @Test
+    public void testConcurrentAddingAndPercolating() throws Exception {
+        client().admin().indices().prepareCreate("index").setSettings(
+                ImmutableSettings.settingsBuilder()
+                        .put("index.number_of_shards", 2)
+                        .put("index.number_of_replicas", 1)
+                        .build()
+        ).execute().actionGet();
+        ensureGreen();
+        final int numIndexThreads = 3;
+        final int numPercolateThreads = 6;
+        final int numPercolatorOperationsPerThread = 1000;
+
+        final AtomicBoolean assertionFailure = new AtomicBoolean(false);
+        final CountDownLatch start = new CountDownLatch(1);
+        final AtomicInteger runningPercolateThreads = new AtomicInteger(numPercolateThreads);
+        final AtomicInteger type1 = new AtomicInteger();
+        final AtomicInteger type2 = new AtomicInteger();
+        final AtomicInteger type3 = new AtomicInteger();
+
+        final AtomicInteger idGen = new AtomicInteger();
+
+        Thread[] indexThreads = new Thread[numIndexThreads];
+        for (int i = 0; i < numIndexThreads; i++) {
+            final Random rand = new Random(getRandom().nextLong());
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        XContentBuilder onlyField1 = XContentFactory.jsonBuilder().startObject()
+                                .field("query", termQuery("field1", "value")).endObject();
+                        XContentBuilder onlyField2 = XContentFactory.jsonBuilder().startObject()
+                                .field("query", termQuery("field2", "value")).endObject();
+                        XContentBuilder field1And2 = XContentFactory.jsonBuilder().startObject()
+                                .field("query", boolQuery().must(termQuery("field1", "value")).must(termQuery("field2", "value"))).endObject();
+
+                        start.await();
+                        while (runningPercolateThreads.get() > 0) {
+                            Thread.sleep(100);
+                            int x = rand.nextInt(3);
+                            String id = Integer.toString(idGen.incrementAndGet());
+                            IndexResponse response;
+                            switch (x) {
+                                case 0:
+                                    response = client().prepareIndex("index", "_percolator", id)
+                                            .setSource(onlyField1)
+                                            .execute().actionGet();
+                                    type1.incrementAndGet();
+                                    break;
+                                case 1:
+                                    response = client().prepareIndex("index", "_percolator", id)
+                                            .setSource(onlyField2)
+                                            .execute().actionGet();
+                                    type2.incrementAndGet();
+                                    break;
+                                case 2:
+                                    response = client().prepareIndex("index", "_percolator", id)
+                                            .setSource(field1And2)
+                                            .execute().actionGet();
+                                    type3.incrementAndGet();
+                                    break;
+                                default:
+                                    throw new IllegalStateException("Illegal x=" + x);
+                            }
+                            assertThat(response.getId(), equalTo(id));
+                            assertThat(response.getVersion(), equalTo(1l));
+                        }
+                    } catch (Throwable t) {
+                        assertionFailure.set(true);
+                        logger.error("Error in indexing thread...", t);
+                    }
+                }
+            };
+            indexThreads[i] = new Thread(r);
+            indexThreads[i].start();
+        }
+
+        Thread[] percolateThreads = new Thread[numPercolateThreads];
+        for (int i = 0; i < numPercolateThreads; i++) {
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        XContentBuilder onlyField1Doc = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                                .field("field1", "value")
+                                .endObject().endObject();
+                        XContentBuilder onlyField2Doc = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                                .field("field2", "value")
+                                .endObject().endObject();
+                        XContentBuilder field1AndField2Doc = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                                .field("field1", "value")
+                                .field("field2", "value")
+                                .endObject().endObject();
+                        Random random = getRandom();
+                        start.await();
+                        for (int counter = 0; counter < numPercolatorOperationsPerThread; counter++) {
+                            int x = random.nextInt(3);
+                            int atLeastExpected;
+                            PercolateResponse response;
+                            switch (x) {
+                                case 0:
+                                    atLeastExpected = type1.get();
+                                    response = client().preparePercolate().setIndices("index").setDocumentType("type")
+                                            .setSource(onlyField1Doc).execute().actionGet();
+                                    assertNoFailures(response);
+                                    assertThat(response.getSuccessfulShards(), equalTo(response.getTotalShards()));
+                                    assertThat(response.getMatches().length, greaterThanOrEqualTo(atLeastExpected));
+                                    break;
+                                case 1:
+                                    atLeastExpected = type2.get();
+                                    response = client().preparePercolate().setIndices("index").setDocumentType("type")
+                                            .setSource(onlyField2Doc).execute().actionGet();
+                                    assertNoFailures(response);
+                                    assertThat(response.getSuccessfulShards(), equalTo(response.getTotalShards()));
+                                    assertThat(response.getMatches().length, greaterThanOrEqualTo(atLeastExpected));
+                                    break;
+                                case 2:
+                                    atLeastExpected = type3.get();
+                                    response = client().preparePercolate().setIndices("index").setDocumentType("type")
+                                            .setSource(field1AndField2Doc).execute().actionGet();
+                                    assertNoFailures(response);
+                                    assertThat(response.getSuccessfulShards(), equalTo(response.getTotalShards()));
+                                    assertThat(response.getMatches().length, greaterThanOrEqualTo(atLeastExpected));
+                                    break;
+                            }
+                        }
+                    } catch (Throwable t) {
+                        assertionFailure.set(true);
+                        logger.error("Error in percolate thread...", t);
+                    } finally {
+                        runningPercolateThreads.decrementAndGet();
+                    }
+                }
+            };
+            percolateThreads[i] = new Thread(r);
+            percolateThreads[i].start();
+        }
+
+        start.countDown();
+        for (Thread thread : indexThreads) {
+            thread.join();
+        }
+        for (Thread thread : percolateThreads) {
+            thread.join();
+        }
+
+        assertThat(assertionFailure.get(), equalTo(false));
+    }
+
+    @Test
+    public void testConcurrentAddingAndRemovingWhilePercolating() throws Exception {
+        client().admin().indices().prepareCreate("index").setSettings(
+                ImmutableSettings.settingsBuilder()
+                        .put("index.number_of_shards", 2)
+                        .put("index.number_of_replicas", 1)
+                        .build()
+        ).execute().actionGet();
+        ensureGreen();
+        final int numIndexThreads = 3;
+        final int numberPercolateOperation = 100;
+
+        final AtomicReference<Throwable> exceptionHolder = new AtomicReference<Throwable>(null);
+        final AtomicInteger idGen = new AtomicInteger(0);
+        final Set<String> liveIds = ConcurrentCollections.newConcurrentSet();
+        final AtomicBoolean run = new AtomicBoolean(true);
+        Thread[] indexThreads = new Thread[numIndexThreads];
+        final Semaphore semaphore = new Semaphore(numIndexThreads, true);
+        for (int i = 0; i < indexThreads.length; i++) {
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        XContentBuilder doc = XContentFactory.jsonBuilder().startObject()
+                                .field("query", termQuery("field1", "value")).endObject();
+                        outer: while (run.get()) {
+                            semaphore.acquire();
+                            try {
+                                if (!liveIds.isEmpty() && getRandom().nextInt(100) < 19) {
+                                    String id;
+                                    do {
+                                        if (liveIds.isEmpty()) {
+                                            continue outer;
+                                        }
+                                        id = Integer.toString(randomInt(idGen.get()));
+                                    } while (!liveIds.remove(id));
+
+                                    DeleteResponse response = client().prepareDelete("index", "_percolator", id)
+                                            .execute().actionGet();
+                                    assertThat(response.getId(), equalTo(id));
+                                    assertThat("doc[" + id + "] should have been deleted, but isn't", response.isNotFound(), equalTo(false));
+                                } else {
+                                    String id = Integer.toString(idGen.getAndIncrement());
+                                    IndexResponse response = client().prepareIndex("index", "_percolator", id)
+                                            .setSource(doc)
+                                            .execute().actionGet();
+                                    liveIds.add(id);
+                                    assertThat(response.isCreated(), equalTo(true)); // We only add new docs
+                                    assertThat(response.getId(), equalTo(id));
+                                }
+                            } finally {
+                                semaphore.release();
+                            }
+                        }
+                    } catch (InterruptedException iex) {
+                        logger.error("indexing thread was interrupted...", iex);
+                        run.set(false);
+                    } catch (Throwable t) {
+                        run.set(false);
+                        exceptionHolder.set(t);
+                        logger.error("Error in indexing thread...", t);
+                    }
+                }
+            };
+            indexThreads[i] = new Thread(r);
+            indexThreads[i].start();
+        }
+
+        XContentBuilder percolateDoc = XContentFactory.jsonBuilder().startObject().startObject("doc")
+                .field("field1", "value")
+                .endObject().endObject();
+        for (int counter = 0; counter < numberPercolateOperation; counter++) {
+            Thread.sleep(5);
+            semaphore.acquire(numIndexThreads);
+            try {
+                if (!run.get()) {
+                    break;
+                }
+                int atLeastExpected = liveIds.size();
+                PercolateResponse response = client().preparePercolate().setIndices("index").setDocumentType("type")
+                        .setSource(percolateDoc).execute().actionGet();
+                assertThat(response.getShardFailures(), emptyArray());
+                assertThat(response.getSuccessfulShards(), equalTo(response.getTotalShards()));
+                assertThat(response.getMatches().length, equalTo(atLeastExpected));
+            } finally {
+                semaphore.release(numIndexThreads);
             }
-            return builder;
         }
-    }
-
-    private final FormatDateTimeFormatter dateTimeFormatter;
-
-    private final String nullValue;
-
-    protected XContentDateFieldMapper(Names names, FormatDateTimeFormatter dateTimeFormatter, int precisionStep,
-                                      Field.Index index, Field.Store store,
-                                      float boost, boolean omitNorms, boolean omitTermFreqAndPositions,
-                                      String nullValue) {
-        super(names, precisionStep, index, store, boost, omitNorms, omitTermFreqAndPositions,
-                new NamedAnalyzer("_date/" + precisionStep, new NumericDateAnalyzer(precisionStep, dateTimeFormatter.parser())),
-                new NamedAnalyzer("_date/max", new NumericDateAnalyzer(Integer.MAX_VALUE, dateTimeFormatter.parser())));
-        this.dateTimeFormatter = dateTimeFormatter;
-        this.nullValue = nullValue;
-    }
-
-    @Override protected int maxPrecisionStep() {
-        return 64;
-    }
-
-    @Override public Long value(Fieldable field) {
-        byte[] value = field.getBinaryValue();
-        if (value == null) {
-            return null;
+        run.set(false);
+        for (Thread thread : indexThreads) {
+            thread.join();
         }
-        return Numbers.bytesToLong(value);
+        assertThat("exceptionHolder should have been empty, but holds: " + exceptionHolder.toString(), exceptionHolder.get(), nullValue());
     }
 
-    /**
-     * Dates should return as a string, delegates to {@link #valueAsString(org.apache.lucene.document.Fieldable)}.
-     */
-    @Override public Object valueForSearch(Fieldable field) {
-        return valueAsString(field);
-    }
-
-    @Override public Object valueForSearch(Object value) {
-        return dateTimeFormatter.printer().print((Long) value);
-    }
-
-    @Override public String valueAsString(Fieldable field) {
-        Long value = value(field);
-        if (value == null) {
-            return null;
-        }
-        return dateTimeFormatter.printer().print(value);
-    }
-
-    @Override public String indexedValue(String value) {
-        return NumericUtils.longToPrefixCoded(dateTimeFormatter.parser().parseMillis(value));
-    }
-
-    @Override public String indexedValue(Long value) {
-        return NumericUtils.longToPrefixCoded(value);
-    }
-
-    @Override public Object valueFromTerm(String term) {
-        final int shift = term.charAt(0) - NumericUtils.SHIFT_START_LONG;
-        if (shift > 0 && shift <= 63) {
-            return null;
-        }
-        return NumericUtils.prefixCodedToLong(term);
-    }
-
-    @Override public Object valueFromString(String text) {
-        return dateTimeFormatter.parser().parseMillis(text);
-    }
-
-    @Override public Query rangeQuery(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper) {
-        return NumericRangeQuery.newLongRange(names.indexName(), precisionStep,
-                lowerTerm == null ? null : dateTimeFormatter.parser().parseMillis(lowerTerm),
-                upperTerm == null ? null : dateTimeFormatter.parser().parseMillis(upperTerm),
-                includeLower, includeUpper);
-    }
-
-    @Override public Filter rangeFilter(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper) {
-        return NumericRangeFilter.newLongRange(names.indexName(), precisionStep,
-                lowerTerm == null ? null : dateTimeFormatter.parser().parseMillis(lowerTerm),
-                upperTerm == null ? null : dateTimeFormatter.parser().parseMillis(upperTerm),
-                includeLower, includeUpper);
-    }
-
-    @Override protected Field parseCreateField(ParseContext context) throws IOException {
-        String dateAsString;
-        if (context.externalValueSet()) {
-            dateAsString = (String) context.externalValue();
-            if (dateAsString == null) {
-                dateAsString = nullValue;
-            }
-        } else {
-            if (context.parser().currentToken() == XContentParser.Token.VALUE_NULL) {
-                dateAsString = nullValue;
-            } else {
-                dateAsString = context.parser().text();
-            }
-        }
-
-        if (dateAsString == null) {
-            return null;
-        }
-        if (includeInAll == null || includeInAll) {
-            context.allEntries().addText(names.fullName(), dateAsString, boost);
-        }
-
-        long value = dateTimeFormatter.parser().parseMillis(dateAsString);
-        Field field = null;
-        if (stored()) {
-            field = new Field(names.indexName(), Numbers.longToBytes(value), store);
-            if (indexed()) {
-                field.setTokenStream(popCachedStream(precisionStep).setLongValue(value));
-            }
-        } else if (indexed()) {
-            field = new Field(names.indexName(), popCachedStream(precisionStep).setLongValue(value));
-        }
-        return field;
-    }
-
-    @Override public int sortType() {
-        return SortField.LONG;
-    }
-
-    @Override public FieldData.Type fieldDataType() {
-        return FieldData.Type.LONG;
-    }
-
-    @Override protected String contentType() {
-        return CONTENT_TYPE;
-    }
-
-    @Override protected void doXContentBody(XContentBuilder builder) throws IOException {
-        super.doXContentBody(builder);
-        builder.field("format", dateTimeFormatter.format());
-        if (nullValue != null) {
-            builder.field("null_value", nullValue);
-        }
-        if (includeInAll != null) {
-            builder.field("include_in_all", includeInAll);
-        }
-    }
 }

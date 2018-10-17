@@ -1,13 +1,13 @@
-return ImmutableSettings.settingsBuilder().put(super.nodeSettings(nodeOrdinal)).put("threadpool.search.type", "cached").build();
+final InternalSearchResponse internalResponse = new InternalSearchResponse(new InternalSearchHits(InternalSearchHits.EMPTY, Long.parseLong(this.scrollId.attributes().get("total_hits")), 0.0f), null, null, false);
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,185 +19,259 @@ return ImmutableSettings.settingsBuilder().put(super.nodeSettings(nodeOrdinal)).
  * under the License.
  */
 
-package org.elasticsearch.threadpool;
+package org.elasticsearch.action.search.type;
 
-import com.google.common.collect.Sets;
-import org.elasticsearch.action.admin.cluster.node.info.NodeInfo;
-import org.elasticsearch.action.admin.cluster.node.info.NodesInfoResponse;
-import org.elasticsearch.action.index.IndexRequestBuilder;
-import org.elasticsearch.common.network.MulticastChannel;
-import org.elasticsearch.common.settings.ImmutableSettings;
+import org.apache.lucene.search.ScoreDoc;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.search.*;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.common.collect.Tuple;
+import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.ToXContent;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.common.xcontent.XContentParser;
-import org.elasticsearch.common.xcontent.json.JsonXContent;
-import org.elasticsearch.index.query.QueryBuilders;
-import org.elasticsearch.test.ElasticsearchIntegrationTest;
-import org.elasticsearch.test.ElasticsearchIntegrationTest.ClusterScope;
-import org.elasticsearch.test.ElasticsearchSingleNodeTest;
-import org.elasticsearch.test.InternalTestCluster;
-import org.elasticsearch.test.hamcrest.RegexMatcher;
-import org.elasticsearch.threadpool.ThreadPool.Names;
-import org.junit.Test;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.search.SearchShardTarget;
+import org.elasticsearch.search.action.SearchServiceListener;
+import org.elasticsearch.search.action.SearchServiceTransportAction;
+import org.elasticsearch.search.controller.SearchPhaseController;
+import org.elasticsearch.search.controller.ShardDoc;
+import org.elasticsearch.search.controller.ShardScoreDoc;
+import org.elasticsearch.search.fetch.QueryFetchSearchResult;
+import org.elasticsearch.search.internal.InternalSearchHits;
+import org.elasticsearch.search.internal.InternalSearchResponse;
+import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.lang.management.ThreadInfo;
-import java.lang.management.ThreadMXBean;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.*;
-import java.util.regex.Pattern;
+import java.util.Queue;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
-import static org.elasticsearch.test.ElasticsearchIntegrationTest.Scope;
-import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;
-import static org.hamcrest.Matchers.*;
+import static org.elasticsearch.action.search.type.TransportSearchHelper.internalScrollSearchRequest;
 
 /**
+ *
  */
-@ClusterScope(scope = Scope.TEST, numDataNodes = 0, numClientNodes = 0)
-public class SimpleThreadPoolTests extends ElasticsearchIntegrationTest {
+public class TransportSearchScrollScanAction extends AbstractComponent {
 
-    @Override
-    protected Settings nodeSettings(int nodeOrdinal) {
-        return ImmutableSettings.settingsBuilder().put("threadpool.search.type", "cached").put(super.nodeSettings(nodeOrdinal)).build();
+    private final ThreadPool threadPool;
+
+    private final ClusterService clusterService;
+
+    private final SearchServiceTransportAction searchService;
+
+    private final SearchPhaseController searchPhaseController;
+
+    private final TransportSearchCache searchCache;
+
+    @Inject
+    public TransportSearchScrollScanAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
+                                           TransportSearchCache searchCache,
+                                           SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.clusterService = clusterService;
+        this.searchCache = searchCache;
+        this.searchService = searchService;
+        this.searchPhaseController = searchPhaseController;
     }
 
-    @Test
-    public void verifyThreadNames() throws Exception {
-
-        ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
-        Set<String> preNodeStartThreadNames = Sets.newHashSet();
-        for (long l : threadBean.getAllThreadIds()) {
-            ThreadInfo threadInfo = threadBean.getThreadInfo(l);
-            if (threadInfo != null) {
-                preNodeStartThreadNames.add(threadInfo.getThreadName());
-            }
-        }
-        logger.info("pre node threads are {}", preNodeStartThreadNames);
-        String node = internalCluster().startNode();
-        logger.info("do some indexing, flushing, optimize, and searches");
-        int numDocs = randomIntBetween(2, 100);
-        IndexRequestBuilder[] builders = new IndexRequestBuilder[numDocs];
-        for (int i = 0; i < numDocs; ++i) {
-            builders[i] = client().prepareIndex("idx", "type").setSource(jsonBuilder()
-                    .startObject()
-                    .field("str_value", "s" + i)
-                    .field("str_values", new String[]{"s" + (i * 2), "s" + (i * 2 + 1)})
-                    .field("l_value", i)
-                    .field("l_values", new int[]{i * 2, i * 2 + 1})
-                    .field("d_value", i)
-                    .field("d_values", new double[]{i * 2, i * 2 + 1})
-                    .endObject());
-        }
-        indexRandom(true, builders);
-        int numSearches = randomIntBetween(2, 100);
-        for (int i = 0; i < numSearches; i++) {
-            assertNoFailures(client().prepareSearch("idx").setQuery(QueryBuilders.termQuery("str_value", "s" + i)).get());
-            assertNoFailures(client().prepareSearch("idx").setQuery(QueryBuilders.termQuery("l_value", i)).get());
-        }
-        Set<String> threadNames = Sets.newHashSet();
-        for (long l : threadBean.getAllThreadIds()) {
-            ThreadInfo threadInfo = threadBean.getThreadInfo(l);
-            if (threadInfo != null) {
-                threadNames.add(threadInfo.getThreadName());
-            }
-        }
-        logger.info("post node threads are {}", threadNames);
-        threadNames.removeAll(preNodeStartThreadNames);
-        logger.info("post node *new* threads are {}", threadNames);
-        for (String threadName : threadNames) {
-            // ignore some shared threads we know that are created within the same VM, like the shared discovery one
-            // or the ones that are occasionally come up from ElasticsearchSingleNodeTest
-            if (threadName.contains("[" + MulticastChannel.SHARED_CHANNEL_NAME + "]")
-                    || threadName.contains("[" + ElasticsearchSingleNodeTest.nodeName() + "]")
-                    || threadName.contains("Keep-Alive-Timer")) {
-                continue;
-            }
-            String nodePrefix = "(" + Pattern.quote(InternalTestCluster.TRANSPORT_CLIENT_PREFIX) + ")?" + Pattern.quote(InternalTestCluster.NODE_PREFIX);
-            assertThat(threadName, RegexMatcher.matches("\\[" + nodePrefix + "\\d+\\]"));
-        }
+    public void execute(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
+        new AsyncAction(request, scrollId, listener).start();
     }
 
-    @Test(timeout = 20000)
-    public void testUpdatingThreadPoolSettings() throws Exception {
-        internalCluster().startNodesAsync(2).get();
-        ThreadPool threadPool = internalCluster().getDataNodeInstance(ThreadPool.class);
-        // Check that settings are changed
-        assertThat(((ThreadPoolExecutor) threadPool.executor(Names.SEARCH)).getKeepAliveTime(TimeUnit.MINUTES), equalTo(5L));
-        client().admin().cluster().prepareUpdateSettings().setTransientSettings(settingsBuilder().put("threadpool.search.keep_alive", "10m").build()).execute().actionGet();
-        assertThat(((ThreadPoolExecutor) threadPool.executor(Names.SEARCH)).getKeepAliveTime(TimeUnit.MINUTES), equalTo(10L));
+    private class AsyncAction {
 
-        // Make sure that threads continue executing when executor is replaced
-        final CyclicBarrier barrier = new CyclicBarrier(2);
-        Executor oldExecutor = threadPool.executor(Names.SEARCH);
-        threadPool.executor(Names.SEARCH).execute(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    barrier.await();
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                } catch (BrokenBarrierException ex) {
-                    //
+        private final SearchScrollRequest request;
+
+        private final ActionListener<SearchResponse> listener;
+
+        private final ParsedScrollId scrollId;
+
+        private final DiscoveryNodes nodes;
+
+        protected volatile Queue<ShardSearchFailure> shardFailures;
+
+        private final Map<SearchShardTarget, QueryFetchSearchResult> queryFetchResults = searchCache.obtainQueryFetchResults();
+
+        private final AtomicInteger successfulOps;
+
+        private final AtomicInteger counter;
+
+        private final long startTime = System.currentTimeMillis();
+
+        private AsyncAction(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
+            this.request = request;
+            this.listener = listener;
+            this.scrollId = scrollId;
+            this.nodes = clusterService.state().nodes();
+            this.successfulOps = new AtomicInteger(scrollId.context().length);
+            this.counter = new AtomicInteger(scrollId.context().length);
+        }
+
+        protected final ShardSearchFailure[] buildShardFailures() {
+            Queue<ShardSearchFailure> localFailures = shardFailures;
+            if (localFailures == null) {
+                return ShardSearchFailure.EMPTY_ARRAY;
+            }
+            return localFailures.toArray(ShardSearchFailure.EMPTY_ARRAY);
+        }
+
+        // we do our best to return the shard failures, but its ok if its not fully concurrently safe
+        // we simply try and return as much as possible
+        protected final void addShardFailure(ShardSearchFailure failure) {
+            if (shardFailures == null) {
+                shardFailures = ConcurrentCollections.newQueue();
+            }
+            shardFailures.add(failure);
+        }
+
+        public void start() {
+            if (scrollId.context().length == 0) {
+                final InternalSearchResponse internalResponse = new InternalSearchResponse(new InternalSearchHits(InternalSearchHits.EMPTY, Long.parseLong(this.scrollId.attributes().get("total_hits")), 0.0f), null, false);
+                searchCache.releaseQueryFetchResults(queryFetchResults);
+                listener.onResponse(new SearchResponse(internalResponse, request.scrollId(), 0, 0, 0l, buildShardFailures()));
+                return;
+            }
+
+            int localOperations = 0;
+            for (Tuple<String, Long> target : scrollId.context()) {
+                DiscoveryNode node = nodes.get(target.v1());
+                if (node != null) {
+                    if (nodes.localNodeId().equals(node.id())) {
+                        localOperations++;
+                    } else {
+                        executePhase(node, target.v2());
+                    }
+                } else {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Node [" + target.v1() + "] not available for scroll request [" + scrollId.source() + "]");
+                    }
+                    successfulOps.decrementAndGet();
+                    if (counter.decrementAndGet() == 0) {
+                        finishHim();
+                    }
                 }
             }
-        });
-        client().admin().cluster().prepareUpdateSettings().setTransientSettings(settingsBuilder().put("threadpool.search.type", "fixed").build()).execute().actionGet();
-        assertThat(threadPool.executor(Names.SEARCH), not(sameInstance(oldExecutor)));
-        assertThat(((ThreadPoolExecutor) oldExecutor).isShutdown(), equalTo(true));
-        assertThat(((ThreadPoolExecutor) oldExecutor).isTerminating(), equalTo(true));
-        assertThat(((ThreadPoolExecutor) oldExecutor).isTerminated(), equalTo(false));
-        barrier.await();
 
-        // Make sure that new thread executor is functional
-        threadPool.executor(Names.SEARCH).execute(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    barrier.await();
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                } catch (BrokenBarrierException ex) {
-                    //
+            if (localOperations > 0) {
+                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
+                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            for (Tuple<String, Long> target : scrollId.context()) {
+                                DiscoveryNode node = nodes.get(target.v1());
+                                if (node != null && nodes.localNodeId().equals(node.id())) {
+                                    executePhase(node, target.v2());
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
+                    for (final Tuple<String, Long> target : scrollId.context()) {
+                        final DiscoveryNode node = nodes.get(target.v1());
+                        if (node != null && nodes.localNodeId().equals(node.id())) {
+                            if (localAsync) {
+                                threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        executePhase(node, target.v2());
+                                    }
+                                });
+                            } else {
+                                executePhase(node, target.v2());
+                            }
+                        }
+                    }
                 }
             }
-        });
-        client().admin().cluster().prepareUpdateSettings().setTransientSettings(settingsBuilder().put("threadpool.search.type", "fixed").build()).execute().actionGet();
-        barrier.await();
-        Thread.sleep(200);
 
-        // Check that node info is correct
-        NodesInfoResponse nodesInfoResponse = client().admin().cluster().prepareNodesInfo().all().execute().actionGet();
-        for (int i = 0; i < 2; i++) {
-            NodeInfo nodeInfo = nodesInfoResponse.getNodes()[i];
-            boolean found = false;
-            for (ThreadPool.Info info : nodeInfo.getThreadPool()) {
-                if (info.getName().equals(Names.SEARCH)) {
-                    assertThat(info.getType(), equalTo("fixed"));
-                    found = true;
-                    break;
+            for (Tuple<String, Long> target : scrollId.context()) {
+                DiscoveryNode node = nodes.get(target.v1());
+                if (node == null) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Node [" + target.v1() + "] not available for scroll request [" + scrollId.source() + "]");
+                    }
+                    successfulOps.decrementAndGet();
+                    if (counter.decrementAndGet() == 0) {
+                        finishHim();
+                    }
+                } else {
                 }
             }
-            assertThat(found, equalTo(true));
+        }
 
-            Map<String, Object> poolMap = getPoolSettingsThroughJson(nodeInfo.getThreadPool(), Names.SEARCH);
+        private void executePhase(DiscoveryNode node, final long searchId) {
+            searchService.sendExecuteScan(node, internalScrollSearchRequest(searchId, request), new SearchServiceListener<QueryFetchSearchResult>() {
+                @Override
+                public void onResult(QueryFetchSearchResult result) {
+                    queryFetchResults.put(result.shardTarget(), result);
+                    if (counter.decrementAndGet() == 0) {
+                        finishHim();
+                    }
+                }
+
+                @Override
+                public void onFailure(Throwable t) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("[{}] Failed to execute query phase", t, searchId);
+                    }
+                    addShardFailure(new ShardSearchFailure(t));
+                    successfulOps.decrementAndGet();
+                    if (counter.decrementAndGet() == 0) {
+                        finishHim();
+                    }
+                }
+            });
+        }
+
+        private void finishHim() {
+            try {
+                innerFinishHim();
+            } catch (Exception e) {
+                ReduceSearchPhaseException failure = new ReduceSearchPhaseException("fetch", "", e, buildShardFailures());
+                if (logger.isDebugEnabled()) {
+                    logger.debug("failed to reduce search", failure);
+                }
+                listener.onFailure(failure);
+            } finally {
+                searchCache.releaseQueryFetchResults(queryFetchResults);
+            }
+        }
+
+        private void innerFinishHim() throws IOException {
+            int numberOfHits = 0;
+            for (QueryFetchSearchResult shardResult : queryFetchResults.values()) {
+                numberOfHits += shardResult.queryResult().topDocs().scoreDocs.length;
+            }
+            ShardDoc[] docs = new ShardDoc[numberOfHits];
+            int counter = 0;
+            for (QueryFetchSearchResult shardResult : queryFetchResults.values()) {
+                ScoreDoc[] scoreDocs = shardResult.queryResult().topDocs().scoreDocs;
+                for (ScoreDoc scoreDoc : scoreDocs) {
+                    docs[counter++] = new ShardScoreDoc(shardResult.shardTarget(), scoreDoc.doc, 0.0f);
+                }
+            }
+            final InternalSearchResponse internalResponse = searchPhaseController.merge(docs, queryFetchResults, queryFetchResults);
+            ((InternalSearchHits) internalResponse.hits()).totalHits = Long.parseLong(this.scrollId.attributes().get("total_hits"));
+
+
+            for (QueryFetchSearchResult shardResult : queryFetchResults.values()) {
+                if (shardResult.queryResult().topDocs().scoreDocs.length < shardResult.queryResult().size()) {
+                    // we found more than we want for this round, remove this from our scrolling
+                    queryFetchResults.remove(shardResult.shardTarget());
+                }
+            }
+
+            String scrollId = null;
+            if (request.scroll() != null) {
+                // we rebuild the scroll id since we remove shards that we finished scrolling on
+                scrollId = TransportSearchHelper.buildScrollId(this.scrollId.type(), queryFetchResults.values(), this.scrollId.attributes()); // continue moving the total_hits
+            }
+            listener.onResponse(new SearchResponse(internalResponse, scrollId, this.scrollId.context().length, successfulOps.get(),
+                    System.currentTimeMillis() - startTime, buildShardFailures()));
         }
     }
-
-    private Map<String, Object> getPoolSettingsThroughJson(ThreadPoolInfo info, String poolName) throws IOException {
-        XContentBuilder builder = XContentFactory.jsonBuilder();
-        builder.startObject();
-        info.toXContent(builder, ToXContent.EMPTY_PARAMS);
-        builder.endObject();
-        builder.close();
-        XContentParser parser = JsonXContent.jsonXContent.createParser(builder.string());
-        Map<String, Object> poolsMap = parser.mapAndClose();
-        return (Map<String, Object>) ((Map<String, Object>) poolsMap.get("thread_pool")).get(poolName);
-    }
-
 }

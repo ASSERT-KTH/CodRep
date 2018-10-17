@@ -1,13 +1,13 @@
-static class IndexShardStatsRequest extends BroadcastShardOperationRequest {
+import static org.elasticsearch.util.gcommon.collect.Sets.*;
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,213 +19,223 @@ static class IndexShardStatsRequest extends BroadcastShardOperationRequest {
  * under the License.
  */
 
-package org.elasticsearch.action.admin.indices.stats;
+package org.elasticsearch.discovery.local;
 
-import com.google.common.collect.Lists;
-import org.elasticsearch.ElasticsearchException;
-import org.elasticsearch.action.ShardOperationFailedException;
-import org.elasticsearch.action.support.ActionFilters;
-import org.elasticsearch.action.support.DefaultShardOperationFailedException;
-import org.elasticsearch.action.support.broadcast.BroadcastShardOperationFailedException;
-import org.elasticsearch.action.support.broadcast.BroadcastShardOperationRequest;
-import org.elasticsearch.action.support.broadcast.TransportBroadcastOperationAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
-import org.elasticsearch.cluster.routing.GroupShardsIterator;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.service.InternalIndexService;
-import org.elasticsearch.index.shard.ShardId;
-import org.elasticsearch.index.shard.service.InternalIndexShard;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.threadpool.ThreadPool;
+import com.google.inject.Inject;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.discovery.Discovery;
+import org.elasticsearch.discovery.InitialStateDiscoveryListener;
 import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.util.component.AbstractLifecycleComponent;
+import org.elasticsearch.util.concurrent.jsr166y.LinkedTransferQueue;
+import org.elasticsearch.util.settings.Settings;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
-import static com.google.common.collect.Lists.newArrayList;
+import static com.google.common.collect.Sets.*;
+import static org.elasticsearch.cluster.ClusterState.*;
+import static org.elasticsearch.cluster.node.DiscoveryNode.*;
 
 /**
+ * @author kimchy (Shay Banon)
  */
-public class TransportIndicesStatsAction extends TransportBroadcastOperationAction<IndicesStatsRequest, IndicesStatsResponse, TransportIndicesStatsAction.IndexShardStatsRequest, ShardStats> {
+public class LocalDiscovery extends AbstractLifecycleComponent<Discovery> implements Discovery {
 
-    private final IndicesService indicesService;
+    private final TransportService transportService;
 
-    @Inject
-    public TransportIndicesStatsAction(Settings settings, ThreadPool threadPool, ClusterService clusterService, TransportService transportService,
-                                       IndicesService indicesService, ActionFilters actionFilters) {
-        super(settings, IndicesStatsAction.NAME, threadPool, clusterService, transportService, actionFilters);
-        this.indicesService = indicesService;
+    private final ClusterService clusterService;
+
+    private final ClusterName clusterName;
+
+    private DiscoveryNode localNode;
+
+    private volatile boolean master = false;
+
+    private volatile boolean firstMaster = false;
+
+    private final AtomicBoolean initialStateSent = new AtomicBoolean();
+
+    private final CopyOnWriteArrayList<InitialStateDiscoveryListener> initialStateListeners = new CopyOnWriteArrayList<InitialStateDiscoveryListener>();
+
+    // use CHM here and not ConcurrentMaps#new since we want to be able to agentify this using TC later on...
+    private static final ConcurrentMap<ClusterName, ClusterGroup> clusterGroups = new ConcurrentHashMap<ClusterName, ClusterGroup>();
+
+    private static final AtomicLong nodeIdGenerator = new AtomicLong();
+
+    @Inject public LocalDiscovery(Settings settings, ClusterName clusterName, TransportService transportService, ClusterService clusterService) {
+        super(settings);
+        this.clusterName = clusterName;
+        this.clusterService = clusterService;
+        this.transportService = transportService;
     }
 
-    @Override
-    protected String executor() {
-        return ThreadPool.Names.MANAGEMENT;
-    }
+    @Override protected void doStart() throws ElasticSearchException {
+        synchronized (clusterGroups) {
+            ClusterGroup clusterGroup = clusterGroups.get(clusterName);
+            if (clusterGroup == null) {
+                clusterGroup = new ClusterGroup();
+                clusterGroups.put(clusterName, clusterGroup);
+            }
+            logger.debug("Connected to cluster [{}]", clusterName);
+            this.localNode = new DiscoveryNode(settings.get("name"), Long.toString(nodeIdGenerator.incrementAndGet()), transportService.boundAddress().publishAddress(), buildCommonNodesAttributes(settings));
 
-    @Override
-    protected IndicesStatsRequest newRequest() {
-        return new IndicesStatsRequest();
-    }
+            clusterGroup.members().add(this);
+            if (clusterGroup.members().size() == 1) {
+                // we are the first master (and the master)
+                master = true;
+                firstMaster = true;
+                clusterService.submitStateUpdateTask("local-disco-initial_connect(master)", new ProcessedClusterStateUpdateTask() {
+                    @Override public ClusterState execute(ClusterState currentState) {
+                        DiscoveryNodes.Builder builder = new DiscoveryNodes.Builder()
+                                .localNodeId(localNode.id())
+                                .masterNodeId(localNode.id())
+                                        // put our local node
+                                .put(localNode);
+                        return newClusterStateBuilder().state(currentState).nodes(builder).build();
+                    }
 
-    /**
-     * Status goes across *all* shards.
-     */
-    @Override
-    protected GroupShardsIterator shards(ClusterState clusterState, IndicesStatsRequest request, String[] concreteIndices) {
-        return clusterState.routingTable().allAssignedShardsGrouped(concreteIndices, true);
-    }
-
-    @Override
-    protected ClusterBlockException checkGlobalBlock(ClusterState state, IndicesStatsRequest request) {
-        return state.blocks().globalBlockedException(ClusterBlockLevel.METADATA);
-    }
-
-    @Override
-    protected ClusterBlockException checkRequestBlock(ClusterState state, IndicesStatsRequest request, String[] concreteIndices) {
-        return state.blocks().indicesBlockedException(ClusterBlockLevel.METADATA, concreteIndices);
-    }
-
-
-    @Override
-    protected IndicesStatsResponse newResponse(IndicesStatsRequest request, AtomicReferenceArray shardsResponses, ClusterState clusterState) {
-        int successfulShards = 0;
-        int failedShards = 0;
-        List<ShardOperationFailedException> shardFailures = null;
-        final List<ShardStats> shards = Lists.newArrayList();
-        for (int i = 0; i < shardsResponses.length(); i++) {
-            Object shardResponse = shardsResponses.get(i);
-            if (shardResponse == null) {
-                // simply ignore non active shards
-            } else if (shardResponse instanceof BroadcastShardOperationFailedException) {
-                failedShards++;
-                if (shardFailures == null) {
-                    shardFailures = newArrayList();
-                }
-                shardFailures.add(new DefaultShardOperationFailedException((BroadcastShardOperationFailedException) shardResponse));
+                    @Override public void clusterStateProcessed(ClusterState clusterState) {
+                        sendInitialStateEventIfNeeded();
+                    }
+                });
             } else {
-                shards.add((ShardStats) shardResponse);
-                successfulShards++;
+                // we are not the master, tell the master to send it
+                LocalDiscovery master = clusterGroup.members().peek();
+                master.clusterService.submitStateUpdateTask("local-disco-receive(from node[" + localNode + "])", new ProcessedClusterStateUpdateTask() {
+                    @Override public ClusterState execute(ClusterState currentState) {
+                        if (currentState.nodes().nodeExists(localNode.id())) {
+                            // no change, the node already exists in the cluster
+                            logger.warn("Received an address [{}] for an existing node [{}]", localNode.address(), localNode);
+                            return currentState;
+                        }
+                        return newClusterStateBuilder().state(currentState).nodes(currentState.nodes().newNode(localNode)).build();
+                    }
+
+                    @Override public void clusterStateProcessed(ClusterState clusterState) {
+                        sendInitialStateEventIfNeeded();
+                    }
+                });
             }
         }
-        return new IndicesStatsResponse(shards.toArray(new ShardStats[shards.size()]), clusterState, shardsResponses.length(), successfulShards, failedShards, shardFailures);
     }
 
-    @Override
-    protected IndexShardStatsRequest newShardRequest() {
-        return new IndexShardStatsRequest();
+    @Override protected void doStop() throws ElasticSearchException {
+        synchronized (clusterGroups) {
+            ClusterGroup clusterGroup = clusterGroups.get(clusterName);
+            if (clusterGroup == null) {
+                logger.warn("Illegal state, should not have an empty cluster group when stopping, I should be there at teh very least...");
+                return;
+            }
+            clusterGroup.members().remove(this);
+            if (clusterGroup.members().isEmpty()) {
+                // no more members, remove and return
+                clusterGroups.remove(clusterName);
+                return;
+            }
+
+            final LocalDiscovery masterDiscovery = clusterGroup.members().peek();
+            // if the removed node is the master, make the next one as the master
+            if (master) {
+                masterDiscovery.master = true;
+            }
+
+            final Set<String> newMembers = newHashSet();
+            for (LocalDiscovery discovery : clusterGroup.members()) {
+                newMembers.add(discovery.localNode.id());
+            }
+
+            masterDiscovery.clusterService.submitStateUpdateTask("local-disco-update", new ClusterStateUpdateTask() {
+                @Override public ClusterState execute(ClusterState currentState) {
+                    DiscoveryNodes newNodes = currentState.nodes().removeDeadMembers(newMembers, masterDiscovery.localNode.id());
+                    DiscoveryNodes.Delta delta = newNodes.delta(currentState.nodes());
+                    if (delta.added()) {
+                        logger.warn("No new nodes should be created when a new discovery view is accepted");
+                    }
+                    return newClusterStateBuilder().state(currentState).nodes(newNodes).build();
+                }
+            });
+        }
     }
 
-    @Override
-    protected IndexShardStatsRequest newShardRequest(int numShards, ShardRouting shard, IndicesStatsRequest request) {
-        return new IndexShardStatsRequest(shard.shardId(), request);
+    @Override protected void doClose() throws ElasticSearchException {
     }
 
-    @Override
-    protected ShardStats newShardResponse() {
-        return new ShardStats();
+    @Override public void addListener(InitialStateDiscoveryListener listener) {
+        this.initialStateListeners.add(listener);
     }
 
-    @Override
-    protected ShardStats shardOperation(IndexShardStatsRequest request) throws ElasticsearchException {
-        InternalIndexService indexService = (InternalIndexService) indicesService.indexServiceSafe(request.shardId().getIndex());
-        InternalIndexShard indexShard = (InternalIndexShard) indexService.shardSafe(request.shardId().id());
-
-        CommonStatsFlags flags = new CommonStatsFlags().clear();
-
-        if (request.request.docs()) {
-            flags.set(CommonStatsFlags.Flag.Docs);
-        }
-        if (request.request.store()) {
-            flags.set(CommonStatsFlags.Flag.Store);
-        }
-        if (request.request.indexing()) {
-            flags.set(CommonStatsFlags.Flag.Indexing);
-            flags.types(request.request.types());
-        }
-        if (request.request.get()) {
-            flags.set(CommonStatsFlags.Flag.Get);
-        }
-        if (request.request.search()) {
-            flags.set(CommonStatsFlags.Flag.Search);
-            flags.groups(request.request.groups());
-        }
-        if (request.request.merge()) {
-            flags.set(CommonStatsFlags.Flag.Merge);
-        }
-        if (request.request.refresh()) {
-            flags.set(CommonStatsFlags.Flag.Refresh);
-        }
-        if (request.request.flush()) {
-            flags.set(CommonStatsFlags.Flag.Flush);
-        }
-        if (request.request.warmer()) {
-            flags.set(CommonStatsFlags.Flag.Warmer);
-        }
-        if (request.request.filterCache()) {
-            flags.set(CommonStatsFlags.Flag.FilterCache);
-        }
-        if (request.request.idCache()) {
-            flags.set(CommonStatsFlags.Flag.IdCache);
-        }
-        if (request.request.fieldData()) {
-            flags.set(CommonStatsFlags.Flag.FieldData);
-            flags.fieldDataFields(request.request.fieldDataFields());
-        }
-        if (request.request.percolate()) {
-            flags.set(CommonStatsFlags.Flag.Percolate);
-        }
-        if (request.request.segments()) {
-            flags.set(CommonStatsFlags.Flag.Segments);
-        }
-        if (request.request.completion()) {
-            flags.set(CommonStatsFlags.Flag.Completion);
-            flags.completionDataFields(request.request.completionFields());
-        }
-        if (request.request.translog()) {
-            flags.set(CommonStatsFlags.Flag.Translog);
-        }
-        if (request.request.suggest()) {
-            flags.set(CommonStatsFlags.Flag.Suggest);
-        }
-        if (request.request.queryCache()) {
-            flags.set(CommonStatsFlags.Flag.QueryCache);
-        }
-
-        return new ShardStats(indexShard, flags);
+    @Override public void removeListener(InitialStateDiscoveryListener listener) {
+        this.initialStateListeners.remove(listener);
     }
 
-    public static class IndexShardStatsRequest extends BroadcastShardOperationRequest {
+    @Override public String nodeDescription() {
+        return clusterName.value() + "/" + localNode.id();
+    }
 
-        // TODO if there are many indices, the request might hold a large indices array..., we don't really need to serialize it
-        IndicesStatsRequest request;
+    @Override public boolean firstMaster() {
+        return firstMaster;
+    }
 
-        IndexShardStatsRequest() {
+    @Override public void publish(ClusterState clusterState) {
+        if (!master) {
+            throw new ElasticSearchIllegalStateException("Shouldn't publish state when not master");
         }
-
-        IndexShardStatsRequest(ShardId shardId, IndicesStatsRequest request) {
-            super(shardId, request);
-            this.request = request;
+        ClusterGroup clusterGroup = clusterGroups.get(clusterName);
+        if (clusterGroup == null) {
+            // nothing to publish to
+            return;
         }
+        try {
+            // we do the marshaling intentionally, to check it works well...
+            final byte[] clusterStateBytes = Builder.toBytes(clusterState);
+            for (LocalDiscovery discovery : clusterGroup.members()) {
+                if (discovery.master) {
+                    continue;
+                }
+                final ClusterState nodeSpecificClusterState = ClusterState.Builder.fromBytes(clusterStateBytes, discovery.settings, discovery.localNode);
+                // ignore cluster state messages that do not include "me", not in the game yet...
+                if (nodeSpecificClusterState.nodes().localNode() != null) {
+                    discovery.clusterService.submitStateUpdateTask("local-disco-receive(from master)", new ProcessedClusterStateUpdateTask() {
+                        @Override public ClusterState execute(ClusterState currentState) {
+                            return nodeSpecificClusterState;
+                        }
 
-        @Override
-        public void readFrom(StreamInput in) throws IOException {
-            super.readFrom(in);
-            request = new IndicesStatsRequest();
-            request.readFrom(in);
+                        @Override public void clusterStateProcessed(ClusterState clusterState) {
+                            sendInitialStateEventIfNeeded();
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {
+            // failure to marshal or un-marshal
+            throw new ElasticSearchIllegalStateException("Cluster state failed to serialize", e);
         }
+    }
 
-        @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            super.writeTo(out);
-            request.writeTo(out);
+    private void sendInitialStateEventIfNeeded() {
+        if (initialStateSent.compareAndSet(false, true)) {
+            for (InitialStateDiscoveryListener listener : initialStateListeners) {
+                listener.initialStateProcessed();
+            }
+        }
+    }
+
+    private class ClusterGroup {
+
+        private Queue<LocalDiscovery> members = new LinkedTransferQueue<LocalDiscovery>();
+
+        Queue<LocalDiscovery> members() {
+            return members;
         }
     }
 }

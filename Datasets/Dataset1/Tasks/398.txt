@@ -1,4 +1,6 @@
-public HttpRequestContentStream( HttpServletRequest req ) {
+public static CloudState load(byte[] bytes, Set<String> liveNodes) {
+
+package org.apache.solr.common.cloud;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,398 +19,263 @@ public HttpRequestContentStream( HttpServletRequest req ) {
  * limitations under the License.
  */
 
-package org.apache.solr.servlet;
-
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UnsupportedEncodingException;
-import java.net.URL;
-import java.net.URLDecoder;
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.Map.Entry;
+import java.util.Set;
 
-import javax.servlet.http.HttpServletRequest;
-
-import org.apache.commons.fileupload.FileItem;
-import org.apache.commons.fileupload.disk.DiskFileItemFactory;
-import org.apache.commons.fileupload.servlet.ServletFileUpload;
+import org.apache.noggit.JSONWriter;
 import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.MultiMapSolrParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.util.ContentStream;
-import org.apache.solr.common.util.ContentStreamBase;
-import org.apache.solr.core.Config;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.request.ServletSolrParams;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.request.SolrQueryRequestBase;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.cloud.HashPartitioner.Range;
+import org.apache.zookeeper.KeeperException;
 
+/**
+ * Immutable state of the cloud. Normally you can get the state by using
+ * {@link ZkStateReader#getCloudState()}.
+ */
+public class CloudState implements JSONWriter.Writable {
+	private final Map<String, Map<String,Slice>> collectionStates;  // Map<collectionName, Map<sliceName,Slice>>
+	private final Set<String> liveNodes;
+  
+  private final HashPartitioner hp = new HashPartitioner();
+  
+  private final Map<String,RangeInfo> rangeInfos = new HashMap<String,RangeInfo>();
+  private final Map<String,Map<String,ZkNodeProps>> leaders = new HashMap<String,Map<String,ZkNodeProps>>();
 
-public class SolrRequestParsers 
-{
-  final Logger log = LoggerFactory.getLogger(SolrRequestParsers.class);
-  
-  // Should these constants be in a more public place?
-  public static final String MULTIPART = "multipart";
-  public static final String RAW = "raw";
-  public static final String SIMPLE = "simple";
-  public static final String STANDARD = "standard";
-  
-  private HashMap<String, SolrRequestParser> parsers;
-  private boolean enableRemoteStreams = false;
-  private boolean handleSelect = true;
-  private StandardRequestParser standard;
-  
-  /**
-   * Pass in an xml configuration.  A null configuration will enable
-   * everythign with maximum values.
-   */
-  public SolrRequestParsers( Config globalConfig )
-  {
-    long uploadLimitKB = 1048;  // 2MB default
-    if( globalConfig == null ) {
-      uploadLimitKB = Long.MAX_VALUE; 
-      enableRemoteStreams = true;
-      handleSelect = true;
-    }
-    else {
-      uploadLimitKB = globalConfig.getInt( 
-          "requestDispatcher/requestParsers/@multipartUploadLimitInKB", (int)uploadLimitKB );
-      
-      enableRemoteStreams = globalConfig.getBool( 
-          "requestDispatcher/requestParsers/@enableRemoteStreaming", false ); 
-  
-      // Let this filter take care of /select?xxx format
-      handleSelect = globalConfig.getBool( 
-          "requestDispatcher/@handleSelect", handleSelect ); 
-    }
-       
-    MultipartRequestParser multi = new MultipartRequestParser( uploadLimitKB );
-    RawRequestParser raw = new RawRequestParser();
-    standard = new StandardRequestParser( multi, raw );
-    
-    // I don't see a need to have this publicly configured just yet
-    // adding it is trivial
-    parsers = new HashMap<String, SolrRequestParser>();
-    parsers.put( MULTIPART, multi );
-    parsers.put( RAW, raw );
-    parsers.put( SIMPLE, new SimpleRequestParser() );
-    parsers.put( STANDARD, standard );
-    parsers.put( "", standard );
-  }
-  
-  public SolrQueryRequest parse( SolrCore core, String path, HttpServletRequest req ) throws Exception
-  {
-    SolrRequestParser parser = standard;
-    
-    // TODO -- in the future, we could pick a different parser based on the request
-    
-    // Pick the parser from the request...
-    ArrayList<ContentStream> streams = new ArrayList<ContentStream>(1);
-    SolrParams params = parser.parseParamsAndFillStreams( req, streams );
-    SolrQueryRequest sreq = buildRequestFrom( core, params, streams );
+	public CloudState(Set<String> liveNodes,
+			Map<String, Map<String,Slice>> collectionStates) {
+		this.liveNodes = new HashSet<String>(liveNodes.size());
+		this.liveNodes.addAll(liveNodes);
+		this.collectionStates = new HashMap<String, Map<String,Slice>>(collectionStates.size());
+		this.collectionStates.putAll(collectionStates);
+		addRangeInfos(collectionStates.keySet());
+		getShardLeaders();
+	}
 
-    // Handlers and login will want to know the path. If it contains a ':'
-    // the handler could use it for RESTful URLs
-    sreq.getContext().put( "path", path );
-    return sreq;
-  }
-  
-  public SolrQueryRequest buildRequestFrom( SolrCore core, SolrParams params, Collection<ContentStream> streams ) throws Exception
-  {
-    // The content type will be applied to all streaming content
-    String contentType = params.get( CommonParams.STREAM_CONTENTTYPE );
-      
-    // Handle anything with a remoteURL
-    String[] strs = params.getParams( CommonParams.STREAM_URL );
-    if( strs != null ) {
-      if( !enableRemoteStreams ) {
-        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Remote Streaming is disabled." );
-      }
-      for( final String url : strs ) {
-        ContentStreamBase stream = new ContentStreamBase.URLStream( new URL(url) );
-        if( contentType != null ) {
-          stream.setContentType( contentType );
-        }
-        streams.add( stream );
-      }
-    }
-    
-    // Handle streaming files
-    strs = params.getParams( CommonParams.STREAM_FILE );
-    if( strs != null ) {
-      if( !enableRemoteStreams ) {
-        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Remote Streaming is disabled." );
-      }
-      for( final String file : strs ) {
-        ContentStreamBase stream = new ContentStreamBase.FileStream( new File(file) );
-        if( contentType != null ) {
-          stream.setContentType( contentType );
-        }
-        streams.add( stream );
-      }
-    }
-    
-    // Check for streams in the request parameters
-    strs = params.getParams( CommonParams.STREAM_BODY );
-    if( strs != null ) {
-      for( final String body : strs ) {
-        ContentStreamBase stream = new ContentStreamBase.StringStream( body );
-        if( contentType != null ) {
-          stream.setContentType( contentType );
-        }
-        streams.add( stream );
-      }
-    }
-    
-    SolrQueryRequestBase q = new SolrQueryRequestBase( core, params ) { };
-    if( streams != null && streams.size() > 0 ) {
-      q.setContentStreams( streams );
-    }
-    return q;
-  }
-  
-
-  /**
-   * Given a standard query string map it into solr params
-   */
-  public static MultiMapSolrParams parseQueryString(String queryString) 
-  {
-    Map<String,String[]> map = new HashMap<String, String[]>();
-    if( queryString != null && queryString.length() > 0 ) {
-      try {
-        for( String kv : queryString.split( "&" ) ) {
-          int idx = kv.indexOf( '=' );
-          if( idx > 0 ) {
-            String name = URLDecoder.decode( kv.substring( 0, idx ), "UTF-8");
-            String value = URLDecoder.decode( kv.substring( idx+1 ), "UTF-8");
-            MultiMapSolrParams.addParam( name, value, map );
-          }
-          else {
-            String name = URLDecoder.decode( kv, "UTF-8" );
-            MultiMapSolrParams.addParam( name, "", map );
+	private void getShardLeaders() {
+    Set<Entry<String,Map<String,Slice>>> collections = collectionStates.entrySet();
+    for (Entry<String,Map<String,Slice>> collection : collections) {
+      Map<String,Slice> state = collection.getValue();
+      Set<Entry<String,Slice>> slices = state.entrySet();
+      for (Entry<String,Slice> sliceEntry : slices) {
+        Slice slice = sliceEntry.getValue();
+        Map<String,ZkNodeProps> shards = slice.getShards();
+        Set<Entry<String,ZkNodeProps>> shardsEntries = shards.entrySet();
+        for (Entry<String,ZkNodeProps> shardEntry : shardsEntries) {
+          ZkNodeProps props = shardEntry.getValue();
+          if (props.containsKey(ZkStateReader.LEADER_PROP)) {
+            Map<String,ZkNodeProps> leadersForCollection = leaders.get(collection.getKey());
+            if (leadersForCollection == null) {
+              leadersForCollection = new HashMap<String,ZkNodeProps>();
+        
+              leaders.put(collection.getKey(), leadersForCollection);
+            }
+            leadersForCollection.put(sliceEntry.getKey(), props);
           }
         }
       }
-      catch( UnsupportedEncodingException uex ) {
-        throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, uex );
+    }
+  }
+
+	/**
+	 * Get properties of a shard leader for specific collection.
+	 */
+	public ZkNodeProps getLeader(String collection, String shard) {
+	  Map<String,ZkNodeProps> collectionLeaders = leaders.get(collection);
+	  if (collectionLeaders == null) return null;
+	  return collectionLeaders.get(shard);
+	}
+	
+	/**
+	 * Get shard properties or null if shard is not found.
+	 */
+	public ZkNodeProps getShardProps(final String collection, final String coreNodeName) {
+	  Map<String, Slice> slices = getSlices(collection);
+	  for(Slice slice: slices.values()) {
+	    if(slice.getShards().get(coreNodeName)!=null) {
+	      return slice.getShards().get(coreNodeName);
+	    }
+	  }
+	  return null;
+	}
+
+  private void addRangeInfos(Set<String> collections) {
+    for (String collection : collections) {
+      addRangeInfo(collection);
+    }
+  }
+
+  /**
+   * Get the index Slice for collection.
+   */
+  public Slice getSlice(String collection, String slice) {
+		if (collectionStates.containsKey(collection)
+				&& collectionStates.get(collection).containsKey(slice))
+			return collectionStates.get(collection).get(slice);
+		return null;
+	}
+
+  /**
+   * Get all slices for collection.
+   */
+	public Map<String, Slice> getSlices(String collection) {
+		if(!collectionStates.containsKey(collection))
+			return null;
+		return Collections.unmodifiableMap(collectionStates.get(collection));
+	}
+
+	/**
+	 * Get collection names.
+	 */
+	public Set<String> getCollections() {
+		return Collections.unmodifiableSet(collectionStates.keySet());
+	}
+
+	public Map<String, Map<String, Slice>> getCollectionStates() {
+		return Collections.unmodifiableMap(collectionStates);
+	}
+
+	/**
+	 * Get names of the currently live nodes.
+	 */
+	public Set<String> getLiveNodes() {
+		return Collections.unmodifiableSet(liveNodes);
+	}
+
+	/**
+	 * Get shardId for core.
+	 * @param coreNodeName in the form of nodeName_coreName
+	 */
+	public String getShardId(String coreNodeName) {
+	  for (Entry<String, Map<String, Slice>> states: collectionStates.entrySet()){
+	    for(Entry<String, Slice> slices: states.getValue().entrySet()) {
+	      for(Entry<String, ZkNodeProps> shards: slices.getValue().getShards().entrySet()){
+	        if(coreNodeName.equals(shards.getKey())) {
+	          return slices.getKey();
+	        }
+	      }
+	    }
+	  }
+	  return null;
+	}
+
+	/**
+	 * Check if node is alive. 
+	 */
+	public boolean liveNodesContain(String name) {
+		return liveNodes.contains(name);
+	}
+	
+	public RangeInfo getRanges(String collection) {
+    // TODO: store this in zk
+    RangeInfo rangeInfo = rangeInfos.get(collection);
+
+	  return rangeInfo;
+	}
+
+  private RangeInfo addRangeInfo(String collection) {
+    List<Range> ranges;
+    RangeInfo rangeInfo;
+    rangeInfo = new RangeInfo();
+
+    Map<String,Slice> slices = getSlices(collection);
+    
+    if (slices == null) {
+      throw new SolrException(ErrorCode.BAD_REQUEST, "Can not find collection "
+          + collection + " in " + this);
+    }
+    
+    Set<String> shards = slices.keySet();
+    ArrayList<String> shardList = new ArrayList<String>(shards.size());
+    shardList.addAll(shards);
+    Collections.sort(shardList);
+    
+    ranges = hp.partitionRange(shards.size());
+    
+    rangeInfo.ranges = ranges;
+    rangeInfo.shardList = shardList;
+    rangeInfos.put(collection, rangeInfo);
+    return rangeInfo;
+  }
+
+  /**
+   * Get shard id for hash. This is used when determining which Slice the
+   * document is to be submitted to.
+   */
+  public String getShard(int hash, String collection) {
+    RangeInfo rangInfo = getRanges(collection);
+    
+    int cnt = 0;
+    for (Range range : rangInfo.ranges) {
+      if (hash < range.max) {
+        return rangInfo.shardList.get(cnt);
       }
-    }
-    return new MultiMapSolrParams( map );
-  }
-
-  public boolean isHandleSelect() {
-    return handleSelect;
-  }
-
-  public void setHandleSelect(boolean handleSelect) {
-    this.handleSelect = handleSelect;
-  }
-}
-
-//-----------------------------------------------------------------
-//-----------------------------------------------------------------
-
-// I guess we don't really even need the interface, but i'll keep it here just for kicks
-interface SolrRequestParser 
-{
-  public SolrParams parseParamsAndFillStreams(
-    final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception;
-}
-
-
-//-----------------------------------------------------------------
-//-----------------------------------------------------------------
-
-/**
- * The simple parser just uses the params directly
- */
-class SimpleRequestParser implements SolrRequestParser
-{
-  public SolrParams parseParamsAndFillStreams( 
-      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
-  {
-    return new ServletSolrParams(req);
-  }
-}
-
-/**
- * Wrap an HttpServletRequest as a ContentStream
- */
-class HttpRequestContentStream extends ContentStreamBase
-{
-  private final HttpServletRequest req;
-  
-  public HttpRequestContentStream( HttpServletRequest req ) throws IOException {
-    this.req = req;
-    
-    contentType = req.getContentType();
-    // name = ???
-    // sourceInfo = ???
-    
-    String v = req.getHeader( "Content-Length" );
-    if( v != null ) {
-      size = Long.valueOf( v );
-    }
-  }
-
-  public InputStream getStream() throws IOException {
-    return req.getInputStream();
-  }
-}
-
-
-/**
- * Wrap a FileItem as a ContentStream
- */
-class FileItemContentStream extends ContentStreamBase
-{
-  private final FileItem item;
-  
-  public FileItemContentStream( FileItem f )
-  {
-    item = f;
-    contentType = item.getContentType();
-    name = item.getName();
-    sourceInfo = item.getFieldName();
-    size = item.getSize();
-  }
-    
-  public InputStream getStream() throws IOException {
-    return item.getInputStream();
-  }
-}
-
-/**
- * The raw parser just uses the params directly
- */
-class RawRequestParser implements SolrRequestParser
-{
-  public SolrParams parseParamsAndFillStreams( 
-      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
-  {
-    // The javadocs for HttpServletRequest are clear that req.getReader() should take
-    // care of any character encoding issues.  BUT, there are problems while running on
-    // some servlet containers: including Tomcat 5 and resin.
-    //
-    // Rather than return req.getReader(), this uses the default ContentStreamBase method
-    // that checks for charset definitions in the ContentType.
-    
-    streams.add( new HttpRequestContentStream( req ) );
-    return SolrRequestParsers.parseQueryString( req.getQueryString() );
-  }
-}
-
-
-
-/**
- * Extract Multipart streams
- */
-class MultipartRequestParser implements SolrRequestParser
-{
-  private long uploadLimitKB;
-  
-  public MultipartRequestParser( long limit )
-  {
-    uploadLimitKB = limit;
-  }
-  
-  public SolrParams parseParamsAndFillStreams( 
-      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
-  {
-    if( !ServletFileUpload.isMultipartContent(req) ) {
-      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Not multipart content! "+req.getContentType() );
+      cnt++;
     }
     
-    MultiMapSolrParams params = SolrRequestParsers.parseQueryString( req.getQueryString() );
+    throw new IllegalStateException("The HashPartitioner failed");
+  }
+
+	@Override
+	public String toString() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("live nodes:" + liveNodes);
+		sb.append(" collections:" + collectionStates);
+		return sb.toString();
+	}
+
+	/**
+	 * Create CloudState by reading the current state from zookeeper. 
+	 */
+	public static CloudState load(SolrZkClient zkClient, Set<String> liveNodes) throws KeeperException, InterruptedException {
+    byte[] state = zkClient.getData(ZkStateReader.CLUSTER_STATE,
+        null, null, true);
+    return load(state, liveNodes);
+	}
+	
+	/**
+	 * Create CloudState from json string that is typically stored in zookeeper.
+	 */
+	public static CloudState load(byte[] bytes, Set<String> liveNodes) throws KeeperException, InterruptedException {
+    if (bytes == null || bytes.length == 0) {
+      return new CloudState(liveNodes, Collections.<String, Map<String,Slice>>emptyMap());
+    }
     
-    // Create a factory for disk-based file items
-    DiskFileItemFactory factory = new DiskFileItemFactory();
+    LinkedHashMap<String, Object> stateMap = (LinkedHashMap<String, Object>) ZkStateReader.fromJSON(bytes);
+    HashMap<String,Map<String, Slice>> state = new HashMap<String,Map<String,Slice>>();
 
-    // Set factory constraints
-    // TODO - configure factory.setSizeThreshold(yourMaxMemorySize);
-    // TODO - configure factory.setRepository(yourTempDirectory);
-
-    // Create a new file upload handler
-    ServletFileUpload upload = new ServletFileUpload(factory);
-    upload.setSizeMax( uploadLimitKB*1024 );
-
-    // Parse the request
-    List items = upload.parseRequest(req);
-    Iterator iter = items.iterator();
-    while (iter.hasNext()) {
-        FileItem item = (FileItem) iter.next();
-
-        // If its a form field, put it in our parameter map
-        if (item.isFormField()) {
-          MultiMapSolrParams.addParam( 
-            item.getFieldName(), 
-            item.getString(), params.getMap() );
+    for(String collectionName: stateMap.keySet()){
+      Map<String, Object> collection = (Map<String, Object>)stateMap.get(collectionName);
+      Map<String, Slice> slices = new LinkedHashMap<String,Slice>();
+      for(String sliceName: collection.keySet()) {
+        Map<String, Map<String, String>> sliceMap = (Map<String, Map<String, String>>)collection.get(sliceName);
+        Map<String, ZkNodeProps> shards = new LinkedHashMap<String,ZkNodeProps>();
+        for(String shardName: sliceMap.keySet()) {
+          shards.put(shardName, new ZkNodeProps(sliceMap.get(shardName)));
         }
-        // Add the stream
-        else { 
-          streams.add( new FileItemContentStream( item ) );
-        }
-    }
-    return params;
-  }
-}
-
-
-/**
- * The default Logic
- */
-class StandardRequestParser implements SolrRequestParser
-{
-  MultipartRequestParser multipart;
-  RawRequestParser raw;
-  
-  StandardRequestParser( MultipartRequestParser multi, RawRequestParser raw ) 
-  {
-    this.multipart = multi;
-    this.raw = raw;
-  }
-  
-  public SolrParams parseParamsAndFillStreams( 
-      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
-  {
-    String method = req.getMethod().toUpperCase(Locale.ENGLISH);
-    if( "GET".equals( method ) || "HEAD".equals( method )) {
-      return new ServletSolrParams(req);
-    }
-    if( "POST".equals( method ) ) {
-      String contentType = req.getContentType();
-      if( contentType != null ) {
-        int idx = contentType.indexOf( ';' );
-        if( idx > 0 ) { // remove the charset definition "; charset=utf-8"
-          contentType = contentType.substring( 0, idx );
-        }
-        if( "application/x-www-form-urlencoded".equals( contentType.toLowerCase(Locale.ENGLISH) ) ) {
-          return new ServletSolrParams(req); // just get the params from parameterMap
-        }
-        if( ServletFileUpload.isMultipartContent(req) ) {
-          return multipart.parseParamsAndFillStreams(req, streams);
-        }
+        Slice slice = new Slice(sliceName, shards);
+        slices.put(sliceName, slice);
       }
-      return raw.parseParamsAndFillStreams(req, streams);
+      state.put(collectionName, slices);
     }
-    throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Unsupported method: "+method );
+    return new CloudState(liveNodes, state);
+	}
+
+  @Override
+  public void write(JSONWriter jsonWriter) {
+    jsonWriter.write(collectionStates);
   }
+  
+  private class RangeInfo {
+    private List<Range> ranges;
+    private ArrayList<String> shardList;
+  }
+
+
 }
-
-
-
-
-
-
-
-

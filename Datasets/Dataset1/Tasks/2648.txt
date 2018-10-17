@@ -1,4 +1,4 @@
-long timeout = DatabaseDescriptor.getRpcTimeout() - (System.currentTimeMillis() - startTime);
+import org.apache.cassandra.io.sstable.SSTableWriter;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,94 +18,197 @@ long timeout = DatabaseDescriptor.getRpcTimeout() - (System.currentTimeMillis() 
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
+package org.apache.cassandra.tools;
 
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.io.FileReader;
 import java.io.IOException;
-import java.util.concurrent.atomic.AtomicInteger;
-
+import java.util.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.net.IAsyncCallback;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.SimpleCondition;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.SuperColumn;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.SSTableWriter;
+import static org.apache.cassandra.utils.FBUtilities.hexToBytes;
+import org.apache.commons.cli.*;
+import org.json.simple.JSONArray;
+import org.json.simple.JSONObject;
+import org.json.simple.JSONValue;
+import org.json.simple.parser.ParseException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-public class WriteResponseHandler implements IAsyncCallback
+/**
+ * Create SSTables from JSON input
+ */
+public class SSTableImport
 {
-    protected static final Logger logger = LoggerFactory.getLogger( WriteResponseHandler.class );
-    protected final SimpleCondition condition = new SimpleCondition();
-    private final int responseCount;
-    protected final Collection<Message> responses;
-    protected AtomicInteger localResponses = new AtomicInteger(0);
-    private final long startTime;
+    private static final String KEYSPACE_OPTION = "K";
+    private static final String COLFAM_OPTION = "c";
+    private static Options options;
+    private static CommandLine cmd;
 
-    public WriteResponseHandler(int responseCount, String table)
+    static
     {
-        // at most one node per range can bootstrap at a time, and these will be added to the write until
-        // bootstrap finishes (at which point we no longer need to write to the old ones).
-        assert 1 <= responseCount && responseCount <= 2 * DatabaseDescriptor.getReplicationFactor(table)
-            : "invalid response count " + responseCount;
-
-        this.responseCount = responseCount;
-        responses = new LinkedBlockingQueue<Message>();
-        startTime = System.currentTimeMillis();
+        options = new Options();
+        Option optKeyspace = new Option(KEYSPACE_OPTION, true, "Keyspace name");
+        optKeyspace.setRequired(true);
+        options.addOption(optKeyspace);
+        Option optColfamily = new Option(COLFAM_OPTION, true, "Column family");
+        optColfamily.setRequired(true);
+        options.addOption(optColfamily);
+    }
+    
+    private static class JsonColumn
+    {
+        private String name;
+        private String value;
+        private long timestamp;
+        private boolean isDeleted;
+        
+        private JsonColumn(Object obj) throws ClassCastException
+        {
+            JSONArray colSpec = (JSONArray)obj;
+            assert colSpec.size() == 4;
+            name = (String)colSpec.get(0);
+            value = (String)colSpec.get(1);
+            timestamp = (Long)colSpec.get(2);
+            isDeleted = (Boolean)colSpec.get(3);
+        }
     }
 
-    public void get() throws TimeoutException
+    /**
+     * Add columns to a column family.
+     * 
+     * @param row the columns associated with a row
+     * @param cfamily the column family to add columns to
+     */
+    private static void addToStandardCF(JSONArray row, ColumnFamily cfamily)
     {
+        for (Object c : row)
+        {
+            JsonColumn col = new JsonColumn(c);
+            QueryPath path = new QueryPath(cfamily.name(), null, hexToBytes(col.name));
+            cfamily.addColumn(path, hexToBytes(col.value), col.timestamp, col.isDeleted);
+        }
+    }
+    
+    /**
+     * Add super columns to a column family.
+     * 
+     * @param row the super columns associated with a row
+     * @param cfamily the column family to add columns to
+     */
+    private static void addToSuperCF(JSONObject row, ColumnFamily cfamily)
+    {
+        // Super columns
+        for (Map.Entry<String, JSONObject> entry : (Set<Map.Entry<String, JSONObject>>)row.entrySet())
+        {
+            byte[] superName = hexToBytes(entry.getKey());
+            long deletedAt = (Long)entry.getValue().get("deletedAt");
+            JSONArray subColumns = (JSONArray)entry.getValue().get("subColumns");
+            
+            // Add sub-columns
+            for (Object c : subColumns)
+            {
+                JsonColumn col = new JsonColumn(c);
+                QueryPath path = new QueryPath(cfamily.name(), superName, hexToBytes(col.name));
+                cfamily.addColumn(path, hexToBytes(col.value), col.timestamp, col.isDeleted);
+            }
+            
+            SuperColumn superColumn = (SuperColumn)cfamily.getColumn(superName);
+            superColumn.markForDeleteAt((int)(System.currentTimeMillis()/1000), deletedAt);
+        }
+    }
+
+    /**
+     * Convert a JSON formatted file to an SSTable.
+     * 
+     * @param jsonFile the file containing JSON formatted data
+     * @param keyspace keyspace the data belongs to
+     * @param cf column family the data belongs to
+     * @param ssTablePath file to write the SSTable to
+     * @throws IOException for errors reading/writing input/output
+     * @throws ParseException for errors encountered parsing JSON input
+     */
+    public static void importJson(String jsonFile, String keyspace, String cf, String ssTablePath)
+    throws IOException, ParseException
+    {
+        ColumnFamily cfamily = ColumnFamily.create(keyspace, cf);
+        String cfType = cfamily.type();    // Super or Standard
+        IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
+        DataOutputBuffer dob = new DataOutputBuffer();
+        
         try
         {
-            long timeout = System.currentTimeMillis() - startTime + DatabaseDescriptor.getRpcTimeout();
-            boolean success;
-            try
-            {
-                success = condition.await(timeout, TimeUnit.MILLISECONDS);
-            }
-            catch (InterruptedException ex)
-            {
-                throw new AssertionError(ex);
-            }
+            JSONObject json = (JSONObject)JSONValue.parseWithException(new FileReader(jsonFile));
+            
+            SSTableWriter writer = new SSTableWriter(ssTablePath, json.size(), partitioner);
+            List<DecoratedKey<?>> decoratedKeys = new ArrayList<DecoratedKey<?>>();
+            
+            for (String key : (Set<String>)json.keySet())
+                decoratedKeys.add(partitioner.decorateKey(key));
+            Collections.sort(decoratedKeys);
 
-            if (!success)
+            for (DecoratedKey<?> rowKey : decoratedKeys)
             {
-                throw new TimeoutException("Operation timed out - received only " + responses.size() + localResponses + " responses");
+                if (cfType.equals("Super"))
+                    addToSuperCF((JSONObject)json.get(rowKey.key), cfamily);
+                else
+                    addToStandardCF((JSONArray)json.get(rowKey.key), cfamily);
+                           
+                ColumnFamily.serializer().serializeWithIndexes(cfamily, dob);
+                writer.append(rowKey, dob);
+                dob.reset();
+                cfamily.clear();
             }
+            
+            writer.closeAndOpenReader();
         }
-        finally
+        catch (ClassCastException cce)
         {
-            for (Message response : responses)
-            {
-                MessagingService.removeRegisteredCallback(response.getMessageId());
-            }
+            throw new RuntimeException("Invalid JSON input, or incorrect column family.", cce);
         }
     }
 
-    public void response(Message message)
+    /**
+     * Converts JSON to an SSTable file. JSON input can either be a file specified
+     * using an optional command line argument, or supplied on standard in.
+     * 
+     * @param args command line arguments
+     * @throws IOException on failure to open/read/write files or output streams
+     * @throws ParseException on failure to parse JSON input
+     */
+    public static void main(String[] args) throws IOException, ParseException
     {
-        responses.add(message);
-        maybeSignal();
-    }
+        String usage = String.format("Usage: %s -K keyspace -c column_family <json> <sstable>%n",
+                SSTableImport.class.getName());
 
-    public void localResponse()
-    {
-        localResponses.addAndGet(1);
-        maybeSignal();
-    }
-
-    private void maybeSignal()
-    {
-        if (responses.size() + localResponses.get() >= responseCount)
+        CommandLineParser parser = new PosixParser();
+        try
         {
-            condition.signal();
+            cmd = parser.parse(options, args);
+        } catch (org.apache.commons.cli.ParseException e1)
+        {
+            System.err.println(e1.getMessage());
+            System.err.println(usage);
+            System.exit(1);
         }
+
+        if (cmd.getArgs().length != 2)
+        {
+            System.err.println(usage);
+            System.exit(1);
+        }
+
+        String json = cmd.getArgs()[0];
+        String ssTable = cmd.getArgs()[1];
+        String keyspace = cmd.getOptionValue(KEYSPACE_OPTION);
+        String cfamily = cmd.getOptionValue(COLFAM_OPTION);
+
+        importJson(json, keyspace, cfamily, ssTable);
+        
+        System.exit(0);
     }
+
 }

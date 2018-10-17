@@ -1,10 +1,10 @@
-public BytesValues getBytesValues(boolean needsHashes) {
+shardInjector.getInstance(Translog.class).close(delete);
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
+ * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
+ * regarding copyright ownership. Elastic Search licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,369 +19,371 @@ public BytesValues getBytesValues(boolean needsHashes) {
  * under the License.
  */
 
-package org.elasticsearch.index.fielddata.plain;
+package org.elasticsearch.index.service;
 
-import org.apache.lucene.util.RamUsageEstimator;
-import org.apache.lucene.util.packed.MonotonicAppendingLongBuffer;
-import org.apache.lucene.util.packed.PackedInts;
-import org.elasticsearch.index.fielddata.*;
-import org.elasticsearch.index.fielddata.ordinals.Ordinals;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ElasticSearchInterruptedException;
+import org.elasticsearch.common.collect.ImmutableMap;
+import org.elasticsearch.common.collect.ImmutableSet;
+import org.elasticsearch.common.collect.UnmodifiableIterator;
+import org.elasticsearch.common.component.CloseableIndexComponent;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.inject.Injector;
+import org.elasticsearch.common.inject.Injectors;
+import org.elasticsearch.common.inject.ModulesBuilder;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.gateway.none.NoneGateway;
+import org.elasticsearch.index.AbstractIndexComponent;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.IndexShardAlreadyExistsException;
+import org.elasticsearch.index.IndexShardMissingException;
+import org.elasticsearch.index.cache.IndexCache;
+import org.elasticsearch.index.deletionpolicy.DeletionPolicyModule;
+import org.elasticsearch.index.engine.Engine;
+import org.elasticsearch.index.engine.EngineModule;
+import org.elasticsearch.index.engine.IndexEngine;
+import org.elasticsearch.index.gateway.IndexGateway;
+import org.elasticsearch.index.gateway.IndexShardGatewayModule;
+import org.elasticsearch.index.gateway.IndexShardGatewayService;
+import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.index.merge.policy.MergePolicyModule;
+import org.elasticsearch.index.merge.scheduler.MergeSchedulerModule;
+import org.elasticsearch.index.query.IndexQueryParserService;
+import org.elasticsearch.index.routing.OperationRouting;
+import org.elasticsearch.index.settings.IndexSettings;
+import org.elasticsearch.index.shard.IndexShardManagement;
+import org.elasticsearch.index.shard.IndexShardModule;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.shard.service.IndexShard;
+import org.elasticsearch.index.similarity.SimilarityService;
+import org.elasticsearch.index.store.IndexStore;
+import org.elasticsearch.index.store.Store;
+import org.elasticsearch.index.store.StoreModule;
+import org.elasticsearch.index.translog.Translog;
+import org.elasticsearch.index.translog.TranslogModule;
+import org.elasticsearch.index.translog.TranslogService;
+import org.elasticsearch.indices.IndicesLifecycle;
+import org.elasticsearch.indices.InternalIndicesLifecycle;
+import org.elasticsearch.plugins.PluginsService;
+import org.elasticsearch.plugins.ShardsPluginsModule;
+import org.elasticsearch.threadpool.ThreadPool;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+
+import static org.elasticsearch.common.collect.MapBuilder.*;
+import static org.elasticsearch.common.collect.Maps.*;
 
 /**
- * {@link AtomicNumericFieldData} implementation which stores data in packed arrays to save memory.
+ * @author kimchy (shay.banon)
  */
-public abstract class PackedArrayAtomicFieldData extends AbstractAtomicNumericFieldData {
+public class InternalIndexService extends AbstractIndexComponent implements IndexService {
 
-    public static PackedArrayAtomicFieldData empty(int numDocs) {
-        return new Empty(numDocs);
+    private final Injector injector;
+
+    private final Settings indexSettings;
+
+    private final ThreadPool threadPool;
+
+    private final PluginsService pluginsService;
+
+    private final InternalIndicesLifecycle indicesLifecycle;
+
+    private final MapperService mapperService;
+
+    private final IndexQueryParserService queryParserService;
+
+    private final SimilarityService similarityService;
+
+    private final IndexCache indexCache;
+
+    private final IndexEngine indexEngine;
+
+    private final IndexGateway indexGateway;
+
+    private final IndexStore indexStore;
+
+    private final OperationRouting operationRouting;
+
+    private volatile ImmutableMap<Integer, Injector> shardsInjectors = ImmutableMap.of();
+
+    private volatile ImmutableMap<Integer, IndexShard> shards = ImmutableMap.of();
+
+    private final CleanCacheOnIndicesLifecycleListener cleanCacheOnIndicesLifecycleListener = new CleanCacheOnIndicesLifecycleListener();
+
+    @Inject public InternalIndexService(Injector injector, Index index, @IndexSettings Settings indexSettings, ThreadPool threadPool,
+                                        MapperService mapperService, IndexQueryParserService queryParserService, SimilarityService similarityService,
+                                        IndexCache indexCache, IndexEngine indexEngine, IndexGateway indexGateway, IndexStore indexStore, OperationRouting operationRouting) {
+        super(index, indexSettings);
+        this.injector = injector;
+        this.threadPool = threadPool;
+        this.indexSettings = indexSettings;
+        this.mapperService = mapperService;
+        this.queryParserService = queryParserService;
+        this.similarityService = similarityService;
+        this.indexCache = indexCache;
+        this.indexEngine = indexEngine;
+        this.indexGateway = indexGateway;
+        this.indexStore = indexStore;
+        this.operationRouting = operationRouting;
+
+        this.pluginsService = injector.getInstance(PluginsService.class);
+        this.indicesLifecycle = (InternalIndicesLifecycle) injector.getInstance(IndicesLifecycle.class);
+
+        this.indicesLifecycle.addListener(cleanCacheOnIndicesLifecycleListener);
     }
 
-    private final int numDocs;
-
-    protected long size = -1;
-
-    public PackedArrayAtomicFieldData(int numDocs) {
-        super(false);
-        this.numDocs = numDocs;
+    @Override public int numberOfShards() {
+        return shards.size();
     }
 
-    @Override
-    public void close() {
+    @Override public UnmodifiableIterator<IndexShard> iterator() {
+        return shards.values().iterator();
     }
 
-    @Override
-    public int getNumDocs() {
-        return numDocs;
+    @Override public boolean hasShard(int shardId) {
+        return shards.containsKey(shardId);
     }
 
-    static class Empty extends PackedArrayAtomicFieldData {
-
-        Empty(int numDocs) {
-            super(numDocs);
-        }
-
-        @Override
-        public LongValues getLongValues() {
-            return LongValues.EMPTY;
-        }
-
-        @Override
-        public DoubleValues getDoubleValues() {
-            return DoubleValues.EMPTY;
-        }
-
-        @Override
-        public boolean isMultiValued() {
-            return false;
-        }
-
-        @Override
-        public boolean isValuesOrdered() {
-            return false;
-        }
-
-        @Override
-        public long getMemorySizeInBytes() {
-            return 0;
-        }
-
-        @Override
-        public long getNumberUniqueValues() {
-            return 0;
-        }
-
-        @Override
-        public BytesValues getBytesValues() {
-            return BytesValues.EMPTY;
-        }
-
-        @Override
-        public ScriptDocValues getScriptValues() {
-            return ScriptDocValues.EMPTY;
-        }
+    @Override public IndexShard shard(int shardId) {
+        return shards.get(shardId);
     }
 
-    public static class WithOrdinals extends PackedArrayAtomicFieldData {
-
-        private final MonotonicAppendingLongBuffer values;
-        private final Ordinals ordinals;
-
-        public WithOrdinals(MonotonicAppendingLongBuffer values, int numDocs, Ordinals ordinals) {
-            super(numDocs);
-            this.values = values;
-            this.ordinals = ordinals;
+    @Override public IndexShard shardSafe(int shardId) throws IndexShardMissingException {
+        IndexShard indexShard = shard(shardId);
+        if (indexShard == null) {
+            throw new IndexShardMissingException(new ShardId(index, shardId));
         }
+        return indexShard;
+    }
 
-        @Override
-        public boolean isMultiValued() {
-            return ordinals.isMultiValued();
-        }
+    @Override public ImmutableSet<Integer> shardIds() {
+        return ImmutableSet.copyOf(shards.keySet());
+    }
 
-        @Override
-        public boolean isValuesOrdered() {
-            return true;
-        }
+    @Override public Injector injector() {
+        return injector;
+    }
 
-        @Override
-        public long getMemorySizeInBytes() {
-            if (size == -1) {
-                size = RamUsageEstimator.NUM_BYTES_INT/*size*/ + RamUsageEstimator.NUM_BYTES_INT/*numDocs*/ + values.ramBytesUsed() + ordinals.getMemorySizeInBytes();
+    @Override public IndexGateway gateway() {
+        return indexGateway;
+    }
+
+    @Override public IndexStore store() {
+        return indexStore;
+    }
+
+    @Override public IndexCache cache() {
+        return indexCache;
+    }
+
+    @Override public OperationRouting operationRouting() {
+        return operationRouting;
+    }
+
+    @Override public MapperService mapperService() {
+        return mapperService;
+    }
+
+    @Override public IndexQueryParserService queryParserService() {
+        return queryParserService;
+    }
+
+    @Override public SimilarityService similarityService() {
+        return similarityService;
+    }
+
+    @Override public IndexEngine indexEngine() {
+        return indexEngine;
+    }
+
+    @Override public void close(final boolean delete) {
+        try {
+            Set<Integer> shardIds = shardIds();
+            final CountDownLatch latch = new CountDownLatch(shardIds.size());
+            for (final int shardId : shardIds) {
+                threadPool.cached().execute(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            deleteShard(shardId, delete, !delete, delete);
+                        } catch (Exception e) {
+                            logger.warn("failed to close shard, delete [{}]", e, delete);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
             }
-            return size;
-        }
-
-        @Override
-        public long getNumberUniqueValues() {
-            return ordinals.getNumOrds();
-        }
-
-        @Override
-        public LongValues getLongValues() {
-            return new LongValues(values, ordinals.ordinals());
-        }
-
-        @Override
-        public DoubleValues getDoubleValues() {
-            return new DoubleValues(values, ordinals.ordinals());
-        }
-
-        static class LongValues extends org.elasticsearch.index.fielddata.LongValues.WithOrdinals {
-
-            private final MonotonicAppendingLongBuffer values;
-
-            LongValues(MonotonicAppendingLongBuffer values, Ordinals.Docs ordinals) {
-                super(ordinals);
-                this.values = values;
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                throw new ElasticSearchInterruptedException("interrupted closing index [ " + index().name() + "]", e);
             }
-
-            @Override
-            public long getValueByOrd(long ord) {
-                assert ord != Ordinals.MISSING_ORDINAL;
-                return values.get(ord - 1);
-            }
-        }
-
-        static class DoubleValues extends org.elasticsearch.index.fielddata.DoubleValues.WithOrdinals {
-
-            private final MonotonicAppendingLongBuffer values;
-
-            DoubleValues(MonotonicAppendingLongBuffer values, Ordinals.Docs ordinals) {
-                super(ordinals);
-                this.values = values;
-            }
-
-            @Override
-            public double getValueByOrd(long ord) {
-                assert ord != Ordinals.MISSING_ORDINAL;
-                return values.get(ord - 1);
-            }
-
-
+        } finally {
+            indicesLifecycle.removeListener(cleanCacheOnIndicesLifecycleListener);
         }
     }
 
-    /**
-     * A single valued case, where not all values are "set", so we have a special
-     * value which encodes the fact that the document has no value.
-     */
-    public static class SingleSparse extends PackedArrayAtomicFieldData {
-
-        private final PackedInts.Mutable values;
-        private final long minValue;
-        private final long missingValue;
-        private final long numOrds;
-
-        public SingleSparse(PackedInts.Mutable values, long minValue, int numDocs, long missingValue, long numOrds) {
-            super(numDocs);
-            this.values = values;
-            this.minValue = minValue;
-            this.missingValue = missingValue;
-            this.numOrds = numOrds;
-        }
-
-        @Override
-        public boolean isMultiValued() {
-            return false;
-        }
-
-        @Override
-        public boolean isValuesOrdered() {
-            return false;
-        }
-
-        @Override
-        public long getNumberUniqueValues() {
-            return numOrds;
-        }
-
-        @Override
-        public long getMemorySizeInBytes() {
-            if (size == -1) {
-                size = values.ramBytesUsed() + 2 * RamUsageEstimator.NUM_BYTES_LONG;
-            }
-            return size;
-        }
-
-        @Override
-        public LongValues getLongValues() {
-            return new LongValues(values, minValue, missingValue);
-        }
-
-        @Override
-        public DoubleValues getDoubleValues() {
-            return new DoubleValues(values, minValue, missingValue);
-        }
-
-        static class LongValues extends org.elasticsearch.index.fielddata.LongValues {
-
-            private final PackedInts.Mutable values;
-            private final long minValue;
-            private final long missingValue;
-
-            LongValues(PackedInts.Mutable values, long minValue, long missingValue) {
-                super(false);
-                this.values = values;
-                this.minValue = minValue;
-                this.missingValue = missingValue;
-            }
-
-            @Override
-            public boolean hasValue(int docId) {
-                return values.get(docId) != missingValue;
-            }
-
-            @Override
-            public long getValue(int docId) {
-                final long value = values.get(docId);
-                return value == missingValue ? 0L : minValue + value;
-            }
-        }
-
-        static class DoubleValues extends org.elasticsearch.index.fielddata.DoubleValues {
-
-            private final PackedInts.Mutable values;
-            private final long minValue;
-            private final long missingValue;
-
-            DoubleValues(PackedInts.Mutable values, long minValue, long missingValue) {
-                super(false);
-                this.values = values;
-                this.minValue = minValue;
-                this.missingValue = missingValue;
-            }
-
-
-            @Override
-            public boolean hasValue(int docId) {
-                return values.get(docId) != missingValue;
-            }
-
-            @Override
-            public double getValue(int docId) {
-                final long value = values.get(docId);
-                return value == missingValue ? 0L : minValue + value;
-            }
-        }
+    @Override public Injector shardInjector(int shardId) throws ElasticSearchException {
+        return shardsInjectors.get(shardId);
     }
 
-    /**
-     * Assumes all the values are "set", and docId is used as the index to the value array.
-     */
-    public static class Single extends PackedArrayAtomicFieldData {
+    @Override public Injector shardInjectorSafe(int shardId) throws IndexShardMissingException {
+        Injector shardInjector = shardInjector(shardId);
+        if (shardInjector == null) {
+            throw new IndexShardMissingException(new ShardId(index, shardId));
+        }
+        return shardInjector;
+    }
 
-        private final PackedInts.Mutable values;
-        private final long minValue;
-        private final long numOrds;
-
-        /**
-         * Note, here, we assume that there is no offset by 1 from docId, so position 0
-         * is the value for docId 0.
-         */
-        public Single(PackedInts.Mutable values, long minValue, int numDocs, long numOrds) {
-            super(numDocs);
-            this.values = values;
-            this.minValue = minValue;
-            this.numOrds = numOrds;
+    @Override public synchronized IndexShard createShard(int sShardId) throws ElasticSearchException {
+        ShardId shardId = new ShardId(index, sShardId);
+        if (shardsInjectors.containsKey(shardId.id())) {
+            throw new IndexShardAlreadyExistsException(shardId + " already exists");
         }
 
-        @Override
-        public boolean isMultiValued() {
-            return false;
-        }
+        indicesLifecycle.beforeIndexShardCreated(shardId);
 
-        @Override
-        public boolean isValuesOrdered() {
-            return false;
-        }
+        logger.debug("creating shard_id [{}]", shardId.id());
 
-        @Override
-        public long getNumberUniqueValues() {
-            return numOrds;
-        }
+        ModulesBuilder modules = new ModulesBuilder();
+        modules.add(new ShardsPluginsModule(indexSettings, pluginsService));
+        modules.add(new IndexShardModule(shardId));
+        modules.add(new StoreModule(indexSettings, injector.getInstance(IndexStore.class)));
+        modules.add(new DeletionPolicyModule(indexSettings));
+        modules.add(new MergePolicyModule(indexSettings));
+        modules.add(new MergeSchedulerModule(indexSettings));
+        modules.add(new TranslogModule(indexSettings));
+        modules.add(new EngineModule(indexSettings));
+        modules.add(new IndexShardGatewayModule(injector.getInstance(IndexGateway.class)));
 
-        @Override
-        public long getMemorySizeInBytes() {
-            if (size == -1) {
-                size = values.ramBytesUsed();
+        Injector shardInjector = modules.createChildInjector(injector);
+
+        shardsInjectors = newMapBuilder(shardsInjectors).put(shardId.id(), shardInjector).immutableMap();
+
+        IndexShard indexShard = shardInjector.getInstance(IndexShard.class);
+
+        indicesLifecycle.afterIndexShardCreated(indexShard);
+
+        shards = newMapBuilder(shards).put(shardId.id(), indexShard).immutableMap();
+
+        return indexShard;
+    }
+
+    @Override public synchronized void cleanShard(int shardId) throws ElasticSearchException {
+        deleteShard(shardId, true, false, false);
+    }
+
+    private void deleteShard(int shardId, boolean delete, boolean snapshotGateway, boolean deleteGateway) throws ElasticSearchException {
+        Injector shardInjector;
+        IndexShard indexShard;
+        synchronized (this) {
+            Map<Integer, Injector> tmpShardInjectors = newHashMap(shardsInjectors);
+            shardInjector = tmpShardInjectors.remove(shardId);
+            if (shardInjector == null) {
+                if (!delete) {
+                    return;
+                }
+                throw new IndexShardMissingException(new ShardId(index, shardId));
             }
-            return size;
-        }
-
-        @Override
-        public LongValues getLongValues() {
-            return new LongValues(values, minValue);
-        }
-
-        @Override
-        public DoubleValues getDoubleValues() {
-            return new DoubleValues(values, minValue);
-        }
-
-        static class LongValues extends DenseLongValues {
-
-            private final PackedInts.Mutable values;
-            private final long minValue;
-
-            LongValues(PackedInts.Mutable values, long minValue) {
-                super(false);
-                this.values = values;
-                this.minValue = minValue;
-            }
-
-            @Override
-            public long getValue(int docId) {
-                return minValue + values.get(docId);
+            shardsInjectors = ImmutableMap.copyOf(tmpShardInjectors);
+            if (delete) {
+                logger.debug("deleting shard_id [{}]", shardId);
             }
 
-            @Override
-            public long nextValue() {
-                return minValue + values.get(docId);
-            }
-            
-
+            Map<Integer, IndexShard> tmpShardsMap = newHashMap(shards);
+            indexShard = tmpShardsMap.remove(shardId);
+            shards = ImmutableMap.copyOf(tmpShardsMap);
         }
 
-        static class DoubleValues extends DenseDoubleValues {
+        ShardId sId = new ShardId(index, shardId);
 
-            private final PackedInts.Mutable values;
-            private final long minValue;
+        indicesLifecycle.beforeIndexShardClosed(sId, indexShard, delete);
 
-            DoubleValues(PackedInts.Mutable values, long minValue) {
-                super(false);
-                this.values = values;
-                this.minValue = minValue;
+        for (Class<? extends CloseableIndexComponent> closeable : pluginsService.shardServices()) {
+            try {
+                shardInjector.getInstance(closeable).close(delete);
+            } catch (Exception e) {
+                logger.debug("failed to clean plugin shard service [{}]", e, closeable);
             }
+        }
 
-            @Override
-            public double getValue(int docId) {
-                return minValue + values.get(docId);
-            }
-            
-            @Override
-            public double nextValue() {
-                return minValue + values.get(docId);
-            }
+        try {
+            // now we can close the translog service, we need to close it before the we close the shard
+            shardInjector.getInstance(TranslogService.class).close();
+        } catch (Exception e) {
+            // ignore
+        }
 
+        // close shard actions
+        if (indexShard != null) {
+            shardInjector.getInstance(IndexShardManagement.class).close();
+        }
+
+        // this logic is tricky, we want to close the engine so we rollback the changes done to it
+        // and close the shard so no operations are allowed to it
+        if (indexShard != null) {
+            indexShard.close();
+        }
+        try {
+            shardInjector.getInstance(Engine.class).close();
+        } catch (Exception e) {
+            // ignore
+        }
+
+        try {
+            // now, we can snapshot to the gateway, it will be only the translog
+            if (snapshotGateway) {
+                shardInjector.getInstance(IndexShardGatewayService.class).snapshotOnClose();
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            shardInjector.getInstance(IndexShardGatewayService.class).close(deleteGateway);
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            // now we can close the translog
+            shardInjector.getInstance(Translog.class).close();
+        } catch (Exception e) {
+            // ignore
+        }
+
+        // call this before we close the store, so we can release resources for it
+        indicesLifecycle.afterIndexShardClosed(sId, delete);
+
+        // if we delete or have no gateway or the store is not persistent, clean the store...
+        Store store = shardInjector.getInstance(Store.class);
+        if (delete || indexGateway.type().equals(NoneGateway.TYPE) || !indexStore.persistent()) {
+            try {
+                store.fullDelete();
+            } catch (IOException e) {
+                logger.warn("failed to clean store on shard deletion", e);
+            }
+        }
+        // and close it
+        try {
+            store.close();
+        } catch (IOException e) {
+            logger.warn("failed to close store on shard deletion", e);
+        }
+
+        Injectors.close(injector);
+    }
+
+    class CleanCacheOnIndicesLifecycleListener extends IndicesLifecycle.Listener {
+
+        @Override public void beforeIndexShardClosed(ShardId shardId, @Nullable IndexShard indexShard, boolean delete) {
+            indexCache.clearUnreferenced();
+        }
+
+        @Override public void afterIndexShardClosed(ShardId shardId, boolean delete) {
+            indexCache.clearUnreferenced();
         }
     }
 }

@@ -1,8 +1,6 @@
-FileUtils.writeStringToFile(new File(subHome, "solrconfig.snippet.randomindexconfig.xml"), rand_snip, Charsets.UTF_8.toString());
+throw new IllegalStateException(e.getCause());
 
-package org.apache.solr.core;
-
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,727 +17,437 @@ package org.apache.solr.core;
  * limitations under the License.
  */
 
-import org.apache.commons.codec.Charsets;
-import org.apache.commons.io.FileUtils;
-import org.apache.solr.SolrTestCaseJ4;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.CoreAdminParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.handler.admin.CoreAdminHandler;
-import org.apache.solr.request.LocalSolrQueryRequest;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.update.AddUpdateCommand;
-import org.apache.solr.update.CommitUpdateCommand;
-import org.apache.solr.update.UpdateHandler;
-import org.apache.solr.util.RefCounted;
-import org.apache.solr.util.TestHarness;
-import org.junit.After;
-import org.junit.BeforeClass;
-import org.junit.Test;
+package org.apache.mahout.classifier.sgd;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.HashMap;
+import com.google.common.collect.Lists;
+import org.apache.mahout.classifier.OnlineLearner;
+import org.apache.mahout.ep.Payload;
+import org.apache.mahout.ep.EvolutionaryProcess;
+import org.apache.mahout.ep.Mapping;
+import org.apache.mahout.ep.State;
+import org.apache.mahout.math.Vector;
+import org.apache.mahout.math.stats.OnlineAuc;
+
 import java.util.List;
-import java.util.Map;
-import java.util.regex.Pattern;
+import java.util.Locale;
+import java.util.concurrent.ExecutionException;
 
-public class TestLazyCores extends SolrTestCaseJ4 {
+/**
+ * This is a meta-learner that maintains a pool of ordinary OnlineLogisticRegression learners. Each
+ * member of the pool has different learning rates.  Whichever of the learners in the pool falls
+ * behind in terms of average log-likelihood will be tossed out and replaced with variants of the
+ * survivors.  This will let us automatically derive an annealing schedule that optimizes learning
+ * speed.  Since on-line learners tend to be IO bound anyway, it doesn't cost as much as it might
+ * seem that it would to maintain multiple learners in memory.  Doing this adaptation on-line as we
+ * learn also decreases the number of learning rate parameters required and replaces the normal
+ * hyper-parameter search.
+ * <p/>
+ * One wrinkle is that the pool of learners that we maintain is actually a pool of CrossFoldLearners
+ * which themselves contain several OnlineLogisticRegression objects.  These pools allow estimation
+ * of performance on the fly even if we make many passes through the data.  This does, however,
+ * increase the cost of training since if we are using 5-fold cross-validation, each vector is used
+ * 4 times for training and once for classification.  If this becomes a problem, then we should
+ * probably use a 2-way unbalanced train/test split rather than full cross validation.  With the
+ * current default settings, we have 100 learners running.  This is better than the alternative
+ * of running hundreds of training passes to find good hyper-parameters because we only have to
+ * parse and feature-ize our inputs once.  If you already have good hyper-parameters, then you
+ * might prefer to just run one CrossFoldLearner with those settings.
+ * <p/>
+ * The fitness used here is AUC.  Another alternative would be to try log-likelihood, but it is
+ * much easier to get bogus values of log-likelihood than with AUC and the results seem to
+ * accord pretty well.  It would be nice to allow the fitness function to be pluggable. This
+ * use of AUC means that AdaptiveLogisticRegression is mostly suited for binary target variables.
+ * This will be fixed before long by extending OnlineAuc to handle non-binary cases or by using
+ * a different fitness value in non-binary cases.
+ */
+public class AdaptiveLogisticRegression implements OnlineLearner {
 
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    initCore("solrconfig-minimal.xml", "schema-tiny.xml");
+  private static final int SURVIVORS = 2;
+
+  private int record;
+  private int cutoff = 1000;
+  private int minInterval = 1000;
+  private int maxInterval = 1000;
+  private int currentStep = 1000;
+  private int bufferSize = 1000;
+
+  private List<TrainingExample> buffer = Lists.newArrayList();
+  private EvolutionaryProcess<Wrapper> ep;
+  private State<Wrapper> best;
+  private int threadCount = 20;
+  private int poolSize = 20;
+  private State<Wrapper> seed;
+  private int numFeatures;
+
+  private boolean freezeSurvivors = true;
+
+  // for GSON
+  private AdaptiveLogisticRegression() {
   }
 
-  private final File solrHomeDirectory = new File(TEMP_DIR, TestLazyCores.getSimpleClassName());
-
-  private CoreContainer init() throws Exception {
-
-    if (solrHomeDirectory.exists()) {
-      FileUtils.deleteDirectory(solrHomeDirectory);
-    }
-    assertTrue("Failed to mkdirs workDir", solrHomeDirectory.mkdirs());
-    for (int idx = 1; idx < 10; ++idx) {
-      copyMinConf(new File(solrHomeDirectory, "collection" + idx));
-    }
-
-    SolrResourceLoader loader = new SolrResourceLoader(solrHomeDirectory.getAbsolutePath());
-
-    File solrXml = new File(solrHomeDirectory, "solr.xml");
-    FileUtils.write(solrXml, LOTS_SOLR_XML, Charsets.UTF_8.toString());
-    ConfigSolrXmlOld config = (ConfigSolrXmlOld) ConfigSolr.fromFile(loader, solrXml);
-
-    CoresLocator locator = new SolrXMLCoresLocator.NonPersistingLocator(LOTS_SOLR_XML, config);
-
-
-    final CoreContainer cores = new CoreContainer(loader, config, locator);
-    cores.load();
-    return cores;
+  public AdaptiveLogisticRegression(int numCategories, int numFeatures, PriorFunction prior) {
+    this.numFeatures = numFeatures;
+    seed = new State<Wrapper>(new double[2], 10);
+    Wrapper w = new Wrapper(numCategories, numFeatures, prior);
+    w.setMappings(seed);
+    seed.setPayload(w);
+    setPoolSize(poolSize);
   }
 
-  @After
-  public void after() throws Exception {
-    if (solrHomeDirectory.exists()) {
-      FileUtils.deleteDirectory(solrHomeDirectory);
+  @Override
+  public void train(int actual, Vector instance) {
+    train(record, null, actual, instance);
+  }
+
+  @Override
+  public void train(long trackingKey, int actual, Vector instance) {
+    train(trackingKey, null, actual, instance);
+  }
+
+  @Override
+  public void train(long trackingKey, String groupKey, int actual, Vector instance) {
+    record++;
+
+    buffer.add(new TrainingExample(trackingKey, groupKey, actual, instance));
+    if (buffer.size() > bufferSize) {
+      trainWithBufferedExamples();
     }
   }
-  @Test
-  public void testLazyLoad() throws Exception {
-    CoreContainer cc = init();
+
+  private void trainWithBufferedExamples() {
     try {
-
-      // NOTE: This checks the initial state for loading, no need to do this elsewhere.
-      checkInCores(cc, "collection1", "collectionLazy2", "collectionLazy5");
-      checkNotInCores(cc, "collectionLazy3", "collectionLazy4", "collectionLazy6", "collectionLazy7",
-          "collectionLazy8", "collectionLazy9");
-
-      SolrCore core1 = cc.getCore("collection1");
-      assertFalse("core1 should not be transient", core1.getCoreDescriptor().isTransient());
-      assertTrue("core1 should be loadable", core1.getCoreDescriptor().isLoadOnStartup());
-      assertNotNull(core1.getSolrConfig());
-
-      SolrCore core2 = cc.getCore("collectionLazy2");
-      assertTrue("core2 should be transient", core2.getCoreDescriptor().isTransient());
-      assertTrue("core2 should be loadable", core2.getCoreDescriptor().isLoadOnStartup());
-
-      SolrCore core3 = cc.getCore("collectionLazy3");
-      assertTrue("core3 should be transient", core3.getCoreDescriptor().isTransient());
-      assertFalse("core3 should not be loadable", core3.getCoreDescriptor().isLoadOnStartup());
-
-      SolrCore core4 = cc.getCore("collectionLazy4");
-      assertFalse("core4 should not be transient", core4.getCoreDescriptor().isTransient());
-      assertFalse("core4 should not be loadable", core4.getCoreDescriptor().isLoadOnStartup());
-
-      SolrCore core5 = cc.getCore("collectionLazy5");
-      assertFalse("core5 should not be transient", core5.getCoreDescriptor().isTransient());
-      assertTrue("core5 should be loadable", core5.getCoreDescriptor().isLoadOnStartup());
-
-      core1.close();
-      core2.close();
-      core3.close();
-      core4.close();
-      core5.close();
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-  // This is a little weak. I'm not sure how to test that lazy core2 is loaded automagically. The getCore
-  // will, of course, load it.
-
-  private void checkSearch(SolrCore core) throws IOException {
-    addLazy(core, "id", "0");
-    addLazy(core, "id", "1", "v_t", "Hello Dude");
-    addLazy(core, "id", "2", "v_t", "Hello Yonik");
-    addLazy(core, "id", "3", "v_s", "{!literal}");
-    addLazy(core, "id", "4", "v_s", "other stuff");
-    addLazy(core, "id", "5", "v_f", "3.14159");
-    addLazy(core, "id", "6", "v_f", "8983");
-
-    SolrQueryRequest req = makeReq(core);
-    CommitUpdateCommand cmtCmd = new CommitUpdateCommand(req, false);
-    core.getUpdateHandler().commit(cmtCmd);
-
-    // Just get a couple of searches to work!
-    assertQ("test prefix query",
-        makeReq(core, "q", "{!prefix f=v_t}hel", "wt", "xml")
-        , "//result[@numFound='2']"
-    );
-
-    assertQ("test raw query",
-        makeReq(core, "q", "{!raw f=v_t}hello", "wt", "xml")
-        , "//result[@numFound='2']"
-    );
-
-    // no analysis is done, so these should match nothing
-    assertQ("test raw query",
-        makeReq(core, "q", "{!raw f=v_t}Hello", "wt", "xml")
-        , "//result[@numFound='0']"
-    );
-    assertQ("test raw query",
-        makeReq(core, "q", "{!raw f=v_f}1.5", "wt", "xml")
-        , "//result[@numFound='0']"
-    );
-  }
-  @Test
-  public void testLazySearch() throws Exception {
-    CoreContainer cc = init();
-    try {
-      // Make sure Lazy4 isn't loaded. Should be loaded on the get
-      checkNotInCores(cc, "collectionLazy4");
-      SolrCore core4 = cc.getCore("collectionLazy4");
-
-      checkSearch(core4);
-
-      // Now just insure that the normal searching on "collection1" finds _0_ on the same query that found _2_ above.
-      // Use of makeReq above and req below is tricky, very tricky.
-      assertQ("test raw query",
-          req("q", "{!raw f=v_t}hello", "wt", "xml")
-          , "//result[@numFound='0']"
-      );
-
-      checkInCores(cc, "collectionLazy4");
-
-      core4.close();
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-  @Test
-  public void testCachingLimit() throws Exception {
-    CoreContainer cc = init();
-    try {
-      // First check that all the cores that should be loaded at startup actually are.
-
-      checkInCores(cc, "collection1", "collectionLazy2", "collectionLazy5");
-      checkNotInCores(cc, "collectionLazy3", "collectionLazy4", "collectionLazy6",
-          "collectionLazy7", "collectionLazy8", "collectionLazy9");
-
-      // By putting these in non-alpha order, we're also checking that we're  not just seeing an artifact.
-      SolrCore core1 = cc.getCore("collection1");
-      SolrCore core3 = cc.getCore("collectionLazy3");
-      SolrCore core4 = cc.getCore("collectionLazy4");
-      SolrCore core2 = cc.getCore("collectionLazy2");
-      SolrCore core5 = cc.getCore("collectionLazy5");
-
-      checkInCores(cc, "collection1", "collectionLazy2", "collectionLazy3", "collectionLazy4", "collectionLazy5");
-      checkNotInCores(cc, "collectionLazy6", "collectionLazy7", "collectionLazy8", "collectionLazy9");
-
-      // map should be full up, add one more and verify
-      SolrCore core6 = cc.getCore("collectionLazy6");
-      checkInCores(cc, "collection1", "collectionLazy2", "collectionLazy3", "collectionLazy4", "collectionLazy5",
-          "collectionLazy6");
-      checkNotInCores(cc, "collectionLazy7", "collectionLazy8", "collectionLazy9");
-
-      SolrCore core7 = cc.getCore("collectionLazy7");
-      checkInCores(cc, "collection1", "collectionLazy2", "collectionLazy3", "collectionLazy4", "collectionLazy5",
-          "collectionLazy6", "collectionLazy7");
-      checkNotInCores(cc, "collectionLazy8", "collectionLazy9");
-
-      SolrCore core8 = cc.getCore("collectionLazy8");
-      checkInCores(cc, "collection1", "collectionLazy2", "collectionLazy4", "collectionLazy5", "collectionLazy6",
-          "collectionLazy7", "collectionLazy8");
-      checkNotInCores(cc, "collectionLazy3", "collectionLazy9");
-
-      SolrCore core9 = cc.getCore("collectionLazy9");
-      checkInCores(cc, "collection1", "collectionLazy4", "collectionLazy5", "collectionLazy6", "collectionLazy7",
-          "collectionLazy8", "collectionLazy9");
-      checkNotInCores(cc, "collectionLazy2", "collectionLazy3");
-
-
-      // Note decrementing the count when the core is removed from the lazyCores list is appropriate, since the
-      // refcount is 1 when constructed. anyone _else_ who's opened up one has to close it.
-      core1.close();
-      core2.close();
-      core3.close();
-      core4.close();
-      core5.close();
-      core6.close();
-      core7.close();
-      core8.close();
-      core9.close();
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-  // Test case for SOLR-4300
-
-  @Test
-  public void testRace() throws Exception {
-    final List<SolrCore> theCores = new ArrayList<SolrCore>();
-    final CoreContainer cc = init();
-    try {
-
-      Thread[] threads = new Thread[15];
-      for (int idx = 0; idx < threads.length; idx++) {
-        threads[idx] = new Thread() {
-          @Override
-          public void run() {
-            SolrCore core = cc.getCore("collectionLazy3");
-            synchronized (theCores) {
-              theCores.add(core);
-            }
+      this.best = ep.parallelDo(new EvolutionaryProcess.Function<Wrapper>() {
+        @Override
+        public double apply(Wrapper x, double[] params) {
+          for (TrainingExample example : buffer) {
+            x.train(example);
           }
-        };
-        threads[idx].start();
-      }
-      for (Thread thread : threads) {
-        thread.join();
-      }
-      for (int idx = 0; idx < theCores.size() - 1; ++idx) {
-        assertEquals("Cores should be the same!", theCores.get(idx), theCores.get(idx + 1));
-      }
-      for (SolrCore core : theCores) {
-        core.close();
-      }
-
-    } finally {
-      cc.shutdown();
+          if (x.getLearner().validModel()) {
+            if (x.getLearner().numCategories() == 2) {
+              return x.wrapped.auc();
+            } else {
+              return x.wrapped.logLikelihood();
+            }
+          } else {
+            return Double.NaN;
+          }
+        }
+      });
+    } catch (InterruptedException e) {
+      // ignore ... shouldn't happen
+    } catch (ExecutionException e) {
+      throw new IllegalStateException(e);
     }
-  }
+    buffer.clear();
 
-  private void tryCreateFail(CoreAdminHandler admin, String name, String dataDir, String... errs) throws Exception {
-    try {
-      SolrQueryResponse resp = new SolrQueryResponse();
+    if (record > cutoff) {
+      cutoff = nextStep(record);
 
-      SolrQueryRequest request = req(CoreAdminParams.ACTION,
-          CoreAdminParams.CoreAdminAction.CREATE.toString(),
-          CoreAdminParams.DATA_DIR, dataDir,
-          CoreAdminParams.NAME, name,
-          "schema", "schema.xml",
-          "config", "solrconfig.xml");
+      // evolve based on new fitness
+      ep.mutatePopulation(SURVIVORS);
 
-      admin.handleRequestBody(request, resp);
-      fail("Should have thrown an error");
-    } catch (SolrException se) {
-      //SolrException cause = (SolrException)se.getCause();
-      assertEquals("Exception code should be 500", 500, se.code());
-      for (String err : errs) {
-       assertTrue("Should have seen an exception containing the an error",
-            se.getMessage().contains(err));
+      if (freezeSurvivors) {
+        // now grossly hack the top survivors so they stick around.  Set their
+        // mutation rates small and also hack their learning rate to be small
+        // as well.
+        for (State<Wrapper> state : ep.getPopulation().subList(0, SURVIVORS)) {
+          state.getPayload().freeze(state);
+        }
       }
     }
-  }
-  @Test
-  public void testCreateSame() throws Exception {
-    final CoreContainer cc = init();
-    try {
-      // First, try all 4 combinations of load on startup and transient
-      final CoreAdminHandler admin = new CoreAdminHandler(cc);
-      SolrCore lc2 = cc.getCore("collectionLazy2");
-      SolrCore lc4 = cc.getCore("collectionLazy4");
-      SolrCore lc5 = cc.getCore("collectionLazy5");
-      SolrCore lc6 = cc.getCore("collectionLazy6");
-
-      copyMinConf(new File(solrHomeDirectory, "t2"));
-      copyMinConf(new File(solrHomeDirectory, "t4"));
-      copyMinConf(new File(solrHomeDirectory, "t5"));
-      copyMinConf(new File(solrHomeDirectory, "t6"));
-
-
-      // Should also fail with the same name
-      tryCreateFail(admin, "collectionLazy2", "t12", "Core with name", "collectionLazy2", "already exists");
-      tryCreateFail(admin, "collectionLazy4", "t14", "Core with name", "collectionLazy4", "already exists");
-      tryCreateFail(admin, "collectionLazy5", "t15", "Core with name", "collectionLazy5", "already exists");
-      tryCreateFail(admin, "collectionLazy6", "t16", "Core with name", "collectionLazy6", "already exists");
-
-      lc2.close();
-      lc4.close();
-      lc5.close();
-      lc6.close();
-
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-  private void createViaAdmin(CoreContainer cc, String name, String instanceDir, boolean isTransient,
-                              boolean loadOnStartup) throws Exception {
-
-    final CoreAdminHandler admin = new CoreAdminHandler(cc);
-    SolrQueryResponse resp = new SolrQueryResponse();
-    admin.handleRequestBody
-        (req(CoreAdminParams.ACTION,
-            CoreAdminParams.CoreAdminAction.CREATE.toString(),
-            CoreAdminParams.INSTANCE_DIR, instanceDir,
-            CoreAdminParams.NAME, name,
-            CoreAdminParams.TRANSIENT, Boolean.toString(isTransient),
-            CoreAdminParams.LOAD_ON_STARTUP, Boolean.toString(loadOnStartup)),
-            resp);
 
   }
 
-  private void unloadViaAdmin(CoreContainer cc, String name) throws Exception {
-
-    final CoreAdminHandler admin = new CoreAdminHandler(cc);
-    SolrQueryResponse resp = new SolrQueryResponse();
-    admin.handleRequestBody
-        (req(CoreAdminParams.ACTION,
-            CoreAdminParams.CoreAdminAction.UNLOAD.toString(),
-            CoreAdminParams.CORE, name),
-            resp);
-
-  }
-
-
-  // Make sure that creating a transient core from the admin handler correctly respects the transient limits etc.
-  @Test
-  public void testCreateTransientFromAdmin() throws Exception {
-    final CoreContainer cc = init();
-    try {
-      copyMinConf(new File(solrHomeDirectory, "core1"));
-      copyMinConf(new File(solrHomeDirectory, "core2"));
-      copyMinConf(new File(solrHomeDirectory, "core3"));
-      copyMinConf(new File(solrHomeDirectory, "core4"));
-      copyMinConf(new File(solrHomeDirectory, "core5"));
-
-      createViaAdmin(cc, "core1", "./core1", true, true);
-      createViaAdmin(cc, "core2", "./core2", true, false);
-      createViaAdmin(cc, "core3", "./core3", true, true);
-      createViaAdmin(cc, "core4", "./core4", true, false);
-      createViaAdmin(cc, "core5", "./core5", true, false);
-
-      SolrCore c1 = cc.getCore("core1");
-      SolrCore c2 = cc.getCore("core2");
-      SolrCore c3 = cc.getCore("core3");
-      SolrCore c4 = cc.getCore("core4");
-      SolrCore c5 = cc.getCore("core5");
-
-      checkNotInCores(cc, "core1", "collectionLazy2", "collectionLazy3", "collectionLazy4", "collectionLazy6"
-          , "collectionLazy7", "collectionLazy8", "collectionLazy9");
-
-      checkInCores(cc, "collection1", "collectionLazy5", "core2", "core3", "core4", "core5");
-
-      // While we're at it, a test for SOLR-5366, unloading transient core that's been unloaded b/c it's
-      // transient generates a "too many closes" errorl
-
-      unloadViaAdmin(cc, "core1");
-      unloadViaAdmin(cc, "core2");
-      unloadViaAdmin(cc, "core3");
-      unloadViaAdmin(cc, "core4");
-      unloadViaAdmin(cc, "core5");
-
-      c1.close();
-      c2.close();
-      c3.close();
-      c4.close();
-      c5.close();
-
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-
-  //Make sure persisting not-loaded lazy cores is done. See SOLR-4347
-
-  @Test
-  public void testPersistence() throws Exception {
-    final CoreContainer cc = init();
-    try {
-      copyMinConf(new File(solrHomeDirectory, "core1"));
-      copyMinConf(new File(solrHomeDirectory, "core2"));
-      copyMinConf(new File(solrHomeDirectory, "core3"));
-      copyMinConf(new File(solrHomeDirectory, "core4"));
-
-      final CoreDescriptor cd1 = buildCoreDescriptor(cc, "core1", "./core1")
-          .isTransient(true).loadOnStartup(true).build();
-      final CoreDescriptor cd2 = buildCoreDescriptor(cc, "core2", "./core2")
-          .isTransient(true).loadOnStartup(false).build();
-      final CoreDescriptor cd3 = buildCoreDescriptor(cc, "core3", "./core3")
-          .isTransient(false).loadOnStartup(true).build();
-      final CoreDescriptor cd4 = buildCoreDescriptor(cc, "core4", "./core4")
-          .isTransient(false).loadOnStartup(false).build();
-
-
-      SolrCore core1 = cc.create(cd1);
-      SolrCore core2 = cc.create(cd2);
-      SolrCore core3 = cc.create(cd3);
-      SolrCore core4 = cc.create(cd4);
-
-      SolrXMLCoresLocator.NonPersistingLocator locator =
-          (SolrXMLCoresLocator.NonPersistingLocator) cc.getCoresLocator();
-
-      TestHarness.validateXPath(locator.xml,
-          "/solr/cores/core[@name='collection1']",
-          "/solr/cores/core[@name='collectionLazy2']",
-          "/solr/cores/core[@name='collectionLazy3']",
-          "/solr/cores/core[@name='collectionLazy4']",
-          "/solr/cores/core[@name='collectionLazy5']",
-          "/solr/cores/core[@name='collectionLazy6']",
-          "/solr/cores/core[@name='collectionLazy7']",
-          "/solr/cores/core[@name='collectionLazy8']",
-          "/solr/cores/core[@name='collectionLazy9']",
-          "/solr/cores/core[@name='core1']",
-          "/solr/cores/core[@name='core2']",
-          "/solr/cores/core[@name='core3']",
-          "/solr/cores/core[@name='core4']",
-          "13=count(/solr/cores/core)");
-
-      removeOne(cc, "collectionLazy2");
-      removeOne(cc, "collectionLazy3");
-      removeOne(cc, "collectionLazy4");
-      removeOne(cc, "collectionLazy5");
-      removeOne(cc, "collectionLazy6");
-      removeOne(cc, "collectionLazy7");
-      removeOne(cc, "core1");
-      removeOne(cc, "core2");
-      removeOne(cc, "core3");
-      removeOne(cc, "core4");
-
-      // now test that unloading a core means the core is not persisted
-      TestHarness.validateXPath(locator.xml, "3=count(/solr/cores/core)");
-
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-
-  // Test that transient cores
-  // 1> produce errors as appropriate when the config or schema files are foo'd
-  // 2> "self heal". That is, if the problem is corrected can the core be reloaded and used?
-  // 3> that OK cores can be searched even when some cores failed to load.
-  @Test
-  public void testBadConfigsGenerateErrors() throws Exception {
-    final CoreContainer cc = initGoodAndBad(Arrays.asList("core1", "core2"),
-        Arrays.asList("badSchema1", "badSchema2"),
-        Arrays.asList("badConfig1", "badConfig2"));
-    try {
-      // first, did the two good cores load successfully?
-      checkInCores(cc, "core1", "core2");
-
-      // Did the bad cores fail to load?
-      checkNotInCores(cc, "badSchema1", "badSchema2", "badConfig1", "badConfig2");
-
-      //  Can we still search the "good" cores even though there were core init failures?
-      SolrCore core1 = cc.getCore("core1");
-      checkSearch(core1);
-
-      // Did we get the expected message for each of the cores that failed to load? Make sure we don't run afoul of
-      // the dreaded slash/backslash difference on Windows and *nix machines.
-      testMessage(cc.getCoreInitFailures(),
-          "TestLazyCores" + File.separator + "badConfig1" + File.separator + "solrconfig.xml");
-      testMessage(cc.getCoreInitFailures(),
-          "TestLazyCores" + File.separator + "badConfig2" + File.separator + "solrconfig.xml");
-      testMessage(cc.getCoreInitFailures(),
-          "TestLazyCores" + File.separator + "badSchema1" + File.separator + "schema.xml");
-      testMessage(cc.getCoreInitFailures(),
-          "TestLazyCores" + File.separator + "badSchema2" + File.separator + "schema.xml");
-
-      // Status should report that there are failure messages for the bad cores and none for the good cores.
-      checkStatus(cc, true, "core1");
-      checkStatus(cc, true, "core2");
-      checkStatus(cc, false, "badSchema1");
-      checkStatus(cc, false, "badSchema2");
-      checkStatus(cc, false, "badConfig1");
-      checkStatus(cc, false, "badConfig2");
-
-      // Copy good config and schema files in and see if you can then load them (they are transient after all)
-      copyGoodConf("badConfig1", "solrconfig-minimal.xml", "solrconfig.xml");
-      copyGoodConf("badConfig2", "solrconfig-minimal.xml", "solrconfig.xml");
-      copyGoodConf("badSchema1", "schema-tiny.xml", "schema.xml");
-      copyGoodConf("badSchema2", "schema-tiny.xml", "schema.xml");
-
-      // This should force a reload of the cores.
-      SolrCore bc1 = cc.getCore("badConfig1");
-      SolrCore bc2 = cc.getCore("badConfig2");
-      SolrCore bs1 = cc.getCore("badSchema1");
-      SolrCore bs2 = cc.getCore("badSchema2");
-
-      // all the cores should be found in the list now.
-      checkInCores(cc, "core1", "core2", "badSchema1", "badSchema2", "badConfig1", "badConfig2");
-
-      // Did we clear out the errors by putting good files in place? And the cores that never were bad should be OK too.
-      checkStatus(cc, true, "core1");
-      checkStatus(cc, true, "core2");
-      checkStatus(cc, true, "badSchema1");
-      checkStatus(cc, true, "badSchema2");
-      checkStatus(cc, true, "badConfig1");
-      checkStatus(cc, true, "badConfig2");
-
-      // Are the formerly bad cores now searchable? Testing one of each should do.
-      checkSearch(core1);
-      checkSearch(bc1);
-      checkSearch(bs1);
-
-      core1.close();
-      bc1.close();
-      bc2.close();
-      bs1.close();
-      bs2.close();
-    } finally {
-      cc.shutdown();
-    }
-  }
-
-  // See fi the message you expect is in the list of failures
-  private void testMessage(Map<String, Exception> failures, String lookFor) {
-    for (Exception e : failures.values()) {
-      if (e.getMessage().indexOf(lookFor) != -1) return;
-    }
-    fail("Should have found message containing these tokens " + lookFor + " in the failure messages");
-  }
-
-  // Just localizes writing a configuration rather than repeating it for good and bad files.
-  private void writeCustomConfig(String coreName, String config, String schema, String rand_snip) throws IOException {
-
-    File coreRoot = new File(solrHomeDirectory, coreName);
-    File subHome = new File(coreRoot, "conf");
-    if (!coreRoot.exists()) {
-      assertTrue("Failed to make subdirectory ", coreRoot.mkdirs());
-    }
-    // Write the file for core discovery
-    FileUtils.writeStringToFile(new File(coreRoot, "core.properties"), "name=" + coreName +
-        System.getProperty("line.separator") + "transient=true" +
-        System.getProperty("line.separator") + "loadOnStartup=true", Charsets.UTF_8.toString());
-
-    FileUtils.writeStringToFile(new File(subHome, "solrconfig.snippet.randomindexconfig.xml"), rand_snip);
-
-    FileUtils.writeStringToFile(new File(subHome, "solrconfig.xml"), config, Charsets.UTF_8.toString());
-
-    FileUtils.writeStringToFile(new File(subHome, "schema.xml"), schema, Charsets.UTF_8.toString());
-  }
-
-  // Write out the cores' config files, both bad schema files, bad config files as well as some good cores.
-  private CoreContainer initGoodAndBad(List<String> goodCores,
-                                       List<String> badSchemaCores,
-                                       List<String> badConfigCores) throws Exception {
-
-    // Don't pollute the log with exception traces when they're expected.
-    ignoreException(Pattern.quote("SAXParseException"));
-
-    if (solrHomeDirectory.exists()) {
-      FileUtils.deleteDirectory(solrHomeDirectory);
-    }
-    assertTrue("Failed to mkdirs workDir", solrHomeDirectory.mkdirs());
-
-    // Create the cores that should be fine.
-    for (String coreName : goodCores) {
-      File coreRoot = new File(solrHomeDirectory, coreName);
-      copyMinConf(coreRoot, "name=" + coreName);
-
+  public int nextStep(int recordNumber) {
+    int stepSize = stepSize(recordNumber, 2.6);
+    if (stepSize < minInterval) {
+      stepSize = minInterval;
     }
 
-    // Collect the files that we'll write to the config directories.
-    String top = SolrTestCaseJ4.TEST_HOME() + "/collection1/conf";
-    String min_schema = FileUtils.readFileToString(new File(top, "schema-tiny.xml"),
-        Charsets.UTF_8.toString());
-    String min_config = FileUtils.readFileToString(new File(top, "solrconfig-minimal.xml"),
-        Charsets.UTF_8.toString());
-    String rand_snip = FileUtils.readFileToString(new File(top, "solrconfig.snippet.randomindexconfig.xml"),
-        Charsets.UTF_8.toString());
-
-    // Now purposely mess up the config files, introducing stupid syntax errors.
-    String bad_config = min_config.replace("<requestHandler", "<reqsthalr");
-    String bad_schema = min_schema.replace("<field", "<filed");
-
-    // Create the cores with bad configs
-    for (String coreName : badConfigCores) {
-      writeCustomConfig(coreName, bad_config, min_schema, rand_snip);
+    if (stepSize > maxInterval) {
+      stepSize = maxInterval;
     }
 
-    // Create the cores with bad schemas.
-    for (String coreName : badSchemaCores) {
-      writeCustomConfig(coreName, min_config, bad_schema, rand_snip);
-    }
-
-    // Write the solr.xml file. Cute how minimal it can be now....
-    File solrXml = new File(solrHomeDirectory, "solr.xml");
-    FileUtils.write(solrXml, "<solr/>", Charsets.UTF_8.toString());
-
-    SolrResourceLoader loader = new SolrResourceLoader(solrHomeDirectory.getAbsolutePath());
-    ConfigSolrXml config = (ConfigSolrXml) ConfigSolr.fromFile(loader, solrXml);
-
-    CoresLocator locator = new CorePropertiesLocator(solrHomeDirectory.getAbsolutePath());
-
-    // OK this should succeed, but at the end we should have recorded a series of errors.
-    final CoreContainer cores = new CoreContainer(loader, config, locator);
-    cores.load();
-    return cores;
-  }
-
-  // We want to see that the core "heals itself" if an un-corrupted file is written to the directory.
-  private void copyGoodConf(String coreName, String srcName, String dstName) throws IOException {
-    File coreRoot = new File(solrHomeDirectory, coreName);
-    File subHome = new File(coreRoot, "conf");
-    String top = SolrTestCaseJ4.TEST_HOME() + "/collection1/conf";
-    FileUtils.copyFile(new File(top, srcName), new File(subHome, dstName));
-
-  }
-
-  // If ok==true, we shouldn't be seeing any failure cases.
-  // if ok==false, the core being examined should have a failure in the list.
-  private void checkStatus(CoreContainer cc, Boolean ok, String core) throws Exception {
-    SolrQueryResponse resp = new SolrQueryResponse();
-    final CoreAdminHandler admin = new CoreAdminHandler(cc);
-    admin.handleRequestBody
-        (req(CoreAdminParams.ACTION,
-            CoreAdminParams.CoreAdminAction.STATUS.toString(),
-            CoreAdminParams.CORE, core),
-            resp);
-
-    Map<String, Exception> failures =
-        (Map<String, Exception>) resp.getValues().get("initFailures");
-
-    if (ok) {
-      if (failures.size() != 0) {
-        fail("Should have cleared the error, but there are failues " + failures.toString());
-      }
+    int newCutoff = stepSize * (recordNumber / stepSize + 1);
+    if (newCutoff < cutoff + currentStep) {
+      newCutoff = cutoff + currentStep;
     } else {
-      if (failures.size() == 0) {
-        fail("Should have had errors here but the status return has no failures!");
+      this.currentStep = stepSize;
+    }
+    return newCutoff;
+  }
+
+  public static int stepSize(int recordNumber, double multiplier) {
+    int[] bumps = {1, 2, 5};
+    double log = Math.floor(multiplier * Math.log10(recordNumber));
+    int bump = bumps[(int) log % bumps.length];
+    int scale = (int) Math.pow(10, Math.floor(log / bumps.length));
+
+    return bump * scale;
+  }
+
+  @Override
+  public void close() {
+    trainWithBufferedExamples();
+    try {
+      ep.parallelDo(new EvolutionaryProcess.Function<Wrapper>() {
+        @Override
+        public double apply(Wrapper payload, double[] params) {
+          payload.getLearner().close();
+          return payload.getLearner().logLikelihood();
+        }
+      });
+      ep.close();
+    } catch (InterruptedException e) {
+      // ignore
+    } catch (ExecutionException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
+   * How often should the evolutionary optimization of learning parameters occur?
+   * @param interval  Number of training examples to use in each epoch of optimization.
+   */
+  public void setInterval(int interval) {
+    setInterval(interval, interval);
+  }
+
+  /**
+   * Starts optimization using the shorter interval and progresses to the longer using the specified
+   * number of steps per decade.  Note that values < 200 are not accepted.  Values even that small
+   * are unlikely to be useful.
+   *
+   * @param minInterval  The minimum epoch length for the evolutionary optimization
+   * @param maxInterval  The maximum epoch length
+   */
+  public void setInterval(int minInterval, int maxInterval) {
+    this.minInterval = Math.max(200, minInterval);
+    this.maxInterval = Math.max(200, maxInterval);
+    this.cutoff = minInterval * (record / minInterval + 1);
+    this.currentStep = minInterval;
+    bufferSize = Math.min(minInterval, bufferSize);
+  }
+
+  public void setPoolSize(int poolSize) {
+    this.poolSize = poolSize;
+    setupOptimizer(poolSize);
+  }
+
+  public void setThreadCount(int threadCount) {
+    this.threadCount = threadCount;
+    setupOptimizer(poolSize);
+  }
+
+  public void setAucEvaluator(OnlineAuc auc) {
+    seed.getPayload().setAucEvaluator(auc);
+    setupOptimizer(poolSize);
+  }
+
+  private void setupOptimizer(int poolSize) {
+    ep = new EvolutionaryProcess<Wrapper>(threadCount, poolSize, seed);
+  }
+
+  /**
+   * Returns the size of the internal feature vector.  Note that this is not the
+   * same as the number of distinct features, especially if feature hashing is
+   * being used.
+   * @return The internal feature vector size.
+   */
+  public int numFeatures() {
+    return numFeatures;
+  }
+
+  /**
+   * What is the AUC for the current best member of the population.  If no member is best,
+   * usually because we haven't done any training yet, then the result is set to NaN.
+   * @return  The AUC of the best member of the population or NaN if we can't figure that out.
+   */
+  public double auc() {
+    if (best == null) {
+      return Double.NaN;
+    } else {
+      return best.getPayload().getLearner().auc();
+    }
+  }
+
+  public State<Wrapper> getBest() {
+    return best;
+  }
+
+  public void setBest(State<Wrapper> best) {
+    this.best = best;
+  }
+
+  public int getRecord() {
+    return record;
+  }
+
+  public void setRecord(int record) {
+    this.record = record;
+  }
+
+  public int getMinInterval() {
+    return minInterval;
+  }
+
+  public int getMaxInterval() {
+    return maxInterval;
+  }
+
+  public int getNumCategories() {
+    return seed.getPayload().getLearner().numCategories();
+  }
+
+  public PriorFunction getPrior() {
+    return seed.getPayload().getLearner().getPrior();
+  }
+
+  public void setBuffer(List<TrainingExample> buffer) {
+    this.buffer = buffer;
+  }
+
+  public List<TrainingExample> getBuffer() {
+    return buffer;
+  }
+
+  public EvolutionaryProcess<Wrapper> getEp() {
+    return ep;
+  }
+
+  public void setEp(EvolutionaryProcess<Wrapper> ep) {
+    this.ep = ep;
+  }
+
+  public State<Wrapper> getSeed() {
+    return seed;
+  }
+
+  public void setSeed(State<Wrapper> seed) {
+    this.seed = seed;
+  }
+
+  public int getNumFeatures() {
+    return numFeatures;
+  }
+
+  public void setAveragingWindow(int averagingWindow) {
+    seed.getPayload().getLearner().setWindowSize(averagingWindow);
+    setupOptimizer(poolSize);
+  }
+
+  public void setFreezeSurvivors(boolean freezeSurvivors) {
+    this.freezeSurvivors = freezeSurvivors;
+  }
+
+  /**
+   * Provides a shim between the EP optimization stuff and the CrossFoldLearner.  The most important
+   * interface has to do with the parameters of the optimization.  These are taken from the double[]
+   * params in the following order <ul> <li> regularization constant lambda <li> learningRate </ul>.
+   * All other parameters are set in such a way so as to defeat annealing to the extent possible.
+   * This lets the evolutionary algorithm handle the annealing.
+   * <p>
+   * Note that per coefficient annealing is still done and no optimization of the per coefficient
+   * offset is done.
+   */
+  public static class Wrapper implements Payload<Wrapper> {
+    private CrossFoldLearner wrapped;
+
+    private Wrapper() {
+      // just here to help copy
+    }
+
+    public Wrapper(int numCategories, int numFeatures, PriorFunction prior) {
+      wrapped = new CrossFoldLearner(5, numCategories, numFeatures, prior);
+    }
+
+    @Override
+    public Wrapper copy() {
+      Wrapper r = new Wrapper();
+      r.wrapped = wrapped.copy();
+      return r;
+    }
+
+    @Override
+    public void update(double[] params) {
+      int i = 0;
+      wrapped.lambda(params[i++]);
+      wrapped.learningRate(params[i]);
+
+      wrapped.stepOffset(1);
+      wrapped.alpha(1);
+      wrapped.decayExponent(0);
+    }
+
+    public void freeze(State<Wrapper> s) {
+      // radically decrease learning rate
+      s.getParams()[1] -= 10;
+
+      // and cause evolution to hold (almost)
+      s.setOmni(s.getOmni() / 20);
+      double[] step = s.getStep();
+      for (int i = 0; i < step.length; i++) {
+        step[i] /= 20;
       }
     }
-  }
 
-  private void removeOne(CoreContainer cc, String coreName) {
-    SolrCore tmp = cc.remove(coreName);
-    if (tmp != null) tmp.close();
-  }
-  public static void checkNotInCores(CoreContainer cc, String... nameCheck) {
-    Collection<String> names = cc.getCoreNames();
-    for (String name : nameCheck) {
-      assertFalse("core " + name + " was found in the list of cores", names.contains(name));
+    public void setMappings(State<Wrapper> x) {
+      int i = 0;
+      // set the range for regularization (lambda)
+      x.setMap(i++, Mapping.logLimit(1.0e-8, 0.1));
+      // set the range for learning rate (mu)
+      x.setMap(i, Mapping.logLimit(1.0e-8, 1));
+    }
+
+    public void train(TrainingExample example) {
+      wrapped.train(example.getKey(), example.getGroupKey(), example.getActual(), example.getInstance());
+    }
+
+    public CrossFoldLearner getLearner() {
+      return wrapped;
+    }
+
+    @Override
+    public String toString() {
+      return String.format(Locale.ENGLISH, "auc=%.2f", wrapped.auc());
+    }
+
+    public void setAucEvaluator(OnlineAuc auc) {
+      wrapped.setAucEvaluator(auc);
     }
   }
 
-  public static void checkInCores(CoreContainer cc, String... nameCheck) {
-    Collection<String> names = cc.getCoreNames();
-    for (String name : nameCheck) {
-      assertTrue("core " + name + " was not found in the list of cores", names.contains(name));
+  public static class TrainingExample {
+    private long key;
+    private String groupKey;
+    private int actual;
+    private Vector instance;
+
+    // for GSON
+    private TrainingExample() {
+    }
+
+    public TrainingExample(long key, String groupKey, int actual, Vector instance) {
+      this.key = key;
+      this.groupKey = groupKey;
+      this.actual = actual;
+      this.instance = instance;
+    }
+
+    public long getKey() {
+      return key;
+    }
+
+    public int getActual() {
+      return actual;
+    }
+
+    public Vector getInstance() {
+      return instance;
+    }
+
+    public String getGroupKey() {
+      return groupKey;
     }
   }
-
-  private void addLazy(SolrCore core, String... fieldValues) throws IOException {
-    UpdateHandler updater = core.getUpdateHandler();
-    AddUpdateCommand cmd = new AddUpdateCommand(makeReq(core));
-    cmd.solrDoc = sdoc((Object[])fieldValues);
-    updater.addDoc(cmd);
-  }
-
-  private LocalSolrQueryRequest makeReq(SolrCore core, String... q) {
-    if (q.length == 1) {
-      return new LocalSolrQueryRequest(core,
-          q[0], null, 0, 20, new HashMap<String, String>());
-    }
-    if (q.length % 2 != 0) {
-      throw new RuntimeException("The length of the string array (query arguments) needs to be even");
-    }
-    NamedList.NamedListEntry[] entries = new NamedList.NamedListEntry[q.length / 2];
-    for (int i = 0; i < q.length; i += 2) {
-      entries[i / 2] = new NamedList.NamedListEntry<String>(q[i], q[i + 1]);
-    }
-    return new LocalSolrQueryRequest(core, new NamedList<Object>(entries));
-  }
-
-  private final static String LOTS_SOLR_XML = " <solr persistent=\"false\"> " +
-      "<cores adminPath=\"/admin/cores\" defaultCoreName=\"collectionLazy2\" transientCacheSize=\"4\">  " +
-      "<core name=\"collection1\" instanceDir=\"collection1\"  /> " +
-
-      "<core name=\"collectionLazy2\" instanceDir=\"collection2\" transient=\"true\" loadOnStartup=\"true\"   /> " +
-
-      "<core name=\"collectionLazy3\" instanceDir=\"collection3\" transient=\"on\" loadOnStartup=\"false\"    /> " +
-
-      "<core name=\"collectionLazy4\" instanceDir=\"collection4\" transient=\"false\" loadOnStartup=\"false\" /> " +
-
-      "<core name=\"collectionLazy5\" instanceDir=\"collection5\" transient=\"false\" loadOnStartup=\"true\" /> " +
-
-      "<core name=\"collectionLazy6\" instanceDir=\"collection6\" transient=\"true\" loadOnStartup=\"false\" /> " +
-
-      "<core name=\"collectionLazy7\" instanceDir=\"collection7\" transient=\"true\" loadOnStartup=\"false\" /> " +
-
-      "<core name=\"collectionLazy8\" instanceDir=\"collection8\" transient=\"true\" loadOnStartup=\"false\" /> " +
-
-      "<core name=\"collectionLazy9\" instanceDir=\"collection9\" transient=\"true\" loadOnStartup=\"false\" /> " +
-
-      "</cores> " +
-      "</solr>";
 }

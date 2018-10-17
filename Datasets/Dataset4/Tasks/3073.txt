@@ -1,15 +1,15 @@
-if (ord != Ordinals.MISSING_ORDINAL) {
+if (smartMappers.explicitTypeInNameWithDocMapper()) {
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
+ * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
+ * regarding copyright ownership. Elastic Search licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -19,174 +19,238 @@ if (ord != Ordinals.MISSING_ORDINAL) {
  * under the License.
  */
 
-package org.elasticsearch.index.fielddata.plain;
+package org.elasticsearch.search.facet.terms.bytes;
 
-import com.google.common.base.Preconditions;
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.BytesRefIterator;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.NumericUtils;
-import org.apache.lucene.util.packed.MonotonicAppendingLongBuffer;
-import org.apache.lucene.util.packed.PackedInts;
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.fielddata.*;
-import org.elasticsearch.index.fielddata.fieldcomparator.LongValuesComparatorSource;
-import org.elasticsearch.index.fielddata.fieldcomparator.SortMode;
-import org.elasticsearch.index.fielddata.ordinals.Ordinals;
-import org.elasticsearch.index.fielddata.ordinals.Ordinals.Docs;
-import org.elasticsearch.index.fielddata.ordinals.OrdinalsBuilder;
-import org.elasticsearch.index.mapper.FieldMapper;
-import org.elasticsearch.index.settings.IndexSettings;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import gnu.trove.iterator.TByteIntIterator;
+import gnu.trove.map.hash.TByteIntHashMap;
+import gnu.trove.set.hash.TByteHashSet;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.Scorer;
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
+import org.elasticsearch.common.CacheRecycler;
+import org.elasticsearch.common.collect.BoundedTreeSet;
+import org.elasticsearch.index.cache.field.data.FieldDataCache;
+import org.elasticsearch.index.field.data.FieldDataType;
+import org.elasticsearch.index.field.data.bytes.ByteFieldData;
+import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.script.SearchScript;
+import org.elasticsearch.search.facet.AbstractFacetCollector;
+import org.elasticsearch.search.facet.Facet;
+import org.elasticsearch.search.facet.FacetPhaseExecutionException;
+import org.elasticsearch.search.facet.terms.TermsFacet;
+import org.elasticsearch.search.facet.terms.support.EntryPriorityQueue;
+import org.elasticsearch.search.internal.SearchContext;
 
-import java.util.EnumSet;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.Set;
 
 /**
- * Stores numeric data into bit-packed arrays for better memory efficiency.
+ *
  */
-public class PackedArrayIndexFieldData extends AbstractIndexFieldData<AtomicNumericFieldData> implements IndexNumericFieldData<AtomicNumericFieldData> {
+public class TermsByteFacetCollector extends AbstractFacetCollector {
 
-    public static class Builder implements IndexFieldData.Builder {
+    private final FieldDataCache fieldDataCache;
 
-        private NumericType numericType;
+    private final String indexFieldName;
 
-        public Builder setNumericType(NumericType numericType) {
-            this.numericType = numericType;
-            return this;
+    private final TermsFacet.ComparatorType comparatorType;
+
+    private final int size;
+
+    private final int numberOfShards;
+
+    private final FieldDataType fieldDataType;
+
+    private ByteFieldData fieldData;
+
+    private final StaticAggregatorValueProc aggregator;
+
+    private final SearchScript script;
+
+    public TermsByteFacetCollector(String facetName, String fieldName, int size, TermsFacet.ComparatorType comparatorType, boolean allTerms, SearchContext context,
+                                   ImmutableSet<String> excluded, String scriptLang, String script, Map<String, Object> params) {
+        super(facetName);
+        this.fieldDataCache = context.fieldDataCache();
+        this.size = size;
+        this.comparatorType = comparatorType;
+        this.numberOfShards = context.numberOfShards();
+
+        MapperService.SmartNameFieldMappers smartMappers = context.smartFieldMappers(fieldName);
+        if (smartMappers == null || !smartMappers.hasMapper()) {
+            throw new ElasticSearchIllegalArgumentException("Field [" + fieldName + "] doesn't have a type, can't run terms short facet collector on it");
+        }
+
+        // add type filter if there is exact doc mapper associated with it
+        if (smartMappers.hasDocMapper() && smartMappers.explicitTypeInName()) {
+            setFilter(context.filterCache().cache(smartMappers.docMapper().typeFilter()));
+        }
+
+        if (smartMappers.mapper().fieldDataType() != FieldDataType.DefaultTypes.BYTE) {
+            throw new ElasticSearchIllegalArgumentException("Field [" + fieldName + "] is not of byte type, can't run terms short facet collector on it");
+        }
+
+        this.indexFieldName = smartMappers.mapper().names().indexName();
+        this.fieldDataType = smartMappers.mapper().fieldDataType();
+
+        if (script != null) {
+            this.script = context.scriptService().search(context.lookup(), scriptLang, script, params);
+        } else {
+            this.script = null;
+        }
+
+        if (this.script == null && excluded.isEmpty()) {
+            aggregator = new StaticAggregatorValueProc(CacheRecycler.popByteIntMap());
+        } else {
+            aggregator = new AggregatorValueProc(CacheRecycler.popByteIntMap(), excluded, this.script);
+        }
+
+        if (allTerms) {
+            try {
+                for (IndexReader reader : context.searcher().subReaders()) {
+                    ByteFieldData fieldData = (ByteFieldData) fieldDataCache.cache(fieldDataType, reader, indexFieldName);
+                    fieldData.forEachValue(aggregator);
+                }
+            } catch (Exception e) {
+                throw new FacetPhaseExecutionException(facetName, "failed to load all terms", e);
+            }
+        }
+    }
+
+    @Override
+    public void setScorer(Scorer scorer) throws IOException {
+        if (script != null) {
+            script.setScorer(scorer);
+        }
+    }
+
+    @Override
+    protected void doSetNextReader(IndexReader reader, int docBase) throws IOException {
+        fieldData = (ByteFieldData) fieldDataCache.cache(fieldDataType, reader, indexFieldName);
+        if (script != null) {
+            script.setNextReader(reader);
+        }
+    }
+
+    @Override
+    protected void doCollect(int doc) throws IOException {
+        fieldData.forEachValueInDoc(doc, aggregator);
+    }
+
+    @Override
+    public Facet facet() {
+        TByteIntHashMap facets = aggregator.facets();
+        if (facets.isEmpty()) {
+            CacheRecycler.pushByteIntMap(facets);
+            return new InternalByteTermsFacet(facetName, comparatorType, size, ImmutableList.<InternalByteTermsFacet.ByteEntry>of(), aggregator.missing(), aggregator.total());
+        } else {
+            if (size < EntryPriorityQueue.LIMIT) {
+                EntryPriorityQueue ordered = new EntryPriorityQueue(size, comparatorType.comparator());
+                for (TByteIntIterator it = facets.iterator(); it.hasNext(); ) {
+                    it.advance();
+                    ordered.insertWithOverflow(new InternalByteTermsFacet.ByteEntry(it.key(), it.value()));
+                }
+                InternalByteTermsFacet.ByteEntry[] list = new InternalByteTermsFacet.ByteEntry[ordered.size()];
+                for (int i = ordered.size() - 1; i >= 0; i--) {
+                    list[i] = (InternalByteTermsFacet.ByteEntry) ordered.pop();
+                }
+                CacheRecycler.pushByteIntMap(facets);
+                return new InternalByteTermsFacet(facetName, comparatorType, size, Arrays.asList(list), aggregator.missing(), aggregator.total());
+            } else {
+                BoundedTreeSet<InternalByteTermsFacet.ByteEntry> ordered = new BoundedTreeSet<InternalByteTermsFacet.ByteEntry>(comparatorType.comparator(), size);
+                for (TByteIntIterator it = facets.iterator(); it.hasNext(); ) {
+                    it.advance();
+                    ordered.add(new InternalByteTermsFacet.ByteEntry(it.key(), it.value()));
+                }
+                CacheRecycler.pushByteIntMap(facets);
+                return new InternalByteTermsFacet(facetName, comparatorType, size, ordered, aggregator.missing(), aggregator.total());
+            }
+        }
+    }
+
+    public static class AggregatorValueProc extends StaticAggregatorValueProc {
+
+        private final SearchScript script;
+
+        private final TByteHashSet excluded;
+
+        public AggregatorValueProc(TByteIntHashMap facets, Set<String> excluded, SearchScript script) {
+            super(facets);
+            if (excluded == null || excluded.isEmpty()) {
+                this.excluded = null;
+            } else {
+                this.excluded = new TByteHashSet(excluded.size());
+                for (String s : excluded) {
+                    this.excluded.add(Byte.parseByte(s));
+                }
+            }
+            this.script = script;
         }
 
         @Override
-        public IndexFieldData<AtomicNumericFieldData> build(Index index, @IndexSettings Settings indexSettings, FieldMapper.Names fieldNames, FieldDataType type, IndexFieldDataCache cache) {
-            return new PackedArrayIndexFieldData(index, indexSettings, fieldNames, type, cache, numericType);
-        }
-    }
-
-    private final NumericType numericType;
-
-    public PackedArrayIndexFieldData(Index index, @IndexSettings Settings indexSettings, FieldMapper.Names fieldNames, FieldDataType fieldDataType, IndexFieldDataCache cache, NumericType numericType) {
-        super(index, indexSettings, fieldNames, fieldDataType, cache);
-        Preconditions.checkNotNull(numericType);
-        Preconditions.checkArgument(EnumSet.of(NumericType.BYTE, NumericType.SHORT, NumericType.INT, NumericType.LONG).contains(numericType), getClass().getSimpleName() + " only supports integer types, not " + numericType);
-        this.numericType = numericType;
-    }
-
-    @Override
-    public NumericType getNumericType() {
-        return numericType;
-    }
-
-    @Override
-    public boolean valuesOrdered() {
-        // because we might have single values? we can dynamically update a flag to reflect that
-        // based on the atomic field data loaded
-        return false;
-    }
-
-    @Override
-    public AtomicNumericFieldData loadDirect(AtomicReaderContext context) throws Exception {
-        AtomicReader reader = context.reader();
-        Terms terms = reader.terms(getFieldNames().indexName());
-        if (terms == null) {
-            return PackedArrayAtomicFieldData.empty(reader.maxDoc());
-        }
-        // TODO: how can we guess the number of terms? numerics end up creating more terms per value...
-        // Lucene encodes numeric data so that the lexicographical (encoded) order matches the integer order so we know the sequence of
-        // longs is going to be monotonically increasing
-        final MonotonicAppendingLongBuffer values = new MonotonicAppendingLongBuffer();
-
-        final float acceptableTransientOverheadRatio = fieldDataType.getSettings().getAsFloat("acceptable_transient_overhead_ratio", OrdinalsBuilder.DEFAULT_ACCEPTABLE_OVERHEAD_RATIO);
-        OrdinalsBuilder builder = new OrdinalsBuilder(-1, reader.maxDoc(), acceptableTransientOverheadRatio);
-        try {
-            BytesRefIterator iter = builder.buildFromTerms(getNumericType().wrapTermsEnum(terms.iterator(null)));
-            BytesRef term;
-            assert !getNumericType().isFloatingPoint();
-            final boolean indexedAsLong = getNumericType().requiredBits() > 32;
-            while ((term = iter.next()) != null) {
-                final long value = indexedAsLong
-                        ? NumericUtils.prefixCodedToLong(term)
-                        : NumericUtils.prefixCodedToInt(term);
-                assert values.size() == 0 || value > values.get(values.size() - 1);
-                values.add(value);
+        public void onValue(int docId, byte value) {
+            if (excluded != null && excluded.contains(value)) {
+                return;
             }
-            Ordinals build = builder.build(fieldDataType.getSettings());
-
-            if (!build.isMultiValued() && CommonSettings.removeOrdsOnSingleValue(fieldDataType)) {
-                Docs ordinals = build.ordinals();
-                final FixedBitSet set = builder.buildDocsWithValuesSet();
-
-                long minValue, maxValue;
-                minValue = maxValue = 0;
-                if (values.size() > 0) {
-                    minValue = values.get(0);
-                    maxValue = values.get(values.size() - 1);
+            if (script != null) {
+                script.setNextDocId(docId);
+                script.setNextVar("term", value);
+                Object scriptValue = script.run();
+                if (scriptValue == null) {
+                    return;
                 }
-
-                // Encode document without a value with a special value
-                long missingValue = 0;
-                if (set != null) {
-                    if ((maxValue - minValue + 1) == values.size()) {
-                        // values are dense
-                        if (minValue > Long.MIN_VALUE) {
-                            missingValue = --minValue;
-                        } else {
-                            assert maxValue != Long.MAX_VALUE;
-                            missingValue = ++maxValue;
-                        }
-                    } else {
-                        for (long i = 1; i < values.size(); ++i) {
-                            if (values.get(i) > values.get(i - 1) + 1) {
-                                missingValue = values.get(i - 1) + 1;
-                                break;
-                            }
-                        }
+                if (scriptValue instanceof Boolean) {
+                    if (!((Boolean) scriptValue)) {
+                        return;
                     }
-                    missingValue -= minValue; // delta
-                }
-
-                final long delta = maxValue - minValue;
-                final int bitsRequired = delta < 0 ? 64 : PackedInts.bitsRequired(delta);
-                final float acceptableOverheadRatio = fieldDataType.getSettings().getAsFloat("acceptable_overhead_ratio", PackedInts.DEFAULT);
-                final PackedInts.FormatAndBits formatAndBits = PackedInts.fastestFormatAndBits(reader.maxDoc(), bitsRequired, acceptableOverheadRatio);
-
-                // there's sweet spot where due to low unique value count, using ordinals will consume less memory
-                final long singleValuesSize = formatAndBits.format.longCount(PackedInts.VERSION_CURRENT, reader.maxDoc(), formatAndBits.bitsPerValue) * 8L;
-                final long uniqueValuesSize = values.ramBytesUsed();
-                final long ordinalsSize = build.getMemorySizeInBytes();
-
-                if (uniqueValuesSize + ordinalsSize < singleValuesSize) {
-                    return new PackedArrayAtomicFieldData.WithOrdinals(values, reader.maxDoc(), build);
-                }
-
-                final PackedInts.Mutable sValues = PackedInts.getMutable(reader.maxDoc(), bitsRequired, acceptableOverheadRatio);
-                if (missingValue != 0) {
-                    sValues.fill(0, sValues.size(), missingValue);
-                }
-                for (int i = 0; i < reader.maxDoc(); i++) {
-                    final long ord = ordinals.getOrd(i);
-                    if (ord > 0) {
-                        sValues.set(i, values.get(ord - 1) - minValue);
-                    }
-                }
-                if (set == null) {
-                    return new PackedArrayAtomicFieldData.Single(sValues, minValue, reader.maxDoc(), ordinals.getNumOrds());
                 } else {
-                    return new PackedArrayAtomicFieldData.SingleSparse(sValues, minValue, reader.maxDoc(), missingValue, ordinals.getNumOrds());
+                    value = ((Number) scriptValue).byteValue();
                 }
-            } else {
-                return new PackedArrayAtomicFieldData.WithOrdinals(values, reader.maxDoc(), build);
             }
-        } finally {
-            builder.close();
+            super.onValue(docId, value);
         }
-
     }
 
-    @Override
-    public XFieldComparatorSource comparatorSource(@Nullable Object missingValue, SortMode sortMode) {
-        return new LongValuesComparatorSource(this, missingValue, sortMode);
+    public static class StaticAggregatorValueProc implements ByteFieldData.ValueInDocProc, ByteFieldData.ValueProc {
+
+        private final TByteIntHashMap facets;
+
+        private int missing;
+        private int total;
+
+        public StaticAggregatorValueProc(TByteIntHashMap facets) {
+            this.facets = facets;
+        }
+
+        @Override
+        public void onValue(byte value) {
+            facets.putIfAbsent(value, 0);
+        }
+
+        @Override
+        public void onValue(int docId, byte value) {
+            facets.adjustOrPutValue(value, 1, 1);
+            total++;
+        }
+
+        @Override
+        public void onMissing(int docID) {
+            missing++;
+        }
+
+        public final TByteIntHashMap facets() {
+            return facets;
+        }
+
+        public final int missing() {
+            return this.missing;
+        }
+
+        public final int total() {
+            return this.total;
+        }
     }
 }

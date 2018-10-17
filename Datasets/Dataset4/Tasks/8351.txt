@@ -1,4 +1,4 @@
-channel.sendResponse(new XContentThrowableRestResponse(request, e));
+import org.elasticsearch.util.collect.ImmutableMap;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,95 +19,173 @@ channel.sendResponse(new XContentThrowableRestResponse(request, e));
  * under the License.
  */
 
-package org.elasticsearch.rest;
+package org.elasticsearch.search.fetch;
 
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchIllegalArgumentException;
-import org.elasticsearch.util.component.AbstractLifecycleComponent;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldSelector;
+import org.apache.lucene.document.Fieldable;
+import org.elasticsearch.index.mapper.*;
+import org.elasticsearch.search.SearchHitField;
+import org.elasticsearch.search.SearchParseElement;
+import org.elasticsearch.search.SearchPhase;
+import org.elasticsearch.search.highlight.HighlightPhase;
+import org.elasticsearch.search.internal.InternalSearchHit;
+import org.elasticsearch.search.internal.InternalSearchHitField;
+import org.elasticsearch.search.internal.InternalSearchHits;
+import org.elasticsearch.search.internal.SearchContext;
+import org.elasticsearch.util.gcommon.collect.ImmutableMap;
 import org.elasticsearch.util.guice.inject.Inject;
-import org.elasticsearch.util.path.PathTrie;
-import org.elasticsearch.util.settings.Settings;
 
 import java.io.IOException;
-
-import static org.elasticsearch.rest.RestResponse.Status.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * @author kimchy (Shay Banon)
+ * @author kimchy (shay.banon)
  */
-public class RestController extends AbstractLifecycleComponent<RestController> {
+public class FetchPhase implements SearchPhase {
 
-    private final PathTrie<RestHandler> getHandlers = new PathTrie<RestHandler>();
-    private final PathTrie<RestHandler> postHandlers = new PathTrie<RestHandler>();
-    private final PathTrie<RestHandler> putHandlers = new PathTrie<RestHandler>();
-    private final PathTrie<RestHandler> deleteHandlers = new PathTrie<RestHandler>();
+    private final HighlightPhase highlightPhase;
 
-    @Inject public RestController(Settings settings) {
-        super(settings);
+    @Inject public FetchPhase(HighlightPhase highlightPhase) {
+        this.highlightPhase = highlightPhase;
     }
 
-    @Override protected void doStart() throws ElasticSearchException {
+    @Override public Map<String, ? extends SearchParseElement> parseElements() {
+        ImmutableMap.Builder<String, SearchParseElement> parseElements = ImmutableMap.builder();
+        parseElements.put("explain", new ExplainParseElement())
+                .put("fields", new FieldsParseElement())
+                .putAll(highlightPhase.parseElements());
+        return parseElements.build();
     }
 
-    @Override protected void doStop() throws ElasticSearchException {
+    @Override public void preProcess(SearchContext context) {
+        highlightPhase.preProcess(context);
     }
 
-    @Override protected void doClose() throws ElasticSearchException {
-    }
+    public void execute(SearchContext context) {
+        FieldSelector fieldSelector = buildFieldSelectors(context);
 
-    public void registerHandler(RestRequest.Method method, String path, RestHandler handler) {
-        switch (method) {
-            case GET:
-                getHandlers.insert(path, handler);
-                break;
-            case DELETE:
-                deleteHandlers.insert(path, handler);
-                break;
-            case POST:
-                postHandlers.insert(path, handler);
-                break;
-            case PUT:
-                putHandlers.insert(path, handler);
-                break;
-            default:
-                throw new ElasticSearchIllegalArgumentException("Can't handle [" + method + "] for path [" + path + "]");
+        InternalSearchHit[] hits = new InternalSearchHit[context.docIdsToLoadSize()];
+        int index = 0;
+        for (int docIdIdx = context.docIdsToLoadFrom(); docIdIdx < context.docIdsToLoadSize(); docIdIdx++) {
+            int docId = context.docIdsToLoad()[docIdIdx];
+            Document doc = loadDocument(context, fieldSelector, docId);
+            Uid uid = extractUid(context, doc);
+
+            DocumentMapper documentMapper = context.mapperService().type(uid.type());
+
+            byte[] source = extractSource(doc, documentMapper);
+
+            InternalSearchHit searchHit = new InternalSearchHit(docId, uid.id(), uid.type(), source, null);
+            hits[index] = searchHit;
+
+            for (Object oField : doc.getFields()) {
+                Fieldable field = (Fieldable) oField;
+                String name = field.name();
+                Object value = null;
+                FieldMappers fieldMappers = documentMapper.mappers().indexName(field.name());
+                if (fieldMappers != null) {
+                    FieldMapper mapper = fieldMappers.mapper();
+                    if (mapper != null) {
+                        name = mapper.names().fullName();
+                        value = mapper.valueForSearch(field);
+                    }
+                }
+                if (value == null) {
+                    if (field.isBinary()) {
+                        value = field.getBinaryValue();
+                    } else {
+                        value = field.stringValue();
+                    }
+                }
+
+                if (searchHit.fields() == null) {
+                    searchHit.fields(new HashMap<String, SearchHitField>(2));
+                }
+
+                SearchHitField hitField = searchHit.fields().get(name);
+                if (hitField == null) {
+                    hitField = new InternalSearchHitField(name, new ArrayList<Object>(2));
+                    searchHit.fields().put(name, hitField);
+                }
+                hitField.values().add(value);
+            }
+            doExplanation(context, docId, searchHit);
+
+            index++;
         }
+        context.fetchResult().hits(new InternalSearchHits(hits, context.queryResult().topDocs().totalHits));
+
+        highlightPhase.execute(context);
     }
 
-    public void dispatchRequest(final RestRequest request, final RestChannel channel) {
-        final RestHandler handler = getHandler(request);
-        if (handler == null) {
-            channel.sendResponse(new StringRestResponse(BAD_REQUEST, "No handler found for uri [" + request.uri() + "] and method [" + request.method() + "]"));
-            return;
-        }
-        try {
-            handler.handleRequest(request, channel);
-        } catch (Exception e) {
+    private void doExplanation(SearchContext context, int docId, InternalSearchHit searchHit) {
+        if (context.explain()) {
             try {
-                channel.sendResponse(new JsonThrowableRestResponse(request, e));
-            } catch (IOException e1) {
-                logger.error("Failed to send failure response for uri [" + request.uri() + "]", e1);
+                searchHit.explanation(context.searcher().explain(context.query(), docId));
+            } catch (IOException e) {
+                throw new FetchPhaseExecutionException(context, "Failed to explain doc [" + docId + "]", e);
             }
         }
     }
 
-    private RestHandler getHandler(RestRequest request) {
-        String path = getPath(request);
-        RestRequest.Method method = request.method();
-        if (method == RestRequest.Method.GET) {
-            return getHandlers.retrieve(path, request.params());
-        } else if (method == RestRequest.Method.POST) {
-            return postHandlers.retrieve(path, request.params());
-        } else if (method == RestRequest.Method.PUT) {
-            return putHandlers.retrieve(path, request.params());
-        } else if (method == RestRequest.Method.DELETE) {
-            return deleteHandlers.retrieve(path, request.params());
-        } else {
-            return null;
+    private byte[] extractSource(Document doc, DocumentMapper documentMapper) {
+        byte[] source = null;
+        Fieldable sourceField = doc.getFieldable(documentMapper.sourceMapper().names().indexName());
+        if (sourceField != null) {
+            source = documentMapper.sourceMapper().value(sourceField);
+            doc.removeField(documentMapper.sourceMapper().names().indexName());
         }
+        return source;
     }
 
-    private String getPath(RestRequest request) {
-        return request.path();
+    private Uid extractUid(SearchContext context, Document doc) {
+        Uid uid = null;
+        for (FieldMapper fieldMapper : context.mapperService().uidFieldMappers()) {
+            String sUid = doc.get(fieldMapper.names().indexName());
+            if (sUid != null) {
+                uid = Uid.createUid(sUid);
+                doc.removeField(fieldMapper.names().indexName());
+                break;
+            }
+        }
+        if (uid == null) {
+            // no type, nothing to do (should not really happen
+            throw new FetchPhaseExecutionException(context, "Failed to load uid from the index");
+        }
+        return uid;
+    }
+
+    private Document loadDocument(SearchContext context, FieldSelector fieldSelector, int docId) {
+        Document doc;
+        try {
+            doc = context.searcher().doc(docId, fieldSelector);
+        } catch (IOException e) {
+            throw new FetchPhaseExecutionException(context, "Failed to fetch doc id [" + docId + "]", e);
+        }
+        return doc;
+    }
+
+    private FieldSelector buildFieldSelectors(SearchContext context) {
+        if (context.fieldNames() == null) {
+            return new UidAndSourceFieldSelector();
+        }
+
+        if (context.fieldNames().length == 0) {
+            return new UidFieldSelector();
+        }
+
+        FieldMappersFieldSelector fieldSelector = new FieldMappersFieldSelector();
+        for (String fieldName : context.fieldNames()) {
+            FieldMappers x = context.mapperService().smartNameFieldMappers(fieldName);
+            if (x == null) {
+                throw new FetchPhaseExecutionException(context, "No mapping for field [" + fieldName + "]");
+            }
+            fieldSelector.add(x);
+        }
+        fieldSelector.add(context.mapperService().uidFieldMappers());
+        return fieldSelector;
     }
 }

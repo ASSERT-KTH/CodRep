@@ -1,4 +1,4 @@
-import static org.elasticsearch.action.ValidateActions.addValidationError;
+result.matches(), result.count(), tookInMillis, result.reducedFacets(), result.reducedAggregations()
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -21,211 +21,184 @@ import static org.elasticsearch.action.ValidateActions.addValidationError;
 
 package org.elasticsearch.action.percolate;
 
-import org.apache.lucene.util.UnicodeUtil;
-import org.elasticsearch.ElasticSearchGenerationException;
-import org.elasticsearch.action.ActionRequestValidationException;
-import org.elasticsearch.action.support.single.custom.SingleCustomOperationRequest;
-import org.elasticsearch.common.BytesHolder;
-import org.elasticsearch.common.Required;
-import org.elasticsearch.common.Unicode;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ShardOperationFailedException;
+import org.elasticsearch.action.get.GetResponse;
+import org.elasticsearch.action.get.TransportGetAction;
+import org.elasticsearch.action.support.DefaultShardOperationFailedException;
+import org.elasticsearch.action.support.broadcast.BroadcastShardOperationFailedException;
+import org.elasticsearch.action.support.broadcast.TransportBroadcastOperationAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.routing.GroupShardsIterator;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.engine.DocumentMissingException;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.percolator.PercolateException;
+import org.elasticsearch.percolator.PercolatorService;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
 
-import java.io.IOException;
-import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
-import static org.elasticsearch.action.Actions.addValidationError;
+import static com.google.common.collect.Lists.newArrayList;
 
 /**
  *
  */
-public class PercolateRequest extends SingleCustomOperationRequest {
+public class TransportPercolateAction extends TransportBroadcastOperationAction<PercolateRequest, PercolateResponse, PercolateShardRequest, PercolateShardResponse> {
 
-    private String index;
-    private String type;
+    private final PercolatorService percolatorService;
+    private final TransportGetAction getAction;
 
-    private byte[] source;
-    private int sourceOffset;
-    private int sourceLength;
-    private boolean sourceUnsafe;
-
-    public PercolateRequest() {
-
+    @Inject
+    public TransportPercolateAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
+                                    TransportService transportService, PercolatorService percolatorService,
+                                    TransportGetAction getAction) {
+        super(settings, threadPool, clusterService, transportService);
+        this.percolatorService = percolatorService;
+        this.getAction = getAction;
     }
 
-    /**
-     * Constructs a new percolate request.
-     *
-     * @param index The index name
-     * @param type  The document type
-     */
-    public PercolateRequest(String index, String type) {
-        this.index = index;
-        this.type = type;
-    }
-
-    public PercolateRequest index(String index) {
-        this.index = index;
-        return this;
-    }
-
-    public PercolateRequest type(String type) {
-        this.type = type;
-        return this;
-    }
-
-    public String index() {
-        return this.index;
-    }
-
-    public String type() {
-        return this.type;
-    }
-
-    /**
-     * Before we fork on a local thread, make sure we copy over the bytes if they are unsafe
-     */
     @Override
-    public void beforeLocalFork() {
-        if (sourceUnsafe) {
-            source();
+    protected void doExecute(final PercolateRequest request, final ActionListener<PercolateResponse> listener) {
+        request.startTime = System.currentTimeMillis();
+        if (request.getRequest() != null) {
+            getAction.execute(request.getRequest(), new ActionListener<GetResponse>() {
+                @Override
+                public void onResponse(GetResponse getResponse) {
+                    if (!getResponse.isExists()) {
+                        onFailure(new DocumentMissingException(null, request.getRequest().type(), request.getRequest().id()));
+                        return;
+                    }
+
+                    BytesReference docSource = getResponse.getSourceAsBytesRef();
+                    TransportPercolateAction.super.doExecute(new PercolateRequest(request, docSource), listener);
+                }
+
+                @Override
+                public void onFailure(Throwable e) {
+                    listener.onFailure(e);
+                }
+            });
+        } else {
+            super.doExecute(request, listener);
         }
     }
 
-    public byte[] source() {
-        if (sourceUnsafe || sourceOffset > 0 || source.length != sourceLength) {
-            source = Arrays.copyOfRange(source, sourceOffset, sourceOffset + sourceLength);
-            sourceOffset = 0;
-            sourceUnsafe = false;
+    @Override
+    protected String executor() {
+        return ThreadPool.Names.PERCOLATE;
+    }
+
+    @Override
+    protected PercolateRequest newRequest() {
+        return new PercolateRequest();
+    }
+
+    @Override
+    protected String transportAction() {
+        return PercolateAction.NAME;
+    }
+
+    @Override
+    protected ClusterBlockException checkGlobalBlock(ClusterState state, PercolateRequest request) {
+        return state.blocks().globalBlockedException(ClusterBlockLevel.READ);
+    }
+
+    @Override
+    protected ClusterBlockException checkRequestBlock(ClusterState state, PercolateRequest request, String[] concreteIndices) {
+        return state.blocks().indicesBlockedException(ClusterBlockLevel.READ, concreteIndices);
+    }
+
+    @Override
+    protected PercolateResponse newResponse(PercolateRequest request, AtomicReferenceArray shardsResponses, ClusterState clusterState) {
+        return reduce(request, shardsResponses, percolatorService);
+    }
+
+    public static PercolateResponse reduce(PercolateRequest request, AtomicReferenceArray shardsResponses, PercolatorService percolatorService) {
+        int successfulShards = 0;
+        int failedShards = 0;
+
+        List<PercolateShardResponse> shardResults = null;
+        List<ShardOperationFailedException> shardFailures = null;
+
+        byte percolatorTypeId = 0x00;
+        for (int i = 0; i < shardsResponses.length(); i++) {
+            Object shardResponse = shardsResponses.get(i);
+            if (shardResponse == null) {
+                // simply ignore non active shards
+            } else if (shardResponse instanceof BroadcastShardOperationFailedException) {
+                failedShards++;
+                if (shardFailures == null) {
+                    shardFailures = newArrayList();
+                }
+                shardFailures.add(new DefaultShardOperationFailedException((BroadcastShardOperationFailedException) shardResponse));
+            } else {
+                PercolateShardResponse percolateShardResponse = (PercolateShardResponse) shardResponse;
+                successfulShards++;
+                if (!percolateShardResponse.isEmpty()) {
+                    if (shardResults == null) {
+                        percolatorTypeId = percolateShardResponse.percolatorTypeId();
+                        shardResults = newArrayList();
+                    }
+                    shardResults.add(percolateShardResponse);
+                }
+            }
         }
-        return source;
-    }
 
-    public byte[] underlyingSource() {
-        if (sourceUnsafe) {
-            source();
+        if (shardResults == null) {
+            long tookInMillis = System.currentTimeMillis() - request.startTime;
+            return new PercolateResponse(shardsResponses.length(), successfulShards, failedShards, shardFailures, tookInMillis);
+        } else {
+            PercolatorService.ReduceResult result = percolatorService.reduce(percolatorTypeId, shardResults);
+            long tookInMillis = System.currentTimeMillis() - request.startTime;
+            return new PercolateResponse(
+                    shardsResponses.length(), successfulShards, failedShards, shardFailures,
+                    result.matches(), result.count(), tookInMillis, result.reducedFacets()
+            );
         }
-        return this.source;
     }
 
-    public int underlyingSourceOffset() {
-        if (sourceUnsafe) {
-            source();
-        }
-        return this.sourceOffset;
+    @Override
+    protected PercolateShardRequest newShardRequest() {
+        return new PercolateShardRequest();
     }
 
-    public int underlyingSourceLength() {
-        if (sourceUnsafe) {
-            source();
-        }
-        return this.sourceLength;
+    @Override
+    protected PercolateShardRequest newShardRequest(ShardRouting shard, PercolateRequest request) {
+        return new PercolateShardRequest(shard.index(), shard.id(), request);
     }
 
-    @Required
-    public PercolateRequest source(Map source) throws ElasticSearchGenerationException {
-        return source(source, XContentType.SMILE);
+    @Override
+    protected PercolateShardResponse newShardResponse() {
+        return new PercolateShardResponse();
     }
 
-    @Required
-    public PercolateRequest source(Map source, XContentType contentType) throws ElasticSearchGenerationException {
+    @Override
+    protected GroupShardsIterator shards(ClusterState clusterState, PercolateRequest request, String[] concreteIndices) {
+        Map<String, Set<String>> routingMap = clusterState.metaData().resolveSearchRouting(request.routing(), request.indices());
+        return clusterService.operationRouting().searchShards(clusterState, request.indices(), concreteIndices, routingMap, request.preference());
+    }
+
+    @Override
+    protected PercolateShardResponse shardOperation(PercolateShardRequest request) throws ElasticSearchException {
         try {
-            XContentBuilder builder = XContentFactory.contentBuilder(contentType);
-            builder.map(source);
-            return source(builder);
-        } catch (IOException e) {
-            throw new ElasticSearchGenerationException("Failed to generate [" + source + "]", e);
+            return percolatorService.percolate(request);
+        } catch (Throwable e) {
+            logger.trace("[{}][{}] failed to percolate", e, request.index(), request.shardId());
+            ShardId shardId = new ShardId(request.index(), request.shardId());
+            throw new PercolateException(shardId, "failed to percolate", e);
         }
     }
 
-    @Required
-    public PercolateRequest source(String source) {
-        UnicodeUtil.UTF8Result result = Unicode.fromStringAsUtf8(source);
-        this.source = result.result;
-        this.sourceOffset = 0;
-        this.sourceLength = result.length;
-        this.sourceUnsafe = true;
-        return this;
-    }
-
-    @Required
-    public PercolateRequest source(XContentBuilder sourceBuilder) {
-        try {
-            source = sourceBuilder.underlyingBytes();
-            sourceOffset = 0;
-            sourceLength = sourceBuilder.underlyingBytesLength();
-            sourceUnsafe = false;
-        } catch (IOException e) {
-            throw new ElasticSearchGenerationException("Failed to generate [" + sourceBuilder + "]", e);
-        }
-        return this;
-    }
-
-    public PercolateRequest source(byte[] source) {
-        return source(source, 0, source.length);
-    }
-
-    @Required
-    public PercolateRequest source(byte[] source, int offset, int length) {
-        return source(source, offset, length, false);
-    }
-
-    @Required
-    public PercolateRequest source(byte[] source, int offset, int length, boolean unsafe) {
-        this.source = source;
-        this.sourceOffset = offset;
-        this.sourceLength = length;
-        this.sourceUnsafe = unsafe;
-        return this;
-    }
-
-    /**
-     * if this operation hits a node with a local relevant shard, should it be preferred
-     * to be executed on, or just do plain round robin. Defaults to <tt>true</tt>
-     */
-    @Override
-    public PercolateRequest preferLocal(boolean preferLocal) {
-        super.preferLocal(preferLocal);
-        return this;
-    }
-
-    @Override
-    public ActionRequestValidationException validate() {
-        ActionRequestValidationException validationException = super.validate();
-        if (index == null) {
-            validationException = addValidationError("index is missing", validationException);
-        }
-        if (type == null) {
-            validationException = addValidationError("type is missing", validationException);
-        }
-        if (source == null) {
-            validationException = addValidationError("source is missing", validationException);
-        }
-        return validationException;
-    }
-
-    @Override
-    public void readFrom(StreamInput in) throws IOException {
-        super.readFrom(in);
-        index = in.readUTF();
-        type = in.readUTF();
-
-        BytesHolder bytes = in.readBytesReference();
-        sourceUnsafe = false;
-        source = bytes.bytes();
-        sourceOffset = bytes.offset();
-        sourceLength = bytes.length();
-    }
-
-    @Override
-    public void writeTo(StreamOutput out) throws IOException {
-        super.writeTo(out);
-        out.writeUTF(index);
-        out.writeUTF(type);
-        out.writeBytesHolder(source, sourceOffset, sourceLength);
-    }
 }

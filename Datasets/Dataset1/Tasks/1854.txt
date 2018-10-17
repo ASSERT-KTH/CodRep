@@ -1,6 +1,6 @@
-public IndexOutput createOutput(String name) throws IOException {
+public boolean score(Collector c, int end, int firstDocID) throws IOException {
 
-package org.apache.lucene.store;
+package org.apache.lucene.search;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,234 +20,162 @@ package org.apache.lucene.store;
  */
 
 import java.io.IOException;
-import java.io.FileNotFoundException;
-import java.io.File;
-import java.io.Serializable;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Set;
 
-/**
- * A memory-resident {@link Directory} implementation.  Locking
- * implementation is by default the {@link SingleInstanceLockFactory}
- * but can be changed with {@link #setLockFactory}.
- *
- * @version $Id$
+import org.apache.lucene.index.DocsEnum;
+
+/** Expert: A <code>Scorer</code> for documents matching a <code>Term</code>.
  */
-public class RAMDirectory extends Directory implements Serializable {
+final class TermScorer extends Scorer {
+  private DocsEnum docsEnum;
+  private byte[] norms;
+  private float weightValue;
+  private int doc = -1;
+  private int freq;
 
-  private static final long serialVersionUID = 1l;
+  private int pointer;
+  private int pointerMax;
 
-  HashMap fileMap = new HashMap();
-  long sizeInBytes = 0;
-  
-  // *****
-  // Lock acquisition sequence:  RAMDirectory, then RAMFile
-  // *****
-
-  /** Constructs an empty {@link Directory}. */
-  public RAMDirectory() {
-    setLockFactory(new SingleInstanceLockFactory());
-  }
-
-  /**
-   * Creates a new <code>RAMDirectory</code> instance from a different
-   * <code>Directory</code> implementation.  This can be used to load
-   * a disk-based index into memory.
-   * <P>
-   * This should be used only with indices that can fit into memory.
-   * <P>
-   * Note that the resulting <code>RAMDirectory</code> instance is fully
-   * independent from the original <code>Directory</code> (it is a
-   * complete copy).  Any subsequent changes to the
-   * original <code>Directory</code> will not be visible in the
-   * <code>RAMDirectory</code> instance.
-   *
-   * @param dir a <code>Directory</code> value
-   * @exception IOException if an error occurs
-   */
-  public RAMDirectory(Directory dir) throws IOException {
-    this(dir, false);
-  }
-  
-  private RAMDirectory(Directory dir, boolean closeDir) throws IOException {
-    this();
-    Directory.copy(dir, this, closeDir);
-  }
+  private static final int SCORE_CACHE_SIZE = 32;
+  private float[] scoreCache = new float[SCORE_CACHE_SIZE];
+  private int[] docs;
+  private int[] freqs;
+  private final DocsEnum.BulkReadResult bulkResult;
 
   /**
-   * Creates a new <code>RAMDirectory</code> instance from the {@link FSDirectory}.
-   *
-   * @param dir a <code>File</code> specifying the index directory
-   *
-   * @see #RAMDirectory(Directory)
+   * Construct a <code>TermScorer</code>.
+   * 
+   * @param weight
+   *          The weight of the <code>Term</code> in the query.
+   * @param td
+   *          An iterator over the documents matching the <code>Term</code>.
+   * @param similarity
+   *          The </code>Similarity</code> implementation to be used for score
+   *          computations.
+   * @param norms
+   *          The field norms of the document fields for the <code>Term</code>.
    */
-  public RAMDirectory(File dir) throws IOException {
-    this(FSDirectory.getDirectory(dir), true);
-  }
-
-  /**
-   * Creates a new <code>RAMDirectory</code> instance from the {@link FSDirectory}.
-   *
-   * @param dir a <code>String</code> specifying the full index directory path
-   *
-   * @see #RAMDirectory(Directory)
-   */
-  public RAMDirectory(String dir) throws IOException {
-    this(FSDirectory.getDirectory(dir), true);
-  }
-
-  /** Returns an array of strings, one for each file in the directory. */
-  public synchronized final String[] list() {
-    ensureOpen();
-    Set fileNames = fileMap.keySet();
-    String[] result = new String[fileNames.size()];
-    int i = 0;
-    Iterator it = fileNames.iterator();
-    while (it.hasNext())
-      result[i++] = (String)it.next();
-    return result;
-  }
-
-  /** Returns true iff the named file exists in this directory. */
-  public final boolean fileExists(String name) {
-    ensureOpen();
-    RAMFile file;
-    synchronized (this) {
-      file = (RAMFile)fileMap.get(name);
-    }
-    return file != null;
-  }
-
-  /** Returns the time the named file was last modified.
-   * @throws IOException if the file does not exist
-   */
-  public final long fileModified(String name) throws IOException {
-    ensureOpen();
-    RAMFile file;
-    synchronized (this) {
-      file = (RAMFile)fileMap.get(name);
-    }
-    if (file==null)
-      throw new FileNotFoundException(name);
-    return file.getLastModified();
-  }
-
-  /** Set the modified time of an existing file to now.
-   * @throws IOException if the file does not exist
-   */
-  public void touchFile(String name) throws IOException {
-    ensureOpen();
-    RAMFile file;
-    synchronized (this) {
-      file = (RAMFile)fileMap.get(name);
-    }
-    if (file==null)
-      throw new FileNotFoundException(name);
+  TermScorer(Weight weight, DocsEnum td, Similarity similarity, byte[] norms) {
+    super(similarity, weight);
     
-    long ts2, ts1 = System.currentTimeMillis();
-    do {
-      try {
-        Thread.sleep(0, 1);
-      } catch (InterruptedException e) {}
-      ts2 = System.currentTimeMillis();
-    } while(ts1 == ts2);
-    
-    file.setLastModified(ts2);
+    this.docsEnum = td;
+    this.norms = norms;
+    this.weightValue = weight.getValue();
+    bulkResult = td.getBulkResult();
+
+    for (int i = 0; i < SCORE_CACHE_SIZE; i++)
+      scoreCache[i] = getSimilarity().tf(i) * weightValue;
   }
 
-  /** Returns the length in bytes of a file in the directory.
-   * @throws IOException if the file does not exist
-   */
-  public final long fileLength(String name) throws IOException {
-    ensureOpen();
-    RAMFile file;
-    synchronized (this) {
-      file = (RAMFile)fileMap.get(name);
+  @Override
+  public void score(Collector c) throws IOException {
+    score(c, Integer.MAX_VALUE, nextDoc());
+  }
+
+  private final void refillBuffer() throws IOException {
+    pointerMax = docsEnum.read();  // refill
+    docs = bulkResult.docs.ints;
+    freqs = bulkResult.freqs.ints;
+  }
+
+  // firstDocID is ignored since nextDoc() sets 'doc'
+  @Override
+  protected boolean score(Collector c, int end, int firstDocID) throws IOException {
+    c.setScorer(this);
+    while (doc < end) {                           // for docs in window
+      c.collect(doc);                      // collect score
+      if (++pointer >= pointerMax) {
+        refillBuffer();
+        if (pointerMax != 0) {
+          pointer = 0;
+        } else {
+          doc = NO_MORE_DOCS;                // set to sentinel value
+          return false;
+        }
+      } 
+      doc = docs[pointer];
+      freq = freqs[pointer];
     }
-    if (file==null)
-      throw new FileNotFoundException(name);
-    return file.getLength();
-  }
-  
-  /** Return total size in bytes of all files in this
-   * directory.  This is currently quantized to
-   * RAMOutputStream.BUFFER_SIZE. */
-  public synchronized final long sizeInBytes() {
-    ensureOpen();
-    return sizeInBytes;
-  }
-  
-  /** Removes an existing file in the directory.
-   * @throws IOException if the file does not exist
-   */
-  public synchronized void deleteFile(String name) throws IOException {
-    ensureOpen();
-    RAMFile file = (RAMFile)fileMap.get(name);
-    if (file!=null) {
-        fileMap.remove(name);
-        file.directory = null;
-        sizeInBytes -= file.sizeInBytes;       // updates to RAMFile.sizeInBytes synchronized on directory
-    } else
-      throw new FileNotFoundException(name);
+    return true;
   }
 
-  /** Renames an existing file in the directory.
-   * @throws FileNotFoundException if from does not exist
-   * @deprecated
-   */
-  public synchronized final void renameFile(String from, String to) throws IOException {
-    ensureOpen();
-    RAMFile fromFile = (RAMFile)fileMap.get(from);
-    if (fromFile==null)
-      throw new FileNotFoundException(from);
-    RAMFile toFile = (RAMFile)fileMap.get(to);
-    if (toFile!=null) {
-      sizeInBytes -= toFile.sizeInBytes;       // updates to RAMFile.sizeInBytes synchronized on directory
-      toFile.directory = null;
-    }
-    fileMap.remove(from);
-    fileMap.put(to, fromFile);
+  @Override
+  public int docID() {
+    return doc;
   }
 
-  /** Creates a new, empty file in the directory with the given name. Returns a stream writing this file. */
-  public IndexOutput createOutput(String name) {
-    ensureOpen();
-    RAMFile file = new RAMFile(this);
-    synchronized (this) {
-      RAMFile existing = (RAMFile)fileMap.get(name);
-      if (existing!=null) {
-        sizeInBytes -= existing.sizeInBytes;
-        existing.directory = null;
+  @Override
+  public float freq() {
+    return freq;
+  }
+
+  /**
+   * Advances to the next document matching the query. <br>
+   * The iterator over the matching documents is buffered using
+   * {@link TermDocs#read(int[],int[])}.
+   * 
+   * @return the document matching the query or NO_MORE_DOCS if there are no more documents.
+   */
+  @Override
+  public int nextDoc() throws IOException {
+    pointer++;
+    if (pointer >= pointerMax) {
+      refillBuffer();
+      if (pointerMax != 0) {
+        pointer = 0;
+      } else {
+        return doc = NO_MORE_DOCS;
       }
-      fileMap.put(name, file);
-    }
-    return new RAMOutputStream(file);
+    } 
+    doc = docs[pointer];
+    freq = freqs[pointer];
+    assert doc != NO_MORE_DOCS;
+    return doc;
   }
+  
+  @Override
+  public float score() {
+    assert doc != NO_MORE_DOCS;
+    float raw =                                   // compute tf(f)*weight
+      freq < SCORE_CACHE_SIZE                        // check cache
+      ? scoreCache[freq]                             // cache hit
+      : getSimilarity().tf(freq)*weightValue;        // cache miss
 
-  /** Returns a stream reading an existing file. */
-  public IndexInput openInput(String name) throws IOException {
-    ensureOpen();
-    RAMFile file;
-    synchronized (this) {
-      file = (RAMFile)fileMap.get(name);
-    }
-    if (file == null)
-      throw new FileNotFoundException(name);
-    return new RAMInputStream(file);
-  }
-
-  /** Closes the store to future operations, releasing associated memory. */
-  public void close() {
-    fileMap = null;
+    return norms == null ? raw : raw * getSimilarity().decodeNormValue(norms[doc]); // normalize for field
   }
 
   /**
-   * @throws AlreadyClosedException if this IndexReader is closed
+   * Advances to the first match beyond the current whose document number is
+   * greater than or equal to a given target. <br>
+   * The implementation uses {@link DocsEnum#advance(int)}.
+   * 
+   * @param target
+   *          The target document number.
+   * @return the matching document or NO_MORE_DOCS if none exist.
    */
-  protected final void ensureOpen() throws AlreadyClosedException {
-    if (fileMap == null) {
-      throw new AlreadyClosedException("this RAMDirectory is closed");
+  @Override
+  public int advance(int target) throws IOException {
+    // first scan in cache
+    for (pointer++; pointer < pointerMax; pointer++) {
+      if (docs[pointer] >= target) {
+        freq = freqs[pointer];
+        return doc = docs[pointer];
+      }
     }
+
+    // not found in readahead cache, seek underlying stream
+    int newDoc = docsEnum.advance(target);
+    //System.out.println("ts.advance docsEnum=" + docsEnum);
+    if (newDoc != NO_MORE_DOCS) {
+      doc = newDoc;
+      freq = docsEnum.freq();
+    } else {
+      doc = NO_MORE_DOCS;
+    }
+    return doc;
   }
+
+  /** Returns a string representation of this <code>TermScorer</code>. */
+  @Override
+  public String toString() { return "scorer(" + weight + ")"; }
+
 }

@@ -1,12 +1,13 @@
-docsEnum = termsEnum.docs(liveDocs, docsEnum, 0);
+public void apply(RowMutation mutation, byte[] serializedMutation, boolean writeCommitLog) throws IOException
 
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,559 +18,709 @@ docsEnum = termsEnum.docs(liveDocs, docsEnum, 0);
  * limitations under the License.
  */
 
-package org.apache.solr.handler.component;
+package org.apache.cassandra.db;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.index.*;
-import org.apache.lucene.search.*;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.SentinelIntSet;
-import org.apache.solr.cloud.ZkController;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.QueryElevationParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.util.DOMUtil;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.core.Config;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.transform.ElevatedMarkerFactory;
-import org.apache.solr.response.transform.ExcludedMarkerFactory;
-import org.apache.solr.schema.FieldType;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.search.SortSpec;
-import org.apache.solr.util.RefCounted;
-import org.apache.solr.util.VersionedFile;
-import org.apache.solr.util.plugin.SolrCoreAware;
+import java.io.File;
+import java.io.IOError;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.dht.LocalToken;
+import org.apache.cassandra.io.ICompactionInfo;
+import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+import org.apache.cassandra.io.sstable.SSTableDeletingReference;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
-import org.xml.sax.InputSource;
 
-import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
-import javax.xml.xpath.XPathExpressionException;
-import javax.xml.xpath.XPathFactory;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.StringReader;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.util.*;
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
 
-/**
- * A component to elevate some documents to the top of the result set.
- *
- * @since solr 1.3
- */
-public class QueryElevationComponent extends SearchComponent implements SolrCoreAware {
-  private static Logger log = LoggerFactory.getLogger(QueryElevationComponent.class);
+public class Table
+{
+    public static final String SYSTEM_TABLE = "system";
 
-  // Constants used in solrconfig.xml
-  static final String FIELD_TYPE = "queryFieldType";
-  static final String CONFIG_FILE = "config-file";
-  static final String EXCLUDE = "exclude";
-  public static final String BOOSTED = "BOOSTED";
-  public static final String EXCLUDED = "EXCLUDED";
+    private static final Logger logger = LoggerFactory.getLogger(Table.class);
+    private static final String SNAPSHOT_SUBDIR_NAME = "snapshots";
 
-  // Runtime param -- should be in common?
+    /**
+     * accesses to CFS.memtable should acquire this for thread safety.
+     * Table.maybeSwitchMemtable should aquire the writeLock; see that method for the full explanation.
+     */
+    static final ReentrantReadWriteLock flusherLock = new ReentrantReadWriteLock(true);
 
-  private SolrParams initArgs = null;
-  private Analyzer analyzer = null;
-  private String idField = null;
-  private FieldType idSchemaFT;
-
-  boolean forceElevation = false;
-  // For each IndexReader, keep a query->elevation map
-  // When the configuration is loaded from the data directory.
-  // The key is null if loaded from the config directory, and
-  // is never re-loaded.
-  final Map<IndexReader, Map<String, ElevationObj>> elevationCache =
-      new WeakHashMap<IndexReader, Map<String, ElevationObj>>();
-
-  class ElevationObj {
-    final String text;
-    final String analyzed;
-    final TermQuery [] exclude;//just keep the term query, b/c we will not always explicitly exclude the item based on markExcludes query time param
-    final BooleanQuery include;
-    final Map<BytesRef, Integer> priority;
-    final Set<String> ids;
-    final Set<String> excludeIds;
-
-    ElevationObj(String qstr, List<String> elevate, List<String> exclude) throws IOException {
-      this.text = qstr;
-      this.analyzed = getAnalyzedQuery(this.text);
-      this.ids = new HashSet<String>();
-      this.excludeIds = new HashSet<String>();
-
-      this.include = new BooleanQuery();
-      this.include.setBoost(0);
-      this.priority = new HashMap<BytesRef, Integer>();
-      int max = elevate.size() + 5;
-      for (String id : elevate) {
-        id = idSchemaFT.readableToIndexed(id);
-        ids.add(id);
-        TermQuery tq = new TermQuery(new Term(idField, id));
-        include.add(tq, BooleanClause.Occur.SHOULD);
-        this.priority.put(new BytesRef(id), max--);
-      }
-
-      if (exclude == null || exclude.isEmpty()) {
-        this.exclude = null;
-      } else {
-        this.exclude = new TermQuery[exclude.size()];
-        for (int i = 0; i < exclude.size(); i++) {
-          String id = idSchemaFT.readableToIndexed(exclude.get(i));
-          excludeIds.add(id);
-          this.exclude[i] = new TermQuery(new Term(idField, id));
+    // It is possible to call Table.open without a running daemon, so it makes sense to ensure
+    // proper directories here as well as in CassandraDaemon.
+    static
+    {
+        try
+        {
+            DatabaseDescriptor.createAllDirectories();
         }
-      }
-    }
-  }
-
-  @Override
-  public void init(NamedList args) {
-    this.initArgs = SolrParams.toSolrParams(args);
-  }
-
-  public void inform(SolrCore core) {
-    String a = initArgs.get(FIELD_TYPE);
-    if (a != null) {
-      FieldType ft = core.getSchema().getFieldTypes().get(a);
-      if (ft == null) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-            "Unknown FieldType: '" + a + "' used in QueryElevationComponent");
-      }
-      analyzer = ft.getQueryAnalyzer();
-    }
-
-    SchemaField sf = core.getSchema().getUniqueKeyField();
-    if( sf == null) {
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, 
-          "QueryElevationComponent requires the schema to have a uniqueKeyField." );
-    }
-    idSchemaFT = sf.getType();
-    idField = sf.getName();
-    //register the EditorialMarkerFactory
-    String excludeName = initArgs.get(QueryElevationParams.EXCLUDE_MARKER_FIELD_NAME, "excluded");
-    if (excludeName == null || excludeName.equals("") == true){
-      excludeName = "excluded";
-    }
-    ExcludedMarkerFactory excludedMarkerFactory = new ExcludedMarkerFactory();
-    core.addTransformerFactory(excludeName, excludedMarkerFactory);
-    ElevatedMarkerFactory elevatedMarkerFactory = new ElevatedMarkerFactory();
-    String markerName = initArgs.get(QueryElevationParams.EDITORIAL_MARKER_FIELD_NAME, "elevated");
-    if (markerName == null || markerName.equals("") == true) {
-      markerName = "elevated";
-    }
-    core.addTransformerFactory(markerName, elevatedMarkerFactory);
-    forceElevation = initArgs.getBool(QueryElevationParams.FORCE_ELEVATION, forceElevation);
-    try {
-      synchronized (elevationCache) {
-        elevationCache.clear();
-        String f = initArgs.get(CONFIG_FILE);
-        if (f == null) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-              "QueryElevationComponent must specify argument: '" + CONFIG_FILE
-                  + "' -- path to elevate.xml");
+        catch (IOException ex)
+        {
+            throw new IOError(ex);
         }
-        boolean exists = false;
-
-        // check if using ZooKeeper
-        ZkController zkController = core.getCoreDescriptor().getCoreContainer().getZkController();
-        if (zkController != null) {
-          // TODO : shouldn't have to keep reading the config name when it has been read before
-          exists = zkController.configFileExists(zkController.readConfigName(core.getCoreDescriptor().getCloudDescriptor().getCollectionName()), f);
-        } else {
-          File fC = new File(core.getResourceLoader().getConfigDir(), f);
-          File fD = new File(core.getDataDir(), f);
-          if (fC.exists() == fD.exists()) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                "QueryElevationComponent missing config file: '" + f + "\n"
-                    + "either: " + fC.getAbsolutePath() + " or " + fD.getAbsolutePath() + " must exist, but not both.");
-          }
-          if (fC.exists()) {
-            exists = true;
-            log.info("Loading QueryElevation from: " + fC.getAbsolutePath());
-            Config cfg = new Config(core.getResourceLoader(), f);
-            elevationCache.put(null, loadElevationMap(cfg));
-          }
-        }
-        //in other words, we think this is in the data dir, not the conf dir
-        if (!exists) {
-          // preload the first data
-          RefCounted<SolrIndexSearcher> searchHolder = null;
-          try {
-            searchHolder = core.getNewestSearcher(false);
-            IndexReader reader = searchHolder.get().getIndexReader();
-            getElevationMap(reader, core);
-          } finally {
-            if (searchHolder != null) searchHolder.decref();
-          }
-        }
-      }
-    } catch (Exception ex) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-          "Error initializing QueryElevationComponent.", ex);
     }
-  }
 
-  //get the elevation map from the data dir
-  Map<String, ElevationObj> getElevationMap(IndexReader reader, SolrCore core) throws Exception {
-    synchronized (elevationCache) {
-      Map<String, ElevationObj> map = elevationCache.get(null);
-      if (map != null) return map;
+    /** Table objects, one per keyspace.  only one instance should ever exist for any given keyspace. */
+    private static final Map<String, Table> instances = new NonBlockingHashMap<String, Table>();
 
-      map = elevationCache.get(reader);
-      if (map == null) {
-        String f = initArgs.get(CONFIG_FILE);
-        if (f == null) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-              "QueryElevationComponent must specify argument: " + CONFIG_FILE);
+    /* Table name. */
+    public final String name;
+    /* ColumnFamilyStore per column family */
+    public final Map<Integer, ColumnFamilyStore> columnFamilyStores = new HashMap<Integer, ColumnFamilyStore>(); // TODO make private again
+    private final Object[] indexLocks;
+    private ScheduledFuture<?> flushTask;
+    private volatile AbstractReplicationStrategy replicationStrategy;
+
+    public static Table open(String table)
+    {
+        Table tableInstance = instances.get(table);
+        if (tableInstance == null)
+        {
+            // instantiate the Table.  we could use putIfAbsent but it's important to making sure it is only done once
+            // per keyspace, so we synchronize and re-check before doing it.
+            synchronized (Table.class)
+            {
+                tableInstance = instances.get(table);
+                if (tableInstance == null)
+                {
+                    // open and store the table
+                    tableInstance = new Table(table);
+                    instances.put(table, tableInstance);
+
+                    //table has to be constructed and in the cache before cacheRow can be called
+                    for (ColumnFamilyStore cfs : tableInstance.getColumnFamilyStores())
+                        cfs.initRowCache();
+                }
+            }
         }
-        log.info("Loading QueryElevation from data dir: " + f);
+        return tableInstance;
+    }
+    
+    public static Lock getFlushLock()
+    {
+        return flusherLock.writeLock();
+    }
+
+    public static Table clear(String table) throws IOException
+    {
+        synchronized (Table.class)
+        {
+            Table t = instances.remove(table);
+            if (t != null)
+            {
+                t.flushTask.cancel(false);
+                for (ColumnFamilyStore cfs : t.getColumnFamilyStores())
+                    t.unloadCf(cfs);
+            }
+            return t;
+        }
+    }
+    
+    public Collection<ColumnFamilyStore> getColumnFamilyStores()
+    {
+        return Collections.unmodifiableCollection(columnFamilyStores.values());
+    }
+
+    public ColumnFamilyStore getColumnFamilyStore(String cfName)
+    {
+        Integer id = CFMetaData.getId(name, cfName);
+        if (id == null)
+            throw new IllegalArgumentException(String.format("Unknown table/cf pair (%s.%s)", name, cfName));
+        return columnFamilyStores.get(id);
+    }
+
+    /**
+     * Do a cleanup of keys that do not belong locally.
+     */
+    public void forceCleanup() throws IOException, ExecutionException, InterruptedException
+    {
+        if (name.equals(SYSTEM_TABLE))
+            throw new RuntimeException("Cleanup of the system table is neither necessary nor wise");
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            cfStore.forceCleanup();
+    }
+
+    /**
+     * Take a snapshot of the entire set of column families with a given timestamp.
+     * 
+     * @param clientSuppliedName the tag associated with the name of the snapshot.  This
+     *                           value can be null.
+     */
+    public void snapshot(String clientSuppliedName)
+    {
+        String snapshotName = getTimestampedSnapshotName(clientSuppliedName);
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+        {
+            cfStore.snapshot(snapshotName);
+        }
+    }
+
+    /**
+     * @param clientSuppliedName; may be null.
+     * @return
+     */
+    public static String getTimestampedSnapshotName(String clientSuppliedName)
+    {
+        String snapshotName = Long.toString(System.currentTimeMillis());
+        if (clientSuppliedName != null && !clientSuppliedName.equals(""))
+        {
+            snapshotName = snapshotName + "-" + clientSuppliedName;
+        }
+        return snapshotName;
+    }
+
+
+    /**
+     * Clear all the snapshots for a given table.
+     */
+    public void clearSnapshot() throws IOException
+    {
+        for (String dataDirPath : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            String snapshotPath = dataDirPath + File.separator + name + File.separator + SNAPSHOT_SUBDIR_NAME;
+            File snapshotDir = new File(snapshotPath);
+            if (snapshotDir.exists())
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("Removing snapshot directory " + snapshotPath);
+                FileUtils.deleteRecursive(snapshotDir);
+            }
+        }
+    }
+    
+    /*
+     * This method is an ADMIN operation to force compaction
+     * of all SSTables on disk. 
+     */
+    public void forceCompaction() throws IOException, ExecutionException, InterruptedException
+    {
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            CompactionManager.instance.performMajor(cfStore);
+    }
+
+    /**
+     * @return A list of open SSTableReaders (TODO: ensure that the caller doesn't modify these).
+     */
+    public List<SSTableReader> getAllSSTables()
+    {
+        List<SSTableReader> list = new ArrayList<SSTableReader>();
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            list.addAll(cfStore.getSSTables());
+        return list;
+    }
+
+    private Table(String table)
+    {
+        name = table;
+        KSMetaData ksm = DatabaseDescriptor.getKSMetaData(table);
+        try
+        {
+            createReplicationStrategy(ksm);
+        }
+        catch (ConfigurationException e)
+        {
+            throw new RuntimeException(e);
+        }
+
+        indexLocks = new Object[DatabaseDescriptor.getConcurrentWriters() * 8];
+        for (int i = 0; i < indexLocks.length; i++)
+            indexLocks[i] = new Object();
+        // create data directories.
+        for (String dataDir : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            try
+            {
+                String keyspaceDir = dataDir + File.separator + table;
+                FileUtils.createDirectory(keyspaceDir);
+    
+                // remove the deprecated streaming directory.
+                File streamingDir = new File(keyspaceDir, "stream");
+                if (streamingDir.exists())
+                    FileUtils.deleteRecursive(streamingDir);
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
+        }
+
+        for (CFMetaData cfm : new ArrayList<CFMetaData>(DatabaseDescriptor.getTableDefinition(table).cfMetaData().values()))
+        {
+            logger.debug("Initializing {}.{}", name, cfm.cfName);
+            initCf(cfm.cfId, cfm.cfName);
+        }
+
+        // check 10x as often as the shortest lifetime, so we can exceed all lifetimes by 10% at most
+        int minCheckMs = Integer.MAX_VALUE;
+        for (ColumnFamilyStore cfs : columnFamilyStores.values())
+        {
+            minCheckMs = Math.min(minCheckMs, cfs.getMemtableFlushAfterMins() * 60 * 1000);
+        }
+
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                for (ColumnFamilyStore cfs : columnFamilyStores.values())
+                {
+                    cfs.forceFlushIfExpired();
+                }
+            }
+        };
+        flushTask = StorageService.scheduledTasks.scheduleWithFixedDelay(runnable, minCheckMs, minCheckMs, TimeUnit.MILLISECONDS);
+    }
+
+    public void createReplicationStrategy(KSMetaData ksm) throws ConfigurationException
+    {
+        if (replicationStrategy != null)
+            StorageService.instance.getTokenMetadata().unregister(replicationStrategy);
+            
+        replicationStrategy = AbstractReplicationStrategy.createReplicationStrategy(ksm.name,
+                                                                                    ksm.strategyClass,
+                                                                                    StorageService.instance.getTokenMetadata(),
+                                                                                    DatabaseDescriptor.getEndpointSnitch(),
+                                                                                    ksm.strategyOptions);
+    }
+
+    // best invoked on the compaction mananger.
+    public void dropCf(Integer cfId) throws IOException
+    {
+        assert columnFamilyStores.containsKey(cfId);
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        if (cfs == null)
+            return;
         
-        Config cfg;
+        unloadCf(cfs);
+        cfs.removeAllSSTables();
+    }
+    
+    // disassociate a cfs from this table instance.
+    private void unloadCf(ColumnFamilyStore cfs) throws IOException
+    {
+        try
+        {
+            cfs.forceBlockingFlush();
+        }
+        catch (ExecutionException e)
+        {
+            throw new IOException(e);
+        }
+        catch (InterruptedException e)
+        {
+            throw new IOException(e);
+        }
+        cfs.unregisterMBean();
+    }
+    
+    /** adds a cf to internal structures, ends up creating disk files). */
+    public void initCf(Integer cfId, String cfName)
+    {
+        assert !columnFamilyStores.containsKey(cfId) : String.format("tried to init %s as %s, but already used by %s",
+                                                                     cfName, cfId, columnFamilyStores.get(cfId));
+        columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(this, cfName));
+    }
+    
+    public void reloadCf(Integer cfId) throws IOException
+    {
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        assert cfs != null;
+        unloadCf(cfs);
+        initCf(cfId, cfs.getColumnFamilyName());
+    }
+    
+    /** basically a combined drop and add */
+    public void renameCf(Integer cfId, String newName) throws IOException
+    {
+        assert columnFamilyStores.containsKey(cfId);
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        unloadCf(cfs);
+        cfs.renameSSTables(newName);
+        initCf(cfId, newName);
+    }
+
+    public Row getRow(QueryFilter filter) throws IOException
+    {
+        ColumnFamilyStore cfStore = getColumnFamilyStore(filter.getColumnFamilyName());
+        ColumnFamily columnFamily = cfStore.getColumnFamily(filter);
+        return new Row(filter.key, columnFamily);
+    }
+
+    /**
+     * This method adds the row to the Commit Log associated with this table.
+     * Once this happens the data associated with the individual column families
+     * is also written to the column family store's memtable.
+    */
+    public void apply(RowMutation mutation, Object serializedMutation, boolean writeCommitLog) throws IOException
+    {
+        List<Memtable> memtablesToFlush = Collections.emptyList();
+        if (logger.isDebugEnabled())
+            logger.debug("applying mutation of row {}", FBUtilities.bytesToHex(mutation.key()));
+
+        // write the mutation to the commitlog and memtables
+        flusherLock.readLock().lock();
+        try
+        {
+            if (writeCommitLog)
+                CommitLog.instance.add(mutation, serializedMutation);
         
-        ZkController zkController = core.getCoreDescriptor().getCoreContainer().getZkController();
-        if (zkController != null) {
-          cfg = new Config(core.getResourceLoader(), f, null, null);
-        } else {
-          InputStream is = VersionedFile.getLatestFile(core.getDataDir(), f);
-          cfg = new Config(core.getResourceLoader(), f, new InputSource(is), null);
-        }
-  
-        map = loadElevationMap(cfg);
-        elevationCache.put(reader, map);
-      }
-      return map;
-    }
-  }
+            DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
+            for (ColumnFamily cf : mutation.getColumnFamilies())
+            {
+                ColumnFamilyStore cfs = columnFamilyStores.get(cf.id());
+                if (cfs == null)
+                {
+                    logger.error("Attempting to mutate non-existant column family " + cf.id());
+                    continue;
+                }
 
-  //load up the elevation map
-  private Map<String, ElevationObj> loadElevationMap(Config cfg) throws IOException {
-    XPath xpath = XPathFactory.newInstance().newXPath();
-    Map<String, ElevationObj> map = new HashMap<String, ElevationObj>();
-    NodeList nodes = (NodeList) cfg.evaluate("elevate/query", XPathConstants.NODESET);
-    for (int i = 0; i < nodes.getLength(); i++) {
-      Node node = nodes.item(i);
-      String qstr = DOMUtil.getAttr(node, "text", "missing query 'text'");
+                SortedSet<ByteBuffer> mutatedIndexedColumns = null;
+                for (ByteBuffer column : cfs.getIndexedColumns())
+                {
+                    if (cf.getColumnNames().contains(column) || cf.isMarkedForDelete())
+                    {
+                        if (mutatedIndexedColumns == null)
+                            mutatedIndexedColumns = new TreeSet<ByteBuffer>();
+                        mutatedIndexedColumns.add(column);
+                        if (logger.isDebugEnabled())
+                        {
+                            // can't actually use validator to print value here, because we overload value
+                            // for deletion timestamp as well (which may not be a well-formed value for the column type)
+                            ByteBuffer value = cf.getColumn(column) == null ? null : cf.getColumn(column).value(); // may be null on row-level deletion
+                            logger.debug(String.format("mutating indexed column %s value %s",
+                                                       cf.getComparator().getString(column),
+                                                       value == null ? "null" : FBUtilities.bytesToHex(value)));
+                        }
+                    }
+                }
 
-      NodeList children = null;
-      try {
-        children = (NodeList) xpath.evaluate("doc", node, XPathConstants.NODESET);
-      } catch (XPathExpressionException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-            "query requires '<doc .../>' child");
-      }
+                synchronized (indexLockFor(mutation.key()))
+                {
+                    ColumnFamily oldIndexedColumns = null;
+                    if (mutatedIndexedColumns != null)
+                    {
+                        // with the raw data CF, we can just apply every update in any order and let
+                        // read-time resolution throw out obsolete versions, thus avoiding read-before-write.
+                        // but for indexed data we need to make sure that we're not creating index entries
+                        // for obsolete writes.
+                        oldIndexedColumns = readCurrentIndexedColumns(key, cfs, mutatedIndexedColumns);
+                        logger.debug("Pre-mutation index row is {}", oldIndexedColumns);
+                        ignoreObsoleteMutations(cf, mutatedIndexedColumns, oldIndexedColumns);
+                    }
 
-      ArrayList<String> include = new ArrayList<String>();
-      ArrayList<String> exclude = new ArrayList<String>();
-      for (int j = 0; j < children.getLength(); j++) {
-        Node child = children.item(j);
-        String id = DOMUtil.getAttr(child, "id", "missing 'id'");
-        String e = DOMUtil.getAttr(child, EXCLUDE, null);
-        if (e != null) {
-          if (Boolean.valueOf(e)) {
-            exclude.add(id);
-            continue;
-          }
-        }
-        include.add(id);
-      }
+                    Memtable fullMemtable = cfs.apply(key, cf);
+                    if (fullMemtable != null)
+                        memtablesToFlush = addFullMemtable(memtablesToFlush, fullMemtable);
 
-      ElevationObj elev = new ElevationObj(qstr, include, exclude);
-      if (map.containsKey(elev.analyzed)) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-            "Boosting query defined twice for query: '" + elev.text + "' (" + elev.analyzed + "')");
-      }
-      map.put(elev.analyzed, elev);
-    }
-    return map;
-  }
-
-  /**
-   * Helpful for testing without loading config.xml
-   *
-   * @throws IOException
-   */
-  void setTopQueryResults(IndexReader reader, String query, String[] ids, String[] ex) throws IOException {
-    if (ids == null) {
-      ids = new String[0];
-    }
-    if (ex == null) {
-      ex = new String[0];
-    }
-
-    Map<String, ElevationObj> elev = elevationCache.get(reader);
-    if (elev == null) {
-      elev = new HashMap<String, ElevationObj>();
-      elevationCache.put(reader, elev);
-    }
-    ElevationObj obj = new ElevationObj(query, Arrays.asList(ids), Arrays.asList(ex));
-    elev.put(obj.analyzed, obj);
-  }
-
-  String getAnalyzedQuery(String query) throws IOException {
-    if (analyzer == null) {
-      return query;
-    }
-    StringBuilder norm = new StringBuilder();
-    TokenStream tokens = analyzer.tokenStream("", new StringReader(query));
-    tokens.reset();
-
-    CharTermAttribute termAtt = tokens.addAttribute(CharTermAttribute.class);
-    while (tokens.incrementToken()) {
-      norm.append(termAtt.buffer(), 0, termAtt.length());
-    }
-    tokens.end();
-    tokens.close();
-    return norm.toString();
-  }
-
-  //---------------------------------------------------------------------------------
-  // SearchComponent
-  //---------------------------------------------------------------------------------
-
-  @Override
-  public void prepare(ResponseBuilder rb) throws IOException {
-    SolrQueryRequest req = rb.req;
-    SolrParams params = req.getParams();
-    // A runtime param can skip 
-    if (!params.getBool(QueryElevationParams.ENABLE, true)) {
-      return;
-    }
-
-    boolean exclusive = params.getBool(QueryElevationParams.EXCLUSIVE, false);
-    // A runtime parameter can alter the config value for forceElevation
-    boolean force = params.getBool(QueryElevationParams.FORCE_ELEVATION, forceElevation);
-    boolean markExcludes = params.getBool(QueryElevationParams.MARK_EXCLUDES, false);
-    Query query = rb.getQuery();
-    String qstr = rb.getQueryString();
-    if (query == null || qstr == null) {
-      return;
-    }
-
-    qstr = getAnalyzedQuery(qstr);
-    IndexReader reader = req.getSearcher().getIndexReader();
-    ElevationObj booster = null;
-    try {
-      booster = getElevationMap(reader, req.getCore()).get(qstr);
-    } catch (Exception ex) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-          "Error loading elevation", ex);
-    }
-
-    if (booster != null) {
-      rb.req.getContext().put(BOOSTED, booster.ids);
-
-      // Change the query to insert forced documents
-      if (exclusive == true) {
-        //we only want these results
-        rb.setQuery(booster.include);
-      } else {
-        BooleanQuery newq = new BooleanQuery(true);
-        newq.add(query, BooleanClause.Occur.SHOULD);
-        newq.add(booster.include, BooleanClause.Occur.SHOULD);
-        if (booster.exclude != null) {
-          if (markExcludes == false) {
-            for (TermQuery tq : booster.exclude) {
-              newq.add(new BooleanClause(tq, BooleanClause.Occur.MUST_NOT));
+                    if (mutatedIndexedColumns != null)
+                    {
+                        // ignore full index memtables -- we flush those when the "master" one is full
+                        applyIndexUpdates(mutation.key(), cf, cfs, mutatedIndexedColumns, oldIndexedColumns);
+                    }
+                }
             }
-          } else {
-            //we are only going to mark items as excluded, not actually exclude them.  This works
-            //with the EditorialMarkerFactory
-            rb.req.getContext().put(EXCLUDED, booster.excludeIds);
-            for (TermQuery tq : booster.exclude) {
-              newq.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
+        }
+        finally
+        {
+            flusherLock.readLock().unlock();
+        }
+
+        // flush memtables that got filled up outside the readlock (maybeSwitchMemtable acquires writeLock).
+        // usually mTF will be empty and this will be a no-op.
+        for (Memtable memtable : memtablesToFlush)
+            memtable.cfs.maybeSwitchMemtable(memtable, writeCommitLog);
+    }
+
+    private static List<Memtable> addFullMemtable(List<Memtable> memtablesToFlush, Memtable fullMemtable)
+    {
+        if (memtablesToFlush.isEmpty())
+            memtablesToFlush = new ArrayList<Memtable>(2);
+        memtablesToFlush.add(fullMemtable);
+        return memtablesToFlush;
+    }
+
+    private static void ignoreObsoleteMutations(ColumnFamily cf, SortedSet<ByteBuffer> mutatedIndexedColumns, ColumnFamily oldIndexedColumns)
+    {
+        if (oldIndexedColumns == null)
+            return;
+
+        ColumnFamily cf2 = cf.cloneMe();
+        for (IColumn oldColumn : oldIndexedColumns)
+        {
+            cf2.addColumn(oldColumn);
+        }
+        ColumnFamily resolved = ColumnFamilyStore.removeDeleted(cf2, Integer.MAX_VALUE);
+
+        for (IColumn oldColumn : oldIndexedColumns)
+        {
+            IColumn resolvedColumn = resolved == null ? null : resolved.getColumn(oldColumn.name());
+            if (resolvedColumn != null && resolvedColumn.equals(oldColumn))
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("ignoring obsolete mutation of " + cf.getComparator().getString(oldColumn.name()));
+                cf.remove(oldColumn.name());
+                mutatedIndexedColumns.remove(oldColumn.name());
+                oldIndexedColumns.remove(oldColumn.name());
             }
-          }
         }
-        rb.setQuery(newq);
-      }
-
-      ElevationComparatorSource comparator = new ElevationComparatorSource(booster);
-      // if the sort is 'score desc' use a custom sorting method to 
-      // insert documents in their proper place 
-      SortSpec sortSpec = rb.getSortSpec();
-      if (sortSpec.getSort() == null) {
-        sortSpec.setSort(new Sort(new SortField[]{
-            new SortField("_elevate_", comparator, true),
-            new SortField(null, SortField.Type.SCORE, false)
-        }));
-      } else {
-        // Check if the sort is based on score
-        boolean modify = false;
-        SortField[] current = sortSpec.getSort().getSort();
-        ArrayList<SortField> sorts = new ArrayList<SortField>(current.length + 1);
-        // Perhaps force it to always sort by score
-        if (force && current[0].getType() != SortField.Type.SCORE) {
-          sorts.add(new SortField("_elevate_", comparator, true));
-          modify = true;
-        }
-        for (SortField sf : current) {
-          if (sf.getType() == SortField.Type.SCORE) {
-            sorts.add(new SortField("_elevate_", comparator, !sf.getReverse()));
-            modify = true;
-          }
-          sorts.add(sf);
-        }
-        if (modify) {
-          sortSpec.setSort(new Sort(sorts.toArray(new SortField[sorts.size()])));
-        }
-      }
     }
 
-    // Add debugging information
-    if (rb.isDebug()) {
-      List<String> match = null;
-      if (booster != null) {
-        // Extract the elevated terms into a list
-        match = new ArrayList<String>(booster.priority.size());
-        for (Object o : booster.include.clauses()) {
-          TermQuery tq = (TermQuery) ((BooleanClause) o).getQuery();
-          match.add(tq.getTerm().text());
-        }
-      }
-
-      SimpleOrderedMap<Object> dbg = new SimpleOrderedMap<Object>();
-      dbg.add("q", qstr);
-      dbg.add("match", match);
-      if (rb.isDebugQuery()) {
-        rb.addDebugInfo("queryBoosting", dbg);
-      }
+    private static ColumnFamily readCurrentIndexedColumns(DecoratedKey key, ColumnFamilyStore cfs, SortedSet<ByteBuffer> mutatedIndexedColumns)
+    {
+        QueryFilter filter = QueryFilter.getNamesFilter(key, new QueryPath(cfs.getColumnFamilyName()), mutatedIndexedColumns);
+        return cfs.getColumnFamily(filter);
     }
-  }
 
-  @Override
-  public void process(ResponseBuilder rb) throws IOException {
-    // Do nothing -- the real work is modifying the input query
-  }
+    /**
+     * removes obsolete index entries and creates new ones for the given row key and mutated columns.
+     * @return list of full (index CF) memtables
+     */
+    private static List<Memtable> applyIndexUpdates(ByteBuffer key,
+                                                    ColumnFamily cf,
+                                                    ColumnFamilyStore cfs,
+                                                    SortedSet<ByteBuffer> mutatedIndexedColumns,
+                                                    ColumnFamily oldIndexedColumns)
+    {
+        List<Memtable> fullMemtables = Collections.emptyList();
 
-  //---------------------------------------------------------------------------------
-  // SolrInfoMBean
-  //---------------------------------------------------------------------------------
+        // add new index entries
+        for (ByteBuffer columnName : mutatedIndexedColumns)
+        {
+            IColumn column = cf.getColumn(columnName);
+            if (column == null || column.isMarkedForDelete())
+                continue; // null column == row deletion
 
-  @Override
-  public String getDescription() {
-    return "Query Boosting -- boost particular documents for a given query";
-  }
-
-  @Override
-  public String getSource() {
-    return "$URL$";
-  }
-
-  @Override
-  public URL[] getDocs() {
-    try {
-      return new URL[]{
-          new URL("http://wiki.apache.org/solr/QueryElevationComponent")
-      };
-    } catch (MalformedURLException e) {
-      throw new RuntimeException(e);
-    }
-  }
-  class ElevationComparatorSource extends FieldComparatorSource {
-  private QueryElevationComponent.ElevationObj elevations;
-  private SentinelIntSet ordSet; //the key half of the map
-  private BytesRef[] termValues;//the value half of the map
-
-  public ElevationComparatorSource(final QueryElevationComponent.ElevationObj elevations) {
-    this.elevations = elevations;
-    int size = elevations.ids.size();
-    ordSet = new SentinelIntSet(size, -1);
-    termValues = new BytesRef[ordSet.keys.length];
-  }
-
-  @Override
-  public FieldComparator<Integer> newComparator(String fieldname, final int numHits, int sortPos, boolean reversed) throws IOException {
-    return new FieldComparator<Integer>() {
-      private final int[] values = new int[numHits];
-      private int bottomVal;
-      private TermsEnum termsEnum;
-      private DocsEnum docsEnum;
-      Set<String> seen = new HashSet<String>(elevations.ids.size());
-
-      @Override
-      public int compare(int slot1, int slot2) {
-        return values[slot1] - values[slot2];  // values will be small enough that there is no overflow concern
-      }
-
-      @Override
-      public void setBottom(int slot) {
-        bottomVal = values[slot];
-      }
-
-      private int docVal(int doc) {
-        if (ordSet.size() > 0) {
-          int slot = ordSet.find(doc);
-          if (slot >= 0) {
-            BytesRef id = termValues[slot];
-            Integer prio = elevations.priority.get(id);
-            return prio == null ? 0 : prio.intValue();
-          }
-        }
-        return 0;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        return bottomVal - docVal(doc);
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        values[slot] = docVal(doc);
-      }
-
-      @Override
-      public FieldComparator setNextReader(AtomicReaderContext context) throws IOException {
-        //convert the ids to Lucene doc ids, the ordSet and termValues needs to be the same size as the number of elevation docs we have
-        ordSet.clear();
-        Fields fields = context.reader().fields();
-        if (fields == null) return this;
-        Terms terms = fields.terms(idField);
-        if (terms == null) return this;
-        termsEnum = terms.iterator(termsEnum);
-        BytesRef term = new BytesRef();
-        Bits liveDocs = context.reader().getLiveDocs();
-
-        for (String id : elevations.ids) {
-          term.copyChars(id);
-          if (seen.contains(id) == false  && termsEnum.seekExact(term, false)) {
-            docsEnum = termsEnum.docs(liveDocs, docsEnum, false);
-            if (docsEnum != null) {
-              int docId = docsEnum.nextDoc();
-              if (docId == DocIdSetIterator.NO_MORE_DOCS ) continue;  // must have been deleted
-              termValues[ordSet.put(docId)] = BytesRef.deepCopyOf(term);
-              seen.add(id);
-              assert docsEnum.nextDoc() == DocIdSetIterator.NO_MORE_DOCS;
+            DecoratedKey<LocalToken> valueKey = cfs.getIndexKeyFor(columnName, column.value());
+            ColumnFamily cfi = cfs.newIndexedColumnFamily(columnName);
+            if (column instanceof ExpiringColumn)
+            {
+                ExpiringColumn ec = (ExpiringColumn)column;
+                cfi.addColumn(new ExpiringColumn(key, FBUtilities.EMPTY_BYTE_BUFFER, ec.timestamp, ec.getTimeToLive(), ec.getLocalDeletionTime()));
             }
-          }
+            else
+            {
+                cfi.addColumn(new Column(key, FBUtilities.EMPTY_BYTE_BUFFER, column.timestamp()));
+            }
+            if (logger.isDebugEnabled())
+                logger.debug("applying index row {}:{}", valueKey, cfi);
+            Memtable fullMemtable = cfs.getIndexedColumnFamilyStore(columnName).apply(valueKey, cfi);
+            if (fullMemtable != null)
+                fullMemtables = addFullMemtable(fullMemtables, fullMemtable);
         }
-        return this;
-      }
 
-      @Override
-      public Integer value(int slot) {
-        return values[slot];
-      }
+        // remove the old index entries
+        if (oldIndexedColumns != null)
+        {
+            int localDeletionTime = (int) (System.currentTimeMillis() / 1000);
+            for (Map.Entry<ByteBuffer, IColumn> entry : oldIndexedColumns.getColumnsMap().entrySet())
+            {
+                ByteBuffer columnName = entry.getKey();
+                IColumn column = entry.getValue();
+                if (column.isMarkedForDelete())
+                    continue;
+                DecoratedKey<LocalToken> valueKey = cfs.getIndexKeyFor(columnName, column.value());
+                ColumnFamily cfi = cfs.newIndexedColumnFamily(columnName);
+                cfi.addTombstone(key, localDeletionTime, column.timestamp());
+                Memtable fullMemtable = cfs.getIndexedColumnFamilyStore(columnName).apply(valueKey, cfi);
+                if (logger.isDebugEnabled())
+                    logger.debug("applying index tombstones {}:{}", valueKey, cfi);
+                if (fullMemtable != null)
+                    fullMemtables = addFullMemtable(fullMemtables, fullMemtable);
+            }
+        }
 
-      @Override
-      public int compareDocToValue(int doc, Integer valueObj) {
-        final int value = valueObj.intValue();
-        final int docValue = docVal(doc);
-        return docValue - value;  // values will be small enough that there is no overflow concern
-      }
-    };
-  }
-  }
+        return fullMemtables;
+    }
+
+    public IndexBuilder createIndexBuilder(ColumnFamilyStore cfs, SortedSet<ByteBuffer> columns, ReducingKeyIterator iter)
+    {
+        return new IndexBuilder(cfs, columns, iter);
+    }
+
+    public AbstractReplicationStrategy getReplicationStrategy()
+    {
+        return replicationStrategy;
+    }
+
+    public class IndexBuilder implements ICompactionInfo
+    {
+        private final ColumnFamilyStore cfs;
+        private final SortedSet<ByteBuffer> columns;
+        private final ReducingKeyIterator iter;
+
+        public IndexBuilder(ColumnFamilyStore cfs, SortedSet<ByteBuffer> columns, ReducingKeyIterator iter)
+        {
+            this.cfs = cfs;
+            this.columns = columns;
+            this.iter = iter;
+        }
+
+        public void build()
+        {
+            while (iter.hasNext())
+            {
+                DecoratedKey key = iter.next();
+                logger.debug("Indexing row {} ", key);
+                List<Memtable> memtablesToFlush = Collections.emptyList();
+                flusherLock.readLock().lock();
+                try
+                {
+                    synchronized (indexLockFor(key.key))
+                    {
+                        ColumnFamily cf = readCurrentIndexedColumns(key, cfs, columns);
+                        if (cf != null)
+                            memtablesToFlush = applyIndexUpdates(key.key, cf, cfs, cf.getColumnNames(), null);
+                    }
+                }
+                finally
+                {
+                    flusherLock.readLock().unlock();
+                }
+
+                // during index build, we do flush index memtables separately from master; otherwise we could OOM
+                for (Memtable memtable : memtablesToFlush)
+                    memtable.cfs.maybeSwitchMemtable(memtable, false);
+            }
+
+            try
+            {
+                iter.close();
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+
+        public long getTotalBytes()
+        {
+            return iter.getTotalBytes();
+        }
+
+        public long getBytesRead()
+        {
+            return iter.getBytesRead();
+        }
+
+        public String getTaskType()
+        {
+            return "Secondary index build";
+        }
+    }
+
+    private Object indexLockFor(ByteBuffer key)
+    {
+        return indexLocks[Math.abs(key.hashCode() % indexLocks.length)];
+    }
+
+    public List<Future<?>> flush() throws IOException
+    {
+        List<Future<?>> futures = new ArrayList<Future<?>>();
+        for (Integer cfId : columnFamilyStores.keySet())
+        {
+            Future<?> future = columnFamilyStores.get(cfId).forceFlush();
+            if (future != null)
+                futures.add(future);
+        }
+        return futures;
+    }
+
+    // for binary load path.  skips commitlog.
+    void load(RowMutation rowMutation) throws IOException
+    {
+        DecoratedKey key = StorageService.getPartitioner().decorateKey(rowMutation.key());
+        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
+        {
+            Collection<IColumn> columns = columnFamily.getSortedColumns();
+            for (IColumn column : columns)
+            {
+                ColumnFamilyStore cfStore = columnFamilyStores.get(FBUtilities.byteBufferToInt(column.name()));
+                cfStore.applyBinary(key, column.value());
+            }
+        }
+    }
+
+    public String getDataFileLocation(long expectedCompactedFileSize)
+    {
+        String path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        if (path == null)
+        {
+            // retry after GCing to force unmap of compacted SSTables so they can be deleted
+            StorageService.instance.requestGC();
+            try
+            {
+                Thread.sleep(SSTableDeletingReference.RETRY_DELAY * 2);
+            }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+            path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        }
+        return path;
+    }
+
+    public static String getSnapshotPath(String dataDirPath, String tableName, String snapshotName)
+    {
+        return dataDirPath + File.separator + tableName + File.separator + SNAPSHOT_SUBDIR_NAME + File.separator + snapshotName;
+    }
+
+    public static Iterable<Table> all()
+    {
+        Function<String, Table> transformer = new Function<String, Table>()
+        {
+            public Table apply(String tableName)
+            {
+                return Table.open(tableName);
+            }
+        };
+        return Iterables.transform(DatabaseDescriptor.getTables(), transformer);
+    }
+
+    /**
+     * Performs a synchronous truncate operation, effectively deleting all data
+     * from the column family cfname
+     * @param cfname
+     * @throws IOException
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    public void truncate(String cfname) throws InterruptedException, ExecutionException, IOException
+    {
+        logger.debug("Truncating...");
+        ColumnFamilyStore cfs = getColumnFamilyStore(cfname);
+        // truncate, blocking
+        cfs.truncate().get();
+        logger.debug("Truncation done.");
+    }
 }

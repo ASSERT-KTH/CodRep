@@ -1,6 +1,8 @@
-: Float.valueOf((String)config.get(THRESHOLD_TOKEN_FREQUENCY));
+assert enumerator.position == tiOrd.termOrd;
 
-/*
+package org.apache.lucene.index.codecs.preflex;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,168 +19,358 @@
  * limitations under the License.
  */
 
-package org.apache.solr.spelling.suggest;
-
-import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.UnsupportedEncodingException;
-import java.util.Collection;
-import java.util.List;
 
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.spell.Dictionary;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.spelling.SolrSpellChecker;
-import org.apache.solr.spelling.SpellingOptions;
-import org.apache.solr.spelling.SpellingResult;
-import org.apache.solr.spelling.suggest.Lookup.LookupResult;
-import org.apache.solr.spelling.suggest.jaspell.JaspellLookup;
-import org.apache.solr.util.HighFrequencyDictionary;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.CloseableThreadLocal;
+import org.apache.lucene.util.DoubleBarrelLRUCache;
 
-public class Suggester extends SolrSpellChecker {
-  private static final Logger LOG = LoggerFactory.getLogger(Suggester.class);
+/** This stores a monotonically increasing set of <Term, TermInfo> pairs in a
+ * Directory.  Pairs are accessed either by Term or by ordinal position the
+ * set
+ * @deprecated (4.0) This class has been replaced by
+ * FormatPostingsTermsDictReader, except for reading old segments. 
+ * @lucene.experimental
+ */
+@Deprecated
+public final class TermInfosReader {
+  private final Directory directory;
+  private final String segment;
+  private final FieldInfos fieldInfos;
+
+  private final CloseableThreadLocal<ThreadResources> threadResources = new CloseableThreadLocal<ThreadResources>();
+  private final SegmentTermEnum origEnum;
+  private final long size;
+
+  private final Term[] indexTerms;
+  private final TermInfo[] indexInfos;
+  private final long[] indexPointers;
   
-  /** Location of the source data - either a path to a file, or null for the
-   * current IndexReader.
-   */
-  public static final String LOCATION = "sourceLocation";
-  /** Field to use as the source of terms if using IndexReader. */
-  public static final String FIELD = "field";
-  /** Fully-qualified class of the {@link Lookup} implementation. */
-  public static final String LOOKUP_IMPL = "lookupImpl";
-  /**
-   * Minimum frequency of terms to consider when building the dictionary.
-   */
-  public static final String THRESHOLD_TOKEN_FREQUENCY = "threshold";
-  /**
-   * Name of the location where to persist the dictionary. If this location
-   * is relative then the data will be stored under the core's dataDir. If this
-   * is null the storing will be disabled.
-   */
-  public static final String STORE_DIR = "storeDir";
+  private final int totalIndexInterval;
+
+  private final static int DEFAULT_CACHE_SIZE = 1024;
   
-  protected String sourceLocation;
-  protected File storeDir;
-  protected String field;
-  protected float threshold;
-  protected Dictionary dictionary;
-  protected IndexReader reader;
-  protected Lookup lookup;
-  protected String lookupImpl;
-  protected SolrCore core;
-  
-  @Override
-  public String init(NamedList config, SolrCore core) {
-    LOG.info("init: " + config);
-    String name = super.init(config, core);
-    threshold = config.get(THRESHOLD_TOKEN_FREQUENCY) == null ? 0.0f
-            : (Float) config.get(THRESHOLD_TOKEN_FREQUENCY);
-    sourceLocation = (String) config.get(LOCATION);
-    field = (String)config.get(FIELD);
-    lookupImpl = (String)config.get(LOOKUP_IMPL);
-    if (lookupImpl == null) {
-      lookupImpl = JaspellLookup.class.getName();
+  // Just adds term's ord to TermInfo
+  private final static class TermInfoAndOrd extends TermInfo {
+    final long termOrd;
+    public TermInfoAndOrd(TermInfo ti, long termOrd) {
+      super(ti);
+      this.termOrd = termOrd;
     }
-    String store = (String)config.get(STORE_DIR);
-    if (store != null) {
-      storeDir = new File(store);
-      if (!storeDir.isAbsolute()) {
-        storeDir = new File(core.getDataDir() + File.separator + storeDir);
-      }
-      if (!storeDir.exists()) {
-        storeDir.mkdirs();
-      }
+  }
+
+  private static class CloneableTerm extends DoubleBarrelLRUCache.CloneableKey {
+    Term term;
+    public CloneableTerm(Term t) {
+      this.term = t;
     }
-    return name;
+
+    @Override
+    public boolean equals(Object other) {
+      CloneableTerm t = (CloneableTerm) other;
+      return this.term.equals(t.term);
+    }
+
+    @Override
+    public int hashCode() {
+      return term.hashCode();
+    }
+
+    @Override
+    public Object clone() {
+      return new CloneableTerm(term);
+    }
+  }
+
+  private final DoubleBarrelLRUCache<CloneableTerm,TermInfoAndOrd> termsCache = new DoubleBarrelLRUCache<CloneableTerm,TermInfoAndOrd>(DEFAULT_CACHE_SIZE);
+
+  /**
+   * Per-thread resources managed by ThreadLocal
+   */
+  private static final class ThreadResources {
+    SegmentTermEnum termEnum;
   }
   
-  @Override
-  public void build(SolrCore core, SolrIndexSearcher searcher) {
-    LOG.info("build()");
-    if (sourceLocation == null) {
-      reader = searcher.getReader();
-      dictionary = new HighFrequencyDictionary(reader, field, threshold);
-    } else {
-      try {
-        dictionary = new FileDictionary(new InputStreamReader(
-                core.getResourceLoader().openResource(sourceLocation), "UTF-8"));
-      } catch (UnsupportedEncodingException e) {
-        e.printStackTrace();
-      }
+  TermInfosReader(Directory dir, String seg, FieldInfos fis, int readBufferSize, int indexDivisor)
+       throws CorruptIndexException, IOException {
+    boolean success = false;
+
+    if (indexDivisor < 1 && indexDivisor != -1) {
+      throw new IllegalArgumentException("indexDivisor must be -1 (don't load terms index) or greater than 0: got " + indexDivisor);
     }
-    lookup = (Lookup) core.getResourceLoader().newInstance(lookupImpl);
+
     try {
-      lookup.build(dictionary);
-      if (storeDir != null) {
-        lookup.store(storeDir);
-      }
-    } catch (Exception e) {
-      e.printStackTrace();
-    }
-  }
+      directory = dir;
+      segment = seg;
+      fieldInfos = fis;
 
-  @Override
-  public void reload(SolrCore core, SolrIndexSearcher searcher) throws IOException {
-    LOG.info("reload()");
-    if (dictionary == null && storeDir != null) {
-      // this may be a firstSearcher event, try loading it
-      if (lookup.load(storeDir)) {
-        return;  // loaded ok
-      }
-    }
-    // dictionary based on the current index may need refreshing
-    if (dictionary instanceof HighFrequencyDictionary) {
-      reader = reader.reopen();
-      dictionary = new HighFrequencyDictionary(reader, field, threshold);
-      try {
-        lookup.build(dictionary);
-        if (storeDir != null) {
-          lookup.store(storeDir);
+      origEnum = new SegmentTermEnum(directory.openInput(IndexFileNames.segmentFileName(segment, "", PreFlexCodec.TERMS_EXTENSION),
+                                                         readBufferSize), fieldInfos, false);
+      size = origEnum.size;
+
+
+      if (indexDivisor != -1) {
+        // Load terms index
+        totalIndexInterval = origEnum.indexInterval * indexDivisor;
+        final SegmentTermEnum indexEnum = new SegmentTermEnum(directory.openInput(IndexFileNames.segmentFileName(segment, "", PreFlexCodec.TERMS_INDEX_EXTENSION),
+                                                                                  readBufferSize), fieldInfos, true);
+
+        try {
+          int indexSize = 1+((int)indexEnum.size-1)/indexDivisor;  // otherwise read index
+
+          indexTerms = new Term[indexSize];
+          indexInfos = new TermInfo[indexSize];
+          indexPointers = new long[indexSize];
+
+          for (int i=0;indexEnum.next(); i++) {
+            indexTerms[i] = indexEnum.term();
+            assert indexTerms[i] != null;
+            assert indexTerms[i].text() != null;
+            assert indexTerms[i].field() != null;
+            indexInfos[i] = indexEnum.termInfo();
+            indexPointers[i] = indexEnum.indexPointer;
+        
+            for (int j = 1; j < indexDivisor; j++)
+              if (!indexEnum.next())
+                break;
+          }
+        } finally {
+          indexEnum.close();
         }
-      } catch (Exception e) {
-        throw new IOException(e.toString());
+      } else {
+        // Do not load terms index:
+        totalIndexInterval = -1;
+        indexTerms = null;
+        indexInfos = null;
+        indexPointers = null;
+      }
+      success = true;
+    } finally {
+      // With lock-less commits, it's entirely possible (and
+      // fine) to hit a FileNotFound exception above. In
+      // this case, we want to explicitly close any subset
+      // of things that were opened so that we don't have to
+      // wait for a GC to do so.
+      if (!success) {
+        close();
       }
     }
   }
 
-  public void add(String query, int numHits) {
-    LOG.info("add " + query + ", " + numHits);
-    lookup.add(query, new Integer(numHits));
+  public int getSkipInterval() {
+    return origEnum.skipInterval;
   }
   
-  static SpellingResult EMPTY_RESULT = new SpellingResult();
-
-
-  @Override
-  public SpellingResult getSuggestions(Collection<Token> tokens, IndexReader reader, int count, boolean onlyMorePopular, boolean extendedResults) throws IOException {
-    return getSuggestions(new SpellingOptions(tokens, reader, count, onlyMorePopular, extendedResults, Float.MIN_VALUE, null));
+  public int getMaxSkipLevels() {
+    return origEnum.maxSkipLevels;
   }
 
-  @Override
-  public SpellingResult getSuggestions(SpellingOptions options) throws IOException {
-    LOG.debug("getSuggestions: " + options.tokens);
-    if (lookup == null) {
-      LOG.info("Lookup is null - invoke spellchecker.build first");
-      return EMPTY_RESULT;
+  void close() throws IOException {
+    if (origEnum != null)
+      origEnum.close();
+    threadResources.close();
+  }
+
+  /** Returns the number of term/value pairs in the set. */
+  long size() {
+    return size;
+  }
+
+  private ThreadResources getThreadResources() {
+    ThreadResources resources = threadResources.get();
+    if (resources == null) {
+      resources = new ThreadResources();
+      resources.termEnum = terms();
+      threadResources.set(resources);
     }
-    SpellingResult res = new SpellingResult();
-    for (Token t : options.tokens) {
-      String term = new String(t.buffer(), 0, t.length());
-      List<LookupResult> suggestions = lookup.lookup(term,
-          options.onlyMorePopular, options.count);
-      if (suggestions == null) {
-        continue;
-      }
-      for (LookupResult lr : suggestions) {
-        res.add(t, lr.key, ((Number)lr.value).intValue());
-      }
+    return resources;
+  }
+
+
+  /** Returns the offset of the greatest index entry which is less than or equal to term.*/
+  private int getIndexOffset(Term term) {
+    int lo = 0;					  // binary search indexTerms[]
+    int hi = indexTerms.length - 1;
+
+    while (hi >= lo) {
+      int mid = (lo + hi) >>> 1;
+      assert indexTerms[mid] != null : "indexTerms = " + indexTerms.length + " mid=" + mid;
+      int delta = term.compareToUTF16(indexTerms[mid]);
+      if (delta < 0)
+	hi = mid - 1;
+      else if (delta > 0)
+	lo = mid + 1;
+      else
+	return mid;
     }
-    return res;
+    return hi;
+  }
+
+  private void seekEnum(SegmentTermEnum enumerator, int indexOffset) throws IOException {
+    enumerator.seek(indexPointers[indexOffset],
+                    ((long) indexOffset * totalIndexInterval) - 1,
+                    indexTerms[indexOffset], indexInfos[indexOffset]);
+  }
+
+  /** Returns the TermInfo for a Term in the set, or null. */
+  TermInfo get(Term term) throws IOException {
+    return get(term, false);
+  }
+  
+  /** Returns the TermInfo for a Term in the set, or null. */
+  private TermInfo get(Term term, boolean mustSeekEnum) throws IOException {
+    if (size == 0) return null;
+
+    ensureIndexIsRead();
+    TermInfoAndOrd tiOrd = termsCache.get(new CloneableTerm(term));
+    ThreadResources resources = getThreadResources();
+
+    if (!mustSeekEnum && tiOrd != null) {
+      return tiOrd;
+    }
+
+    return seekEnum(resources.termEnum, term, tiOrd, true);
+  }
+
+  public void cacheCurrentTerm(SegmentTermEnum enumerator) {
+    termsCache.put(new CloneableTerm(enumerator.term()),
+                   new TermInfoAndOrd(enumerator.termInfo,
+                                      enumerator.position));
+  }
+
+  TermInfo seekEnum(SegmentTermEnum enumerator, Term term, boolean useCache) throws IOException {
+    if (useCache) {
+      return seekEnum(enumerator, term, termsCache.get(new CloneableTerm(term)), useCache);
+    } else {
+      return seekEnum(enumerator, term, null, useCache);
+    }
+  }
+
+  TermInfo seekEnum(SegmentTermEnum enumerator, Term term, TermInfoAndOrd tiOrd, boolean useCache) throws IOException {
+    if (size == 0) {
+      return null;
+    }
+
+    // optimize sequential access: first try scanning cached enum w/o seeking
+    if (enumerator.term() != null                 // term is at or past current
+	&& ((enumerator.prev() != null && term.compareToUTF16(enumerator.prev())> 0)
+	    || term.compareToUTF16(enumerator.term()) >= 0)) {
+      int enumOffset = (int)(enumerator.position/totalIndexInterval)+1;
+      if (indexTerms.length == enumOffset	  // but before end of block
+    || term.compareToUTF16(indexTerms[enumOffset]) < 0) {
+       // no need to seek
+
+        final TermInfo ti;
+        int numScans = enumerator.scanTo(term);
+        if (enumerator.term() != null && term.compareToUTF16(enumerator.term()) == 0) {
+          ti = enumerator.termInfo;
+          if (numScans > 1) {
+            // we only  want to put this TermInfo into the cache if
+            // scanEnum skipped more than one dictionary entry.
+            // This prevents RangeQueries or WildcardQueries to 
+            // wipe out the cache when they iterate over a large numbers
+            // of terms in order
+            if (tiOrd == null) {
+              if (useCache) {
+                termsCache.put(new CloneableTerm(term), new TermInfoAndOrd(ti, enumerator.position));
+              }
+            } else {
+              assert sameTermInfo(ti, tiOrd, enumerator);
+              assert (int) enumerator.position == tiOrd.termOrd;
+            }
+          }
+        } else {
+          ti = null;
+        }
+
+        return ti;
+      }  
+    }
+
+    // random-access: must seek
+    final int indexPos;
+    if (tiOrd != null) {
+      indexPos = (int) (tiOrd.termOrd / totalIndexInterval);
+    } else {
+      // Must do binary search:
+      indexPos = getIndexOffset(term);
+    }
+
+    seekEnum(enumerator, indexPos);
+    enumerator.scanTo(term);
+    final TermInfo ti;
+
+    if (enumerator.term() != null && term.compareToUTF16(enumerator.term()) == 0) {
+      ti = enumerator.termInfo;
+      if (tiOrd == null) {
+        if (useCache) {
+          termsCache.put(new CloneableTerm(term), new TermInfoAndOrd(ti, enumerator.position));
+        }
+      } else {
+        assert sameTermInfo(ti, tiOrd, enumerator);
+        assert (int) enumerator.position == tiOrd.termOrd;
+      }
+    } else {
+      ti = null;
+    }
+    return ti;
+  }
+
+  // called only from asserts
+  private boolean sameTermInfo(TermInfo ti1, TermInfo ti2, SegmentTermEnum enumerator) {
+    if (ti1.docFreq != ti2.docFreq) {
+      return false;
+    }
+    if (ti1.freqPointer != ti2.freqPointer) {
+      return false;
+    }
+    if (ti1.proxPointer != ti2.proxPointer) {
+      return false;
+    }
+    // skipOffset is only valid when docFreq >= skipInterval:
+    if (ti1.docFreq >= enumerator.skipInterval &&
+        ti1.skipOffset != ti2.skipOffset) {
+      return false;
+    }
+    return true;
+  }
+
+  private void ensureIndexIsRead() {
+    if (indexTerms == null) {
+      throw new IllegalStateException("terms index was not loaded when this reader was created");
+    }
+  }
+
+  /** Returns the position of a Term in the set or -1. */
+  long getPosition(Term term) throws IOException {
+    if (size == 0) return -1;
+
+    ensureIndexIsRead();
+    int indexOffset = getIndexOffset(term);
+    
+    SegmentTermEnum enumerator = getThreadResources().termEnum;
+    seekEnum(enumerator, indexOffset);
+
+    while(term.compareToUTF16(enumerator.term()) > 0 && enumerator.next()) {}
+
+    if (term.compareToUTF16(enumerator.term()) == 0)
+      return enumerator.position;
+    else
+      return -1;
+  }
+
+  /** Returns an enumeration of all the Terms and TermInfos in the set. */
+  public SegmentTermEnum terms() {
+    return (SegmentTermEnum)origEnum.clone();
+  }
+
+  /** Returns an enumeration of terms starting at or after the named term. */
+  public SegmentTermEnum terms(Term term) throws IOException {
+    get(term, true);
+    return (SegmentTermEnum)getThreadResources().termEnum.clone();
   }
 }

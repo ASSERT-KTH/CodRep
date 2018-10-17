@@ -1,10 +1,10 @@
-package org.elasticsearch.indices.recovery;
+StreamOutput stream = cachedEntry.handles(CompressorFactory.defaultCompressor());
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
+ * Licensed to ElasticSearch and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
+ * regarding copyright ownership. ElasticSearch licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,107 +19,136 @@ package org.elasticsearch.indices.recovery;
  * under the License.
  */
 
-package org.elasticsearch.index.shard.recovery;
+package org.elasticsearch.discovery.zen.publish;
 
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.io.stream.Streamable;
-import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.common.BytesHolder;
+import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.common.compress.Compressor;
+import org.elasticsearch.common.compress.CompressorFactory;
+import org.elasticsearch.common.io.stream.*;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.discovery.zen.DiscoveryNodesProvider;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
 
 import java.io.IOException;
 
 /**
- * @author kimchy (shay.banon)
+ *
  */
-class RecoveryFileChunkRequest implements Streamable {
+public class PublishClusterStateAction extends AbstractComponent {
 
-    private ShardId shardId;
-    private String name;
-    private long position;
-    private long length;
-    private String checksum;
-    private byte[] content;
-    private int contentLength;
-
-    RecoveryFileChunkRequest() {
+    public static interface NewClusterStateListener {
+        void onNewClusterState(ClusterState clusterState);
     }
 
-    RecoveryFileChunkRequest(ShardId shardId, String name, long position, long length, String checksum, byte[] content, int contentLength) {
-        this.shardId = shardId;
-        this.name = name;
-        this.position = position;
-        this.length = length;
-        this.checksum = checksum;
-        this.content = content;
-        this.contentLength = contentLength;
+    private final TransportService transportService;
+
+    private final DiscoveryNodesProvider nodesProvider;
+
+    private final NewClusterStateListener listener;
+
+    public PublishClusterStateAction(Settings settings, TransportService transportService, DiscoveryNodesProvider nodesProvider,
+                                     NewClusterStateListener listener) {
+        super(settings);
+        this.transportService = transportService;
+        this.nodesProvider = nodesProvider;
+        this.listener = listener;
+
+        transportService.registerHandler(PublishClusterStateRequestHandler.ACTION, new PublishClusterStateRequestHandler());
     }
 
-    public ShardId shardId() {
-        return shardId;
+    public void close() {
+        transportService.removeHandler(PublishClusterStateRequestHandler.ACTION);
     }
 
-    public String name() {
-        return name;
-    }
+    public void publish(ClusterState clusterState) {
+        DiscoveryNode localNode = nodesProvider.nodes().localNode();
 
-    public long position() {
-        return position;
-    }
-
-    @Nullable public String checksum() {
-        return this.checksum;
-    }
-
-    public long length() {
-        return length;
-    }
-
-    public byte[] content() {
-        return content;
-    }
-
-    public int contentLength() {
-        return contentLength;
-    }
-
-    public RecoveryFileChunkRequest readFileChunk(StreamInput in) throws IOException {
-        RecoveryFileChunkRequest request = new RecoveryFileChunkRequest();
-        request.readFrom(in);
-        return request;
-    }
-
-    @Override public void readFrom(StreamInput in) throws IOException {
-        shardId = ShardId.readShardId(in);
-        name = in.readUTF();
-        position = in.readVLong();
-        length = in.readVLong();
-        if (in.readBoolean()) {
-            checksum = in.readUTF();
+        // serialize the cluster state here, so we won't do it several times per node
+        CachedStreamOutput.Entry cachedEntry = CachedStreamOutput.popEntry();
+        byte[] clusterStateInBytes;
+        try {
+            StreamOutput stream = cachedEntry.cachedHandles(CompressorFactory.defaultCompressor());
+            ClusterState.Builder.writeTo(clusterState, stream);
+            stream.close();
+            clusterStateInBytes = cachedEntry.bytes().copiedByteArray();
+        } catch (Exception e) {
+            logger.warn("failed to serialize cluster_state before publishing it to nodes", e);
+            return;
+        } finally {
+            CachedStreamOutput.pushEntry(cachedEntry);
         }
-        contentLength = in.readVInt();
-        content = new byte[contentLength];
-        in.readFully(content);
-    }
 
-    @Override public void writeTo(StreamOutput out) throws IOException {
-        shardId.writeTo(out);
-        out.writeUTF(name);
-        out.writeVLong(position);
-        out.writeVLong(length);
-        if (checksum == null) {
-            out.writeBoolean(false);
-        } else {
-            out.writeBoolean(true);
-            out.writeUTF(checksum);
+        for (final DiscoveryNode node : clusterState.nodes()) {
+            if (node.equals(localNode)) {
+                // no need to send to our self
+                continue;
+            }
+            transportService.sendRequest(node, PublishClusterStateRequestHandler.ACTION,
+                    new PublishClusterStateRequest(clusterStateInBytes),
+                    TransportRequestOptions.options().withHighType().withCompress(false), // no need to compress, we already compressed the bytes
+
+                    new VoidTransportResponseHandler(ThreadPool.Names.SAME) {
+                        @Override
+                        public void handleException(TransportException exp) {
+                            logger.debug("failed to send cluster state to [{}], should be detected as failed soon...", exp, node);
+                        }
+                    });
         }
-        out.writeVInt(contentLength);
-        out.writeBytes(content, 0, contentLength);
     }
 
-    @Override public String toString() {
-        return shardId + ": name='" + name + '\'' +
-                ", position=" + position +
-                ", length=" + length;
+    class PublishClusterStateRequest implements Streamable {
+
+        BytesHolder clusterStateInBytes;
+
+        private PublishClusterStateRequest() {
+        }
+
+        private PublishClusterStateRequest(byte[] clusterStateInBytes) {
+            this.clusterStateInBytes = new BytesHolder(clusterStateInBytes);
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            clusterStateInBytes = in.readBytesReference();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeBytesHolder(clusterStateInBytes);
+        }
+    }
+
+    private class PublishClusterStateRequestHandler extends BaseTransportRequestHandler<PublishClusterStateRequest> {
+
+        static final String ACTION = "discovery/zen/publish";
+
+        @Override
+        public PublishClusterStateRequest newInstance() {
+            return new PublishClusterStateRequest();
+        }
+
+        @Override
+        public void messageReceived(PublishClusterStateRequest request, TransportChannel channel) throws Exception {
+            Compressor compressor = CompressorFactory.compressor(request.clusterStateInBytes.bytes(), request.clusterStateInBytes.offset(), request.clusterStateInBytes.length());
+            BytesStreamInput bytes = new BytesStreamInput(request.clusterStateInBytes.bytes(), request.clusterStateInBytes.offset(), request.clusterStateInBytes.length(), false);
+            StreamInput in;
+            if (compressor != null) {
+                in = CachedStreamInput.cachedHandlesCompressed(compressor, bytes);
+            } else {
+                in = CachedStreamInput.cachedHandles(bytes);
+            }
+            ClusterState clusterState = ClusterState.Builder.readFrom(in, nodesProvider.nodes().localNode());
+            listener.onNewClusterState(clusterState);
+            channel.sendResponse(VoidStreamable.INSTANCE);
+        }
+
+        @Override
+        public String executor() {
+            return ThreadPool.Names.SAME;
+        }
     }
 }

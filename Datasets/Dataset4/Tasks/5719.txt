@@ -1,4 +1,4 @@
-docMapper.parse(SourceToParse.source(getResponse.source()).type(request.type()).id(request.id()), new DocumentMapper.ParseListenerAdapter() {
+return cacheValue.value() == DocSet.EMPTY_DOC_SET ? null : cacheValue.value();
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,255 +19,232 @@ docMapper.parse(SourceToParse.source(getResponse.source()).type(request.type()).
  * under the License.
  */
 
-package org.elasticsearch.action.mlt;
+package org.elasticsearch.index.cache.filter.support;
 
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.index.Term;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.Filter;
 import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.TransportActions;
-import org.elasticsearch.action.get.GetField;
-import org.elasticsearch.action.get.GetRequest;
-import org.elasticsearch.action.get.GetResponse;
-import org.elasticsearch.action.get.TransportGetAction;
-import org.elasticsearch.action.search.SearchRequest;
-import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.TransportSearchAction;
-import org.elasticsearch.action.support.BaseAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.RamUsage;
+import org.elasticsearch.common.collect.Sets;
+import org.elasticsearch.common.concurrentlinkedhashmap.EvictionListener;
+import org.elasticsearch.common.concurrentlinkedhashmap.Weigher;
+import org.elasticsearch.common.lab.LongsLAB;
+import org.elasticsearch.common.lucene.docset.DocSet;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.mapper.*;
-import org.elasticsearch.index.query.xcontent.BoolQueryBuilder;
-import org.elasticsearch.index.query.xcontent.MoreLikeThisFieldQueryBuilder;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.transport.BaseTransportRequestHandler;
-import org.elasticsearch.transport.TransportChannel;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.index.AbstractIndexComponent;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.cache.filter.FilterCache;
+import org.elasticsearch.index.settings.IndexSettings;
 
-import java.util.Collections;
-import java.util.Iterator;
+import java.io.IOException;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
-import static org.elasticsearch.client.Requests.*;
-import static org.elasticsearch.common.collect.Sets.*;
-import static org.elasticsearch.index.query.xcontent.QueryBuilders.*;
-import static org.elasticsearch.search.builder.SearchSourceBuilder.*;
+public abstract class AbstractWeightedFilterCache extends AbstractIndexComponent implements FilterCache, IndexReader.ReaderFinishedListener, EvictionListener<AbstractWeightedFilterCache.FilterCacheKey, FilterCacheValue<DocSet>> {
 
-/**
- * The more like this action.
- *
- * @author kimchy (shay.banon)
- */
-public class TransportMoreLikeThisAction extends BaseAction<MoreLikeThisRequest, SearchResponse> {
+    final ConcurrentMap<Object, Boolean> seenReaders = ConcurrentCollections.newConcurrentMap();
 
-    private final TransportSearchAction searchAction;
+    final boolean labEnabled;
+    final ByteSizeValue labMaxAlloc;
+    final ByteSizeValue labChunkSize;
 
-    private final TransportGetAction getAction;
+    final int labMaxAllocBytes;
+    final int labChunkSizeBytes;
 
-    private final IndicesService indicesService;
+    protected final AtomicLong evictions = new AtomicLong();
 
-    private final ClusterService clusterService;
+    protected AbstractWeightedFilterCache(Index index, @IndexSettings Settings indexSettings) {
+        super(index, indexSettings);
 
-    @Inject public TransportMoreLikeThisAction(Settings settings, TransportSearchAction searchAction, TransportGetAction getAction,
-                                               ClusterService clusterService, IndicesService indicesService, TransportService transportService) {
-        super(settings);
-        this.searchAction = searchAction;
-        this.getAction = getAction;
-        this.indicesService = indicesService;
-        this.clusterService = clusterService;
+        // The LAB is stored per reader, so whole chunks will be cleared once reader is discarded.
+        // This means that with filter entry specific based eviction, like access time
+        // we might get into cases where the LAB is held by a puny filter and other filters have been released.
+        // This usually will not be that bad, compared to the GC benefit of using a LAB, but, that is why
+        // the soft filter cache is recommended.
+        this.labEnabled = componentSettings.getAsBoolean("lab", false);
+        // These values should not be too high, basically we want to cached the small readers and use the LAB for
+        // them, 1M docs on OpenBitSet is around 110kb.
+        this.labMaxAlloc = componentSettings.getAsBytesSize("lab.max_alloc", new ByteSizeValue(128, ByteSizeUnit.KB));
+        this.labChunkSize = componentSettings.getAsBytesSize("lab.chunk_size", new ByteSizeValue(1, ByteSizeUnit.MB));
 
-        transportService.registerHandler(TransportActions.MORE_LIKE_THIS, new TransportHandler());
+        this.labMaxAllocBytes = (int) (labMaxAlloc.bytes() / RamUsage.NUM_BYTES_LONG);
+        this.labChunkSizeBytes = (int) (labChunkSize.bytes() / RamUsage.NUM_BYTES_LONG);
     }
 
-    @Override protected void doExecute(final MoreLikeThisRequest request, final ActionListener<SearchResponse> listener) {
-        // update to actual index name
-        ClusterState clusterState = clusterService.state();
-        // update to the concrete index
-        request.index(clusterState.metaData().concreteIndex(request.index()));
+    protected abstract ConcurrentMap<FilterCacheKey, FilterCacheValue<DocSet>> cache();
 
-        Set<String> getFields = newHashSet();
-        if (request.fields() != null) {
-            Collections.addAll(getFields, request.fields());
+    @Override public void close() throws ElasticSearchException {
+        clear();
+    }
+
+    @Override public void clear() {
+        for (Object readerKey : seenReaders.keySet()) {
+            Boolean removed = seenReaders.remove(readerKey);
+            if (removed == null) {
+                return;
+            }
+            ConcurrentMap<FilterCacheKey, FilterCacheValue<DocSet>> cache = cache();
+            for (FilterCacheKey key : cache.keySet()) {
+                if (key.readerKey() == readerKey) {
+                    cache.remove(key);
+                }
+            }
         }
-        // add the source, in case we need to parse it to get fields
-        getFields.add(SourceFieldMapper.NAME);
-
-        GetRequest getRequest = getRequest(request.index())
-                .fields(getFields.toArray(new String[getFields.size()]))
-                .type(request.type())
-                .id(request.id())
-                .listenerThreaded(false)
-                .operationThreaded(true);
-
-        request.beforeLocalFork();
-        getAction.execute(getRequest, new ActionListener<GetResponse>() {
-            @Override public void onResponse(GetResponse getResponse) {
-                if (!getResponse.exists()) {
-                    listener.onFailure(new ElasticSearchException("document missing"));
-                    return;
-                }
-                final BoolQueryBuilder boolBuilder = boolQuery();
-                try {
-                    DocumentMapper docMapper = indicesService.indexServiceSafe(request.index()).mapperService().documentMapper(request.type());
-                    final Set<String> fields = newHashSet();
-                    if (request.fields() != null) {
-                        for (String field : request.fields()) {
-                            FieldMappers fieldMappers = docMapper.mappers().smartName(field);
-                            if (fieldMappers != null) {
-                                fields.add(fieldMappers.mapper().names().indexName());
-                            } else {
-                                fields.add(field);
-                            }
-                        }
-                    }
-
-                    if (!fields.isEmpty()) {
-                        // if fields are not empty, see if we got them in the response
-                        for (Iterator<String> it = fields.iterator(); it.hasNext();) {
-                            String field = it.next();
-                            GetField getField = getResponse.field(field);
-                            if (getField != null) {
-                                for (Object value : getField.values()) {
-                                    addMoreLikeThis(request, boolBuilder, getField.name(), value.toString());
-                                }
-                                it.remove();
-                            }
-                        }
-                        if (!fields.isEmpty()) {
-                            // if we don't get all the fields in the get response, see if we can parse the source
-                            parseSource(getResponse, boolBuilder, docMapper, fields, request);
-                        }
-                    } else {
-                        // we did not ask for any fields, try and get it from the source
-                        parseSource(getResponse, boolBuilder, docMapper, fields, request);
-                    }
-
-                    if (boolBuilder.clauses().isEmpty()) {
-                        // no field added, fail
-                        listener.onFailure(new ElasticSearchException("No fields found to fetch the 'likeText' from"));
-                        return;
-                    }
-
-                    // exclude myself
-                    Term uidTerm = docMapper.uidMapper().term(request.type(), request.id());
-                    boolBuilder.mustNot(termQuery(uidTerm.field(), uidTerm.text()));
-                } catch (Exception e) {
-                    listener.onFailure(e);
-                    return;
-                }
-
-                String[] searchIndices = request.searchIndices();
-                if (searchIndices == null) {
-                    searchIndices = new String[]{request.index()};
-                }
-                String[] searchTypes = request.searchTypes();
-                if (searchTypes == null) {
-                    searchTypes = new String[]{request.type()};
-                }
-
-                SearchRequest searchRequest = searchRequest(searchIndices)
-                        .types(searchTypes)
-                        .searchType(request.searchType())
-                        .scroll(request.searchScroll())
-                        .extraSource(searchSource()
-                                .query(boolBuilder)
-                        )
-                        .listenerThreaded(request.listenerThreaded());
-                if (request.searchSource() != null) {
-                    searchRequest.source(request.searchSource(), request.searchSourceOffset(), request.searchSourceLength(), request.searchSourceUnsafe());
-                }
-                searchAction.execute(searchRequest, new ActionListener<SearchResponse>() {
-                    @Override public void onResponse(SearchResponse response) {
-                        listener.onResponse(response);
-                    }
-
-                    @Override public void onFailure(Throwable e) {
-                        listener.onFailure(e);
-                    }
-                });
-
-            }
-
-            @Override public void onFailure(Throwable e) {
-                listener.onFailure(e);
-            }
-        });
     }
 
-    private void parseSource(GetResponse getResponse, final BoolQueryBuilder boolBuilder, DocumentMapper docMapper, final Set<String> fields, final MoreLikeThisRequest request) {
-        if (getResponse.source() == null) {
+    @Override public void finished(IndexReader reader) {
+        clear(reader);
+    }
+
+    @Override public void clear(IndexReader reader) {
+        // we add the seen reader before we add the first cache entry for this reader
+        // so, if we don't see it here, its won't be in the cache
+        Boolean removed = seenReaders.remove(reader.getCoreCacheKey());
+        if (removed == null) {
             return;
         }
-        docMapper.parse(request.type(), request.id(), getResponse.source(), new DocumentMapper.ParseListenerAdapter() {
-            @Override public boolean beforeFieldAdded(FieldMapper fieldMapper, Fieldable field, Object parseContext) {
-                if (fieldMapper instanceof InternalMapper) {
-                    return true;
-                }
-                String value = fieldMapper.valueAsString(field);
-                if (value == null) {
-                    return false;
-                }
-
-                if (fields.isEmpty() || fields.contains(field.name())) {
-                    addMoreLikeThis(request, boolBuilder, fieldMapper, field);
-                }
-
-                return false;
+        ConcurrentMap<FilterCacheKey, FilterCacheValue<DocSet>> cache = cache();
+        for (FilterCacheKey key : cache.keySet()) {
+            if (key.readerKey() == reader.getCoreCacheKey()) {
+                cache.remove(key);
             }
-        });
+        }
     }
 
-    private void addMoreLikeThis(MoreLikeThisRequest request, BoolQueryBuilder boolBuilder, FieldMapper fieldMapper, Fieldable field) {
-        addMoreLikeThis(request, boolBuilder, field.name(), fieldMapper.valueAsString(field));
+    @Override public EntriesStats entriesStats() {
+        long sizeInBytes = 0;
+        long totalCount = 0;
+        Set<Object> segmentsCount = Sets.newHashSet();
+        for (Map.Entry<FilterCacheKey, FilterCacheValue<DocSet>> entry : cache().entrySet()) {
+            // if its not a reader associated with this index, then don't aggreagte stats for it
+            if (!seenReaders.containsKey(entry.getKey().readerKey())) {
+                continue;
+            }
+            if (!segmentsCount.contains(entry.getKey().readerKey())) {
+                segmentsCount.add(entry.getKey().readerKey());
+            }
+            sizeInBytes += entry.getValue().value().sizeInBytes();
+            totalCount++;
+        }
+        return new EntriesStats(sizeInBytes, segmentsCount.size() == 0 ? 0 : totalCount / segmentsCount.size());
     }
 
-    private void addMoreLikeThis(MoreLikeThisRequest request, BoolQueryBuilder boolBuilder, String fieldName, String likeText) {
-        MoreLikeThisFieldQueryBuilder mlt = moreLikeThisFieldQuery(fieldName)
-                .likeText(likeText)
-                .percentTermsToMatch(request.percentTermsToMatch())
-                .boostTerms(request.boostTerms())
-                .minDocFreq(request.minDocFreq())
-                .maxDocFreq(request.maxDocFreq())
-                .minWordLen(request.minWordLen())
-                .maxWordLen(request.maxWordLen())
-                .minTermFreq(request.minTermFreq())
-                .maxQueryTerms(request.maxQueryTerms())
-                .stopWords(request.stopWords());
-        boolBuilder.should(mlt);
+    @Override public long evictions() {
+        return evictions.get();
     }
 
-    private class TransportHandler extends BaseTransportRequestHandler<MoreLikeThisRequest> {
+    @Override public Filter cache(Filter filterToCache) {
+        if (isCached(filterToCache)) {
+            return filterToCache;
+        }
+        return new FilterCacheFilterWrapper(filterToCache, this);
+    }
 
-        @Override public MoreLikeThisRequest newInstance() {
-            return new MoreLikeThisRequest();
+    @Override public boolean isCached(Filter filter) {
+        return filter instanceof FilterCacheFilterWrapper;
+    }
+
+    static class FilterCacheFilterWrapper extends Filter {
+
+        private final Filter filter;
+
+        private final AbstractWeightedFilterCache cache;
+
+        FilterCacheFilterWrapper(Filter filter, AbstractWeightedFilterCache cache) {
+            this.filter = filter;
+            this.cache = cache;
         }
 
-        @Override public void messageReceived(MoreLikeThisRequest request, final TransportChannel channel) throws Exception {
-            // no need to have a threaded listener since we just send back a response
-            request.listenerThreaded(false);
-            execute(request, new ActionListener<SearchResponse>() {
-                @Override public void onResponse(SearchResponse result) {
-                    try {
-                        channel.sendResponse(result);
-                    } catch (Exception e) {
-                        onFailure(e);
-                    }
+        @Override public DocIdSet getDocIdSet(IndexReader reader) throws IOException {
+            FilterCacheKey cacheKey = new FilterCacheKey(reader.getCoreCacheKey(), filter);
+            ConcurrentMap<FilterCacheKey, FilterCacheValue<DocSet>> innerCache = cache.cache();
+
+            FilterCacheValue<DocSet> cacheValue = innerCache.get(cacheKey);
+            if (cacheValue == null) {
+                if (!cache.seenReaders.containsKey(reader.getCoreCacheKey())) {
+                    reader.addReaderFinishedListener(cache);
+                    cache.seenReaders.put(reader.getCoreCacheKey(), Boolean.TRUE);
                 }
 
-                @Override public void onFailure(Throwable e) {
-                    try {
-                        channel.sendResponse(e);
-                    } catch (Exception e1) {
-                        logger.warn("Failed to send response for get", e1);
-                    }
+                LongsLAB longsLAB = null;
+                if (cache.labEnabled) {
+                    longsLAB = new LongsLAB(cache.labChunkSizeBytes, cache.labMaxAllocBytes);
                 }
-            });
+                DocIdSet docIdSet = filter.getDocIdSet(reader);
+                DocSet docSet = FilterCacheValue.cacheable(reader, longsLAB, docIdSet);
+                cacheValue = new FilterCacheValue<DocSet>(docSet, longsLAB);
+                innerCache.putIfAbsent(cacheKey, cacheValue);
+            }
+
+            return cacheValue.value();
         }
 
-        @Override public boolean spawn() {
-            return false;
+        public String toString() {
+            return "FilterCacheFilterWrapper(" + filter + ")";
+        }
+
+        public boolean equals(Object o) {
+            if (!(o instanceof FilterCacheFilterWrapper)) return false;
+            return this.filter.equals(((FilterCacheFilterWrapper) o).filter);
+        }
+
+        public int hashCode() {
+            return filter.hashCode() ^ 0x1117BF25;
+        }
+    }
+
+
+    // factored by 10
+    public static class FilterCacheValueWeigher implements Weigher<FilterCacheValue<DocSet>> {
+
+        public static final long FACTOR = 10l;
+
+        @Override public int weightOf(FilterCacheValue<DocSet> value) {
+            int weight = (int) Math.min(value.value().sizeInBytes() / 10, Integer.MAX_VALUE);
+            return weight == 0 ? 1 : weight;
+        }
+    }
+
+    @Override public void onEviction(FilterCacheKey filterCacheKey, FilterCacheValue<DocSet> docSetFilterCacheValue) {
+        if (filterCacheKey != null) {
+            if (seenReaders.containsKey(filterCacheKey.readerKey())) {
+                evictions.incrementAndGet();
+            }
+        }
+    }
+
+    public static class FilterCacheKey {
+        private final Object readerKey;
+        private final Filter filter;
+
+        public FilterCacheKey(Object readerKey, Filter filter) {
+            this.readerKey = readerKey;
+            this.filter = filter;
+        }
+
+        public Object readerKey() {
+            return readerKey;
+        }
+
+        public Filter filter() {
+            return filter;
+        }
+
+        @Override public boolean equals(Object o) {
+            if (this == o) return true;
+//            if (o == null || getClass() != o.getClass()) return false;
+            FilterCacheKey that = (FilterCacheKey) o;
+            return (readerKey == that.readerKey && filter.equals(that.filter));
+        }
+
+        @Override public int hashCode() {
+            return readerKey.hashCode() + 31 * filter().hashCode();
         }
     }
 }

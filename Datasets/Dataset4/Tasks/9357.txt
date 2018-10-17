@@ -1,13 +1,13 @@
-final InternalSearchResponse internalResponse = new InternalSearchResponse(new InternalSearchHits(InternalSearchHits.EMPTY, Long.parseLong(this.scrollId.getAttributes().get("total_hits")), 0.0f), null, null, false, null);
+import org.elasticsearch.index.query.QueryParseContext;
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,217 +19,317 @@ final InternalSearchResponse internalResponse = new InternalSearchResponse(new I
  * under the License.
  */
 
-package org.elasticsearch.action.search.type;
+package org.apache.lucene.queryParser;
 
-import org.apache.lucene.search.ScoreDoc;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.search.ReduceSearchPhaseException;
-import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchScrollRequest;
-import org.elasticsearch.action.search.ShardSearchFailure;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.node.DiscoveryNodes;
-import org.elasticsearch.common.collect.Tuple;
-import org.elasticsearch.common.component.AbstractComponent;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.util.concurrent.AtomicArray;
-import org.elasticsearch.search.action.SearchServiceListener;
-import org.elasticsearch.search.action.SearchServiceTransportAction;
-import org.elasticsearch.search.controller.SearchPhaseController;
-import org.elasticsearch.search.fetch.QueryFetchSearchResult;
-import org.elasticsearch.search.internal.InternalSearchHits;
-import org.elasticsearch.search.internal.InternalSearchResponse;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.search.Query;
+import org.elasticsearch.common.collect.ImmutableMap;
+import org.elasticsearch.common.io.FastStringReader;
+import org.elasticsearch.common.lucene.Lucene;
+import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.index.mapper.AllFieldMapper;
+import org.elasticsearch.index.mapper.FieldMapper;
+import org.elasticsearch.index.mapper.FieldMappers;
+import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.index.query.xcontent.QueryParseContext;
 
 import java.io.IOException;
+import java.io.StringReader;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.elasticsearch.action.search.type.TransportSearchHelper.internalScrollSearchRequest;
+import static org.elasticsearch.common.lucene.search.Queries.*;
+import static org.elasticsearch.index.query.support.QueryParsers.*;
 
 /**
+ * A query parser that uses the {@link MapperService} in order to build smarter
+ * queries based on the mapping information.
  *
+ * <p>Also breaks fields with [type].[name] into a boolean query that must include the type
+ * as well as the query on the name.
+ *
+ * @author kimchy (shay.banon)
  */
-public class TransportSearchScrollScanAction extends AbstractComponent {
+public class MapperQueryParser extends QueryParser {
 
-    private final ClusterService clusterService;
-    private final SearchServiceTransportAction searchService;
-    private final SearchPhaseController searchPhaseController;
+    public static final ImmutableMap<String, FieldQueryExtension> fieldQueryExtensions;
 
-    @Inject
-    public TransportSearchScrollScanAction(Settings settings, ClusterService clusterService,
-                                           SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
-        super(settings);
-        this.clusterService = clusterService;
-        this.searchService = searchService;
-        this.searchPhaseController = searchPhaseController;
+    static {
+        fieldQueryExtensions = ImmutableMap.<String, FieldQueryExtension>builder()
+                .put(ExistsFieldQueryExtension.NAME, new ExistsFieldQueryExtension())
+                .put(MissingFieldQueryExtension.NAME, new MissingFieldQueryExtension())
+                .build();
     }
 
-    public void execute(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
-        new AsyncAction(request, scrollId, listener).start();
+    private final QueryParseContext parseContext;
+
+    private FieldMapper currentMapper;
+
+    private boolean analyzeWildcard;
+
+    public MapperQueryParser(QueryParseContext parseContext) {
+        super(Lucene.QUERYPARSER_VERSION, null, null);
+        this.parseContext = parseContext;
     }
 
-    private class AsyncAction {
+    public MapperQueryParser(QueryParserSettings settings, QueryParseContext parseContext) {
+        super(Lucene.QUERYPARSER_VERSION, settings.defaultField(), settings.analyzer());
+        this.parseContext = parseContext;
+        reset(settings);
+    }
 
-        private final SearchScrollRequest request;
+    public void reset(QueryParserSettings settings) {
+        this.field = settings.defaultField();
+        this.analyzer = settings.analyzer();
+        setMultiTermRewriteMethod(MultiTermQuery.CONSTANT_SCORE_AUTO_REWRITE_DEFAULT);
+        setEnablePositionIncrements(settings.enablePositionIncrements());
+        setAutoGeneratePhraseQueries(settings.autoGeneratePhraseQueries());
+        setAllowLeadingWildcard(settings.allowLeadingWildcard());
+        setLowercaseExpandedTerms(settings.lowercaseExpandedTerms());
+        setPhraseSlop(settings.phraseSlop());
+        setDefaultOperator(settings.defaultOperator());
+        setFuzzyMinSim(settings.fuzzyMinSim());
+        setFuzzyPrefixLength(settings.fuzzyPrefixLength());
+        this.analyzeWildcard = settings.analyzeWildcard();
+    }
 
-        private final ActionListener<SearchResponse> listener;
-
-        private final ParsedScrollId scrollId;
-
-        private final DiscoveryNodes nodes;
-
-        private volatile AtomicArray<ShardSearchFailure> shardFailures;
-        private final AtomicArray<QueryFetchSearchResult> queryFetchResults;
-
-        private final AtomicInteger successfulOps;
-        private final AtomicInteger counter;
-        private final long startTime = System.currentTimeMillis();
-
-        private AsyncAction(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
-            this.request = request;
-            this.listener = listener;
-            this.scrollId = scrollId;
-            this.nodes = clusterService.state().nodes();
-            this.successfulOps = new AtomicInteger(scrollId.getContext().length);
-            this.counter = new AtomicInteger(scrollId.getContext().length);
-
-            this.queryFetchResults = new AtomicArray<>(scrollId.getContext().length);
+    @Override protected Query newTermQuery(Term term) {
+        if (currentMapper != null) {
+            Query termQuery = currentMapper.queryStringTermQuery(term);
+            if (termQuery != null) {
+                return termQuery;
+            }
         }
+        return super.newTermQuery(term);
+    }
 
-        protected final ShardSearchFailure[] buildShardFailures() {
-            if (shardFailures == null) {
-                return ShardSearchFailure.EMPTY_ARRAY;
-            }
-            List<AtomicArray.Entry<ShardSearchFailure>> entries = shardFailures.asList();
-            ShardSearchFailure[] failures = new ShardSearchFailure[entries.size()];
-            for (int i = 0; i < failures.length; i++) {
-                failures[i] = entries.get(i).value;
-            }
-            return failures;
+    @Override protected Query newMatchAllDocsQuery() {
+        return Queries.MATCH_ALL_QUERY;
+    }
+
+    @Override public Query getFieldQuery(String field, String queryText, boolean quoted) throws ParseException {
+        FieldQueryExtension fieldQueryExtension = fieldQueryExtensions.get(field);
+        if (fieldQueryExtension != null) {
+            return fieldQueryExtension.query(parseContext, queryText);
         }
-
-        // we do our best to return the shard failures, but its ok if its not fully concurrently safe
-        // we simply try and return as much as possible
-        protected final void addShardFailure(final int shardIndex, ShardSearchFailure failure) {
-            if (shardFailures == null) {
-                shardFailures = new AtomicArray<>(scrollId.getContext().length);
-            }
-            shardFailures.set(shardIndex, failure);
-        }
-
-        public void start() {
-            if (scrollId.getContext().length == 0) {
-                final InternalSearchResponse internalResponse = new InternalSearchResponse(new InternalSearchHits(InternalSearchHits.EMPTY, Long.parseLong(this.scrollId.getAttributes().get("total_hits")), 0.0f), null, null, null, false, null);
-                listener.onResponse(new SearchResponse(internalResponse, request.scrollId(), 0, 0, 0l, buildShardFailures()));
-                return;
-            }
-
-            Tuple<String, Long>[] context = scrollId.getContext();
-            for (int i = 0; i < context.length; i++) {
-                Tuple<String, Long> target = context[i];
-                DiscoveryNode node = nodes.get(target.v1());
-                if (node != null) {
-                    executePhase(i, node, target.v2());
-                } else {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Node [" + target.v1() + "] not available for scroll request [" + scrollId.getSource() + "]");
+        currentMapper = null;
+        if (parseContext.mapperService() != null) {
+            MapperService.SmartNameFieldMappers fieldMappers = parseContext.mapperService().smartName(field);
+            if (fieldMappers != null) {
+                currentMapper = fieldMappers.fieldMappers().mapper();
+                if (currentMapper != null) {
+                    Query query = null;
+                    if (currentMapper.useFieldQueryWithQueryString()) {
+                        query = currentMapper.fieldQuery(queryText, parseContext);
                     }
-                    successfulOps.decrementAndGet();
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
+                    if (query == null) {
+                        query = super.getFieldQuery(currentMapper.names().indexName(), queryText, quoted);
                     }
-                }
-            }
-
-            for (Tuple<String, Long> target : scrollId.getContext()) {
-                DiscoveryNode node = nodes.get(target.v1());
-                if (node == null) {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Node [" + target.v1() + "] not available for scroll request [" + scrollId.getSource() + "]");
-                    }
-                    successfulOps.decrementAndGet();
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
-                    }
-                } else {
+                    return wrapSmartNameQuery(query, fieldMappers, parseContext);
                 }
             }
         }
+        return super.getFieldQuery(field, queryText, quoted);
+    }
 
-        void executePhase(final int shardIndex, DiscoveryNode node, final long searchId) {
-            searchService.sendExecuteScan(node, internalScrollSearchRequest(searchId, request), new SearchServiceListener<QueryFetchSearchResult>() {
-                @Override
-                public void onResult(QueryFetchSearchResult result) {
-                    queryFetchResults.set(shardIndex, result);
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
-                    }
-                }
-
-                @Override
-                public void onFailure(Throwable t) {
-                    onPhaseFailure(t, searchId, shardIndex);
-                }
-            });
+    @Override protected Query getRangeQuery(String field, String part1, String part2, boolean inclusive) throws ParseException {
+        if ("*".equals(part1)) {
+            part1 = null;
         }
-
-        void onPhaseFailure(Throwable t, long searchId, int shardIndex) {
-            if (logger.isDebugEnabled()) {
-                logger.debug("[{}] Failed to execute query phase", t, searchId);
-            }
-            addShardFailure(shardIndex, new ShardSearchFailure(t));
-            successfulOps.decrementAndGet();
-            if (counter.decrementAndGet() == 0) {
-                finishHim();
+        if ("*".equals(part2)) {
+            part2 = null;
+        }
+        currentMapper = null;
+        if (parseContext.mapperService() != null) {
+            MapperService.SmartNameFieldMappers fieldMappers = parseContext.mapperService().smartName(field);
+            if (fieldMappers != null) {
+                currentMapper = fieldMappers.fieldMappers().mapper();
+                if (currentMapper != null) {
+                    Query rangeQuery = currentMapper.rangeQuery(part1, part2, inclusive, inclusive);
+                    return wrapSmartNameQuery(rangeQuery, fieldMappers, parseContext);
+                }
             }
         }
+        return newRangeQuery(field, part1, part2, inclusive);
+    }
 
-        private void finishHim() {
+    @Override protected Query getFuzzyQuery(String field, String termStr, float minSimilarity) throws ParseException {
+        currentMapper = null;
+        if (parseContext.mapperService() != null) {
+            MapperService.SmartNameFieldMappers fieldMappers = parseContext.mapperService().smartName(field);
+            if (fieldMappers != null) {
+                currentMapper = fieldMappers.fieldMappers().mapper();
+                if (currentMapper != null) {
+                    Query fuzzyQuery = currentMapper.fuzzyQuery(termStr, minSimilarity, fuzzyPrefixLength, FuzzyQuery.defaultMaxExpansions);
+                    return wrapSmartNameQuery(fuzzyQuery, fieldMappers, parseContext);
+                }
+            }
+        }
+        return super.getFuzzyQuery(field, termStr, minSimilarity);
+    }
+
+    @Override protected Query getPrefixQuery(String field, String termStr) throws ParseException {
+        String indexedNameField = field;
+        currentMapper = null;
+        if (parseContext.mapperService() != null) {
+            MapperService.SmartNameFieldMappers fieldMappers = parseContext.mapperService().smartName(field);
+            if (fieldMappers != null) {
+                currentMapper = fieldMappers.fieldMappers().mapper();
+                if (currentMapper != null) {
+                    indexedNameField = currentMapper.names().indexName();
+                }
+                return wrapSmartNameQuery(getPossiblyAnalyzedPrefixQuery(indexedNameField, termStr), fieldMappers, parseContext);
+            }
+        }
+        return getPossiblyAnalyzedPrefixQuery(indexedNameField, termStr);
+    }
+
+    private Query getPossiblyAnalyzedPrefixQuery(String field, String termStr) throws ParseException {
+        if (!analyzeWildcard) {
+            return super.getPrefixQuery(field, termStr);
+        }
+        // get Analyzer from superclass and tokenize the term
+        TokenStream source;
+        try {
+            source = getAnalyzer().reusableTokenStream(field, new StringReader(termStr));
+        } catch (IOException e) {
+            return super.getPrefixQuery(field, termStr);
+        }
+        List<String> tlist = new ArrayList<String>();
+        CharTermAttribute termAtt = source.addAttribute(CharTermAttribute.class);
+
+        while (true) {
             try {
-                innerFinishHim();
-            } catch (Throwable e) {
-                ReduceSearchPhaseException failure = new ReduceSearchPhaseException("fetch", "", e, buildShardFailures());
-                if (logger.isDebugEnabled()) {
-                    logger.debug("failed to reduce search", failure);
+                if (!source.incrementToken()) break;
+            } catch (IOException e) {
+                break;
+            }
+            tlist.add(termAtt.toString());
+        }
+
+        try {
+            source.close();
+        } catch (IOException e) {
+            // ignore
+        }
+
+        if (tlist.size() == 1) {
+            return super.getPrefixQuery(field, tlist.get(0));
+        } else {
+            return super.getPrefixQuery(field, termStr);
+            /* this means that the analyzer used either added or consumed
+* (common for a stemmer) tokens, and we can't build a PrefixQuery */
+//            throw new ParseException("Cannot build PrefixQuery with analyzer "
+//                    + getAnalyzer().getClass()
+//                    + (tlist.size() > 1 ? " - token(s) added" : " - token consumed"));
+        }
+
+    }
+
+    @Override protected Query getWildcardQuery(String field, String termStr) throws ParseException {
+        if (AllFieldMapper.NAME.equals(field) && termStr.equals("*")) {
+            return newMatchAllDocsQuery();
+        }
+        String indexedNameField = field;
+        currentMapper = null;
+        if (parseContext.mapperService() != null) {
+            MapperService.SmartNameFieldMappers fieldMappers = parseContext.mapperService().smartName(field);
+            if (fieldMappers != null) {
+                currentMapper = fieldMappers.fieldMappers().mapper();
+                if (currentMapper != null) {
+                    indexedNameField = currentMapper.names().indexName();
                 }
-                listener.onFailure(failure);
+                return wrapSmartNameQuery(getPossiblyAnalyzedWildcardQuery(indexedNameField, termStr), fieldMappers, parseContext);
+            }
+        }
+        return getPossiblyAnalyzedWildcardQuery(indexedNameField, termStr);
+    }
+
+    private Query getPossiblyAnalyzedWildcardQuery(String field, String termStr) throws ParseException {
+        if (!analyzeWildcard) {
+            return super.getWildcardQuery(field, termStr);
+        }
+        boolean isWithinToken = (!termStr.startsWith("?") && !termStr.startsWith("*"));
+        StringBuilder aggStr = new StringBuilder();
+        StringBuilder tmp = new StringBuilder();
+        for (int i = 0; i < termStr.length(); i++) {
+            char c = termStr.charAt(i);
+            if (c == '?' || c == '*') {
+                if (isWithinToken) {
+                    try {
+                        TokenStream source = getAnalyzer().reusableTokenStream(field, new FastStringReader(tmp.toString()));
+                        CharTermAttribute termAtt = source.addAttribute(CharTermAttribute.class);
+                        if (source.incrementToken()) {
+                            String term = termAtt.toString();
+                            if (term.length() == 0) {
+                                // no tokens, just use what we have now
+                                aggStr.append(tmp);
+                            } else {
+                                aggStr.append(term);
+                            }
+                        } else {
+                            // no tokens, just use what we have now
+                            aggStr.append(tmp);
+                        }
+                        source.close();
+                    } catch (IOException e) {
+                        aggStr.append(tmp);
+                    }
+                    tmp.setLength(0);
+                }
+                isWithinToken = false;
+                aggStr.append(c);
+            } else {
+                tmp.append(c);
+                isWithinToken = true;
+            }
+        }
+        if (isWithinToken) {
+            try {
+                TokenStream source = getAnalyzer().reusableTokenStream(field, new FastStringReader(tmp.toString()));
+                CharTermAttribute termAtt = source.addAttribute(CharTermAttribute.class);
+                if (source.incrementToken()) {
+                    String term = termAtt.toString();
+                    if (term.length() == 0) {
+                        // no tokens, just use what we have now
+                        aggStr.append(tmp);
+                    } else {
+                        aggStr.append(term);
+                    }
+                } else {
+                    // no tokens, just use what we have now
+                    aggStr.append(tmp);
+                }
+                source.close();
+            } catch (IOException e) {
+                aggStr.append(tmp);
             }
         }
 
-        private void innerFinishHim() throws IOException {
-            int numberOfHits = 0;
-            for (AtomicArray.Entry<QueryFetchSearchResult> entry : queryFetchResults.asList()) {
-                numberOfHits += entry.value.queryResult().topDocs().scoreDocs.length;
-            }
-            ScoreDoc[] docs = new ScoreDoc[numberOfHits];
-            int counter = 0;
-            for (AtomicArray.Entry<QueryFetchSearchResult> entry : queryFetchResults.asList()) {
-                ScoreDoc[] scoreDocs = entry.value.queryResult().topDocs().scoreDocs;
-                for (ScoreDoc scoreDoc : scoreDocs) {
-                    scoreDoc.shardIndex = entry.index;
-                    docs[counter++] = scoreDoc;
-                }
-            }
-            final InternalSearchResponse internalResponse = searchPhaseController.merge(docs, queryFetchResults, queryFetchResults);
-            ((InternalSearchHits) internalResponse.hits()).totalHits = Long.parseLong(this.scrollId.getAttributes().get("total_hits"));
+        return super.getWildcardQuery(field, aggStr.toString());
+    }
 
-
-            for (AtomicArray.Entry<QueryFetchSearchResult> entry : queryFetchResults.asList()) {
-                if (entry.value.queryResult().topDocs().scoreDocs.length < entry.value.queryResult().size()) {
-                    // we found more than we want for this round, remove this from our scrolling
-                    queryFetchResults.set(entry.index, null);
-                }
-            }
-
-            String scrollId = null;
-            if (request.scroll() != null) {
-                // we rebuild the scroll id since we remove shards that we finished scrolling on
-                scrollId = TransportSearchHelper.buildScrollId(this.scrollId.getType(), queryFetchResults, this.scrollId.getAttributes()); // continue moving the total_hits
-            }
-            listener.onResponse(new SearchResponse(internalResponse, scrollId, this.scrollId.getContext().length, successfulOps.get(),
-                    System.currentTimeMillis() - startTime, buildShardFailures()));
+    @Override protected Query getBooleanQuery(List<BooleanClause> clauses, boolean disableCoord) throws ParseException {
+        Query q = super.getBooleanQuery(clauses, disableCoord);
+        if (q == null) {
+            return null;
         }
+        return optimizeQuery(fixNegativeQueryIfNeeded(q));
+    }
+
+    protected FieldMapper fieldMapper(String smartName) {
+        if (parseContext.mapperService() == null) {
+            return null;
+        }
+        FieldMappers fieldMappers = parseContext.mapperService().smartNameFieldMappers(smartName);
+        if (fieldMappers == null) {
+            return null;
+        }
+        return fieldMappers.mapper();
     }
 }

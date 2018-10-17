@@ -1,6 +1,6 @@
-return dto.iterator(reader);
+throw new RuntimeException("One thread threw an exception", exception.get());
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,1398 +20,713 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.io.PrintStream;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.List;
+import java.util.HashSet;
 import java.util.Map;
-import java.util.WeakHashMap;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.BinaryDocValues;
-import org.apache.lucene.index.DocTermOrds;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.NumericDocValues;
-import org.apache.lucene.index.SegmentReader;
-import org.apache.lucene.index.SingletonSortedSetDocValues;
-import org.apache.lucene.index.SortedDocValues;
-import org.apache.lucene.index.SortedSetDocValues;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.Bits;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
+import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.TermVectorsFormat;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.TermsEnum.SeekStatus;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.AttributeImpl;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.FieldCacheSanityChecker;
 import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.PagedBytes;
-import org.apache.lucene.util.packed.GrowableWriter;
-import org.apache.lucene.util.packed.PackedInts;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util._TestUtil;
+
+import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 
 /**
- * Expert: The default cache implementation, storing all values in memory.
- * A WeakHashMap is used for storage.
- *
- * @since   lucene 1.4
+ * Base class aiming at testing {@link TermVectorsFormat term vectors formats}.
+ * To test a new format, all you need is to register a new {@link Codec} which
+ * uses it and extend this class and override {@link #getCodec()}.
+ * @lucene.experimental
  */
-class FieldCacheImpl implements FieldCache {
+public abstract class BaseTermVectorsFormatTestCase extends LuceneTestCase {
 
-  private Map<Class<?>,Cache> caches;
-  FieldCacheImpl() {
-    init();
+  private Codec savedCodec;
+
+  /**
+   * Returns the Codec to run tests against
+   */
+  protected abstract Codec getCodec();
+
+  public void setUp() throws Exception {
+    super.setUp();
+    // set the default codec, so adding test cases to this isn't fragile
+    savedCodec = Codec.getDefault();
+    Codec.setDefault(getCodec());
   }
 
-  private synchronized void init() {
-    caches = new HashMap<Class<?>,Cache>(9);
-    caches.put(Byte.TYPE, new ByteCache(this));
-    caches.put(Short.TYPE, new ShortCache(this));
-    caches.put(Integer.TYPE, new IntCache(this));
-    caches.put(Float.TYPE, new FloatCache(this));
-    caches.put(Long.TYPE, new LongCache(this));
-    caches.put(Double.TYPE, new DoubleCache(this));
-    caches.put(BinaryDocValues.class, new BinaryDocValuesCache(this));
-    caches.put(SortedDocValues.class, new SortedDocValuesCache(this));
-    caches.put(DocTermOrds.class, new DocTermOrdsCache(this));
-    caches.put(DocsWithFieldCache.class, new DocsWithFieldCache(this));
+  public void tearDown() throws Exception {
+    Codec.setDefault(savedCodec); // restore
+    super.tearDown();
   }
 
-  @Override
-  public synchronized void purgeAllCaches() {
-    init();
-  }
-
-  @Override
-  public synchronized void purge(AtomicReader r) {
-    for(Cache c : caches.values()) {
-      c.purge(r);
+  /**
+   * A combination of term vectors options.
+   */
+  protected enum Options {
+    NONE(false, false, false),
+    POSITIONS(true, false, false),
+    OFFSETS(false, true, false),
+    POSITIONS_AND_OFFSETS(true, true, false),
+    POSITIONS_AND_PAYLOADS(true, false, true),
+    POSITIONS_AND_OFFSETS_AND_PAYLOADS(true, true, true);
+    final boolean positions, offsets, payloads;
+    private Options(boolean positions, boolean offsets, boolean payloads) {
+      this.positions = positions;
+      this.offsets = offsets;
+      this.payloads = payloads;
     }
   }
 
-  @Override
-  public synchronized CacheEntry[] getCacheEntries() {
-    List<CacheEntry> result = new ArrayList<CacheEntry>(17);
-    for(final Map.Entry<Class<?>,Cache> cacheEntry: caches.entrySet()) {
-      final Cache cache = cacheEntry.getValue();
-      final Class<?> cacheType = cacheEntry.getKey();
-      synchronized(cache.readerCache) {
-        for (final Map.Entry<Object,Map<CacheKey, Object>> readerCacheEntry : cache.readerCache.entrySet()) {
-          final Object readerKey = readerCacheEntry.getKey();
-          if (readerKey == null) continue;
-          final Map<CacheKey, Object> innerCache = readerCacheEntry.getValue();
-          for (final Map.Entry<CacheKey, Object> mapEntry : innerCache.entrySet()) {
-            CacheKey entry = mapEntry.getKey();
-            result.add(new CacheEntry(readerKey, entry.field,
-                                      cacheType, entry.custom,
-                                      mapEntry.getValue()));
+  protected Set<Options> validOptions() {
+    return EnumSet.allOf(Options.class);
+  }
+
+  protected Options randomOptions() {
+    return RandomPicks.randomFrom(random(), new ArrayList<Options>(validOptions()));
+  }
+
+  protected FieldType fieldType(Options options) {
+    FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
+    ft.setStoreTermVectors(true);
+    ft.setStoreTermVectorPositions(options.positions);
+    ft.setStoreTermVectorOffsets(options.offsets);
+    ft.setStoreTermVectorPayloads(options.payloads);
+    ft.freeze();
+    return ft;
+  }
+
+  protected BytesRef randomPayload() {
+    final int len = random().nextInt(5);
+    if (len == 0) {
+      return null;
+    }
+    final BytesRef payload = new BytesRef(len);
+    random().nextBytes(payload.bytes);
+    payload.length = len;
+    return payload;
+  }
+
+  // custom impl to test cases that are forbidden by the default OffsetAttribute impl
+  private static class PermissiveOffsetAttributeImpl extends AttributeImpl implements OffsetAttribute {
+
+    int start, end;
+
+    @Override
+    public int startOffset() {
+      return start;
+    }
+
+    @Override
+    public int endOffset() {
+      return end;
+    }
+
+    @Override
+    public void setOffset(int startOffset, int endOffset) {
+      // no check!
+      start = startOffset;
+      end = endOffset;
+    }
+
+    @Override
+    public void clear() {
+      start = end = 0;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (other == this) {
+        return true;
+      }
+
+      if (other instanceof PermissiveOffsetAttributeImpl) {
+        PermissiveOffsetAttributeImpl o = (PermissiveOffsetAttributeImpl) other;
+        return o.start == start && o.end == end;
+      }
+
+      return false;
+    }
+
+    @Override
+    public int hashCode() {
+      return start + 31 * end;
+    }
+
+    @Override
+    public void copyTo(AttributeImpl target) {
+      OffsetAttribute t = (OffsetAttribute) target;
+      t.setOffset(start, end);
+    }
+
+  }
+
+  // TODO: use CannedTokenStream?
+  protected class RandomTokenStream extends TokenStream {
+
+    final String[] terms;
+    final BytesRef[] termBytes;
+    final int[] positionsIncrements;
+    final int[] positions;
+    final int[] startOffsets, endOffsets;
+    final BytesRef[] payloads;
+
+    final Map<String, Integer> freqs;
+    final Map<Integer, Set<Integer>> positionToTerms;
+    final Map<Integer, Set<Integer>> startOffsetToTerms;
+
+    final CharTermAttribute termAtt;
+    final PositionIncrementAttribute piAtt;
+    final OffsetAttribute oAtt;
+    final PayloadAttribute pAtt;
+    int i = 0;
+
+    protected RandomTokenStream(int len, String[] sampleTerms, BytesRef[] sampleTermBytes) {
+      this(len, sampleTerms, sampleTermBytes, rarely());
+    }
+
+    protected RandomTokenStream(int len, String[] sampleTerms, BytesRef[] sampleTermBytes, boolean offsetsGoBackwards) {
+      terms = new String[len];
+      termBytes = new BytesRef[len];
+      positionsIncrements = new int[len];
+      positions = new int[len];
+      startOffsets = new int[len];
+      endOffsets = new int[len];
+      payloads = new BytesRef[len];
+      for (int i = 0; i < len; ++i) {
+        final int o = random().nextInt(sampleTerms.length);
+        terms[i] = sampleTerms[o];
+        termBytes[i] = sampleTermBytes[o];
+        positionsIncrements[i] = _TestUtil.nextInt(random(), i == 0 ? 1 : 0, 10);
+        if (offsetsGoBackwards) {
+          startOffsets[i] = random().nextInt();
+          endOffsets[i] = random().nextInt();
+        } else {
+          if (i == 0) {
+            startOffsets[i] = _TestUtil.nextInt(random(), 0, 1 << 16);
+          } else {
+            startOffsets[i] = startOffsets[i-1] + _TestUtil.nextInt(random(), 0, rarely() ? 1 << 16 : 20);
           }
+          endOffsets[i] = startOffsets[i] + _TestUtil.nextInt(random(), 0, rarely() ? 1 << 10 : 20);
         }
       }
-    }
-    return result.toArray(new CacheEntry[result.size()]);
-  }
 
-  // per-segment fieldcaches don't purge until the shared core closes.
-  final SegmentReader.CoreClosedListener purgeCore = new SegmentReader.CoreClosedListener() {
-    @Override
-    public void onClose(SegmentReader owner) {
-      FieldCacheImpl.this.purge(owner);
-    }
-  };
-
-  // composite/SlowMultiReaderWrapper fieldcaches don't purge until composite reader is closed.
-  final IndexReader.ReaderClosedListener purgeReader = new IndexReader.ReaderClosedListener() {
-    @Override
-    public void onClose(IndexReader owner) {
-      assert owner instanceof AtomicReader;
-      FieldCacheImpl.this.purge((AtomicReader) owner);
-    }
-  };
-  
-  private void initReader(AtomicReader reader) {
-    if (reader instanceof SegmentReader) {
-      ((SegmentReader) reader).addCoreClosedListener(purgeCore);
-    } else {
-      // we have a slow reader of some sort, try to register a purge event
-      // rather than relying on gc:
-      Object key = reader.getCoreCacheKey();
-      if (key instanceof AtomicReader) {
-        ((AtomicReader)key).addReaderClosedListener(purgeReader); 
+      for (int i = 0; i < len; ++i) {
+        if (i == 0) {
+          positions[i] = positionsIncrements[i] - 1;
+        } else {
+          positions[i] = positions[i - 1] + positionsIncrements[i];
+        }
+      }
+      if (rarely()) {
+        Arrays.fill(payloads, randomPayload());
       } else {
-        // last chance
-        reader.addReaderClosedListener(purgeReader);
-      }
-    }
-  }
-
-  /** Expert: Internal cache. */
-  abstract static class Cache {
-
-    Cache(FieldCacheImpl wrapper) {
-      this.wrapper = wrapper;
-    }
-
-    final FieldCacheImpl wrapper;
-
-    final Map<Object,Map<CacheKey,Object>> readerCache = new WeakHashMap<Object,Map<CacheKey,Object>>();
-    
-    protected abstract Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException;
-
-    /** Remove this reader from the cache, if present. */
-    public void purge(AtomicReader r) {
-      Object readerKey = r.getCoreCacheKey();
-      synchronized(readerCache) {
-        readerCache.remove(readerKey);
-      }
-    }
-
-    /** Sets the key to the value for the provided reader;
-     *  if the key is already set then this doesn't change it. */
-    public void put(AtomicReader reader, CacheKey key, Object value) {
-      final Object readerKey = reader.getCoreCacheKey();
-      synchronized (readerCache) {
-        Map<CacheKey,Object> innerCache = readerCache.get(readerKey);
-        if (innerCache == null) {
-          // First time this reader is using FieldCache
-          innerCache = new HashMap<CacheKey,Object>();
-          readerCache.put(readerKey, innerCache);
-          wrapper.initReader(reader);
+        for (int i = 0; i < len; ++i) {
+          payloads[i] = randomPayload();
         }
-        if (innerCache.get(key) == null) {
-          innerCache.put(key, value);
+      }
+
+      positionToTerms = new HashMap<Integer, Set<Integer>>(len);
+      startOffsetToTerms = new HashMap<Integer, Set<Integer>>(len);
+      for (int i = 0; i < len; ++i) {
+        if (!positionToTerms.containsKey(positions[i])) {
+          positionToTerms.put(positions[i], new HashSet<Integer>(1));
+        }
+        positionToTerms.get(positions[i]).add(i);
+        if (!startOffsetToTerms.containsKey(startOffsets[i])) {
+          startOffsetToTerms.put(startOffsets[i], new HashSet<Integer>(1));
+        }
+        startOffsetToTerms.get(startOffsets[i]).add(i);
+      }
+
+      freqs = new HashMap<String, Integer>();
+      for (String term : terms) {
+        if (freqs.containsKey(term)) {
+          freqs.put(term, freqs.get(term) + 1);
         } else {
-          // Another thread beat us to it; leave the current
-          // value
+          freqs.put(term, 1);
         }
       }
+
+      addAttributeImpl(new PermissiveOffsetAttributeImpl());
+
+      termAtt = addAttribute(CharTermAttribute.class);
+      piAtt = addAttribute(PositionIncrementAttribute.class);
+      oAtt = addAttribute(OffsetAttribute.class);
+      pAtt = addAttribute(PayloadAttribute.class);
     }
 
-    public Object get(AtomicReader reader, CacheKey key, boolean setDocsWithField) throws IOException {
-      Map<CacheKey,Object> innerCache;
-      Object value;
-      final Object readerKey = reader.getCoreCacheKey();
-      synchronized (readerCache) {
-        innerCache = readerCache.get(readerKey);
-        if (innerCache == null) {
-          // First time this reader is using FieldCache
-          innerCache = new HashMap<CacheKey,Object>();
-          readerCache.put(readerKey, innerCache);
-          wrapper.initReader(reader);
-          value = null;
-        } else {
-          value = innerCache.get(key);
-        }
-        if (value == null) {
-          value = new CreationPlaceholder();
-          innerCache.put(key, value);
-        }
-      }
-      if (value instanceof CreationPlaceholder) {
-        synchronized (value) {
-          CreationPlaceholder progress = (CreationPlaceholder) value;
-          if (progress.value == null) {
-            progress.value = createValue(reader, key, setDocsWithField);
-            synchronized (readerCache) {
-              innerCache.put(key, progress.value);
-            }
-
-            // Only check if key.custom (the parser) is
-            // non-null; else, we check twice for a single
-            // call to FieldCache.getXXX
-            if (key.custom != null && wrapper != null) {
-              final PrintStream infoStream = wrapper.getInfoStream();
-              if (infoStream != null) {
-                printNewInsanity(infoStream, progress.value);
-              }
-            }
-          }
-          return progress.value;
-        }
-      }
-      return value;
-    }
-
-    private void printNewInsanity(PrintStream infoStream, Object value) {
-      final FieldCacheSanityChecker.Insanity[] insanities = FieldCacheSanityChecker.checkSanity(wrapper);
-      for(int i=0;i<insanities.length;i++) {
-        final FieldCacheSanityChecker.Insanity insanity = insanities[i];
-        final CacheEntry[] entries = insanity.getCacheEntries();
-        for(int j=0;j<entries.length;j++) {
-          if (entries[j].getValue() == value) {
-            // OK this insanity involves our entry
-            infoStream.println("WARNING: new FieldCache insanity created\nDetails: " + insanity.toString());
-            infoStream.println("\nStack:\n");
-            new Throwable().printStackTrace(infoStream);
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  /** Expert: Every composite-key in the internal cache is of this type. */
-  static class CacheKey {
-    final String field;        // which Field
-    final Object custom;       // which custom comparator or parser
-
-    /** Creates one of these objects for a custom comparator/parser. */
-    CacheKey(String field, Object custom) {
-      this.field = field;
-      this.custom = custom;
-    }
-
-    /** Two of these are equal iff they reference the same field and type. */
-    @Override
-    public boolean equals (Object o) {
-      if (o instanceof CacheKey) {
-        CacheKey other = (CacheKey) o;
-        if (other.field.equals(field)) {
-          if (other.custom == null) {
-            if (custom == null) return true;
-          } else if (other.custom.equals (custom)) {
-            return true;
-          }
+    public boolean hasPayloads() {
+      for (BytesRef payload : payloads) {
+        if (payload != null && payload.length > 0) {
+          return true;
         }
       }
       return false;
     }
 
-    /** Composes a hashcode based on the field and type. */
     @Override
-    public int hashCode() {
-      return field.hashCode() ^ (custom==null ? 0 : custom.hashCode());
+    public final boolean incrementToken() throws IOException {
+      if (i < terms.length) {
+        termAtt.setLength(0).append(terms[i]);
+        piAtt.setPositionIncrement(positionsIncrements[i]);
+        oAtt.setOffset(startOffsets[i], endOffsets[i]);
+        pAtt.setPayload(payloads[i]);
+        ++i;
+        return true;
+      } else {
+        return false;
+      }
+    }
+
+  }
+
+  protected class RandomDocument {
+
+    private final String[] fieldNames;
+    private final FieldType[] fieldTypes;
+    private final RandomTokenStream[] tokenStreams;
+
+    protected RandomDocument(int fieldCount, int maxTermCount, Options options, String[] fieldNames, String[] sampleTerms, BytesRef[] sampleTermBytes) {
+      if (fieldCount > fieldNames.length) {
+        throw new IllegalArgumentException();
+      }
+      this.fieldNames = new String[fieldCount];
+      fieldTypes = new FieldType[fieldCount];
+      tokenStreams = new RandomTokenStream[fieldCount];
+      Arrays.fill(fieldTypes, fieldType(options));
+      final Set<String> usedFileNames = new HashSet<String>();
+      for (int i = 0; i < fieldCount; ++i) {
+        do {
+          this.fieldNames[i] = RandomPicks.randomFrom(random(), fieldNames);
+        } while (usedFileNames.contains(this.fieldNames[i]));
+        usedFileNames.add(this.fieldNames[i]);
+        tokenStreams[i] = new RandomTokenStream(_TestUtil.nextInt(random(), 1, maxTermCount), sampleTerms, sampleTermBytes);
+      }
+    }
+
+    public Document toDocument() {
+      final Document doc = new Document();
+      for (int i = 0; i < fieldNames.length; ++i) {
+        doc.add(new Field(fieldNames[i], tokenStreams[i], fieldTypes[i]));
+      }
+      return doc;
+    }
+
+  }
+
+  protected class RandomDocumentFactory {
+
+    private final String[] fieldNames;
+    private final String[] terms;
+    private final BytesRef[] termBytes;
+
+    protected RandomDocumentFactory(int distinctFieldNames, int disctinctTerms) {
+      final Set<String> fieldNames = new HashSet<String>();
+      while (fieldNames.size() < distinctFieldNames) {
+        fieldNames.add(_TestUtil.randomSimpleString(random()));
+        fieldNames.remove("id");
+      }
+      this.fieldNames = fieldNames.toArray(new String[0]);
+      terms = new String[disctinctTerms];
+      termBytes = new BytesRef[disctinctTerms];
+      for (int i = 0; i < disctinctTerms; ++i) {
+        terms[i] = _TestUtil.randomRealisticUnicodeString(random());
+        termBytes[i] = new BytesRef(terms[i]);
+      }
+    }
+
+    public RandomDocument newDocument(int fieldCount, int maxTermCount, Options options) {
+      return new RandomDocument(fieldCount, maxTermCount, options, fieldNames, terms, termBytes);
+    }
+
+  }
+
+  protected void assertEquals(RandomDocument doc, Fields fields) throws IOException {
+    // compare field names
+    assertEquals(doc == null, fields == null);
+    assertEquals(doc.fieldNames.length, fields.size());
+    final Set<String> fields1 = new HashSet<String>();
+    final Set<String> fields2 = new HashSet<String>();
+    for (int i = 0; i < doc.fieldNames.length; ++i) {
+      fields1.add(doc.fieldNames[i]);
+    }
+    for (String field : fields) {
+      fields2.add(field);
+    }
+    assertEquals(fields1, fields2);
+
+    for (int i = 0; i < doc.fieldNames.length; ++i) {
+      assertEquals(doc.tokenStreams[i], doc.fieldTypes[i], fields.terms(doc.fieldNames[i]));
     }
   }
 
-  private static abstract class Uninvert {
+  protected static boolean equals(Object o1, Object o2) {
+    if (o1 == null) {
+      return o2 == null;
+    } else {
+      return o1.equals(o2);
+    }
+  }
 
-    public Bits docsWithField;
+  // to test reuse
+  private final ThreadLocal<TermsEnum> termsEnum = new ThreadLocal<TermsEnum>();
+  private final ThreadLocal<DocsEnum> docsEnum = new ThreadLocal<DocsEnum>();
+  private final ThreadLocal<DocsAndPositionsEnum> docsAndPositionsEnum = new ThreadLocal<DocsAndPositionsEnum>();
 
-    public void uninvert(AtomicReader reader, String field, boolean setDocsWithField) throws IOException {
-      final int maxDoc = reader.maxDoc();
-      Terms terms = reader.terms(field);
-      if (terms != null) {
-        if (setDocsWithField) {
-          final int termsDocCount = terms.getDocCount();
-          assert termsDocCount <= maxDoc;
-          if (termsDocCount == maxDoc) {
-            // Fast case: all docs have this field:
-            docsWithField = new Bits.MatchAllBits(maxDoc);
-            setDocsWithField = false;
-          }
-        }
+  protected void assertEquals(RandomTokenStream tk, FieldType ft, Terms terms) throws IOException {
+    assertEquals(1, terms.getDocCount());
+    final int termCount = new HashSet<String>(Arrays.asList(tk.terms)).size();
+    assertEquals(termCount, terms.size());
+    assertEquals(termCount, terms.getSumDocFreq());
+    assertEquals(ft.storeTermVectorPositions(), terms.hasPositions());
+    assertEquals(ft.storeTermVectorOffsets(), terms.hasOffsets());
+    assertEquals(ft.storeTermVectorPayloads() && tk.hasPayloads(), terms.hasPayloads());
+    final Set<BytesRef> uniqueTerms = new HashSet<BytesRef>();
+    for (String term : tk.freqs.keySet()) {
+      uniqueTerms.add(new BytesRef(term));
+    }
+    final BytesRef[] sortedTerms = uniqueTerms.toArray(new BytesRef[0]);
+    Arrays.sort(sortedTerms, terms.getComparator());
+    final TermsEnum termsEnum = terms.iterator(random().nextBoolean() ? null : this.termsEnum.get());
+    this.termsEnum.set(termsEnum);
+    for (int i = 0; i < sortedTerms.length; ++i) {
+      final BytesRef nextTerm = termsEnum.next();
+      assertEquals(sortedTerms[i], nextTerm);
+      assertEquals(sortedTerms[i], termsEnum.term());
+      assertEquals(1, termsEnum.docFreq());
 
-        final TermsEnum termsEnum = termsEnum(terms);
+      final FixedBitSet bits = new FixedBitSet(1);
+      DocsEnum docsEnum = termsEnum.docs(bits, random().nextBoolean() ? null : this.docsEnum.get());
+      assertEquals(DocsEnum.NO_MORE_DOCS, docsEnum.nextDoc());
+      bits.set(0);
 
-        DocsEnum docs = null;
-        FixedBitSet docsWithField = null;
-        while(true) {
-          final BytesRef term = termsEnum.next();
-          if (term == null) {
-            break;
-          }
-          visitTerm(term);
-          docs = termsEnum.docs(null, docs, DocsEnum.FLAG_NONE);
-          while (true) {
-            final int docID = docs.nextDoc();
-            if (docID == DocIdSetIterator.NO_MORE_DOCS) {
-              break;
+      docsEnum = termsEnum.docs(random().nextBoolean() ? bits : null, random().nextBoolean() ? null : docsEnum);
+      assertNotNull(docsEnum);
+      assertEquals(0, docsEnum.nextDoc());
+      assertEquals(0, docsEnum.docID());
+      assertEquals(tk.freqs.get(termsEnum.term().utf8ToString()), (Integer) docsEnum.freq());
+      assertEquals(DocsEnum.NO_MORE_DOCS, docsEnum.nextDoc());
+      this.docsEnum.set(docsEnum);
+
+      bits.clear(0);
+      DocsAndPositionsEnum docsAndPositionsEnum = termsEnum.docsAndPositions(bits, random().nextBoolean() ? null : this.docsAndPositionsEnum.get());
+      assertEquals(ft.storeTermVectorOffsets() || ft.storeTermVectorPositions(), docsAndPositionsEnum != null);
+      if (docsAndPositionsEnum != null) {
+        assertEquals(DocsEnum.NO_MORE_DOCS, docsAndPositionsEnum.nextDoc());
+      }
+      bits.set(0);
+
+      docsAndPositionsEnum = termsEnum.docsAndPositions(random().nextBoolean() ? bits : null, random().nextBoolean() ? null : docsAndPositionsEnum);
+      assertEquals(ft.storeTermVectorOffsets() || ft.storeTermVectorPositions(), docsAndPositionsEnum != null);
+      if (terms.hasPositions() || terms.hasOffsets()) {
+        assertEquals(0, docsAndPositionsEnum.nextDoc());
+        final int freq = docsAndPositionsEnum.freq();
+        assertEquals(tk.freqs.get(termsEnum.term().utf8ToString()), (Integer) freq);
+        if (docsAndPositionsEnum != null) {
+          for (int k = 0; k < freq; ++k) {
+            final int position = docsAndPositionsEnum.nextPosition();
+            final Set<Integer> indexes;
+            if (terms.hasPositions()) {
+              indexes = tk.positionToTerms.get(position);
+              assertNotNull(indexes);
+            } else {
+              indexes = tk.startOffsetToTerms.get(docsAndPositionsEnum.startOffset());
+              assertNotNull(indexes);
             }
-            visitDoc(docID);
-            if (setDocsWithField) {
-              if (docsWithField == null) {
-                // Lazy init
-                this.docsWithField = docsWithField = new FixedBitSet(maxDoc);
+            if (terms.hasPositions()) {
+              boolean foundPosition = false;
+              for (int index : indexes) {
+                if (tk.termBytes[index].equals(termsEnum.term()) && tk.positions[index] == position) {
+                  foundPosition = true;
+                  break;
+                }
               }
-              docsWithField.set(docID);
+              assertTrue(foundPosition);
+            }
+            if (terms.hasOffsets()) {
+              boolean foundOffset = false;
+              for (int index : indexes) {
+                if (tk.termBytes[index].equals(termsEnum.term()) && tk.startOffsets[index] == docsAndPositionsEnum.startOffset() && tk.endOffsets[index] == docsAndPositionsEnum.endOffset()) {
+                  foundOffset = true;
+                  break;
+                }
+              }
+              assertTrue(foundOffset);
+            }
+            if (terms.hasPayloads()) {
+              boolean foundPayload = false;
+              for (int index : indexes) {
+                if (tk.termBytes[index].equals(termsEnum.term()) && equals(tk.payloads[index], docsAndPositionsEnum.getPayload())) {
+                  foundPayload = true;
+                  break;
+                }
+              }
+              assertTrue(foundPayload);
             }
           }
+          try {
+            docsAndPositionsEnum.nextPosition();
+            fail();
+          } catch (Exception e) {
+            // ok
+          } catch (AssertionError e) {
+            // ok
+          }
         }
+        assertEquals(DocsEnum.NO_MORE_DOCS, docsAndPositionsEnum.nextDoc());
       }
+      this.docsAndPositionsEnum.set(docsAndPositionsEnum);
     }
-
-    protected abstract TermsEnum termsEnum(Terms terms) throws IOException;
-    protected abstract void visitTerm(BytesRef term);
-    protected abstract void visitDoc(int docID);
-  }
-
-  // null Bits means no docs matched
-  void setDocsWithField(AtomicReader reader, String field, Bits docsWithField) {
-    final int maxDoc = reader.maxDoc();
-    final Bits bits;
-    if (docsWithField == null) {
-      bits = new Bits.MatchNoBits(maxDoc);
-    } else if (docsWithField instanceof FixedBitSet) {
-      final int numSet = ((FixedBitSet) docsWithField).cardinality();
-      if (numSet >= maxDoc) {
-        // The cardinality of the BitSet is maxDoc if all documents have a value.
-        assert numSet == maxDoc;
-        bits = new Bits.MatchAllBits(maxDoc);
+    assertNull(termsEnum.next());
+    for (int i = 0; i < 5; ++i) {
+      if (random().nextBoolean()) {
+        assertTrue(termsEnum.seekExact(RandomPicks.randomFrom(random(), tk.termBytes), random().nextBoolean()));
       } else {
-        bits = docsWithField;
+        assertEquals(SeekStatus.FOUND, termsEnum.seekCeil(RandomPicks.randomFrom(random(), tk.termBytes), random().nextBoolean()));
       }
-    } else {
-      bits = docsWithField;
-    }
-    caches.get(DocsWithFieldCache.class).put(reader, new CacheKey(field, null), bits);
-  }
-  
-  // inherit javadocs
-  public Bytes getBytes (AtomicReader reader, String field, boolean setDocsWithField) throws IOException {
-    return getBytes(reader, field, null, setDocsWithField);
-  }
-
-  // inherit javadocs
-  public Bytes getBytes(AtomicReader reader, String field, ByteParser parser, boolean setDocsWithField)
-      throws IOException {
-    final NumericDocValues valuesIn = reader.getNumericDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return new Bytes() {
-        @Override
-        public byte get(int docID) {
-          return (byte) valuesIn.get(docID);
-        }
-      };
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return Bytes.EMPTY;
-      } else if (info.hasDocValues()) {
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return Bytes.EMPTY;
-      }
-      return (Bytes) caches.get(Byte.TYPE).get(reader, new CacheKey(field, parser), setDocsWithField);
     }
   }
 
-  static class BytesFromArray extends Bytes {
-    private final byte[] values;
-
-    public BytesFromArray(byte[] values) {
-      this.values = values;
-    }
-    
-    @Override
-    public byte get(int docID) {
-      return values[docID];
-    }
+  protected Document addId(Document doc, String id) {
+    doc.add(new StringField("id", id, Store.NO));
+    return doc;
   }
 
-  static final class ByteCache extends Cache {
-    ByteCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException {
-
-      int maxDoc = reader.maxDoc();
-      final byte[] values;
-      final ByteParser parser = (ByteParser) key.custom;
-      if (parser == null) {
-        // Confusing: must delegate to wrapper (vs simply
-        // setting parser = DEFAULT_SHORT_PARSER) so cache
-        // key includes DEFAULT_SHORT_PARSER:
-        return wrapper.getBytes(reader, key.field, DEFAULT_BYTE_PARSER, setDocsWithField);
-      }
-
-      values = new byte[maxDoc];
-
-      Uninvert u = new Uninvert() {
-          private byte currentValue;
-
-          @Override
-          public void visitTerm(BytesRef term) {
-            currentValue = parser.parseByte(term);
-          }
-
-          @Override
-          public void visitDoc(int docID) {
-            values[docID] = currentValue;
-          }
-
-          @Override
-          protected TermsEnum termsEnum(Terms terms) throws IOException {
-            return parser.termsEnum(terms);
-          }
-        };
-
-      u.uninvert(reader, key.field, setDocsWithField);
-
-      if (setDocsWithField) {
-        wrapper.setDocsWithField(reader, key.field, u.docsWithField);
-      }
-
-      return new BytesFromArray(values);
-    }
-  }
-  
-  // inherit javadocs
-  public Shorts getShorts (AtomicReader reader, String field, boolean setDocsWithField) throws IOException {
-    return getShorts(reader, field, null, setDocsWithField);
+  protected int docID(IndexReader reader, String id) throws IOException {
+    return new IndexSearcher(reader).search(new TermQuery(new Term("id", id)), 1).scoreDocs[0].doc;
   }
 
-  // inherit javadocs
-  public Shorts getShorts(AtomicReader reader, String field, ShortParser parser, boolean setDocsWithField)
-      throws IOException {
-    final NumericDocValues valuesIn = reader.getNumericDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return new Shorts() {
-        @Override
-        public short get(int docID) {
-          return (short) valuesIn.get(docID);
-        }
-      };
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return Shorts.EMPTY;
-      } else if (info.hasDocValues()) {
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return Shorts.EMPTY;
-      }
-      return (Shorts) caches.get(Short.TYPE).get(reader, new CacheKey(field, parser), setDocsWithField);
-    }
-  }
-
-  static class ShortsFromArray extends Shorts {
-    private final short[] values;
-
-    public ShortsFromArray(short[] values) {
-      this.values = values;
-    }
-    
-    @Override
-    public short get(int docID) {
-      return values[docID];
-    }
-  }
-
-  static final class ShortCache extends Cache {
-    ShortCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException {
-
-      int maxDoc = reader.maxDoc();
-      final short[] values;
-      final ShortParser parser = (ShortParser) key.custom;
-      if (parser == null) {
-        // Confusing: must delegate to wrapper (vs simply
-        // setting parser = DEFAULT_SHORT_PARSER) so cache
-        // key includes DEFAULT_SHORT_PARSER:
-        return wrapper.getShorts(reader, key.field, DEFAULT_SHORT_PARSER, setDocsWithField);
-      }
-
-      values = new short[maxDoc];
-      Uninvert u = new Uninvert() {
-          private short currentValue;
-
-          @Override
-          public void visitTerm(BytesRef term) {
-            currentValue = parser.parseShort(term);
-          }
-
-          @Override
-          public void visitDoc(int docID) {
-            values[docID] = currentValue;
-          }
-          
-          @Override
-          protected TermsEnum termsEnum(Terms terms) throws IOException {
-            return parser.termsEnum(terms);
-          }
-        };
-
-      u.uninvert(reader, key.field, setDocsWithField);
-
-      if (setDocsWithField) {
-        wrapper.setDocsWithField(reader, key.field, u.docsWithField);
-      }
-      return new ShortsFromArray(values);
-    }
-  }
-
-  // inherit javadocs
-  public Ints getInts (AtomicReader reader, String field, boolean setDocsWithField) throws IOException {
-    return getInts(reader, field, null, setDocsWithField);
-  }
-
-  // inherit javadocs
-  public Ints getInts(AtomicReader reader, String field, IntParser parser, boolean setDocsWithField)
-      throws IOException {
-    final NumericDocValues valuesIn = reader.getNumericDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return new Ints() {
-        @Override
-        public int get(int docID) {
-          return (int) valuesIn.get(docID);
-        }
-      };
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return Ints.EMPTY;
-      } else if (info.hasDocValues()) {
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return Ints.EMPTY;
-      }
-      return (Ints) caches.get(Integer.TYPE).get(reader, new CacheKey(field, parser), setDocsWithField);
-    }
-  }
-
-  static class IntsFromArray extends Ints {
-    private final int[] values;
-
-    public IntsFromArray(int[] values) {
-      this.values = values;
-    }
-    
-    @Override
-    public int get(int docID) {
-      return values[docID];
-    }
-  }
-
-  private static class HoldsOneThing<T> {
-    private T it;
-
-    public void set(T it) {
-      this.it = it;
-    }
-
-    public T get() {
-      return it;
-    }
-  }
-
-  static final class IntCache extends Cache {
-    IntCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(final AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException {
-
-      final IntParser parser = (IntParser) key.custom;
-      if (parser == null) {
-        // Confusing: must delegate to wrapper (vs simply
-        // setting parser =
-        // DEFAULT_INT_PARSER/NUMERIC_UTILS_INT_PARSER) so
-        // cache key includes
-        // DEFAULT_INT_PARSER/NUMERIC_UTILS_INT_PARSER:
-        try {
-          return wrapper.getInts(reader, key.field, DEFAULT_INT_PARSER, setDocsWithField);
-        } catch (NumberFormatException ne) {
-          return wrapper.getInts(reader, key.field, NUMERIC_UTILS_INT_PARSER, setDocsWithField);
-        }
-      }
-
-      final HoldsOneThing<int[]> valuesRef = new HoldsOneThing<int[]>();
-
-      Uninvert u = new Uninvert() {
-          private int currentValue;
-          private int[] values;
-
-          @Override
-          public void visitTerm(BytesRef term) {
-            currentValue = parser.parseInt(term);
-            if (values == null) {
-              // Lazy alloc so for the numeric field case
-              // (which will hit a NumberFormatException
-              // when we first try the DEFAULT_INT_PARSER),
-              // we don't double-alloc:
-              values = new int[reader.maxDoc()];
-              valuesRef.set(values);
-            }
-          }
-
-          @Override
-          public void visitDoc(int docID) {
-            values[docID] = currentValue;
-          }
-          
-          @Override
-          protected TermsEnum termsEnum(Terms terms) throws IOException {
-            return parser.termsEnum(terms);
-          }
-        };
-
-      u.uninvert(reader, key.field, setDocsWithField);
-
-      if (setDocsWithField) {
-        wrapper.setDocsWithField(reader, key.field, u.docsWithField);
-      }
-      int[] values = valuesRef.get();
-      if (values == null) {
-        values = new int[reader.maxDoc()];
-      }
-      return new IntsFromArray(values);
-    }
-  }
-
-  public Bits getDocsWithField(AtomicReader reader, String field) throws IOException {
-    final FieldInfo fieldInfo = reader.getFieldInfos().fieldInfo(field);
-    if (fieldInfo == null) {
-      // field does not exist or has no value
-      return new Bits.MatchNoBits(reader.maxDoc());
-    } else if (fieldInfo.hasDocValues()) {
-      // doc values are dense
-      return new Bits.MatchAllBits(reader.maxDoc());
-    } else if (!fieldInfo.isIndexed()) {
-      return new Bits.MatchNoBits(reader.maxDoc());
-    }
-    return (Bits) caches.get(DocsWithFieldCache.class).get(reader, new CacheKey(field, null), false);
-  }
-
-  static final class DocsWithFieldCache extends Cache {
-    DocsWithFieldCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-    
-    @Override
-    protected Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField /* ignored */)
-    throws IOException {
-      final String field = key.field;
-      final int maxDoc = reader.maxDoc();
-
-      // Visit all docs that have terms for this field
-      FixedBitSet res = null;
-      Terms terms = reader.terms(field);
-      if (terms != null) {
-        final int termsDocCount = terms.getDocCount();
-        assert termsDocCount <= maxDoc;
-        if (termsDocCount == maxDoc) {
-          // Fast case: all docs have this field:
-          return new Bits.MatchAllBits(maxDoc);
-        }
-        final TermsEnum termsEnum = terms.iterator(null);
-        DocsEnum docs = null;
-        while(true) {
-          final BytesRef term = termsEnum.next();
-          if (term == null) {
-            break;
-          }
-          if (res == null) {
-            // lazy init
-            res = new FixedBitSet(maxDoc);
-          }
-
-          docs = termsEnum.docs(null, docs, DocsEnum.FLAG_NONE);
-          // TODO: use bulk API
-          while (true) {
-            final int docID = docs.nextDoc();
-            if (docID == DocIdSetIterator.NO_MORE_DOCS) {
-              break;
-            }
-            res.set(docID);
-          }
-        }
-      }
-      if (res == null) {
-        return new Bits.MatchNoBits(maxDoc);
-      }
-      final int numSet = res.cardinality();
-      if (numSet >= maxDoc) {
-        // The cardinality of the BitSet is maxDoc if all documents have a value.
-        assert numSet == maxDoc;
-        return new Bits.MatchAllBits(maxDoc);
-      }
-      return res;
-    }
-  }
-
-  // inherit javadocs
-  public Floats getFloats (AtomicReader reader, String field, boolean setDocsWithField)
-    throws IOException {
-    return getFloats(reader, field, null, setDocsWithField);
-  }
-
-  // inherit javadocs
-  public Floats getFloats(AtomicReader reader, String field, FloatParser parser, boolean setDocsWithField)
-    throws IOException {
-    final NumericDocValues valuesIn = reader.getNumericDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return new Floats() {
-        @Override
-        public float get(int docID) {
-          return Float.intBitsToFloat((int) valuesIn.get(docID));
-        }
-      };
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return Floats.EMPTY;
-      } else if (info.hasDocValues()) {
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return Floats.EMPTY;
-      }
-      return (Floats) caches.get(Float.TYPE).get(reader, new CacheKey(field, parser), setDocsWithField);
-    }
-  }
-
-  static class FloatsFromArray extends Floats {
-    private final float[] values;
-
-    public FloatsFromArray(float[] values) {
-      this.values = values;
-    }
-    
-    @Override
-    public float get(int docID) {
-      return values[docID];
-    }
-  }
-
-  static final class FloatCache extends Cache {
-    FloatCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(final AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException {
-
-      final FloatParser parser = (FloatParser) key.custom;
-      if (parser == null) {
-        // Confusing: must delegate to wrapper (vs simply
-        // setting parser =
-        // DEFAULT_FLOAT_PARSER/NUMERIC_UTILS_FLOAT_PARSER) so
-        // cache key includes
-        // DEFAULT_FLOAT_PARSER/NUMERIC_UTILS_FLOAT_PARSER:
-        try {
-          return wrapper.getFloats(reader, key.field, DEFAULT_FLOAT_PARSER, setDocsWithField);
-        } catch (NumberFormatException ne) {
-          return wrapper.getFloats(reader, key.field, NUMERIC_UTILS_FLOAT_PARSER, setDocsWithField);
-        }
-      }
-
-      final HoldsOneThing<float[]> valuesRef = new HoldsOneThing<float[]>();
-
-      Uninvert u = new Uninvert() {
-          private float currentValue;
-          private float[] values;
-
-          @Override
-          public void visitTerm(BytesRef term) {
-            currentValue = parser.parseFloat(term);
-            if (values == null) {
-              // Lazy alloc so for the numeric field case
-              // (which will hit a NumberFormatException
-              // when we first try the DEFAULT_INT_PARSER),
-              // we don't double-alloc:
-              values = new float[reader.maxDoc()];
-              valuesRef.set(values);
-            }
-          }
-
-          @Override
-          public void visitDoc(int docID) {
-            values[docID] = currentValue;
-          }
-          
-          @Override
-          protected TermsEnum termsEnum(Terms terms) throws IOException {
-            return parser.termsEnum(terms);
-          }
-        };
-
-      u.uninvert(reader, key.field, setDocsWithField);
-
-      if (setDocsWithField) {
-        wrapper.setDocsWithField(reader, key.field, u.docsWithField);
-      }
-
-      float[] values = valuesRef.get();
-      if (values == null) {
-        values = new float[reader.maxDoc()];
-      }
-      return new FloatsFromArray(values);
-    }
-  }
-
-  // inherit javadocs
-  public Longs getLongs(AtomicReader reader, String field, boolean setDocsWithField) throws IOException {
-    return getLongs(reader, field, null, setDocsWithField);
-  }
-  
-  // inherit javadocs
-  public Longs getLongs(AtomicReader reader, String field, FieldCache.LongParser parser, boolean setDocsWithField)
-      throws IOException {
-    final NumericDocValues valuesIn = reader.getNumericDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return new Longs() {
-        @Override
-        public long get(int docID) {
-          return valuesIn.get(docID);
-        }
-      };
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return Longs.EMPTY;
-      } else if (info.hasDocValues()) {
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return Longs.EMPTY;
-      }
-      return (Longs) caches.get(Long.TYPE).get(reader, new CacheKey(field, parser), setDocsWithField);
-    }
-  }
-
-  static class LongsFromArray extends Longs {
-    private final long[] values;
-
-    public LongsFromArray(long[] values) {
-      this.values = values;
-    }
-    
-    @Override
-    public long get(int docID) {
-      return values[docID];
-    }
-  }
-
-  static final class LongCache extends Cache {
-    LongCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(final AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException {
-
-      final LongParser parser = (LongParser) key.custom;
-      if (parser == null) {
-        // Confusing: must delegate to wrapper (vs simply
-        // setting parser =
-        // DEFAULT_LONG_PARSER/NUMERIC_UTILS_LONG_PARSER) so
-        // cache key includes
-        // DEFAULT_LONG_PARSER/NUMERIC_UTILS_LONG_PARSER:
-        try {
-          return wrapper.getLongs(reader, key.field, DEFAULT_LONG_PARSER, setDocsWithField);
-        } catch (NumberFormatException ne) {
-          return wrapper.getLongs(reader, key.field, NUMERIC_UTILS_LONG_PARSER, setDocsWithField);
-        }
-      }
-
-      final HoldsOneThing<long[]> valuesRef = new HoldsOneThing<long[]>();
-
-      Uninvert u = new Uninvert() {
-          private long currentValue;
-          private long[] values;
-
-          @Override
-          public void visitTerm(BytesRef term) {
-            currentValue = parser.parseLong(term);
-            if (values == null) {
-              // Lazy alloc so for the numeric field case
-              // (which will hit a NumberFormatException
-              // when we first try the DEFAULT_INT_PARSER),
-              // we don't double-alloc:
-              values = new long[reader.maxDoc()];
-              valuesRef.set(values);
-            }
-          }
-
-          @Override
-          public void visitDoc(int docID) {
-            values[docID] = currentValue;
-          }
-          
-          @Override
-          protected TermsEnum termsEnum(Terms terms) throws IOException {
-            return parser.termsEnum(terms);
-          }
-        };
-
-      u.uninvert(reader, key.field, setDocsWithField);
-
-      if (setDocsWithField) {
-        wrapper.setDocsWithField(reader, key.field, u.docsWithField);
-      }
-      long[] values = valuesRef.get();
-      if (values == null) {
-        values = new long[reader.maxDoc()];
-      }
-      return new LongsFromArray(values);
-    }
-  }
-
-  // inherit javadocs
-  public Doubles getDoubles(AtomicReader reader, String field, boolean setDocsWithField)
-    throws IOException {
-    return getDoubles(reader, field, null, setDocsWithField);
-  }
-
-  // inherit javadocs
-  public Doubles getDoubles(AtomicReader reader, String field, FieldCache.DoubleParser parser, boolean setDocsWithField)
-      throws IOException {
-    final NumericDocValues valuesIn = reader.getNumericDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return new Doubles() {
-        @Override
-        public double get(int docID) {
-          return Double.longBitsToDouble(valuesIn.get(docID));
-        }
-      };
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return Doubles.EMPTY;
-      } else if (info.hasDocValues()) {
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return Doubles.EMPTY;
-      }
-      return (Doubles) caches.get(Double.TYPE).get(reader, new CacheKey(field, parser), setDocsWithField);
-    }
-  }
-
-  static class DoublesFromArray extends Doubles {
-    private final double[] values;
-
-    public DoublesFromArray(double[] values) {
-      this.values = values;
-    }
-    
-    @Override
-    public double get(int docID) {
-      return values[docID];
-    }
-  }
-
-  static final class DoubleCache extends Cache {
-    DoubleCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(final AtomicReader reader, CacheKey key, boolean setDocsWithField)
-        throws IOException {
-
-      final DoubleParser parser = (DoubleParser) key.custom;
-      if (parser == null) {
-        // Confusing: must delegate to wrapper (vs simply
-        // setting parser =
-        // DEFAULT_DOUBLE_PARSER/NUMERIC_UTILS_DOUBLE_PARSER) so
-        // cache key includes
-        // DEFAULT_DOUBLE_PARSER/NUMERIC_UTILS_DOUBLE_PARSER:
-        try {
-          return wrapper.getDoubles(reader, key.field, DEFAULT_DOUBLE_PARSER, setDocsWithField);
-        } catch (NumberFormatException ne) {
-          return wrapper.getDoubles(reader, key.field, NUMERIC_UTILS_DOUBLE_PARSER, setDocsWithField);
-        }
-      }
-
-      final HoldsOneThing<double[]> valuesRef = new HoldsOneThing<double[]>();
-
-      Uninvert u = new Uninvert() {
-          private double currentValue;
-          private double[] values;
-
-          @Override
-          public void visitTerm(BytesRef term) {
-            currentValue = parser.parseDouble(term);
-            if (values == null) {
-              // Lazy alloc so for the numeric field case
-              // (which will hit a NumberFormatException
-              // when we first try the DEFAULT_INT_PARSER),
-              // we don't double-alloc:
-              values = new double[reader.maxDoc()];
-              valuesRef.set(values);
-            }
-          }
-
-          @Override
-          public void visitDoc(int docID) {
-            values[docID] = currentValue;
-          }
-          
-          @Override
-          protected TermsEnum termsEnum(Terms terms) throws IOException {
-            return parser.termsEnum(terms);
-          }
-        };
-
-      u.uninvert(reader, key.field, setDocsWithField);
-
-      if (setDocsWithField) {
-        wrapper.setDocsWithField(reader, key.field, u.docsWithField);
-      }
-      double[] values = valuesRef.get();
-      if (values == null) {
-        values = new double[reader.maxDoc()];
-      }
-      return new DoublesFromArray(values);
-    }
-  }
-
-  public static class SortedDocValuesImpl extends SortedDocValues {
-    private final PagedBytes.Reader bytes;
-    private final PackedInts.Reader termOrdToBytesOffset;
-    private final PackedInts.Reader docToTermOrd;
-    private final int numOrd;
-
-    public SortedDocValuesImpl(PagedBytes.Reader bytes, PackedInts.Reader termOrdToBytesOffset, PackedInts.Reader docToTermOrd, int numOrd) {
-      this.bytes = bytes;
-      this.docToTermOrd = docToTermOrd;
-      this.termOrdToBytesOffset = termOrdToBytesOffset;
-      this.numOrd = numOrd;
-    }
-
-    @Override
-    public int getValueCount() {
-      return numOrd;
-    }
-
-    @Override
-    public int getOrd(int docID) {
-      // Subtract 1, matching the 1+ord we did when
-      // storing, so that missing values, which are 0 in the
-      // packed ints, are returned as -1 ord:
-      return (int) docToTermOrd.get(docID)-1;
-    }
-
-    @Override
-    public void lookupOrd(int ord, BytesRef ret) {
-      if (ord < 0) {
-        throw new IllegalArgumentException("ord must be >=0 (got ord=" + ord + ")");
-      }
-      bytes.fill(ret, termOrdToBytesOffset.get(ord));
-    }
-  }
-
-  public SortedDocValues getTermsIndex(AtomicReader reader, String field) throws IOException {
-    return getTermsIndex(reader, field, PackedInts.FAST);
-  }
-
-  public SortedDocValues getTermsIndex(AtomicReader reader, String field, float acceptableOverheadRatio) throws IOException {
-    SortedDocValues valuesIn = reader.getSortedDocValues(field);
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return valuesIn;
-    } else {
-      final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-      if (info == null) {
-        return EMPTY_TERMSINDEX;
-      } else if (info.hasDocValues()) {
-        // we don't try to build a sorted instance from numeric/binary doc
-        // values because dedup can be very costly
-        throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-      } else if (!info.isIndexed()) {
-        return EMPTY_TERMSINDEX;
-      }
-      return (SortedDocValues) caches.get(SortedDocValues.class).get(reader, new CacheKey(field, acceptableOverheadRatio), false);
-    }
-  }
-
-  static class SortedDocValuesCache extends Cache {
-    SortedDocValuesCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField /* ignored */)
-        throws IOException {
-
-      final int maxDoc = reader.maxDoc();
-
-      Terms terms = reader.terms(key.field);
-
-      final float acceptableOverheadRatio = ((Float) key.custom).floatValue();
-
-      final PagedBytes bytes = new PagedBytes(15);
-
-      int startBytesBPV;
-      int startTermsBPV;
-      int startNumUniqueTerms;
-
-      final int termCountHardLimit;
-      if (maxDoc == Integer.MAX_VALUE) {
-        termCountHardLimit = Integer.MAX_VALUE;
-      } else {
-        termCountHardLimit = maxDoc+1;
-      }
-
-      // TODO: use Uninvert?
-      if (terms != null) {
-        // Try for coarse estimate for number of bits; this
-        // should be an underestimate most of the time, which
-        // is fine -- GrowableWriter will reallocate as needed
-        long numUniqueTerms = terms.size();
-        if (numUniqueTerms != -1L) {
-          if (numUniqueTerms > termCountHardLimit) {
-            // app is misusing the API (there is more than
-            // one term per doc); in this case we make best
-            // effort to load what we can (see LUCENE-2142)
-            numUniqueTerms = termCountHardLimit;
-          }
-
-          startBytesBPV = PackedInts.bitsRequired(numUniqueTerms*4);
-          startTermsBPV = PackedInts.bitsRequired(numUniqueTerms);
-
-          startNumUniqueTerms = (int) numUniqueTerms;
+  // only one doc with vectors
+  public void testRareVectors() throws IOException {
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(10, 20);
+    for (Options options : validOptions()) {
+      final int numDocs = _TestUtil.nextInt(random(), 10, 10000);
+      final int docWithVectors = random().nextInt(numDocs);
+      final Document emptyDoc = new Document();
+      final Directory dir = newDirectory();
+      final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+      final RandomDocument doc = docFactory.newDocument(_TestUtil.nextInt(random(), 1, 3), 20, options);
+      for (int i = 0; i < numDocs; ++i) {
+        if (i == docWithVectors) {
+          writer.addDocument(addId(doc.toDocument(), "42"));
         } else {
-          startBytesBPV = 1;
-          startTermsBPV = 1;
-          startNumUniqueTerms = 1;
-        }
-      } else {
-        startBytesBPV = 1;
-        startTermsBPV = 1;
-        startNumUniqueTerms = 1;
-      }
-
-      GrowableWriter termOrdToBytesOffset = new GrowableWriter(startBytesBPV, 1+startNumUniqueTerms, acceptableOverheadRatio);
-      final GrowableWriter docToTermOrd = new GrowableWriter(startTermsBPV, maxDoc, acceptableOverheadRatio);
-
-      int termOrd = 0;
-
-      // TODO: use Uninvert?
-
-      if (terms != null) {
-        final TermsEnum termsEnum = terms.iterator(null);
-        DocsEnum docs = null;
-
-        while(true) {
-          final BytesRef term = termsEnum.next();
-          if (term == null) {
-            break;
-          }
-          if (termOrd >= termCountHardLimit) {
-            break;
-          }
-
-          if (termOrd == termOrdToBytesOffset.size()) {
-            // NOTE: this code only runs if the incoming
-            // reader impl doesn't implement
-            // size (which should be uncommon)
-            termOrdToBytesOffset = termOrdToBytesOffset.resize(ArrayUtil.oversize(1+termOrd, 1));
-          }
-          termOrdToBytesOffset.set(termOrd, bytes.copyUsingLengthPrefix(term));
-          docs = termsEnum.docs(null, docs, DocsEnum.FLAG_NONE);
-          while (true) {
-            final int docID = docs.nextDoc();
-            if (docID == DocIdSetIterator.NO_MORE_DOCS) {
-              break;
-            }
-            // Store 1+ ord into packed bits
-            docToTermOrd.set(docID, 1+termOrd);
-          }
-          termOrd++;
-        }
-
-        if (termOrdToBytesOffset.size() > termOrd) {
-          termOrdToBytesOffset = termOrdToBytesOffset.resize(termOrd);
+          writer.addDocument(emptyDoc);
         }
       }
-
-      // maybe an int-only impl?
-      return new SortedDocValuesImpl(bytes.freeze(true), termOrdToBytesOffset.getMutable(), docToTermOrd.getMutable(), termOrd);
-    }
-  }
-
-  private static class BinaryDocValuesImpl extends BinaryDocValues {
-    private final PagedBytes.Reader bytes;
-    private final PackedInts.Reader docToOffset;
-
-    public BinaryDocValuesImpl(PagedBytes.Reader bytes, PackedInts.Reader docToOffset) {
-      this.bytes = bytes;
-      this.docToOffset = docToOffset;
-    }
-
-    @Override
-    public void get(int docID, BytesRef ret) {
-      final int pointer = (int) docToOffset.get(docID);
-      if (pointer == 0) {
-        ret.bytes = MISSING;
-        ret.offset = 0;
-        ret.length = 0;
-      } else {
-        bytes.fill(ret, pointer);
-      }
-    }
-  }
-
-  // TODO: this if DocTermsIndex was already created, we
-  // should share it...
-  public BinaryDocValues getTerms(AtomicReader reader, String field) throws IOException {
-    return getTerms(reader, field, PackedInts.FAST);
-  }
-
-  public BinaryDocValues getTerms(AtomicReader reader, String field, float acceptableOverheadRatio) throws IOException {
-    BinaryDocValues valuesIn = reader.getBinaryDocValues(field);
-    if (valuesIn == null) {
-      valuesIn = reader.getSortedDocValues(field);
-    }
-
-    if (valuesIn != null) {
-      // Not cached here by FieldCacheImpl (cached instead
-      // per-thread by SegmentReader):
-      return valuesIn;
-    }
-
-    final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-    if (info == null) {
-      return BinaryDocValues.EMPTY;
-    } else if (info.hasDocValues()) {
-      throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-    } else if (!info.isIndexed()) {
-      return BinaryDocValues.EMPTY;
-    }
-
-    return (BinaryDocValues) caches.get(BinaryDocValues.class).get(reader, new CacheKey(field, acceptableOverheadRatio), false);
-  }
-
-  static final class BinaryDocValuesCache extends Cache {
-    BinaryDocValuesCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField /* ignored */)
-        throws IOException {
-
-      // TODO: would be nice to first check if DocTermsIndex
-      // was already cached for this field and then return
-      // that instead, to avoid insanity
-
-      final int maxDoc = reader.maxDoc();
-      Terms terms = reader.terms(key.field);
-
-      final float acceptableOverheadRatio = ((Float) key.custom).floatValue();
-
-      final int termCountHardLimit = maxDoc;
-
-      // Holds the actual term data, expanded.
-      final PagedBytes bytes = new PagedBytes(15);
-
-      int startBPV;
-
-      if (terms != null) {
-        // Try for coarse estimate for number of bits; this
-        // should be an underestimate most of the time, which
-        // is fine -- GrowableWriter will reallocate as needed
-        long numUniqueTerms = terms.size();
-        if (numUniqueTerms != -1L) {
-          if (numUniqueTerms > termCountHardLimit) {
-            numUniqueTerms = termCountHardLimit;
-          }
-          startBPV = PackedInts.bitsRequired(numUniqueTerms*4);
+      final IndexReader reader = writer.getReader();
+      final int docWithVectorsID = docID(reader, "42");
+      for (int i = 0; i < 10; ++i) {
+        final int docID = random().nextInt(numDocs);
+        final Fields fields = reader.getTermVectors(docID);
+        if (docID == docWithVectorsID) {
+          assertEquals(doc, fields);
         } else {
-          startBPV = 1;
+          assertNull(fields);
         }
-      } else {
-        startBPV = 1;
+      }
+      final Fields fields = reader.getTermVectors(docWithVectorsID);
+      assertEquals(doc, fields);
+      reader.close();
+      writer.close();
+      dir.close();
+    }
+  }
+
+  public void testHighFreqs() throws IOException {
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(3, 5);
+    for (Options options : validOptions()) {
+      if (options == Options.NONE) {
+        continue;
+      }
+      final Directory dir = newDirectory();
+      final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+      final RandomDocument doc = docFactory.newDocument(_TestUtil.nextInt(random(), 1, 2), _TestUtil.nextInt(random(), 50000, 100000), options);
+      writer.addDocument(doc.toDocument());
+      final IndexReader reader = writer.getReader();
+      assertEquals(doc, reader.getTermVectors(0));
+      reader.close();
+      writer.close();
+      dir.close();
+    }
+  }
+
+  public void testLotsOfFields() throws IOException {
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(5000, 10);
+    for (Options options : validOptions()) {
+      final Directory dir = newDirectory();
+      final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+      final RandomDocument doc = docFactory.newDocument(_TestUtil.nextInt(random(), 500, 1000), 5, options);
+      writer.addDocument(doc.toDocument());
+      final IndexReader reader = writer.getReader();
+      assertEquals(doc, reader.getTermVectors(0));
+      reader.close();
+      writer.close();
+      dir.close();
+    }
+  }
+
+  // different options for the same field
+  public void testMixedOptions() throws IOException {
+    final int numFields = _TestUtil.nextInt(random(), 1, 3);
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(numFields, 10);
+    for (Options options1 : validOptions()) {
+      for (Options options2 : validOptions()) {
+        if (options1 == options2) {
+          continue;
+        }
+        final Directory dir = newDirectory();
+        final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+        final RandomDocument doc1 = docFactory.newDocument(numFields, 20, options1);
+        final RandomDocument doc2 = docFactory.newDocument(numFields, 20,  options2);
+        writer.addDocument(addId(doc1.toDocument(), "1"));
+        writer.addDocument(addId(doc2.toDocument(), "2"));
+        final IndexReader reader = writer.getReader();
+        final int doc1ID = docID(reader, "1");
+        assertEquals(doc1, reader.getTermVectors(doc1ID));
+        final int doc2ID = docID(reader, "2");
+        assertEquals(doc2, reader.getTermVectors(doc2ID));
+        reader.close();
+        writer.close();
+        dir.close();
+      }
+    }
+  }
+
+  public void testRandom() throws IOException {
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(5, 20);
+    final int numDocs = _TestUtil.nextInt(random(), 100, 1000);
+    final RandomDocument[] docs = new RandomDocument[numDocs];
+    for (int i = 0; i < numDocs; ++i) {
+      docs[i] = docFactory.newDocument(_TestUtil.nextInt(random(), 1, 3), _TestUtil.nextInt(random(), 10, 50), randomOptions());
+    }
+    final Directory dir = newDirectory();
+    final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+    for (int i = 0; i < numDocs; ++i) {
+      writer.addDocument(addId(docs[i].toDocument(), ""+i));
+    }
+    final IndexReader reader = writer.getReader();
+    for (int i = 0; i < numDocs; ++i) {
+      final int docID = docID(reader, ""+i);
+      assertEquals(docs[i], reader.getTermVectors(docID));
+    }
+    reader.close();
+    writer.close();
+    dir.close();
+  }
+
+  public void testMerge() throws IOException {
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(5, 20);
+    final int numDocs = _TestUtil.nextInt(random(), 100, 500);
+    final int numDeletes = random().nextInt(numDocs);
+    final Set<Integer> deletes = new HashSet<Integer>();
+    while (deletes.size() < numDeletes) {
+      deletes.add(random().nextInt(numDocs));
+    }
+    for (Options options : validOptions()) {
+      final RandomDocument[] docs = new RandomDocument[numDocs];
+      for (int i = 0; i < numDocs; ++i) {
+        docs[i] = docFactory.newDocument(_TestUtil.nextInt(random(), 1, 3), _TestUtil.nextInt(random(), 10, 50), options);
+      }
+      final Directory dir = newDirectory();
+      final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+      for (int i = 0; i < numDocs; ++i) {
+        writer.addDocument(addId(docs[i].toDocument(), ""+i));
+        if (rarely()) {
+          writer.commit();
+        }
+      }
+      for (int delete : deletes) {
+        writer.deleteDocuments(new Term("id", "" + delete));
+      }
+      // merge with deletes
+      writer.forceMerge(1);
+      final IndexReader reader = writer.getReader();
+      for (int i = 0; i < numDocs; ++i) {
+        if (!deletes.contains(i)) {
+          final int docID = docID(reader, ""+i);
+          assertEquals(docs[i], reader.getTermVectors(docID));
+        }
+      }
+      reader.close();
+      writer.close();
+      dir.close();
+    }
+  }
+
+  // run random tests from different threads to make sure the per-thread clones
+  // don't share mutable data
+  public void testClone() throws IOException, InterruptedException {
+    final RandomDocumentFactory docFactory = new RandomDocumentFactory(5, 20);
+    final int numDocs = _TestUtil.nextInt(random(), 100, 1000);
+    for (Options options : validOptions()) {
+      final RandomDocument[] docs = new RandomDocument[numDocs];
+      for (int i = 0; i < numDocs; ++i) {
+        docs[i] = docFactory.newDocument(_TestUtil.nextInt(random(), 1, 3), _TestUtil.nextInt(random(), 10, 50), options);
+      }
+      final Directory dir = newDirectory();
+      final RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+      for (int i = 0; i < numDocs; ++i) {
+        writer.addDocument(addId(docs[i].toDocument(), ""+i));
+      }
+      final IndexReader reader = writer.getReader();
+      for (int i = 0; i < numDocs; ++i) {
+        final int docID = docID(reader, ""+i);
+        assertEquals(docs[i], reader.getTermVectors(docID));
       }
 
-      final GrowableWriter docToOffset = new GrowableWriter(startBPV, maxDoc, acceptableOverheadRatio);
-      
-      // pointer==0 means not set
-      bytes.copyUsingLengthPrefix(new BytesRef());
-
-      if (terms != null) {
-        int termCount = 0;
-        final TermsEnum termsEnum = terms.iterator(null);
-        DocsEnum docs = null;
-        while(true) {
-          if (termCount++ == termCountHardLimit) {
-            // app is misusing the API (there is more than
-            // one term per doc); in this case we make best
-            // effort to load what we can (see LUCENE-2142)
-            break;
-          }
-
-          final BytesRef term = termsEnum.next();
-          if (term == null) {
-            break;
-          }
-          final long pointer = bytes.copyUsingLengthPrefix(term);
-          docs = termsEnum.docs(null, docs, DocsEnum.FLAG_NONE);
-          while (true) {
-            final int docID = docs.nextDoc();
-            if (docID == DocIdSetIterator.NO_MORE_DOCS) {
-              break;
+      final AtomicReference<Throwable> exception = new AtomicReference<Throwable>();
+      final Thread[] threads = new Thread[2];
+      for (int i = 0; i < threads.length; ++i) {
+        threads[i] = new Thread() {
+          @Override
+          public void run() {
+            try {
+              for (int i = 0; i < atLeast(100); ++i) {
+                final int idx = random().nextInt(numDocs);
+                final int docID = docID(reader, ""+idx);
+                assertEquals(docs[idx], reader.getTermVectors(docID));
+              }
+            } catch (Throwable t) {
+              exception.set(t);
             }
-            docToOffset.set(docID, pointer);
           }
-        }
+        };
       }
-
-      // maybe an int-only impl?
-      return new BinaryDocValuesImpl(bytes.freeze(true), docToOffset.getMutable());
+      for (Thread thread : threads) {
+        thread.start();
+      }
+      for (Thread thread : threads) {
+        thread.join();
+      }
+      reader.close();
+      writer.close();
+      dir.close();
+      if (exception.get() != null) {
+        throw new AssertionError("One thread threw an exception", exception.get());
+      }
     }
   }
 
-  // TODO: this if DocTermsIndex was already created, we
-  // should share it...
-  public SortedSetDocValues getDocTermOrds(AtomicReader reader, String field) throws IOException {
-    SortedSetDocValues dv = reader.getSortedSetDocValues(field);
-    if (dv != null) {
-      return dv;
-    }
-    
-    SortedDocValues sdv = reader.getSortedDocValues(field);
-    if (sdv != null) {
-      return new SingletonSortedSetDocValues(sdv);
-    }
-    
-    final FieldInfo info = reader.getFieldInfos().fieldInfo(field);
-    if (info == null) {
-      return SortedSetDocValues.EMPTY;
-    } else if (info.hasDocValues()) {
-      throw new IllegalStateException("Type mismatch: " + field + " was indexed as " + info.getDocValuesType());
-    } else if (!info.isIndexed()) {
-      return SortedSetDocValues.EMPTY;
-    }
-    
-    DocTermOrds dto = (DocTermOrds) caches.get(DocTermOrds.class).get(reader, new CacheKey(field, null), false);
-    return dto.iterator(dto.getOrdTermsEnum(reader));
-  }
-
-  static final class DocTermOrdsCache extends Cache {
-    DocTermOrdsCache(FieldCacheImpl wrapper) {
-      super(wrapper);
-    }
-
-    @Override
-    protected Object createValue(AtomicReader reader, CacheKey key, boolean setDocsWithField /* ignored */)
-        throws IOException {
-      return new DocTermOrds(reader, null, key.field);
-    }
-  }
-
-  private volatile PrintStream infoStream;
-
-  public void setInfoStream(PrintStream stream) {
-    infoStream = stream;
-  }
-
-  public PrintStream getInfoStream() {
-    return infoStream;
-  }
 }

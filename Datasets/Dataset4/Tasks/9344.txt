@@ -1,4 +1,4 @@
-return true;
+if (!fieldsVisitor.fields().isEmpty()) {
 
 /*
  * Licensed to ElasticSearch and Shay Banon under one
@@ -19,148 +19,204 @@ return true;
  * under the License.
  */
 
-package org.elasticsearch.cluster;
+package org.elasticsearch.search.fetch;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
-import org.elasticsearch.cluster.metadata.IndexMetaData;
-import org.elasticsearch.cluster.metadata.MetaData;
-import org.elasticsearch.cluster.node.DiscoveryNodes;
+import com.google.common.collect.ImmutableMap;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.ReaderUtil;
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.text.StringAndBytesText;
+import org.elasticsearch.common.text.Text;
+import org.elasticsearch.index.fieldvisitor.CustomFieldsVisitor;
+import org.elasticsearch.index.fieldvisitor.FieldsVisitor;
+import org.elasticsearch.index.fieldvisitor.JustUidFieldsVisitor;
+import org.elasticsearch.index.fieldvisitor.UidAndSourceFieldsVisitor;
+import org.elasticsearch.index.mapper.DocumentMapper;
+import org.elasticsearch.index.mapper.FieldMappers;
+import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
+import org.elasticsearch.search.SearchHitField;
+import org.elasticsearch.search.SearchParseElement;
+import org.elasticsearch.search.SearchPhase;
+import org.elasticsearch.search.fetch.explain.ExplainFetchSubPhase;
+import org.elasticsearch.search.fetch.matchedfilters.MatchedFiltersFetchSubPhase;
+import org.elasticsearch.search.fetch.partial.PartialFieldsFetchSubPhase;
+import org.elasticsearch.search.fetch.script.ScriptFieldsFetchSubPhase;
+import org.elasticsearch.search.fetch.version.VersionFetchSubPhase;
+import org.elasticsearch.search.highlight.HighlightPhase;
+import org.elasticsearch.search.internal.InternalSearchHit;
+import org.elasticsearch.search.internal.InternalSearchHitField;
+import org.elasticsearch.search.internal.InternalSearchHits;
+import org.elasticsearch.search.internal.SearchContext;
 
-import java.util.List;
+import java.io.IOException;
+import java.util.*;
+
+import static com.google.common.collect.Lists.newArrayList;
 
 /**
  *
  */
-public class ClusterChangedEvent {
+public class FetchPhase implements SearchPhase {
 
-    private final String source;
+    private final FetchSubPhase[] fetchSubPhases;
 
-    private final ClusterState previousState;
-
-    private final ClusterState state;
-
-    private final DiscoveryNodes.Delta nodesDelta;
-
-    public ClusterChangedEvent(String source, ClusterState state, ClusterState previousState) {
-        this.source = source;
-        this.state = state;
-        this.previousState = previousState;
-        this.nodesDelta = state.nodes().delta(previousState.nodes());
+    @Inject
+    public FetchPhase(HighlightPhase highlightPhase, ScriptFieldsFetchSubPhase scriptFieldsPhase, PartialFieldsFetchSubPhase partialFieldsPhase,
+                      MatchedFiltersFetchSubPhase matchFiltersPhase, ExplainFetchSubPhase explainPhase, VersionFetchSubPhase versionPhase) {
+        this.fetchSubPhases = new FetchSubPhase[]{scriptFieldsPhase, partialFieldsPhase, matchFiltersPhase, explainPhase, highlightPhase, versionPhase};
     }
 
-    /**
-     * The source that caused this cluster event to be raised.
-     */
-    public String source() {
-        return this.source;
-    }
-
-    public ClusterState state() {
-        return this.state;
-    }
-
-    public ClusterState previousState() {
-        return this.previousState;
-    }
-
-    public boolean routingTableChanged() {
-        return state.routingTable() != previousState.routingTable();
-    }
-
-    public boolean indexRoutingTableChanged(String index) {
-        if (!state.routingTable().hasIndex(index) && !previousState.routingTable().hasIndex(index)) {
-            return false;
+    @Override
+    public Map<String, ? extends SearchParseElement> parseElements() {
+        ImmutableMap.Builder<String, SearchParseElement> parseElements = ImmutableMap.builder();
+        parseElements.put("fields", new FieldsParseElement());
+        for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
+            parseElements.putAll(fetchSubPhase.parseElements());
         }
-        if (state.routingTable().hasIndex(index) && previousState.routingTable().hasIndex(index)) {
-            return state.routingTable().index(index) != previousState.routingTable().index(index);
-        }
-        return true;
+        return parseElements.build();
     }
 
-    /**
-     * Returns the indices created in this event
-     */
-    public List<String> indicesCreated() {
-        if (previousState == null) {
-            return Lists.newArrayList(state.metaData().indices().keySet());
-        }
-        if (!metaDataChanged()) {
-            return ImmutableList.of();
-        }
-        List<String> created = null;
-        for (String index : state.metaData().indices().keySet()) {
-            if (!previousState.metaData().hasIndex(index)) {
-                if (created == null) {
-                    created = Lists.newArrayList();
+    @Override
+    public void preProcess(SearchContext context) {
+    }
+
+    public void execute(SearchContext context) {
+        FieldsVisitor fieldsVisitor;
+        List<String> extractFieldNames = null;
+        boolean sourceRequested = false;
+        if (!context.hasFieldNames()) {
+            if (context.hasPartialFields()) {
+                // partial fields need the source, so fetch it, but don't return it
+                fieldsVisitor = new UidAndSourceFieldsVisitor();
+            } else if (context.hasScriptFields()) {
+                // we ask for script fields, and no field names, don't load the source
+                fieldsVisitor = new JustUidFieldsVisitor();
+            } else {
+                sourceRequested = true;
+                fieldsVisitor = new UidAndSourceFieldsVisitor();
+            }
+        } else if (context.fieldNames().isEmpty()) {
+            fieldsVisitor = new JustUidFieldsVisitor();
+        } else {
+            boolean loadAllStored = false;
+            Set<String> fieldNames = null;
+            for (String fieldName : context.fieldNames()) {
+                if (fieldName.equals("*")) {
+                    loadAllStored = true;
+                    continue;
                 }
-                created.add(index);
+                if (fieldName.equals(SourceFieldMapper.NAME)) {
+                    sourceRequested = true;
+                    continue;
+                }
+                FieldMappers x = context.smartNameFieldMappers(fieldName);
+                if (x != null && x.mapper().fieldType().stored()) {
+                    if (fieldNames == null) {
+                        fieldNames = new HashSet<String>();
+                    }
+                    fieldNames.add(x.mapper().names().indexName());
+                } else {
+                    if (extractFieldNames == null) {
+                        extractFieldNames = newArrayList();
+                    }
+                    extractFieldNames.add(fieldName);
+                }
+            }
+            if (loadAllStored) {
+                if (sourceRequested || extractFieldNames != null) {
+                    fieldsVisitor = new CustomFieldsVisitor(true, true); // load everything, including _source
+                } else {
+                    fieldsVisitor = new CustomFieldsVisitor(true, false);
+                }
+            } else if (fieldNames != null) {
+                boolean loadSource = extractFieldNames != null || sourceRequested;
+                fieldsVisitor = new CustomFieldsVisitor(fieldNames, loadSource);
+            } else if (extractFieldNames != null || sourceRequested) {
+                fieldsVisitor = new UidAndSourceFieldsVisitor();
+            } else {
+                fieldsVisitor = new JustUidFieldsVisitor();
             }
         }
-        return created == null ? ImmutableList.<String>of() : created;
-    }
 
-    /**
-     * Returns the indices deleted in this event
-     */
-    public List<String> indicesDeleted() {
-        if (previousState == null) {
-            return ImmutableList.of();
-        }
-        if (!metaDataChanged()) {
-            return ImmutableList.of();
-        }
-        List<String> deleted = null;
-        for (String index : previousState.metaData().indices().keySet()) {
-            if (!state.metaData().hasIndex(index)) {
-                if (deleted == null) {
-                    deleted = Lists.newArrayList();
+        InternalSearchHit[] hits = new InternalSearchHit[context.docIdsToLoadSize()];
+        for (int index = 0; index < context.docIdsToLoadSize(); index++) {
+            int docId = context.docIdsToLoad()[context.docIdsToLoadFrom() + index];
+
+            loadStoredFields(context, fieldsVisitor, docId);
+            fieldsVisitor.postProcess(context.mapperService());
+
+            Map<String, SearchHitField> searchFields = null;
+            if (fieldsVisitor.fields() != null) {
+                searchFields = new HashMap<String, SearchHitField>(fieldsVisitor.fields().size());
+                for (Map.Entry<String, List<Object>> entry : fieldsVisitor.fields().entrySet()) {
+                    searchFields.put(entry.getKey(), new InternalSearchHitField(entry.getKey(), entry.getValue()));
                 }
-                deleted.add(index);
+            }
+
+            DocumentMapper documentMapper = context.mapperService().documentMapper(fieldsVisitor.uid().type());
+            Text typeText;
+            if (documentMapper == null) {
+                typeText = new StringAndBytesText(fieldsVisitor.uid().type());
+            } else {
+                typeText = documentMapper.typeText();
+            }
+            InternalSearchHit searchHit = new InternalSearchHit(docId, fieldsVisitor.uid().id(), typeText, sourceRequested ? fieldsVisitor.source() : null, searchFields);
+
+            hits[index] = searchHit;
+
+            int readerIndex = ReaderUtil.subIndex(docId, context.searcher().getIndexReader().leaves());
+            AtomicReaderContext subReaderContext = context.searcher().getIndexReader().leaves().get(readerIndex);
+            int subDoc = docId - subReaderContext.docBase;
+
+            // go over and extract fields that are not mapped / stored
+            context.lookup().setNextReader(subReaderContext);
+            context.lookup().setNextDocId(subDoc);
+            if (searchHit.source() != null) {
+                context.lookup().source().setNextSource(new BytesArray(searchHit.source()));
+            }
+            if (extractFieldNames != null) {
+                for (String extractFieldName : extractFieldNames) {
+                    Object value = context.lookup().source().extractValue(extractFieldName);
+                    if (value != null) {
+                        if (searchHit.fieldsOrNull() == null) {
+                            searchHit.fields(new HashMap<String, SearchHitField>(2));
+                        }
+
+                        SearchHitField hitField = searchHit.fields().get(extractFieldName);
+                        if (hitField == null) {
+                            hitField = new InternalSearchHitField(extractFieldName, new ArrayList<Object>(2));
+                            searchHit.fields().put(extractFieldName, hitField);
+                        }
+                        hitField.values().add(value);
+                    }
+                }
+            }
+
+            for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
+                FetchSubPhase.HitContext hitContext = new FetchSubPhase.HitContext();
+                if (fetchSubPhase.hitExecutionNeeded(context)) {
+                    hitContext.reset(searchHit, subReaderContext, subDoc, context.searcher().getIndexReader(), docId, fieldsVisitor);
+                    fetchSubPhase.hitExecute(context, hitContext);
+                }
             }
         }
-        return deleted == null ? ImmutableList.<String>of() : deleted;
-    }
 
-    public boolean metaDataChanged() {
-        return state.metaData() != previousState.metaData();
-    }
-
-    public boolean indexMetaDataChanged(IndexMetaData current) {
-        MetaData previousMetaData = previousState.metaData();
-        if (previousMetaData == null) {
-            return true;
+        for (FetchSubPhase fetchSubPhase : fetchSubPhases) {
+            if (fetchSubPhase.hitsExecutionNeeded(context)) {
+                fetchSubPhase.hitsExecute(context, hits);
+            }
         }
-        IndexMetaData previousIndexMetaData = previousMetaData.index(current.index());
-        // no need to check on version, since disco modules will make sure to use the
-        // same instance if its a version match
-        if (previousIndexMetaData == current) {
-            return false;
+
+        context.fetchResult().hits(new InternalSearchHits(hits, context.queryResult().topDocs().totalHits, context.queryResult().topDocs().getMaxScore()));
+    }
+
+    private void loadStoredFields(SearchContext context, FieldsVisitor fieldVisitor, int docId) {
+        fieldVisitor.reset();
+        try {
+            context.searcher().doc(docId, fieldVisitor);
+        } catch (IOException e) {
+            throw new FetchPhaseExecutionException(context, "Failed to fetch doc id [" + docId + "]", e);
         }
-        return false;
-    }
-
-    public boolean blocksChanged() {
-        return state.blocks() != previousState.blocks();
-    }
-
-    public boolean localNodeMaster() {
-        return state.nodes().localNodeMaster();
-    }
-
-    public DiscoveryNodes.Delta nodesDelta() {
-        return this.nodesDelta;
-    }
-
-    public boolean nodesRemoved() {
-        return nodesDelta.removed();
-    }
-
-    public boolean nodesAdded() {
-        return nodesDelta.added();
-    }
-
-    public boolean nodesChanged() {
-        return nodesRemoved() || nodesAdded();
     }
 }

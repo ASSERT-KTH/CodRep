@@ -1,7 +1,7 @@
-DefaultTransactionStatus status = prepareTransactionStatus(
+commitIfNecessary(sessionToUse, message);
 
 /*
- * Copyright 2002-2009 the original author or authors.
+ * Copyright 2002-2010 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,353 +16,504 @@ DefaultTransactionStatus status = prepareTransactionStatus(
  * limitations under the License.
  */
 
-package org.springframework.transaction.jta;
+package org.springframework.jms.listener;
 
-import java.util.List;
-import javax.naming.NamingException;
+import javax.jms.Connection;
+import javax.jms.Destination;
+import javax.jms.JMSException;
+import javax.jms.Message;
+import javax.jms.MessageConsumer;
+import javax.jms.Session;
+import javax.jms.Topic;
 
-import com.ibm.websphere.uow.UOWSynchronizationRegistry;
-import com.ibm.wsspi.uow.UOWAction;
-import com.ibm.wsspi.uow.UOWActionException;
-import com.ibm.wsspi.uow.UOWException;
-import com.ibm.wsspi.uow.UOWManager;
-import com.ibm.wsspi.uow.UOWManagerFactory;
-
-import org.springframework.transaction.IllegalTransactionStateException;
-import org.springframework.transaction.InvalidTimeoutException;
-import org.springframework.transaction.NestedTransactionNotSupportedException;
-import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.TransactionException;
-import org.springframework.transaction.TransactionSystemException;
-import org.springframework.transaction.support.CallbackPreferringPlatformTransactionManager;
+import org.springframework.beans.factory.BeanNameAware;
+import org.springframework.jms.connection.ConnectionFactoryUtils;
+import org.springframework.jms.connection.JmsResourceHolder;
+import org.springframework.jms.connection.SingleConnectionFactory;
+import org.springframework.jms.support.JmsUtils;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.DefaultTransactionDefinition;
-import org.springframework.transaction.support.DefaultTransactionStatus;
-import org.springframework.transaction.support.TransactionCallback;
-import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.ResourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
-import org.springframework.util.ReflectionUtils;
+import org.springframework.transaction.support.TransactionSynchronizationUtils;
 
 /**
- * WebSphere-specific PlatformTransactionManager implementation that delegates
- * to a {@link com.ibm.wsspi.uow.UOWManager} instance, obtained from WebSphere's
- * JNDI environment. This allows Spring to leverage the full power of the WebSphere
- * transaction coordinator, including transaction suspension, in a manner that is
- * perfectly compliant with officially supported WebSphere API.
+ * Base class for listener container implementations which are based on polling.
+ * Provides support for listener handling based on {@link javax.jms.MessageConsumer},
+ * optionally participating in externally managed transactions.
  *
- * <p>The {@link CallbackPreferringPlatformTransactionManager} interface
- * implemented by this class indicates that callers should preferably pass in
- * a {@link TransactionCallback} through the {@link #execute} method, which
- * will be handled through the callback-based WebSphere UOWManager API instead
- * of through standard JTA API (UserTransaction / TransactionManager). This avoids
- * the use of the non-public <code>javax.transaction.TransactionManager</code>
- * API on WebSphere, staying within supported WebSphere API boundaries.
+ * <p>This listener container variant is built for repeated polling attempts,
+ * each invoking the {@link #receiveAndExecute} method. The MessageConsumer used
+ * may be reobtained fo reach attempt or cached inbetween attempts; this is up
+ * to the concrete implementation. The receive timeout for each attempt can be
+ * configured through the {@link #setReceiveTimeout "receiveTimeout"} property.
  *
- * <p>This transaction manager implementation derives from Spring's standard
- * {@link JtaTransactionManager}, inheriting the capability to support programmatic
- * transaction demarcation via <code>getTransaction</code> / <code>commit</code> /
- * <code>rollback</code> calls through a JTA UserTransaction handle, for callers
- * that do not use the TransactionCallback-based {@link #execute} method. However,
- * transaction suspension is <i>not</i> supported in this <code>getTransaction</code>
- * style (unless you explicitly specify a {@link #setTransactionManager} reference,
- * despite the official WebSphere recommendations). Use the {@link #execute} style
- * for any code that might require transaction suspension.
+ * <p>The underlying mechanism is based on standard JMS MessageConsumer handling,
+ * which is perfectly compatible with both native JMS and JMS in a J2EE environment.
+ * Neither the JMS <code>MessageConsumer.setMessageListener</code> facility
+ * nor the JMS ServerSessionPool facility is required. A further advantage
+ * of this approach is full control over the listening process, allowing for
+ * custom scaling and throttling and of concurrent message processing
+ * (which is up to concrete subclasses).
  *
- * <p>This transaction manager is compatible with WebSphere 6.1.0.9 and above.
- * The default JNDI location for the UOWManager is "java:comp/websphere/UOWManager".
- * If the location happens to differ according to your WebSphere documentation,
- * simply specify the actual location through this transaction manager's
- * "uowManagerName" bean property.
+ * <p>Message reception and listener execution can automatically be wrapped
+ * in transactions through passing a Spring
+ * {@link org.springframework.transaction.PlatformTransactionManager} into the
+ * {@link #setTransactionManager "transactionManager"} property. This will usually
+ * be a {@link org.springframework.transaction.jta.JtaTransactionManager} in a
+ * J2EE enviroment, in combination with a JTA-aware JMS ConnectionFactory obtained
+ * from JNDI (check your J2EE server's documentation).
+ *
+ * <p>This base class does not assume any specific mechanism for asynchronous
+ * execution of polling invokers. Check out {@link DefaultMessageListenerContainer}
+ * for a concrete implementation which is based on Spring's
+ * {@link org.springframework.core.task.TaskExecutor} abstraction,
+ * including dynamic scaling of concurrent consumers and automatic self recovery.
  *
  * @author Juergen Hoeller
- * @since 2.5
- * @see #setUowManager
- * @see #setUowManagerName
- * @see com.ibm.wsspi.uow.UOWManager
+ * @since 2.0.3
+ * @see #createListenerConsumer
+ * @see #receiveAndExecute
+ * @see #setTransactionManager
  */
-public class WebSphereUowTransactionManager extends JtaTransactionManager
-		implements CallbackPreferringPlatformTransactionManager {
+public abstract class AbstractPollingMessageListenerContainer extends AbstractMessageListenerContainer
+		implements BeanNameAware {
 
 	/**
-	 * Default JNDI location for the WebSphere UOWManager.
-	 * @see #setUowManagerName
+	 * The default receive timeout: 1000 ms = 1 second.
 	 */
-	public static final String DEFAULT_UOW_MANAGER_NAME = "java:comp/websphere/UOWManager";
+	public static final long DEFAULT_RECEIVE_TIMEOUT = 1000;
 
 
-	private UOWManager uowManager;
+	private final MessageListenerContainerResourceFactory transactionalResourceFactory =
+			new MessageListenerContainerResourceFactory();
 
-	private String uowManagerName;
+	private boolean sessionTransactedCalled = false;
+
+	private boolean pubSubNoLocal = false;
+
+	private PlatformTransactionManager transactionManager;
+
+	private DefaultTransactionDefinition transactionDefinition = new DefaultTransactionDefinition();
+
+	private long receiveTimeout = DEFAULT_RECEIVE_TIMEOUT;
 
 
-	/**
-	 * Create a new WebSphereUowTransactionManager.
-	 */
-	public WebSphereUowTransactionManager() {
-		setAutodetectTransactionManager(false);
+	public void setSessionTransacted(boolean sessionTransacted) {
+		super.setSessionTransacted(sessionTransacted);
+		this.sessionTransactedCalled = true;
 	}
 
 	/**
-	 * Create a new WebSphereUowTransactionManager for the given UOWManager.
-	 * @param uowManager the WebSphere UOWManager to use as direct reference
+	 * Set whether to inhibit the delivery of messages published by its own connection.
+	 * Default is "false".
+	 * @see javax.jms.TopicSession#createSubscriber(javax.jms.Topic, String, boolean)
 	 */
-	public WebSphereUowTransactionManager(UOWManager uowManager) {
-		this();
-		this.uowManager = uowManager;
+	public void setPubSubNoLocal(boolean pubSubNoLocal) {
+		this.pubSubNoLocal = pubSubNoLocal;
+	}
+
+	/**
+	 * Return whether to inhibit the delivery of messages published by its own connection.
+	 */
+	protected boolean isPubSubNoLocal() {
+		return this.pubSubNoLocal;
+	}
+
+	/**
+	 * Specify the Spring {@link org.springframework.transaction.PlatformTransactionManager}
+	 * to use for transactional wrapping of message reception plus listener execution.
+	 * <p>Default is none, not performing any transactional wrapping.
+	 * If specified, this will usually be a Spring
+	 * {@link org.springframework.transaction.jta.JtaTransactionManager} or one
+	 * of its subclasses, in combination with a JTA-aware ConnectionFactory that
+	 * this message listener container obtains its Connections from.
+	 * <p><b>Note: Consider the use of local JMS transactions instead.</b>
+	 * Simply switch the {@link #setSessionTransacted "sessionTransacted"} flag
+	 * to "true" in order to use a locally transacted JMS Session for the entire
+	 * receive processing, including any Session operations performed by a
+	 * {@link SessionAwareMessageListener} (e.g. sending a response message).
+	 * Alternatively, a {@link org.springframework.jms.connection.JmsTransactionManager}
+	 * may be used for fully synchronized Spring transactions based on local JMS
+	 * transactions. Check {@link AbstractMessageListenerContainer}'s javadoc for
+	 * a discussion of transaction choices and message redelivery scenarios.
+	 * @see org.springframework.transaction.jta.JtaTransactionManager
+	 * @see org.springframework.jms.connection.JmsTransactionManager
+	 */
+	public void setTransactionManager(PlatformTransactionManager transactionManager) {
+		this.transactionManager = transactionManager;
+	}
+
+	/**
+	 * Return the Spring PlatformTransactionManager to use for transactional
+	 * wrapping of message reception plus listener execution.
+	 */
+	protected final PlatformTransactionManager getTransactionManager() {
+		return this.transactionManager;
+	}
+
+	/**
+	 * Specify the transaction name to use for transactional wrapping.
+	 * Default is the bean name of this listener container, if any.
+	 * @see org.springframework.transaction.TransactionDefinition#getName()
+	 */
+	public void setTransactionName(String transactionName) {
+		this.transactionDefinition.setName(transactionName);
+	}
+
+	/**
+	 * Specify the transaction timeout to use for transactional wrapping, in <b>seconds</b>.
+	 * Default is none, using the transaction manager's default timeout.
+	 * @see org.springframework.transaction.TransactionDefinition#getTimeout()
+	 * @see #setReceiveTimeout
+	 */
+	public void setTransactionTimeout(int transactionTimeout) {
+		this.transactionDefinition.setTimeout(transactionTimeout);
+	}
+
+	/**
+	 * Set the timeout to use for receive calls, in <b>milliseconds</b>.
+	 * The default is 1000 ms, that is, 1 second.
+	 * <p><b>NOTE:</b> This value needs to be smaller than the transaction
+	 * timeout used by the transaction manager (in the appropriate unit,
+	 * of course). -1 indicates no timeout at all; however, this is only
+	 * feasible if not running within a transaction manager.
+	 * @see javax.jms.MessageConsumer#receive(long)
+	 * @see javax.jms.MessageConsumer#receive()
+	 * @see #setTransactionTimeout
+	 */
+	public void setReceiveTimeout(long receiveTimeout) {
+		this.receiveTimeout = receiveTimeout;
+	}
+
+
+	public void initialize() {
+		// Set sessionTransacted=true in case of a non-JTA transaction manager.
+		if (!this.sessionTransactedCalled &&
+				this.transactionManager instanceof ResourceTransactionManager &&
+				!TransactionSynchronizationUtils.sameResourceFactory(
+						(ResourceTransactionManager) this.transactionManager, getConnectionFactory())) {
+			super.setSessionTransacted(true);
+		}
+
+		// Use bean name as default transaction name.
+		if (this.transactionDefinition.getName() == null) {
+			this.transactionDefinition.setName(getBeanName());
+		}
+
+		// Proceed with superclass initialization.
+		super.initialize();
 	}
 
 
 	/**
-	 * Set the WebSphere UOWManager to use as direct reference.
-	 * <p>Typically just used for test setups; in a J2EE environment,
-	 * the UOWManager will always be fetched from JNDI.
-	 * @see #setUserTransactionName
+	 * Create a MessageConsumer for the given JMS Session,
+	 * registering a MessageListener for the specified listener.
+	 * @param session the JMS Session to work on
+	 * @return the MessageConsumer
+	 * @throws javax.jms.JMSException if thrown by JMS methods
+	 * @see #receiveAndExecute
 	 */
-	public void setUowManager(UOWManager uowManager) {
-		this.uowManager = uowManager;
+	protected MessageConsumer createListenerConsumer(Session session) throws JMSException {
+		Destination destination = getDestination();
+		if (destination == null) {
+			destination = resolveDestinationName(session, getDestinationName());
+		}
+		return createConsumer(session, destination);
 	}
 
 	/**
-	 * Set the JNDI name of the WebSphere UOWManager.
-	 * The default "java:comp/websphere/UOWManager" is used if not set.
-	 * @see #DEFAULT_USER_TRANSACTION_NAME
-	 * @see #setUowManager
+	 * Execute the listener for a message received from the given consumer,
+	 * wrapping the entire operation in an external transaction if demanded.
+	 * @param session the JMS Session to work on
+	 * @param consumer the MessageConsumer to work on
+	 * @return whether a message has been received
+	 * @throws JMSException if thrown by JMS methods
+	 * @see #doReceiveAndExecute
 	 */
-	public void setUowManagerName(String uowManagerName) {
-		this.uowManagerName = uowManagerName;
+	protected boolean receiveAndExecute(Object invoker, Session session, MessageConsumer consumer)
+			throws JMSException {
+
+		if (this.transactionManager != null) {
+			// Execute receive within transaction.
+			TransactionStatus status = this.transactionManager.getTransaction(this.transactionDefinition);
+			boolean messageReceived;
+			try {
+				messageReceived = doReceiveAndExecute(invoker, session, consumer, status);
+			}
+			catch (JMSException ex) {
+				rollbackOnException(status, ex);
+				throw ex;
+			}
+			catch (RuntimeException ex) {
+				rollbackOnException(status, ex);
+				throw ex;
+			}
+			catch (Error err) {
+				rollbackOnException(status, err);
+				throw err;
+			}
+			this.transactionManager.commit(status);
+			return messageReceived;
+		}
+
+		else {
+			// Execute receive outside of transaction.
+			return doReceiveAndExecute(invoker, session, consumer, null);
+		}
 	}
 
+	/**
+	 * Actually execute the listener for a message received from the given consumer,
+	 * fetching all requires resources and invoking the listener.
+	 * @param session the JMS Session to work on
+	 * @param consumer the MessageConsumer to work on
+	 * @param status the TransactionStatus (may be <code>null</code>)
+	 * @return whether a message has been received
+	 * @throws JMSException if thrown by JMS methods
+	 * @see #doExecuteListener(javax.jms.Session, javax.jms.Message)
+	 */
+	protected boolean doReceiveAndExecute(
+			Object invoker, Session session, MessageConsumer consumer, TransactionStatus status)
+			throws JMSException {
 
-	@Override
-	public void afterPropertiesSet() throws TransactionSystemException {
-		initUserTransactionAndTransactionManager();
-
-		// Fetch UOWManager handle from JNDI, if necessary.
-		if (this.uowManager == null) {
-			if (this.uowManagerName != null) {
-				this.uowManager = lookupUowManager(this.uowManagerName);
+		Connection conToClose = null;
+		Session sessionToClose = null;
+		MessageConsumer consumerToClose = null;
+		try {
+			Session sessionToUse = session;
+			boolean transactional = false;
+			if (sessionToUse == null) {
+				sessionToUse = ConnectionFactoryUtils.doGetTransactionalSession(
+						getConnectionFactory(), this.transactionalResourceFactory, true);
+				transactional = (sessionToUse != null);
+			}
+			if (sessionToUse == null) {
+				Connection conToUse;
+				if (sharedConnectionEnabled()) {
+					conToUse = getSharedConnection();
+				}
+				else {
+					conToUse = createConnection();
+					conToClose = conToUse;
+					conToUse.start();
+				}
+				sessionToUse = createSession(conToUse);
+				sessionToClose = sessionToUse;
+			}
+			MessageConsumer consumerToUse = consumer;
+			if (consumerToUse == null) {
+				consumerToUse = createListenerConsumer(sessionToUse);
+				consumerToClose = consumerToUse;
+			}
+			Message message = receiveMessage(consumerToUse);
+			if (message != null) {
+				if (logger.isDebugEnabled()) {
+					logger.debug("Received message of type [" + message.getClass() + "] from consumer [" +
+							consumerToUse + "] of " + (transactional ? "transactional " : "") + "session [" +
+							sessionToUse + "]");
+				}
+				messageReceived(invoker, sessionToUse);
+				boolean exposeResource = (!transactional && isExposeListenerSession() &&
+						!TransactionSynchronizationManager.hasResource(getConnectionFactory()));
+				if (exposeResource) {
+					TransactionSynchronizationManager.bindResource(
+							getConnectionFactory(), new LocallyExposedJmsResourceHolder(sessionToUse));
+				}
+				try {
+					doExecuteListener(sessionToUse, message);
+				}
+				catch (Throwable ex) {
+					if (status != null) {
+						if (logger.isDebugEnabled()) {
+							logger.debug("Rolling back transaction because of listener exception thrown: " + ex);
+						}
+						status.setRollbackOnly();
+					}
+					handleListenerException(ex);
+					// Rethrow JMSException to indicate an infrastructure problem
+					// that may have to trigger recovery...
+					if (ex instanceof JMSException) {
+						throw (JMSException) ex;
+					}
+				}
+				finally {
+					if (exposeResource) {
+						TransactionSynchronizationManager.unbindResource(getConnectionFactory());
+					}
+				}
+				// Indicate that a message has been received.
+				return true;
 			}
 			else {
-				this.uowManager = lookupDefaultUowManager();
+				if (logger.isTraceEnabled()) {
+					logger.trace("Consumer [" + consumerToUse + "] of " + (transactional ? "transactional " : "") +
+							"session [" + sessionToUse + "] did not receive a message");
+				}
+				noMessageReceived(invoker, sessionToUse);
+				// Nevertheless call commit, in order to reset the transaction timeout (if any).
+				commitIfNecessary(session, message);
+				// Indicate that no message has been received.
+				return false;
 			}
+		}
+		finally {
+			JmsUtils.closeMessageConsumer(consumerToClose);
+			JmsUtils.closeSession(sessionToClose);
+			ConnectionFactoryUtils.releaseConnection(conToClose, getConnectionFactory(), true);
 		}
 	}
 
 	/**
-	 * Look up the WebSphere UOWManager in JNDI via the configured name.
-	 * @param uowManagerName the JNDI name of the UOWManager
-	 * @return the UOWManager object
-	 * @throws TransactionSystemException if the JNDI lookup failed
-	 * @see #setJndiTemplate
-	 * @see #setUowManagerName
+	 * This implementation checks whether the Session is externally synchronized.
+	 * In this case, the Session is not locally transacted, despite the listener
+	 * container's "sessionTransacted" flag being set to "true".
+	 * @see org.springframework.jms.connection.JmsResourceHolder
 	 */
-	protected UOWManager lookupUowManager(String uowManagerName) throws TransactionSystemException {
+	protected boolean isSessionLocallyTransacted(Session session) {
+		if (!super.isSessionLocallyTransacted(session)) {
+			return false;
+		}
+		JmsResourceHolder resourceHolder =
+				(JmsResourceHolder) TransactionSynchronizationManager.getResource(getConnectionFactory());
+		return (resourceHolder == null || resourceHolder instanceof LocallyExposedJmsResourceHolder ||
+				!resourceHolder.containsSession(session));
+	}
+
+	/**
+	 * Perform a rollback, handling rollback exceptions properly.
+	 * @param status object representing the transaction
+	 * @param ex the thrown listener exception or error
+	 */
+	private void rollbackOnException(TransactionStatus status, Throwable ex) {
+		logger.debug("Initiating transaction rollback on listener exception", ex);
 		try {
-			if (logger.isDebugEnabled()) {
-				logger.debug("Retrieving WebSphere UOWManager from JNDI location [" + uowManagerName + "]");
-			}
-			return getJndiTemplate().lookup(uowManagerName, UOWManager.class);
+			this.transactionManager.rollback(status);
 		}
-		catch (NamingException ex) {
-			throw new TransactionSystemException(
-					"WebSphere UOWManager is not available at JNDI location [" + uowManagerName + "]", ex);
+		catch (RuntimeException ex2) {
+			logger.error("Listener exception overridden by rollback exception", ex);
+			throw ex2;
 		}
-	}
-
-	/**
-	 * Obtain the WebSphere UOWManager from the default JNDI location
-	 * "java:comp/websphere/UOWManager".
-	 * @return the UOWManager object
-	 * @throws TransactionSystemException if the JNDI lookup failed
-	 * @see #setJndiTemplate
-	 */
-	protected UOWManager lookupDefaultUowManager() throws TransactionSystemException {
-		try {
-			logger.debug("Retrieving WebSphere UOWManager from default JNDI location [" + DEFAULT_UOW_MANAGER_NAME + "]");
-			return getJndiTemplate().lookup(DEFAULT_UOW_MANAGER_NAME, UOWManager.class);
-		}
-		catch (NamingException ex) {
-			logger.debug("WebSphere UOWManager is not available at default JNDI location [" +
-					DEFAULT_UOW_MANAGER_NAME + "] - falling back to UOWManagerFactory lookup");
-			return UOWManagerFactory.getUOWManager();
+		catch (Error err) {
+			logger.error("Listener exception overridden by rollback error", ex);
+			throw err;
 		}
 	}
 
 	/**
-	 * Registers the synchronizations as interposed JTA Synchronization on the UOWManager.
+	 * Receive a message from the given consumer.
+	 * @param consumer the MessageConsumer to use
+	 * @return the Message, or <code>null</code> if none
+	 * @throws JMSException if thrown by JMS methods
 	 */
-	@Override
-	protected void doRegisterAfterCompletionWithJtaTransaction(
-			JtaTransactionObject txObject, List<TransactionSynchronization> synchronizations) {
-
-		this.uowManager.registerInterposedSynchronization(new JtaAfterCompletionSynchronization(synchronizations));
+	protected Message receiveMessage(MessageConsumer consumer) throws JMSException {
+		return (this.receiveTimeout < 0 ? consumer.receive() : consumer.receive(this.receiveTimeout));
 	}
 
 	/**
-	 * Returns <code>true</code> since WebSphere ResourceAdapters (as exposed in JNDI)
-	 * implicitly perform transaction enlistment if the MessageEndpointFactory's
-	 * <code>isDeliveryTransacted</code> method returns <code>true</code>.
-	 * In that case we'll simply skip the {@link #createTransaction} call.
-	 * @see javax.resource.spi.endpoint.MessageEndpointFactory#isDeliveryTransacted
-	 * @see org.springframework.jca.endpoint.AbstractMessageEndpointFactory
-	 * @see TransactionFactory#createTransaction
+	 * Template method that gets called right when a new message has been received,
+	 * before attempting to process it. Allows subclasses to react to the event
+	 * of an actual incoming message, for example adapting their consumer count.
+	 * @param invoker the invoker object (passed through)
+	 * @param session the receiving JMS Session
 	 */
-	@Override
-	public boolean supportsResourceAdapterManagedTransactions() {
-		return true;
+	protected void messageReceived(Object invoker, Session session) {
+	}
+
+	/**
+	 * Template method that gets called when <i>no</i> message has been received,
+	 * before returning to the receive loop again. Allows subclasses to react to
+	 * the event of no incoming message, for example marking the invoker as idle.
+	 * @param invoker the invoker object (passed through)
+	 * @param session the receiving JMS Session
+	 */
+	protected void noMessageReceived(Object invoker, Session session) {
 	}
 
 
-	public <T> T execute(TransactionDefinition definition, TransactionCallback<T> callback) throws TransactionException {
-		if (definition == null) {
-			// Use defaults if no transaction definition given.
-			definition = new DefaultTransactionDefinition();
-		}
+	//-------------------------------------------------------------------------
+	// JMS 1.1 factory methods, potentially overridden for JMS 1.0.2
+	//-------------------------------------------------------------------------
 
-		if (definition.getTimeout() < TransactionDefinition.TIMEOUT_DEFAULT) {
-			throw new InvalidTimeoutException("Invalid transaction timeout", definition.getTimeout());
-		}
-		int pb = definition.getPropagationBehavior();
-		boolean existingTx = (this.uowManager.getUOWStatus() != UOWSynchronizationRegistry.UOW_STATUS_NONE &&
-				this.uowManager.getUOWType() != UOWSynchronizationRegistry.UOW_TYPE_LOCAL_TRANSACTION);
+	/**
+	 * Fetch an appropriate Connection from the given JmsResourceHolder.
+	 * <p>This implementation accepts any JMS 1.1 Connection.
+	 * @param holder the JmsResourceHolder
+	 * @return an appropriate Connection fetched from the holder,
+	 * or <code>null</code> if none found
+	 */
+	protected Connection getConnection(JmsResourceHolder holder) {
+		return holder.getConnection();
+	}
 
-		int uowType = UOWSynchronizationRegistry.UOW_TYPE_GLOBAL_TRANSACTION;
-		boolean joinTx = false;
-		boolean newSynch = false;
+	/**
+	 * Fetch an appropriate Session from the given JmsResourceHolder.
+	 * <p>This implementation accepts any JMS 1.1 Session.
+	 * @param holder the JmsResourceHolder
+	 * @return an appropriate Session fetched from the holder,
+	 * or <code>null</code> if none found
+	 */
+	protected Session getSession(JmsResourceHolder holder) {
+		return holder.getSession();
+	}
 
-		if (existingTx) {
-			if (pb == TransactionDefinition.PROPAGATION_NEVER) {
-				throw new IllegalTransactionStateException(
-						"Transaction propagation 'never' but existing transaction found");
-			}
-			if (pb == TransactionDefinition.PROPAGATION_NESTED) {
-				throw new NestedTransactionNotSupportedException(
-						"Transaction propagation 'nested' not supported for WebSphere UOW transactions");
-			}
-			if (pb == TransactionDefinition.PROPAGATION_SUPPORTS ||
-					pb == TransactionDefinition.PROPAGATION_REQUIRED || pb == TransactionDefinition.PROPAGATION_MANDATORY) {
-				joinTx = true;
-				newSynch = (getTransactionSynchronization() != SYNCHRONIZATION_NEVER);
-			}
-			else if (pb == TransactionDefinition.PROPAGATION_NOT_SUPPORTED) {
-				uowType = UOWSynchronizationRegistry.UOW_TYPE_LOCAL_TRANSACTION;
-				newSynch = (getTransactionSynchronization() == SYNCHRONIZATION_ALWAYS);
+	/**
+	 * Create a JMS MessageConsumer for the given Session and Destination.
+	 * <p>This implementation uses JMS 1.1 API.
+	 * @param session the JMS Session to create a MessageConsumer for
+	 * @param destination the JMS Destination to create a MessageConsumer for
+	 * @return the new JMS MessageConsumer
+	 * @throws javax.jms.JMSException if thrown by JMS API methods
+	 */
+	protected MessageConsumer createConsumer(Session session, Destination destination) throws JMSException {
+		// Only pass in the NoLocal flag in case of a Topic:
+		// Some JMS providers, such as WebSphere MQ 6.0, throw IllegalStateException
+		// in case of the NoLocal flag being specified for a Queue.
+		if (isPubSubDomain()) {
+			if (isSubscriptionDurable() && destination instanceof Topic) {
+				return session.createDurableSubscriber(
+						(Topic) destination, getDurableSubscriptionName(), getMessageSelector(), isPubSubNoLocal());
 			}
 			else {
-				newSynch = (getTransactionSynchronization() != SYNCHRONIZATION_NEVER);
+				return session.createConsumer(destination, getMessageSelector(), isPubSubNoLocal());
 			}
 		}
 		else {
-			if (pb == TransactionDefinition.PROPAGATION_MANDATORY) {
-				throw new IllegalTransactionStateException(
-						"Transaction propagation 'mandatory' but no existing transaction found");
-			}
-			if (pb == TransactionDefinition.PROPAGATION_SUPPORTS ||
-					pb == TransactionDefinition.PROPAGATION_NOT_SUPPORTED || pb == TransactionDefinition.PROPAGATION_NEVER) {
-				uowType = UOWSynchronizationRegistry.UOW_TYPE_LOCAL_TRANSACTION;
-				newSynch = (getTransactionSynchronization() == SYNCHRONIZATION_ALWAYS);
-			}
-			else {
-				newSynch = (getTransactionSynchronization() != SYNCHRONIZATION_NEVER);
-			}
-		}
-
-		boolean debug = logger.isDebugEnabled();
-		if (debug) {
-			logger.debug("Creating new transaction with name [" + definition.getName() + "]: " + definition);
-		}
-		SuspendedResourcesHolder suspendedResources = (!joinTx ? suspend(null) : null);
-		try {
-			if (definition.getTimeout() > TransactionDefinition.TIMEOUT_DEFAULT) {
-				this.uowManager.setUOWTimeout(uowType, definition.getTimeout());
-			}
-			if (debug) {
-				logger.debug("Invoking WebSphere UOW action: type=" + uowType + ", join=" + joinTx);
-			}
-			UOWActionAdapter<T> action = new UOWActionAdapter<T>(
-					definition, callback, (uowType == UOWManager.UOW_TYPE_GLOBAL_TRANSACTION), !joinTx, newSynch, debug);
-			this.uowManager.runUnderUOW(uowType, joinTx, action);
-			if (debug) {
-				logger.debug("Returned from WebSphere UOW action: type=" + uowType + ", join=" + joinTx);
-			}
-			return action.getResult();
-		}
-		catch (UOWException ex) {
-			throw new TransactionSystemException("UOWManager transaction processing failed", ex);
-		}
-		catch (UOWActionException ex) {
-			throw new TransactionSystemException("UOWManager threw unexpected UOWActionException", ex);
-		}
-		finally {
-			if (suspendedResources != null) {
-				resume(null, suspendedResources);
-			}
+			return session.createConsumer(destination, getMessageSelector());
 		}
 	}
 
 
 	/**
-	 * Adapter that executes the given Spring transaction within the WebSphere UOWAction shape.
+	 * ResourceFactory implementation that delegates to this listener container's protected callback methods.
 	 */
-	private class UOWActionAdapter<T> implements UOWAction {
+	private class MessageListenerContainerResourceFactory implements ConnectionFactoryUtils.ResourceFactory {
 
-		private final TransactionDefinition definition;
-
-		private final TransactionCallback<T> callback;
-
-		private final boolean actualTransaction;
-
-		private final boolean newTransaction;
-
-		private final boolean newSynchronization;
-
-		private boolean debug;
-
-		private T result;
-
-		private Throwable exception;
-
-		public UOWActionAdapter(TransactionDefinition definition, TransactionCallback<T> callback,
-				boolean actualTransaction, boolean newTransaction, boolean newSynchronization, boolean debug) {
-			this.definition = definition;
-			this.callback = callback;
-			this.actualTransaction = actualTransaction;
-			this.newTransaction = newTransaction;
-			this.newSynchronization = newSynchronization;
-			this.debug = debug;
+		public Connection getConnection(JmsResourceHolder holder) {
+			return AbstractPollingMessageListenerContainer.this.getConnection(holder);
 		}
 
-		public void run() {
-			DefaultTransactionStatus status = newTransactionStatus(
-					this.definition, (this.actualTransaction ? this : null),
-					this.newTransaction, this.newSynchronization, this.debug, null);
-			try {
-				this.result = this.callback.doInTransaction(status);
-				triggerBeforeCommit(status);
+		public Session getSession(JmsResourceHolder holder) {
+			return AbstractPollingMessageListenerContainer.this.getSession(holder);
+		}
+
+		public Connection createConnection() throws JMSException {
+			if (AbstractPollingMessageListenerContainer.this.sharedConnectionEnabled()) {
+				Connection sharedCon = AbstractPollingMessageListenerContainer.this.getSharedConnection();
+				return new SingleConnectionFactory(sharedCon).createConnection();
 			}
-			catch (Throwable ex) {
-				this.exception = ex;
-			}
-			finally {
-				if (status.isLocalRollbackOnly()) {
-					if (status.isDebug()) {
-						logger.debug("Transactional code has requested rollback");
-					}
-					uowManager.setRollbackOnly();
-				}
-				triggerBeforeCompletion(status);
-				if (status.isNewSynchronization()) {
-					List<TransactionSynchronization> synchronizations = TransactionSynchronizationManager.getSynchronizations();
-					TransactionSynchronizationManager.clear();
-					uowManager.registerInterposedSynchronization(new JtaAfterCompletionSynchronization(synchronizations));
-				}
+			else {
+				return AbstractPollingMessageListenerContainer.this.createConnection();
 			}
 		}
 
-		public T getResult() {
-			if (this.exception != null) {
-				ReflectionUtils.rethrowRuntimeException(this.exception);
-			}
-			return this.result;
+		public Session createSession(Connection con) throws JMSException {
+			return AbstractPollingMessageListenerContainer.this.createSession(con);
+		}
+
+		public boolean isSynchedLocalTransactionAllowed() {
+			return AbstractPollingMessageListenerContainer.this.isSessionTransacted();
 		}
 	}
 

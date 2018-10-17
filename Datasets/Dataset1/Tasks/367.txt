@@ -1,4 +1,4 @@
-mbs.registerMBean(this, new ObjectName("org.apache.cassandra.net:type=MessagingService"));
+if (newPosition > (bufferOffset + validBufferBytes) || newPosition < bufferOffset)
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -17,573 +17,450 @@ mbs.registerMBean(this, new ObjectName("org.apache.cassandra.net:type=MessagingS
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.cassandra.io.util;
 
-package org.apache.cassandra.net;
-
-import java.io.IOError;
+import java.io.EOFException;
+import java.io.File;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
-import java.nio.channels.AsynchronousCloseException;
-import java.nio.channels.ServerSocketChannel;
-import java.security.MessageDigest;
-import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.utils.CLibrary;
 
-import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.net.io.SerializerType;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.streaming.FileStreamTask;
-import org.apache.cassandra.streaming.StreamHeader;
-import org.apache.cassandra.utils.ExpiringMap;
-import org.apache.cassandra.utils.GuidGenerator;
-import org.apache.cassandra.utils.SimpleCondition;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-
-public class MessagingService implements MessagingServiceMBean
+/**
+ * A <code>BufferedRandomAccessFile</code> is like a
+ * <code>RandomAccessFile</code>, but it uses a private buffer so that most
+ * operations do not require a disk access.
+ * <P>
+ * 
+ * Note: The operations on this class are unmonitored. Also, the correct
+ * functioning of the <code>RandomAccessFile</code> methods that are not
+ * overridden here relies on the implementation of those methods in the
+ * superclass.
+ */
+public class BufferedRandomAccessFile extends RandomAccessFile implements FileDataInput
 {
-    private static int version_ = 1;
-    //TODO: make this parameter dynamic somehow.  Not sure if config is appropriate.
-    private static SerializerType serializerType_ = SerializerType.BINARY;
-
-    /** we preface every message with this number so the recipient can validate the sender is sane */
-    public static final int PROTOCOL_MAGIC = 0xCA552DFA;
-
-    /* This records all the results mapped by message Id */
-    private static ExpiringMap<String, IAsyncCallback> callbackMap_;
-    private static ExpiringMap<String, IAsyncResult> taskCompletionMap_;
+    private static final long MAX_BYTES_IN_PAGE_CACHE = (long) Math.pow(2, 27); // 128mb
     
-    /* Lookup table for registering message handlers based on the verb. */
-    private static Map<StorageService.Verb, IVerbHandler> verbHandlers_;
+    // absolute filesystem path to the file
+    private final String filePath;
 
-    /* Thread pool to handle messaging write activities */
-    private static ExecutorService streamExecutor_;
-    
-    private static NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool> connectionManagers_ = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
-    
-    private static Logger logger_ = LoggerFactory.getLogger(MessagingService.class);
-    private static int LOG_DROPPED_INTERVAL_IN_MS = 1000;
+    // default buffer size, 64Kb
+    public static final int DEFAULT_BUFFER_SIZE = 65535;
 
-    public static final MessagingService instance = new MessagingService();
+    // isDirty - true if this.buffer contains any un-synced bytes
+    private boolean isDirty, syncNeeded;
 
-    private SocketThread socketThread;
-    private SimpleCondition listenGate;
-    private static AtomicInteger droppedMessages = new AtomicInteger();
+    // buffer which will cache file blocks
+    private byte[] buffer;
 
-    public Object clone() throws CloneNotSupportedException
+    // `current` as current position in file
+    // `bufferOffset` is the offset of the beginning of the buffer
+    // `validBufferBytes` is the number of bytes in the buffer that are actually valid; this will be LESS than buffer capacity if buffer is not full!
+    private long bufferOffset, current = 0;
+    private int validBufferBytes = 0;
+
+    // constant, used for caching purpose, -1 if file is open in "rw" mode
+    // otherwise this will hold cached file length
+    private final long fileLength;
+
+    // channel liked with the file, used to retrieve data and force updates.
+    private final FileChannel channel;
+
+    private long markedPointer;
+
+    // file descriptor
+    private int fd;
+
+    // skip cache - used for commit log and sstable writing w/ posix_fadvise
+    private final boolean skipCache;
+
+    private long bytesSinceCacheFlush = 0;
+    private long minBufferOffset = Long.MAX_VALUE;
+
+    /*
+     * Open a new <code>BufferedRandomAccessFile</code> on the file named
+     * <code>name</code> in mode <code>mode</code>, which should be "r" for
+     * reading only, or "rw" for reading and writing.
+     */
+    public BufferedRandomAccessFile(String name, String mode) throws IOException
     {
-        //Prevents the singleton from being cloned
-        throw new CloneNotSupportedException();
+        this(new File(name), mode, DEFAULT_BUFFER_SIZE);
     }
 
-    protected MessagingService()
+    public BufferedRandomAccessFile(String name, String mode, int bufferSize) throws IOException
     {
-        listenGate = new SimpleCondition();
-        verbHandlers_ = new EnumMap<StorageService.Verb, IVerbHandler>(StorageService.Verb.class);
-        /*
-         * Leave callbacks in the cachetable long enough that any related messages will arrive
-         * before the callback is evicted from the table. The concurrency level is set at 128
-         * which is the sum of the threads in the pool that adds shit into the table and the 
-         * pool that retrives the callback from here.
-        */
-        callbackMap_ = new ExpiringMap<String, IAsyncCallback>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()));
-        taskCompletionMap_ = new ExpiringMap<String, IAsyncResult>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()));
+        this(new File(name), mode, bufferSize);
+    }
 
-        streamExecutor_ = new JMXEnabledThreadPoolExecutor("MESSAGE-STREAMING-POOL");
-        TimerTask logDropped = new TimerTask()
+    /*
+     * Open a new <code>BufferedRandomAccessFile</code> on <code>file</code> in
+     * mode <code>mode</code>, which should be "r" for reading only, or "rw" for
+     * reading and writing.
+     */
+    public BufferedRandomAccessFile(File file, String mode) throws IOException
+    {
+        this(file, mode, DEFAULT_BUFFER_SIZE);
+    }
+
+    public BufferedRandomAccessFile(File file, String mode, int bufferSize) throws IOException
+    {
+        this(file, mode, bufferSize, false);
+    }
+
+    public BufferedRandomAccessFile(File file, String mode, int bufferSize, boolean skipCache) throws IOException
+    {
+        super(file, mode);
+
+        this.skipCache = skipCache;
+
+        channel = super.getChannel();
+        filePath = file.getAbsolutePath();
+
+        // allocating required size of the buffer
+        if (bufferSize <= 0)
+            throw new IllegalArgumentException("bufferSize must be positive");
+        buffer = new byte[bufferSize];
+        reBuffer();
+
+        // if in read-only mode, caching file size
+        fileLength = (mode.equals("r")) ? this.channel.size() : -1;
+        fd = CLibrary.getfd(this.getFD());
+    }
+
+    public void sync() throws IOException
+    {
+        if (syncNeeded)
         {
-            public void run()
+            flush();
+
+            channel.force(true); // true, because file length counts as
+                                 // "meta-data"
+
+            if (skipCache)
             {
-                logDroppedMessages();
+                // clear entire file from page cache
+                CLibrary.trySkipCache(this.fd, 0, 0);
+
+                minBufferOffset = Long.MAX_VALUE;
+                bytesSinceCacheFlush = 0;
             }
-        };
-        Timer timer = new Timer("DroppedMessagesLogger");
-        timer.schedule(logDropped, LOG_DROPPED_INTERVAL_IN_MS, LOG_DROPPED_INTERVAL_IN_MS);
 
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.concurrent:type=MESSAGING-SERVICE-POOL"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
+            syncNeeded = false;
         }
     }
 
-    public byte[] hash(String type, byte data[])
+    public void flush() throws IOException
     {
-        byte result[];
-        try
+        if (isDirty)
         {
-            MessageDigest messageDigest = MessageDigest.getInstance(type);
-            result = messageDigest.digest(data);
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-        return result;
-    }
+            if (channel.position() != bufferOffset)
+                channel.position(bufferOffset);
 
-    /** called from gossiper when it notices a node is not responding. */
-    public void convict(InetAddress ep)
-    {
-        logger_.debug("Resetting pool for " + ep);
-        getConnectionPool(ep).reset();
-    }
+            super.write(buffer, 0, validBufferBytes);
 
-    /**
-     * Listen on the specified port.
-     * @param localEp InetAddress whose port to listen on.
-     */
-    public void listen(InetAddress localEp) throws IOException
-    {        
-        ServerSocketChannel serverChannel = ServerSocketChannel.open();
-        final ServerSocket ss = serverChannel.socket();
-        ss.setReuseAddress(true);
-        ss.bind(new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort()));
-        socketThread = new SocketThread(ss, "ACCEPT-" + localEp);
-        socketThread.start();
-        listenGate.signalAll();
-    }
+            if (skipCache)
+            {
 
-    public void waitUntilListening()
-    {
-        try
-        {
-            listenGate.await();
-        }
-        catch (InterruptedException ie)
-        {
-            logger_.debug("await interrupted");
+                // we don't know when the data reaches disk since we aren't
+                // calling flush
+                // so we continue to clear pages we don't need from the first
+                // offset we see
+                // periodically we update this starting offset
+                bytesSinceCacheFlush += validBufferBytes;
+
+                if (bufferOffset < minBufferOffset)
+                    minBufferOffset = bufferOffset;
+
+                if (bytesSinceCacheFlush >= MAX_BYTES_IN_PAGE_CACHE)
+                {
+                    CLibrary.trySkipCache(this.fd, (int) minBufferOffset, 0);
+                    minBufferOffset = bufferOffset;
+                    bytesSinceCacheFlush = 0;
+                }
+
+            }
+
+            isDirty = false;
         }
     }
 
-    public static OutboundTcpConnectionPool getConnectionPool(InetAddress to)
+    private void reBuffer() throws IOException
     {
-        OutboundTcpConnectionPool cp = connectionManagers_.get(to);
-        if (cp == null)
-        {
-            connectionManagers_.putIfAbsent(to, new OutboundTcpConnectionPool(to));
-            cp = connectionManagers_.get(to);
-        }
-        return cp;
-    }
+        flush(); // synchronizing buffer and file on disk
 
-    public static OutboundTcpConnection getConnection(InetAddress to, Message msg)
-    {
-        return getConnectionPool(to).getConnection(msg);
-    }
-        
-    /**
-     * Register a verb and the corresponding verb handler with the
-     * Messaging Service.
-     * @param verb
-     * @param verbHandler handler for the specified verb
-     */
-    public void registerVerbHandlers(StorageService.Verb verb, IVerbHandler verbHandler)
-    {
-    	assert !verbHandlers_.containsKey(verb);
-    	verbHandlers_.put(verb, verbHandler);
-    }
-        
-    /**
-     * This method returns the verb handler associated with the registered
-     * verb. If no handler has been registered then null is returned.
-     * @param type for which the verb handler is sought
-     * @return a reference to IVerbHandler which is the handler for the specified verb
-     */
-    public IVerbHandler getVerbHandler(StorageService.Verb type)
-    {
-        return verbHandlers_.get(type);
-    }
-
-    /**
-     * Send a message to a given endpoint.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @return an reference to an IAsyncResult which can be queried for the
-     * response
-     */
-    public String sendRR(Message message, InetAddress[] to, IAsyncCallback cb)
-    {
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId);
-        for (InetAddress endpoint : to)
+        bufferOffset = current;
+        if (bufferOffset >= channel.size())
         {
-            sendOneWay(message, endpoint);
-        }
-        return messageId;
-    }
-
-    public void addCallback(IAsyncCallback cb, String messageId)
-    {
-        callbackMap_.put(messageId, cb);
-    }
-
-    /**
-     * Send a message to a given endpoint. This method specifies a callback
-     * which is invoked with the actual response.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occurred to the invoker of the send().
-     *           suggest that a timeout occurred to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message message, InetAddress to, IAsyncCallback cb)
-    {        
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId);
-        sendOneWay(message, to);
-        return messageId;
-    }
-
-    /**
-     * Send a message to a given endpoint. The ith element in the <code>messages</code>
-     * array is sent to the ith element in the <code>to</code> array.This method assumes
-     * there is a one-one mapping between the <code>messages</code> array and
-     * the <code>to</code> array. Otherwise an  IllegalArgumentException will be thrown.
-     * This method also informs the MessagingService to wait for at least
-     * <code>howManyResults</code> responses to determine success of failure.
-     * @param messages messages to be sent.
-     * @param to endpoints to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occured to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message[] messages, InetAddress[] to, IAsyncCallback cb)
-    {
-        if ( messages.length != to.length )
-        {
-            throw new IllegalArgumentException("Number of messages and the number of endpoints need to be same.");
-        }
-        String groupId = GuidGenerator.guid();
-        addCallback(cb, groupId);
-        for ( int i = 0; i < messages.length; ++i )
-        {
-            messages[i].setMessageId(groupId);
-            sendOneWay(messages[i], to[i]);
-        }
-        return groupId;
-    } 
-    
-    /**
-     * Send a message to a given endpoint. This method adheres to the fire and forget
-     * style messaging.
-     * @param message messages to be sent.
-     * @param to endpoint to which the message needs to be sent
-     */
-    public void sendOneWay(Message message, InetAddress to)
-    {
-        // do local deliveries
-        if ( message.getFrom().equals(to) )
-        {
-            MessagingService.receive(message);
+            validBufferBytes = 0;
             return;
         }
 
-        // message sinks are a testing hook
-        Message processedMessage = SinkManager.processClientMessageSink(message, to);
-        if (processedMessage == null)
-        {
-            return;
-        }
+        if (bufferOffset < minBufferOffset)
+            minBufferOffset = bufferOffset;
 
-        // get pooled connection (really, connection queue)
-        OutboundTcpConnection connection = getConnection(to, message);
-
-        // pack message with header in a bytebuffer
-        byte[] data;
-        try
+        channel.position(bufferOffset); // setting channel position
+        int read = 0;
+        while (read < buffer.length)
         {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            Message.serializer().serialize(message, buffer);
-            data = buffer.getData();
+            int n = super.read(buffer, read, buffer.length - read);
+            if (n < 0)
+                break;
+            read += n;
         }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert data.length > 0;
-        ByteBuffer buffer = packIt(data , false);
+        validBufferBytes = read;
 
-        // write it
-        connection.write(buffer);
+        bytesSinceCacheFlush += read;
+        if (skipCache && bytesSinceCacheFlush >= MAX_BYTES_IN_PAGE_CACHE)
+        {
+            CLibrary.trySkipCache(this.fd, (int) minBufferOffset, 0);
+            bytesSinceCacheFlush = 0;
+            minBufferOffset = Long.MAX_VALUE;
+        }
     }
-    
-    public IAsyncResult sendRR(Message message, InetAddress to)
+
+    @Override
+    // -1 will be returned if there is nothing to read; higher-level methods like readInt
+    // or readFully (from RandomAccessFile) will throw EOFException but this should not
+    public int read() throws IOException
     {
-        IAsyncResult iar = new AsyncResult();
-        taskCompletionMap_.put(message.getMessageId(), iar);
-        sendOneWay(message, to);
-        return iar;
+        if (isEOF())
+            return -1; // required by RandomAccessFile
+
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current >= bufferOffset && current < bufferOffset + validBufferBytes;
+
+        return ((int) buffer[(int) (current++ - bufferOffset)]) & 0xFF;
     }
-    
+
+    @Override
+    public int read(byte[] buffer) throws IOException
+    {
+        return read(buffer, 0, buffer.length);
+    }
+
+    @Override
+    // -1 will be returned if there is nothing to read; higher-level methods like readInt
+    // or readFully (from RandomAccessFile) will throw EOFException but this should not
+    public int read(byte[] buff, int offset, int length) throws IOException
+    {
+        if (length == 0)
+            return 0;
+
+        if (isEOF())
+            return -1;
+
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current >= bufferOffset && current < bufferOffset + validBufferBytes;
+
+        int toCopy = Math.min(length, validBufferBytes - (int) (current - bufferOffset));
+        System.arraycopy(buffer, (int) (current - bufferOffset), buff, offset, toCopy);
+        current += toCopy;
+
+        return toCopy;
+    }
+
+    public ByteBuffer readBytes(int length) throws IOException
+    {
+        assert length >= 0 : "buffer length should not be negative: " + length;
+
+        byte[] buff = new byte[length];
+        readFully(buff); // reading data buffer
+
+        return ByteBuffer.wrap(buff);
+    }
+
+    private final byte[] singleByteBuffer = new byte[1]; // so we can use the write(byte[]) path w/o tons of new byte[] allocations
+    @Override
+    public void write(int val) throws IOException
+    {
+        singleByteBuffer[0] = (byte) val;
+        this.write(singleByteBuffer, 0, 1);
+    }
+
+    @Override
+    public void write(byte[] b) throws IOException
+    {
+        write(b, 0, b.length);
+    }
+
+    @Override
+    public void write(byte[] buff, int offset, int length) throws IOException
+    {
+        if (buffer == null)
+            throw new ClosedChannelException();
+
+        if (isReadOnly())
+            throw new IOException("Unable to write: file is in the read-only mode.");
+
+        while (length > 0)
+        {
+            int n = writeAtMost(buff, offset, length);
+            offset += n;
+            length -= n;
+            isDirty = true;
+            syncNeeded = true;
+        }
+    }
+
+    private boolean isReadOnly()
+    {
+        return fileLength != -1;
+    }
+
+    /*
+     * Write at most "length" bytes from "b" starting at position "offset", and
+     * return the number of bytes written. caller is responsible for setting
+     * isDirty.
+     */
+    private int writeAtMost(byte[] buff, int offset, int length) throws IOException
+    {
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current < bufferOffset + buffer.length;
+
+        int positionWithinBuffer = (int) (current - bufferOffset);
+        int toCopy = Math.min(length, buffer.length - positionWithinBuffer);
+        System.arraycopy(buff, offset, buffer, positionWithinBuffer, toCopy);
+        current += toCopy;
+        validBufferBytes = Math.max(validBufferBytes, positionWithinBuffer + toCopy);
+        assert current <= bufferOffset + buffer.length;
+
+        return toCopy;
+    }
+
+    @Override
+    public void seek(long newPosition) throws IOException
+    {
+        if (newPosition < 0)
+            throw new IllegalArgumentException("new position should not be negative");
+
+        if (isReadOnly() && newPosition > fileLength)
+            throw new EOFException(String.format("unable to seek to position %d in %s (%d bytes) in read-only mode",
+                                                 newPosition, filePath, fileLength));
+
+        current = newPosition;
+
+        if (newPosition >= bufferOffset + validBufferBytes || newPosition < bufferOffset)
+            reBuffer(); // this will set bufferEnd for us
+    }
+
+    @Override
+    public int skipBytes(int count) throws IOException
+    {
+        if (count > 0)
+        {
+            long currentPos = getFilePointer(), eof = length();
+            int newCount = (int) ((currentPos + count > eof) ? eof - currentPos : count);
+
+            seek(currentPos + newCount);
+            return newCount;
+        }
+
+        return 0;
+    }
+
+    public long length() throws IOException
+    {
+        return (fileLength == -1) ? Math.max(Math.max(current, channel.size()), bufferOffset + validBufferBytes) : fileLength;
+    }
+
+    public long getFilePointer()
+    {
+        return current;
+    }
+
+    public String getPath()
+    {
+        return filePath;
+    }
+
     /**
-     * Stream a file from source to destination. This is highly optimized
-     * to not hold any of the contents of the file in memory.
-     * @param header Header contains file to stream and other metadata.
-     * @param to endpoint to which we need to stream the file.
-    */
-
-    public void stream(StreamHeader header, InetAddress to)
+     * @return true if there is no more data to read
+     */
+    public boolean isEOF() throws IOException
     {
-        /* Streaming asynchronously on streamExector_ threads. */
-        streamExecutor_.execute(new FileStreamTask(header, to));
-    }
-    
-    /** blocks until the processing pools are empty and done. */
-    public static void waitFor() throws InterruptedException
-    {
-        while (!streamExecutor_.isTerminated())
-            streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
+        return getFilePointer() == length();
     }
 
-    public static void shutdown()
+    public long bytesRemaining() throws IOException
     {
-        logger_.info("Shutting down MessageService...");
+        return length() - getFilePointer();
+    }
 
-        try
+    @Override
+    public void close() throws IOException
+    {
+        sync();
+        buffer = null;
+
+        if (skipCache && bytesSinceCacheFlush > 0)
         {
-            instance.socketThread.close();
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
+            CLibrary.trySkipCache(this.fd, 0, 0);
         }
 
-        streamExecutor_.shutdownNow();
-
-        /* shut down the cachetables */
-        taskCompletionMap_.shutdown();
-        callbackMap_.shutdown();
-
-        logger_.info("Shutdown complete (no further commands will be processed)");
+        super.close();
     }
 
-    public static void receive(Message message)
+    public void reset() throws IOException
     {
-        message = SinkManager.processServerMessageSink(message, null);
-
-        Runnable runnable = new MessageDeliveryTask(message);
-        ExecutorService stage = StageManager.getStage(message.getMessageType());
-        assert stage != null;
-        stage.execute(runnable);
+        seek(markedPointer);
     }
 
-    public static IAsyncCallback getRegisteredCallback(String key)
+    public long bytesPastMark()
     {
-        return callbackMap_.get(key);
-    }
-    
-    public static void removeRegisteredCallback(String key)
-    {
-        callbackMap_.remove(key);
-    }
-    
-    public static IAsyncResult getAsyncResult(String key)
-    {
-        return taskCompletionMap_.remove(key);
+        long bytes = getFilePointer() - markedPointer;
+        assert bytes >= 0;
+        return bytes;
     }
 
-    public static long getRegisteredCallbackAge(String key)
+    public FileMark mark()
     {
-        return callbackMap_.getAge(key);
+        markedPointer = getFilePointer();
+        return new BufferedRandomAccessFileMark(markedPointer);
     }
 
-    public static long getAsyncResultAge(String key)
+    public void reset(FileMark mark) throws IOException
     {
-        return taskCompletionMap_.getAge(key);
+        assert mark instanceof BufferedRandomAccessFileMark;
+        seek(((BufferedRandomAccessFileMark) mark).pointer);
     }
 
-    public static void validateMagic(int magic) throws IOException
+    public long bytesPastMark(FileMark mark)
     {
-        if (magic != PROTOCOL_MAGIC)
-            throw new IOException("invalid protocol header");
+        assert mark instanceof BufferedRandomAccessFileMark;
+        long bytes = getFilePointer() - ((BufferedRandomAccessFileMark) mark).pointer;
+        assert bytes >= 0;
+        return bytes;
     }
 
-    public static int getBits(int x, int p, int n)
+    public static BufferedRandomAccessFile getUncachingReader(String filename) throws IOException
     {
-        return x >>> (p + 1) - n & ~(-1 << n);
+        return new BufferedRandomAccessFile(new File(filename), "r", 8 * 1024 * 1024, true);
     }
-        
-    public static ByteBuffer packIt(byte[] bytes, boolean compress)
-    {
-        /*
-             Setting up the protocol header. This is 4 bytes long
-             represented as an integer. The first 2 bits indicate
-             the serializer type. The 3rd bit indicates if compression
-             is turned on or off. It is turned off by default. The 4th
-             bit indicates if we are in streaming mode. It is turned off
-             by default. The 5th-8th bits are reserved for future use.
-             The next 8 bits indicate a version number. Remaining 15 bits 
-             are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if (compress)
-            header |= 4;
-        // Setting up the version bit
-        header |= (version_ << 8);
 
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-        
-    public static ByteBuffer constructStreamHeader(StreamHeader streamHeader, boolean compress)
+    /**
+     * Class to hold a mark to the position of the file
+     */
+    protected static class BufferedRandomAccessFileMark implements FileMark
     {
-        /* 
-        Setting up the protocol header. This is 4 bytes long
-        represented as an integer. The first 2 bits indicate
-        the serializer type. The 3rd bit indicates if compression
-        is turned on or off. It is turned off by default. The 4th
-        bit indicates if we are in streaming mode. It is turned off
-        by default. The following 4 bits are reserved for future use. 
-        The next 8 bits indicate a version number. Remaining 15 bits 
-        are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if ( compress )
-            header |= 4;
-        // set streaming bit
-        header |= 8;
-        // Setting up the version bit
-        header |= (version_ << 8);
-        /* Finished the protocol header setup */
+        long pointer;
 
-        /* Adding the StreamHeader which contains the session Id along
-         * with the pendingfile info for the stream.
-         * | Session Id | Pending File Size | Pending File | Bool more files |
-         * | No. of Pending files | Pending Files ... |
-         */
-        byte[] bytes;
-        try
+        public BufferedRandomAccessFileMark(long pointer)
         {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            StreamHeader.serializer().serialize(streamHeader, buffer);
-            bytes = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert bytes.length > 0;
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-
-    public static int incrementDroppedMessages()
-    {
-        return droppedMessages.incrementAndGet();
-    }
-               
-    private static void logDroppedMessages()
-    {
-        if (droppedMessages.get() > 0)
-            logger_.warn("Dropped " + droppedMessages + " messages in the last " + LOG_DROPPED_INTERVAL_IN_MS + "ms");
-        droppedMessages.set(0);
-    }
-
-    private class SocketThread extends Thread
-    {
-        private final ServerSocket server;
-        
-        SocketThread(ServerSocket server, String name)
-        {
-            super(name);
-            this.server = server;
-        }
-
-        public void run()
-        {
-            while (true)
-            {
-                try
-                {
-                    Socket socket = server.accept();
-                    new IncomingTcpConnection(socket).start();
-                }
-                catch (AsynchronousCloseException e)
-                {
-                    // this happens when another thread calls close().
-                    logger_.info("MessagingService shutting down server thread.");
-                    break;
-                }
-                catch (IOException e)
-                {
-                    throw new RuntimeException(e);
-                }
-            }
-        }
-        
-        void close() throws IOException
-        {
-            server.close();
+            this.pointer = pointer;
         }
     }
 
-    public Map<String, Integer> getCommandPendingTasks()
-    {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getPendingMessages());
-        return pendingTasks;
-    }
-
-    public Map<String, Long> getCommandCompletedTasks()
-    {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getCompletedMesssages());
-        return completedTasks;
-    }
-
-    public Map<String, Integer> getResponsePendingTasks()
-    {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getPendingMessages());
-        return pendingTasks;
-    }
-
-    public Map<String, Long> getResponseCompletedTasks()
-    {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getCompletedMesssages());
-        return completedTasks;
+    @Override
+    public String toString() {
+        return getClass().getSimpleName() + "(" +
+               "filePath='" + filePath + "'" +
+               ", length=" + fileLength +
+               ", skipCache=" + skipCache + ")";
     }
 }

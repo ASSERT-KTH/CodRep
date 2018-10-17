@@ -1,4 +1,4 @@
-logger.debug("{}: failed to execute [{}]", t, shard != null ? shard.shortSummary() : shardIt.shardId(), request);
+private final Set<CustomTieredMergePolicyProvider> policies = new CopyOnWriteArraySet<>();
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -19,326 +19,225 @@ logger.debug("{}: failed to execute [{}]", t, shard != null ? shard.shortSummary
  * under the License.
  */
 
-package org.elasticsearch.action.support.broadcast;
+package org.elasticsearch.index.merge.policy;
 
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.index.TieredMergePolicy;
 import org.elasticsearch.ElasticsearchException;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.NoShardAvailableActionException;
-import org.elasticsearch.action.support.ActionFilters;
-import org.elasticsearch.action.support.TransportAction;
-import org.elasticsearch.action.support.TransportActions;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.node.DiscoveryNodes;
-import org.elasticsearch.cluster.routing.GroupShardsIterator;
-import org.elasticsearch.cluster.routing.ShardIterator;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.*;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.index.settings.IndexSettingsService;
+import org.elasticsearch.index.store.Store;
 
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.io.IOException;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 
-/**
- *
- */
-public abstract class TransportBroadcastOperationAction<Request extends BroadcastOperationRequest, Response extends BroadcastOperationResponse, ShardRequest extends BroadcastShardOperationRequest, ShardResponse extends BroadcastShardOperationResponse>
-        extends TransportAction<Request, Response> {
+public class TieredMergePolicyProvider extends AbstractMergePolicyProvider<TieredMergePolicy> {
 
-    protected final ThreadPool threadPool;
-    protected final ClusterService clusterService;
-    protected final TransportService transportService;
+    private final IndexSettingsService indexSettingsService;
 
-    final String transportShardAction;
-    final String executor;
+    private final Set<CustomTieredMergePolicyProvider> policies = new CopyOnWriteArraySet<CustomTieredMergePolicyProvider>();
 
-    protected TransportBroadcastOperationAction(Settings settings, String actionName, ThreadPool threadPool, ClusterService clusterService, TransportService transportService, ActionFilters actionFilters) {
-        super(settings, actionName, threadPool, actionFilters);
-        this.clusterService = clusterService;
-        this.transportService = transportService;
-        this.threadPool = threadPool;
-        this.transportShardAction = actionName + "[s]";
-        this.executor = executor();
+    private volatile double forceMergeDeletesPctAllowed;
+    private volatile ByteSizeValue floorSegment;
+    private volatile int maxMergeAtOnce;
+    private volatile int maxMergeAtOnceExplicit;
+    private volatile ByteSizeValue maxMergedSegment;
+    private volatile double segmentsPerTier;
+    private volatile double reclaimDeletesWeight;
+    private boolean asyncMerge;
 
-        transportService.registerHandler(actionName, new TransportHandler());
-        transportService.registerHandler(transportShardAction, new ShardTransportHandler());
+    private final ApplySettings applySettings = new ApplySettings();
+
+    
+
+    @Inject
+    public TieredMergePolicyProvider(Store store, IndexSettingsService indexSettingsService) {
+        super(store);
+        this.indexSettingsService = indexSettingsService;
+        this.asyncMerge = indexSettings.getAsBoolean("index.merge.async", true);
+        this.forceMergeDeletesPctAllowed = componentSettings.getAsDouble("expunge_deletes_allowed", 10d); // percentage
+        this.floorSegment = componentSettings.getAsBytesSize("floor_segment", new ByteSizeValue(2, ByteSizeUnit.MB));
+        this.maxMergeAtOnce = componentSettings.getAsInt("max_merge_at_once", 10);
+        this.maxMergeAtOnceExplicit = componentSettings.getAsInt("max_merge_at_once_explicit", 30);
+        // TODO is this really a good default number for max_merge_segment, what happens for large indices, won't they end up with many segments?
+        this.maxMergedSegment = componentSettings.getAsBytesSize("max_merged_segment", componentSettings.getAsBytesSize("max_merge_segment", new ByteSizeValue(5, ByteSizeUnit.GB)));
+        this.segmentsPerTier = componentSettings.getAsDouble("segments_per_tier", 10.0d);
+        this.reclaimDeletesWeight = componentSettings.getAsDouble("reclaim_deletes_weight", 2.0d);
+
+        fixSettingsIfNeeded();
+
+        logger.debug("using [tiered] merge policy with expunge_deletes_allowed[{}], floor_segment[{}], max_merge_at_once[{}], max_merge_at_once_explicit[{}], max_merged_segment[{}], segments_per_tier[{}], reclaim_deletes_weight[{}], async_merge[{}]",
+                forceMergeDeletesPctAllowed, floorSegment, maxMergeAtOnce, maxMergeAtOnceExplicit, maxMergedSegment, segmentsPerTier, reclaimDeletesWeight, asyncMerge);
+
+        indexSettingsService.addListener(applySettings);
+    }
+    
+    private void fixSettingsIfNeeded() {
+        // fixing maxMergeAtOnce, see TieredMergePolicy#setMaxMergeAtOnce
+        if (!(segmentsPerTier >= maxMergeAtOnce)) {
+            int newMaxMergeAtOnce = (int) segmentsPerTier;
+            // max merge at once should be at least 2
+            if (newMaxMergeAtOnce <= 1) {
+                newMaxMergeAtOnce = 2;
+            }
+            logger.debug("[tiered] merge policy changing max_merge_at_once from [{}] to [{}] because segments_per_tier [{}] has to be higher or equal to it", maxMergeAtOnce, newMaxMergeAtOnce, segmentsPerTier);
+            this.maxMergeAtOnce = newMaxMergeAtOnce;
+        }
+    }
+
+
+    @Override
+    public TieredMergePolicy newMergePolicy() {
+        CustomTieredMergePolicyProvider mergePolicy;
+        if (asyncMerge) {
+            mergePolicy = new EnableMergeTieredMergePolicyProvider(this);
+        } else {
+            mergePolicy = new CustomTieredMergePolicyProvider(this);
+        }
+        mergePolicy.setNoCFSRatio(noCFSRatio);
+        mergePolicy.setForceMergeDeletesPctAllowed(forceMergeDeletesPctAllowed);
+        mergePolicy.setFloorSegmentMB(floorSegment.mbFrac());
+        mergePolicy.setMaxMergeAtOnce(maxMergeAtOnce);
+        mergePolicy.setMaxMergeAtOnceExplicit(maxMergeAtOnceExplicit);
+        mergePolicy.setMaxMergedSegmentMB(maxMergedSegment.mbFrac());
+        mergePolicy.setSegmentsPerTier(segmentsPerTier);
+        mergePolicy.setReclaimDeletesWeight(reclaimDeletesWeight);
+        return mergePolicy;
     }
 
     @Override
-    protected void doExecute(Request request, ActionListener<Response> listener) {
-        new AsyncBroadcastAction(request, listener).start();
+    public void close() throws ElasticsearchException {
+        indexSettingsService.removeListener(applySettings);
     }
 
-    protected abstract String executor();
+    public static final String INDEX_MERGE_POLICY_EXPUNGE_DELETES_ALLOWED = "index.merge.policy.expunge_deletes_allowed";
+    public static final String INDEX_MERGE_POLICY_FLOOR_SEGMENT = "index.merge.policy.floor_segment";
+    public static final String INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE = "index.merge.policy.max_merge_at_once";
+    public static final String INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE_EXPLICIT = "index.merge.policy.max_merge_at_once_explicit";
+    public static final String INDEX_MERGE_POLICY_MAX_MERGED_SEGMENT = "index.merge.policy.max_merged_segment";
+    public static final String INDEX_MERGE_POLICY_SEGMENTS_PER_TIER = "index.merge.policy.segments_per_tier";
+    public static final String INDEX_MERGE_POLICY_RECLAIM_DELETES_WEIGHT = "index.merge.policy.reclaim_deletes_weight";
 
-    protected abstract Request newRequest();
-
-    protected abstract Response newResponse(Request request, AtomicReferenceArray shardsResponses, ClusterState clusterState);
-
-    protected abstract ShardRequest newShardRequest();
-
-    protected abstract ShardRequest newShardRequest(int numShards, ShardRouting shard, Request request);
-
-    protected abstract ShardResponse newShardResponse();
-
-    protected abstract ShardResponse shardOperation(ShardRequest request) throws ElasticsearchException;
-
-    /**
-     * Determines the shards this operation will be executed on. The operation is executed once per shard iterator, typically
-     * on the first shard in it. If the operation fails, it will be retried on the next shard in the iterator.
-     */
-    protected abstract GroupShardsIterator shards(ClusterState clusterState, Request request, String[] concreteIndices);
-
-    protected abstract ClusterBlockException checkGlobalBlock(ClusterState state, Request request);
-
-    protected abstract ClusterBlockException checkRequestBlock(ClusterState state, Request request, String[] concreteIndices);
-
-    protected class AsyncBroadcastAction {
-
-        private final Request request;
-        private final ActionListener<Response> listener;
-        private final ClusterState clusterState;
-        private final DiscoveryNodes nodes;
-        private final GroupShardsIterator shardsIts;
-        private final int expectedOps;
-        private final AtomicInteger counterOps = new AtomicInteger();
-        private final AtomicReferenceArray shardsResponses;
-
-        protected AsyncBroadcastAction(Request request, ActionListener<Response> listener) {
-            this.request = request;
-            this.listener = listener;
-
-            clusterState = clusterService.state();
-
-            ClusterBlockException blockException = checkGlobalBlock(clusterState, request);
-            if (blockException != null) {
-                throw blockException;
-            }
-            // update to concrete indices
-            String[] concreteIndices = clusterState.metaData().concreteIndices(request.indicesOptions(), request.indices());
-            blockException = checkRequestBlock(clusterState, request, concreteIndices);
-            if (blockException != null) {
-                throw blockException;
-            }
-
-            nodes = clusterState.nodes();
-            logger.trace("resolving shards based on cluster state version [{}]", clusterState.version());
-            shardsIts = shards(clusterState, request, concreteIndices);
-            expectedOps = shardsIts.size();
-
-            shardsResponses = new AtomicReferenceArray<Object>(expectedOps);
-        }
-
-        public void start() {
-            if (shardsIts.size() == 0) {
-                // no shards
-                try {
-                    listener.onResponse(newResponse(request, new AtomicReferenceArray(0), clusterState));
-                } catch (Throwable e) {
-                    listener.onFailure(e);
-                }
-                return;
-            }
-            request.beforeStart();
-            // count the local operations, and perform the non local ones
-            int shardIndex = -1;
-            for (final ShardIterator shardIt : shardsIts) {
-                shardIndex++;
-                final ShardRouting shard = shardIt.nextOrNull();
-                if (shard != null) {
-                    performOperation(shardIt, shard, shardIndex);
-                } else {
-                    // really, no shards active in this group
-                    onOperation(null, shardIt, shardIndex, new NoShardAvailableActionException(shardIt.shardId()));
+    class ApplySettings implements IndexSettingsService.Listener {
+        @Override
+        public void onRefreshSettings(Settings settings) {
+            double expungeDeletesPctAllowed = settings.getAsDouble(INDEX_MERGE_POLICY_EXPUNGE_DELETES_ALLOWED, TieredMergePolicyProvider.this.forceMergeDeletesPctAllowed);
+            if (expungeDeletesPctAllowed != TieredMergePolicyProvider.this.forceMergeDeletesPctAllowed) {
+                logger.info("updating [expunge_deletes_allowed] from [{}] to [{}]", TieredMergePolicyProvider.this.forceMergeDeletesPctAllowed, expungeDeletesPctAllowed);
+                TieredMergePolicyProvider.this.forceMergeDeletesPctAllowed = expungeDeletesPctAllowed;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setForceMergeDeletesPctAllowed(expungeDeletesPctAllowed);
                 }
             }
-        }
 
-        protected void performOperation(final ShardIterator shardIt, final ShardRouting shard, final int shardIndex) {
-            if (shard == null) {
-                // no more active shards... (we should not really get here, just safety)
-                onOperation(null, shardIt, shardIndex, new NoShardAvailableActionException(shardIt.shardId()));
-            } else {
-                try {
-                    final ShardRequest shardRequest = newShardRequest(shardIt.size(), shard, request);
-                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
-                        threadPool.executor(executor).execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    onOperation(shard, shardIndex, shardOperation(shardRequest));
-                                } catch (Throwable e) {
-                                    onOperation(shard, shardIt, shardIndex, e);
-                                }
-                            }
-                        });
-                    } else {
-                        DiscoveryNode node = nodes.get(shard.currentNodeId());
-                        if (node == null) {
-                            // no node connected, act as failure
-                            onOperation(shard, shardIt, shardIndex, new NoShardAvailableActionException(shardIt.shardId()));
-                        } else {
-                            transportService.sendRequest(node, transportShardAction, shardRequest, new BaseTransportResponseHandler<ShardResponse>() {
-                                @Override
-                                public ShardResponse newInstance() {
-                                    return newShardResponse();
-                                }
-
-                                @Override
-                                public String executor() {
-                                    return ThreadPool.Names.SAME;
-                                }
-
-                                @Override
-                                public void handleResponse(ShardResponse response) {
-                                    onOperation(shard, shardIndex, response);
-                                }
-
-                                @Override
-                                public void handleException(TransportException e) {
-                                    onOperation(shard, shardIt, shardIndex, e);
-                                }
-                            });
-                        }
-                    }
-                } catch (Throwable e) {
-                    onOperation(shard, shardIt, shardIndex, e);
+            ByteSizeValue floorSegment = settings.getAsBytesSize(INDEX_MERGE_POLICY_FLOOR_SEGMENT, TieredMergePolicyProvider.this.floorSegment);
+            if (!floorSegment.equals(TieredMergePolicyProvider.this.floorSegment)) {
+                logger.info("updating [floor_segment] from [{}] to [{}]", TieredMergePolicyProvider.this.floorSegment, floorSegment);
+                TieredMergePolicyProvider.this.floorSegment = floorSegment;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setFloorSegmentMB(floorSegment.mbFrac());
                 }
             }
-        }
 
-        @SuppressWarnings({"unchecked"})
-        protected void onOperation(ShardRouting shard, int shardIndex, ShardResponse response) {
-            shardsResponses.set(shardIndex, response);
-            if (expectedOps == counterOps.incrementAndGet()) {
-                finishHim();
-            }
-        }
-
-        @SuppressWarnings({"unchecked"})
-        void onOperation(@Nullable ShardRouting shard, final ShardIterator shardIt, int shardIndex, Throwable t) {
-            // we set the shard failure always, even if its the first in the replication group, and the next one
-            // will work (it will just override it...)
-            setFailure(shardIt, shardIndex, t);
-
-            ShardRouting nextShard = shardIt.nextOrNull();
-            if (nextShard != null) {
-                if (t != null) {
-                    if (logger.isTraceEnabled()) {
-                        if (!TransportActions.isShardNotAvailableException(t)) {
-                            logger.trace("{}: failed to execute [{}]", t, shard != null ? shard.shortSummary() : shardIt.shardId(), request);
-                        }
-                    }
-                }
-                performOperation(shardIt, nextShard, shardIndex);
-            } else {
-                if (logger.isDebugEnabled()) {
-                    if (t != null) {
-                        if (!TransportActions.isShardNotAvailableException(t)) {
-                            logger.debug("{}: failed to executed [{}]", t, shard != null ? shard.shortSummary() : shardIt.shardId(), request);
-                        }
-                    }
-                }
-                if (expectedOps == counterOps.incrementAndGet()) {
-                    finishHim();
+            int maxMergeAtOnce = settings.getAsInt(INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE, TieredMergePolicyProvider.this.maxMergeAtOnce);
+            if (maxMergeAtOnce != TieredMergePolicyProvider.this.maxMergeAtOnce) {
+                logger.info("updating [max_merge_at_once] from [{}] to [{}]", TieredMergePolicyProvider.this.maxMergeAtOnce, maxMergeAtOnce);
+                TieredMergePolicyProvider.this.maxMergeAtOnce = maxMergeAtOnce;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setMaxMergeAtOnce(maxMergeAtOnce);
                 }
             }
-        }
 
-        protected void finishHim() {
-            try {
-                listener.onResponse(newResponse(request, shardsResponses, clusterState));
-            } catch (Throwable e) {
-                listener.onFailure(e);
-            }
-        }
-
-        void setFailure(ShardIterator shardIt, int shardIndex, Throwable t) {
-            // we don't aggregate shard failures on non active shards (but do keep the header counts right)
-            if (TransportActions.isShardNotAvailableException(t)) {
-                return;
+            int maxMergeAtOnceExplicit = settings.getAsInt(INDEX_MERGE_POLICY_MAX_MERGE_AT_ONCE_EXPLICIT, TieredMergePolicyProvider.this.maxMergeAtOnceExplicit);
+            if (maxMergeAtOnceExplicit != TieredMergePolicyProvider.this.maxMergeAtOnceExplicit) {
+                logger.info("updating [max_merge_at_once_explicit] from [{}] to [{}]", TieredMergePolicyProvider.this.maxMergeAtOnceExplicit, maxMergeAtOnceExplicit);
+                TieredMergePolicyProvider.this.maxMergeAtOnceExplicit = maxMergeAtOnceExplicit;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setMaxMergeAtOnceExplicit(maxMergeAtOnceExplicit);
+                }
             }
 
-            if (!(t instanceof BroadcastShardOperationFailedException)) {
-                t = new BroadcastShardOperationFailedException(shardIt.shardId(), t);
+            ByteSizeValue maxMergedSegment = settings.getAsBytesSize(INDEX_MERGE_POLICY_MAX_MERGED_SEGMENT, TieredMergePolicyProvider.this.maxMergedSegment);
+            if (!maxMergedSegment.equals(TieredMergePolicyProvider.this.maxMergedSegment)) {
+                logger.info("updating [max_merged_segment] from [{}] to [{}]", TieredMergePolicyProvider.this.maxMergedSegment, maxMergedSegment);
+                TieredMergePolicyProvider.this.maxMergedSegment = maxMergedSegment;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setFloorSegmentMB(maxMergedSegment.mbFrac());
+                }
             }
 
-            Object response = shardsResponses.get(shardIndex);
-            if (response == null) {
-                // just override it and return
-                shardsResponses.set(shardIndex, t);
+            double segmentsPerTier = settings.getAsDouble(INDEX_MERGE_POLICY_SEGMENTS_PER_TIER, TieredMergePolicyProvider.this.segmentsPerTier);
+            if (segmentsPerTier != TieredMergePolicyProvider.this.segmentsPerTier) {
+                logger.info("updating [segments_per_tier] from [{}] to [{}]", TieredMergePolicyProvider.this.segmentsPerTier, segmentsPerTier);
+                TieredMergePolicyProvider.this.segmentsPerTier = segmentsPerTier;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setSegmentsPerTier(segmentsPerTier);
+                }
             }
 
-            if (!(response instanceof Throwable)) {
-                // we should never really get here...
-                return;
+            double reclaimDeletesWeight = settings.getAsDouble(INDEX_MERGE_POLICY_RECLAIM_DELETES_WEIGHT, TieredMergePolicyProvider.this.reclaimDeletesWeight);
+            if (reclaimDeletesWeight != TieredMergePolicyProvider.this.reclaimDeletesWeight) {
+                logger.info("updating [reclaim_deletes_weight] from [{}] to [{}]", TieredMergePolicyProvider.this.reclaimDeletesWeight, reclaimDeletesWeight);
+                TieredMergePolicyProvider.this.reclaimDeletesWeight = reclaimDeletesWeight;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setReclaimDeletesWeight(reclaimDeletesWeight);
+                }
             }
 
-            // the failure is already present, try and not override it with an exception that is less meaningless
-            // for example, getting illegal shard state
-            if (TransportActions.isReadOverrideException(t)) {
-                shardsResponses.set(shardIndex, t);
+            final double noCFSRatio = parseNoCFSRatio(settings.get(INDEX_COMPOUND_FORMAT, Double.toString(TieredMergePolicyProvider.this.noCFSRatio)));
+            if (noCFSRatio != TieredMergePolicyProvider.this.noCFSRatio) {
+                logger.info("updating index.compound_format from [{}] to [{}]", formatNoCFSRatio(TieredMergePolicyProvider.this.noCFSRatio), formatNoCFSRatio(noCFSRatio));
+                TieredMergePolicyProvider.this.noCFSRatio = noCFSRatio;
+                for (CustomTieredMergePolicyProvider policy : policies) {
+                    policy.setNoCFSRatio(noCFSRatio);
+                }
             }
+
+            fixSettingsIfNeeded();
         }
     }
 
-    class TransportHandler extends BaseTransportRequestHandler<Request> {
+    public static class CustomTieredMergePolicyProvider extends TieredMergePolicy {
 
-        @Override
-        public Request newInstance() {
-            return newRequest();
+        private final TieredMergePolicyProvider provider;
+
+        public CustomTieredMergePolicyProvider(TieredMergePolicyProvider provider) {
+            super();
+            this.provider = provider;
         }
 
         @Override
-        public String executor() {
-            return ThreadPool.Names.SAME;
+        public void close() {
+            super.close();
+            provider.policies.remove(this);
         }
-
+        
         @Override
-        public void messageReceived(Request request, final TransportChannel channel) throws Exception {
-            // we just send back a response, no need to fork a listener
-            request.listenerThreaded(false);
-            execute(request, new ActionListener<Response>() {
-                @Override
-                public void onResponse(Response response) {
-                    try {
-                        channel.sendResponse(response);
-                    } catch (Throwable e) {
-                        onFailure(e);
-                    }
-                }
-
-                @Override
-                public void onFailure(Throwable e) {
-                    try {
-                        channel.sendResponse(e);
-                    } catch (Exception e1) {
-                        logger.warn("Failed to send response", e1);
-                    }
-                }
-            });
+        public MergePolicy clone() {
+            // Lucene IW makes a clone internally but since we hold on to this instance 
+            // the clone will just be the identity.
+            return this;
         }
     }
 
-    class ShardTransportHandler extends BaseTransportRequestHandler<ShardRequest> {
+    public static class EnableMergeTieredMergePolicyProvider extends CustomTieredMergePolicyProvider {
 
-        @Override
-        public ShardRequest newInstance() {
-            return newShardRequest();
+        public EnableMergeTieredMergePolicyProvider(TieredMergePolicyProvider provider) {
+            super(provider);
         }
 
         @Override
-        public String executor() {
-            return executor;
-        }
-
-        @Override
-        public void messageReceived(final ShardRequest request, final TransportChannel channel) throws Exception {
-            channel.sendResponse(shardOperation(request));
+        public MergePolicy.MergeSpecification findMerges(MergeTrigger trigger, SegmentInfos infos) throws IOException {
+            // we don't enable merges while indexing documents, we do them in the background
+            if (trigger == MergeTrigger.SEGMENT_FLUSH) {
+                return null;
+            }
+            return super.findMerges(trigger, infos);
         }
     }
 }

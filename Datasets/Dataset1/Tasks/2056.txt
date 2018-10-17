@@ -1,13 +1,14 @@
-Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8));
+assert termsEnum.docs(liveDocs, null, false) != null: "termstate found but no term exists in reader";
 
- /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.search;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,271 +19,563 @@ Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8)
  * limitations under the License.
  */
 
-package org.apache.cassandra.dht;
+import java.io.IOException;
+import java.util.*;
 
- import java.io.IOException;
- import java.net.InetAddress;
- import java.util.*;
- import java.util.concurrent.locks.Condition;
- import java.util.concurrent.CountDownLatch;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexReaderContext;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.index.TermState;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.similarities.Similarity.SloppySimScorer;
+import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.ToStringUtils;
 
- import com.google.common.base.Charsets;
- import com.google.common.collect.ArrayListMultimap;
- import com.google.common.collect.HashMultimap;
- import com.google.common.collect.Multimap;
- import org.apache.commons.lang.ArrayUtils;
- import org.apache.commons.lang.StringUtils;
- import org.slf4j.Logger;
- import org.slf4j.LoggerFactory;
+/**
+ * MultiPhraseQuery is a generalized version of PhraseQuery, with an added
+ * method {@link #add(Term[])}.
+ * To use this class, to search for the phrase "Microsoft app*" first use
+ * add(Term) on the term "Microsoft", then find all terms that have "app" as
+ * prefix using IndexReader.terms(Term), and use MultiPhraseQuery.add(Term[]
+ * terms) to add them to the query.
+ *
+ */
+public class MultiPhraseQuery extends Query {
+  private String field;
+  private ArrayList<Term[]> termArrays = new ArrayList<Term[]>();
+  private ArrayList<Integer> positions = new ArrayList<Integer>();
 
- import org.apache.cassandra.config.DatabaseDescriptor;
- import org.apache.cassandra.db.Table;
- import org.apache.cassandra.gms.FailureDetector;
- import org.apache.cassandra.gms.IFailureDetector;
- import org.apache.cassandra.locator.AbstractReplicationStrategy;
- import org.apache.cassandra.config.ConfigurationException;
- import org.apache.cassandra.locator.TokenMetadata;
- import org.apache.cassandra.net.IAsyncCallback;
- import org.apache.cassandra.net.IVerbHandler;
- import org.apache.cassandra.net.Message;
- import org.apache.cassandra.net.MessagingService;
- import org.apache.cassandra.service.StorageService;
- import org.apache.cassandra.streaming.StreamIn;
- import org.apache.cassandra.utils.FBUtilities;
- import org.apache.cassandra.utils.SimpleCondition;
+  private int slop = 0;
 
+  /** Sets the phrase slop for this query.
+   * @see PhraseQuery#setSlop(int)
+   */
+  public void setSlop(int s) { slop = s; }
 
-public class BootStrapper
-{
-    private static final Logger logger = LoggerFactory.getLogger(BootStrapper.class);
+  /** Sets the phrase slop for this query.
+   * @see PhraseQuery#getSlop()
+   */
+  public int getSlop() { return slop; }
 
-    /* endpoints that need to be bootstrapped */
-    protected final InetAddress address;
-    /* tokens of the nodes being bootstrapped. */
-    protected final Token token;
-    protected final TokenMetadata tokenMetadata;
+  /** Add a single term at the next position in the phrase.
+   * @see PhraseQuery#add(Term)
+   */
+  public void add(Term term) { add(new Term[]{term}); }
 
-    public BootStrapper(InetAddress address, Token token, TokenMetadata tmd)
-    {
-        assert address != null;
-        assert token != null;
+  /** Add multiple terms at the next position in the phrase.  Any of the terms
+   * may match.
+   *
+   * @see PhraseQuery#add(Term)
+   */
+  public void add(Term[] terms) {
+    int position = 0;
+    if (positions.size() > 0)
+      position = positions.get(positions.size()-1).intValue() + 1;
 
-        this.address = address;
-        this.token = token;
-        tokenMetadata = tmd;
+    add(terms, position);
+  }
+
+  /**
+   * Allows to specify the relative position of terms within the phrase.
+   * 
+   * @see PhraseQuery#add(Term, int)
+   * @param terms
+   * @param position
+   */
+  public void add(Term[] terms, int position) {
+    if (termArrays.size() == 0)
+      field = terms[0].field();
+
+    for (int i = 0; i < terms.length; i++) {
+      if (!terms[i].field().equals(field)) {
+        throw new IllegalArgumentException(
+            "All phrase terms must be in the same field (" + field + "): "
+                + terms[i]);
+      }
     }
 
-    public void bootstrap() throws IOException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("Beginning bootstrap process");
+    termArrays.add(terms);
+    positions.add(Integer.valueOf(position));
+  }
 
-        final Multimap<String, Map.Entry<InetAddress, Collection<Range>>> rangesToFetch = HashMultimap.create();
+  /**
+   * Returns a List of the terms in the multiphrase.
+   * Do not modify the List or its contents.
+   */
+  public List<Term[]> getTermArrays() {
+	  return Collections.unmodifiableList(termArrays);
+  }
 
-        int requests = 0;
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            Map<InetAddress, Collection<Range>> workMap = getWorkMap(getRangesWithSources(table)).asMap();
-            for (Map.Entry<InetAddress, Collection<Range>> entry : workMap.entrySet())
-            {
-                requests++;
-                rangesToFetch.put(table, entry);
+  /**
+   * Returns the relative positions of terms in this phrase.
+   */
+  public int[] getPositions() {
+    int[] result = new int[positions.size()];
+    for (int i = 0; i < positions.size(); i++)
+      result[i] = positions.get(i).intValue();
+    return result;
+  }
+
+  // inherit javadoc
+  @Override
+  public void extractTerms(Set<Term> terms) {
+    for (final Term[] arr : termArrays) {
+      for (final Term term: arr) {
+        terms.add(term);
+      }
+    }
+  }
+
+
+  private class MultiPhraseWeight extends Weight {
+    private final Similarity similarity;
+    private final Similarity.SimWeight stats;
+    private final Map<Term,TermContext> termContexts = new HashMap<Term,TermContext>();
+
+    public MultiPhraseWeight(IndexSearcher searcher)
+      throws IOException {
+      this.similarity = searcher.getSimilarity();
+      final IndexReaderContext context = searcher.getTopReaderContext();
+      
+      // compute idf
+      ArrayList<TermStatistics> allTermStats = new ArrayList<TermStatistics>();
+      for(final Term[] terms: termArrays) {
+        for (Term term: terms) {
+          TermContext termContext = termContexts.get(term);
+          if (termContext == null) {
+            termContext = TermContext.build(context, term, true);
+            termContexts.put(term, termContext);
+          }
+          allTermStats.add(searcher.termStatistics(term, termContext));
+        }
+      }
+      stats = similarity.computeWeight(getBoost(),
+          searcher.collectionStatistics(field), 
+          allTermStats.toArray(new TermStatistics[allTermStats.size()]));
+    }
+
+    @Override
+    public Query getQuery() { return MultiPhraseQuery.this; }
+
+    @Override
+    public float getValueForNormalization() {
+      return stats.getValueForNormalization();
+    }
+
+    @Override
+    public void normalize(float queryNorm, float topLevelBoost) {
+      stats.normalize(queryNorm, topLevelBoost);
+    }
+
+    @Override
+    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
+        boolean topScorer, Bits acceptDocs) throws IOException {
+      assert !termArrays.isEmpty();
+      final AtomicReader reader = context.reader();
+      final Bits liveDocs = acceptDocs;
+      
+      PhraseQuery.PostingsAndFreq[] postingsFreqs = new PhraseQuery.PostingsAndFreq[termArrays.size()];
+
+      final Terms fieldTerms = reader.terms(field);
+      if (fieldTerms == null) {
+        return null;
+      }
+
+      // Reuse single TermsEnum below:
+      final TermsEnum termsEnum = fieldTerms.iterator(null);
+
+      for (int pos=0; pos<postingsFreqs.length; pos++) {
+        Term[] terms = termArrays.get(pos);
+
+        final DocsAndPositionsEnum postingsEnum;
+        int docFreq;
+
+        if (terms.length > 1) {
+          postingsEnum = new UnionDocsAndPositionsEnum(liveDocs, context, terms, termContexts, termsEnum);
+
+          // coarse -- this overcounts since a given doc can
+          // have more than one term:
+          docFreq = 0;
+          for(int termIdx=0;termIdx<terms.length;termIdx++) {
+            final Term term = terms[termIdx];
+            TermState termState = termContexts.get(term).get(context.ord);
+            if (termState == null) {
+              // Term not in reader
+              continue;
             }
+            termsEnum.seekExact(term.bytes(), termState);
+            docFreq += termsEnum.docFreq();
+          }
+
+          if (docFreq == 0) {
+            // None of the terms are in this reader
+            return null;
+          }
+        } else {
+          final Term term = terms[0];
+          TermState termState = termContexts.get(term).get(context.ord);
+          if (termState == null) {
+            // Term not in reader
+            return null;
+          }
+          termsEnum.seekExact(term.bytes(), termState);
+          postingsEnum = termsEnum.docsAndPositions(liveDocs, null, 0);
+
+          if (postingsEnum == null) {
+            // term does exist, but has no positions
+            assert termsEnum.docs(liveDocs, null, 0) != null: "termstate found but no term exists in reader";
+            throw new IllegalStateException("field \"" + term.field() + "\" was indexed without position data; cannot run PhraseQuery (term=" + term.text() + ")");
+          }
+
+          docFreq = termsEnum.docFreq();
         }
 
-        final CountDownLatch latch = new CountDownLatch(requests);
-        for (final String table : rangesToFetch.keySet())
-        {
-            /* Send messages to respective folks to stream data over to me */
-            for (Map.Entry<InetAddress, Collection<Range>> entry : rangesToFetch.get(table))
-            {
-                final InetAddress source = entry.getKey();
-                Collection<Range> ranges = entry.getValue();
-                final Runnable callback = new Runnable()
-                {
-                    public void run()
-                    {
-                        latch.countDown();
-                        if (logger.isDebugEnabled())
-                            logger.debug(String.format("Removed %s/%s as a bootstrap source; remaining is %s",
-                                                       source, table, latch.getCount()));
-                    }
-                };
-                if (logger.isDebugEnabled())
-                    logger.debug("Bootstrapping from " + source + " ranges " + StringUtils.join(ranges, ", "));
-                StreamIn.requestRanges(source, table, ranges, callback);
-            }
-        }
+        postingsFreqs[pos] = new PhraseQuery.PostingsAndFreq(postingsEnum, docFreq, positions.get(pos).intValue(), terms);
+      }
 
-        try
-        {
-            latch.await();
-            StorageService.instance.finishBootstrapping();
+      // sort by increasing docFreq order
+      if (slop == 0) {
+        ArrayUtil.mergeSort(postingsFreqs);
+      }
+
+      if (slop == 0) {
+        ExactPhraseScorer s = new ExactPhraseScorer(this, postingsFreqs, similarity.exactSimScorer(stats, context));
+        if (s.noDocs) {
+          return null;
+        } else {
+          return s;
         }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
+      } else {
+        return new SloppyPhraseScorer(this, postingsFreqs, slop, similarity.sloppySimScorer(stats, context));
+      }
     }
 
-    /**
-     * if initialtoken was specified, use that.
-     * otherwise, pick a token to assume half the load of the most-loaded node.
-     */
-    public static Token getBootstrapToken(final TokenMetadata metadata, final Map<InetAddress, Double> load) throws IOException, ConfigurationException
-    {
-        if (DatabaseDescriptor.getInitialToken() != null)
-        {
-            logger.debug("token manually specified as " + DatabaseDescriptor.getInitialToken());
-            Token token = StorageService.getPartitioner().getTokenFactory().fromString(DatabaseDescriptor.getInitialToken());
-            if (metadata.getEndpoint(token) != null)
-                throw new ConfigurationException("Bootstraping to existing token " + token + " is not allowed (decommission/removetoken the old node first).");
-            return token;
+    @Override
+    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
+      Scorer scorer = scorer(context, true, false, context.reader().getLiveDocs());
+      if (scorer != null) {
+        int newDoc = scorer.advance(doc);
+        if (newDoc == doc) {
+          float freq = scorer.freq();
+          SloppySimScorer docScorer = similarity.sloppySimScorer(stats, context);
+          ComplexExplanation result = new ComplexExplanation();
+          result.setDescription("weight("+getQuery()+" in "+doc+") [" + similarity.getClass().getSimpleName() + "], result of:");
+          Explanation scoreExplanation = docScorer.explain(doc, new Explanation(freq, "phraseFreq=" + freq));
+          result.addDetail(scoreExplanation);
+          result.setValue(scoreExplanation.getValue());
+          result.setMatch(true);          
+          return result;
         }
+      }
+      
+      return new ComplexExplanation(false, 0.0f, "no matching term");
+    }
+  }
 
-        return getBalancedToken(metadata, load);
+  @Override
+  public Query rewrite(IndexReader reader) {
+    if (termArrays.isEmpty()) {
+      BooleanQuery bq = new BooleanQuery();
+      bq.setBoost(getBoost());
+      return bq;
+    } else if (termArrays.size() == 1) {                 // optimize one-term case
+      Term[] terms = termArrays.get(0);
+      BooleanQuery boq = new BooleanQuery(true);
+      for (int i=0; i<terms.length; i++) {
+        boq.add(new TermQuery(terms[i]), BooleanClause.Occur.SHOULD);
+      }
+      boq.setBoost(getBoost());
+      return boq;
+    } else {
+      return this;
+    }
+  }
+
+  @Override
+  public Weight createWeight(IndexSearcher searcher) throws IOException {
+    return new MultiPhraseWeight(searcher);
+  }
+
+  /** Prints a user-readable version of this query. */
+  @Override
+  public final String toString(String f) {
+    StringBuilder buffer = new StringBuilder();
+    if (field == null || !field.equals(f)) {
+      buffer.append(field);
+      buffer.append(":");
     }
 
-    public static Token getBalancedToken(TokenMetadata metadata, Map<InetAddress, Double> load)
-    {
-        InetAddress maxEndpoint = getBootstrapSource(metadata, load);
-        Token<?> t = getBootstrapTokenFrom(maxEndpoint);
-        logger.info("New token will be " + t + " to assume load from " + maxEndpoint);
-        return t;
-    }
-
-    static InetAddress getBootstrapSource(final TokenMetadata metadata, final Map<InetAddress, Double> load)
-    {
-        // sort first by number of nodes already bootstrapping into a source node's range, then by load.
-        List<InetAddress> endpoints = new ArrayList<InetAddress>(load.size());
-        for (InetAddress endpoint : load.keySet())
-        {
-            if (!metadata.isMember(endpoint))
-                continue;
-            endpoints.add(endpoint);
+    buffer.append("\"");
+    int k = 0;
+    Iterator<Term[]> i = termArrays.iterator();
+    int lastPos = -1;
+    boolean first = true;
+    while (i.hasNext()) {
+      Term[] terms = i.next();
+      int position = positions.get(k);
+      if (first) {
+        first = false;
+      } else {
+        buffer.append(" ");
+        for (int j=1; j<(position-lastPos); j++) {
+          buffer.append("? ");
         }
-
-        if (endpoints.isEmpty())
-            throw new RuntimeException("No other nodes seen!  Unable to bootstrap");
-        Collections.sort(endpoints, new Comparator<InetAddress>()
-        {
-            public int compare(InetAddress ia1, InetAddress ia2)
-            {
-                int n1 = metadata.pendingRangeChanges(ia1);
-                int n2 = metadata.pendingRangeChanges(ia2);
-                if (n1 != n2)
-                    return -(n1 - n2); // more targets = _less_ priority!
-
-                double load1 = load.get(ia1);
-                double load2 = load.get(ia2);
-                if (load1 == load2)
-                    return 0;
-                return load1 < load2 ? -1 : 1;
-            }
-        });
-
-        InetAddress maxEndpoint = endpoints.get(endpoints.size() - 1);
-        assert !maxEndpoint.equals(FBUtilities.getLocalAddress());
-        if (metadata.pendingRangeChanges(maxEndpoint) > 0)
-            throw new RuntimeException("Every node is a bootstrap source! Please specify an initial token manually or wait for an existing bootstrap operation to finish.");
-        
-        return maxEndpoint;
-    }
-
-    /** get potential sources for each range, ordered by proximity (as determined by EndpointSnitch) */
-    Multimap<Range, InetAddress> getRangesWithSources(String table)
-    {
-        assert tokenMetadata.sortedTokens().size() > 0;
-        final AbstractReplicationStrategy strat = Table.open(table).replicationStrategy;
-        Collection<Range> myRanges = strat.getPendingAddressRanges(tokenMetadata, token, address);
-
-        Multimap<Range, InetAddress> myRangeAddresses = ArrayListMultimap.create();
-        Multimap<Range, InetAddress> rangeAddresses = strat.getRangeAddresses(tokenMetadata);
-        for (Range myRange : myRanges)
-        {
-            for (Range range : rangeAddresses.keySet())
-            {
-                if (range.contains(myRange))
-                {
-                    List<InetAddress> preferred = DatabaseDescriptor.getEndpointSnitch().getSortedListByProximity(address, rangeAddresses.get(range));
-                    myRangeAddresses.putAll(myRange, preferred);
-                    break;
-                }
-            }
-            assert myRangeAddresses.keySet().contains(myRange);
+      }
+      if (terms.length > 1) {
+        buffer.append("(");
+        for (int j = 0; j < terms.length; j++) {
+          buffer.append(terms[j].text());
+          if (j < terms.length-1)
+            buffer.append(" ");
         }
-        return myRangeAddresses;
+        buffer.append(")");
+      } else {
+        buffer.append(terms[0].text());
+      }
+      lastPos = position;
+      ++k;
+    }
+    buffer.append("\"");
+
+    if (slop != 0) {
+      buffer.append("~");
+      buffer.append(slop);
     }
 
-    static Token<?> getBootstrapTokenFrom(InetAddress maxEndpoint)
-    {
-        Message message = new Message(FBUtilities.getLocalAddress(), StorageService.Verb.BOOTSTRAP_TOKEN, ArrayUtils.EMPTY_BYTE_ARRAY);
-        BootstrapTokenCallback btc = new BootstrapTokenCallback();
-        MessagingService.instance.sendRR(message, maxEndpoint, btc);
-        return btc.getToken();
+    buffer.append(ToStringUtils.boost(getBoost()));
+
+    return buffer.toString();
+  }
+
+
+  /** Returns true if <code>o</code> is equal to this. */
+  @Override
+  public boolean equals(Object o) {
+    if (!(o instanceof MultiPhraseQuery)) return false;
+    MultiPhraseQuery other = (MultiPhraseQuery)o;
+    return this.getBoost() == other.getBoost()
+      && this.slop == other.slop
+      && termArraysEquals(this.termArrays, other.termArrays)
+      && this.positions.equals(other.positions);
+  }
+
+  /** Returns a hash code value for this object.*/
+  @Override
+  public int hashCode() {
+    return Float.floatToIntBits(getBoost())
+      ^ slop
+      ^ termArraysHashCode()
+      ^ positions.hashCode()
+      ^ 0x4AC65113;
+  }
+  
+  // Breakout calculation of the termArrays hashcode
+  private int termArraysHashCode() {
+    int hashCode = 1;
+    for (final Term[] termArray: termArrays) {
+      hashCode = 31 * hashCode
+          + (termArray == null ? 0 : Arrays.hashCode(termArray));
     }
+    return hashCode;
+  }
 
-    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget)
-    {
-        return getWorkMap(rangesWithSourceTarget, FailureDetector.instance);
+  // Breakout calculation of the termArrays equals
+  private boolean termArraysEquals(List<Term[]> termArrays1, List<Term[]> termArrays2) {
+    if (termArrays1.size() != termArrays2.size()) {
+      return false;
     }
+    ListIterator<Term[]> iterator1 = termArrays1.listIterator();
+    ListIterator<Term[]> iterator2 = termArrays2.listIterator();
+    while (iterator1.hasNext()) {
+      Term[] termArray1 = iterator1.next();
+      Term[] termArray2 = iterator2.next();
+      if (!(termArray1 == null ? termArray2 == null : Arrays.equals(termArray1,
+          termArray2))) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
 
-    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget, IFailureDetector failureDetector)
-    {
-        /*
-         * Map whose key is the source node and the value is a map whose key is the
-         * target and value is the list of ranges to be sent to it.
-        */
-        Multimap<InetAddress, Range> sources = ArrayListMultimap.create();
+/**
+ * Takes the logical union of multiple DocsEnum iterators.
+ */
 
-        // TODO look for contiguous ranges and map them to the same source
-        for (Range range : rangesWithSourceTarget.keySet())
-        {
-            for (InetAddress source : rangesWithSourceTarget.get(range))
-            {
-                if (failureDetector.isAlive(source))
-                {
-                    sources.put(source, range);
-                    break;
-                }
-            }
+// TODO: if ever we allow subclassing of the *PhraseScorer
+class UnionDocsAndPositionsEnum extends DocsAndPositionsEnum {
+
+  private static final class DocsQueue extends PriorityQueue<DocsAndPositionsEnum> {
+    DocsQueue(List<DocsAndPositionsEnum> docsEnums) throws IOException {
+      super(docsEnums.size());
+
+      Iterator<DocsAndPositionsEnum> i = docsEnums.iterator();
+      while (i.hasNext()) {
+        DocsAndPositionsEnum postings = i.next();
+        if (postings.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+          add(postings);
         }
-        return sources;
+      }
     }
 
-    public static class BootstrapTokenVerbHandler implements IVerbHandler
-    {
-        public void doVerb(Message message)
-        {
-            StorageService ss = StorageService.instance;
-            String tokenString = StorageService.getPartitioner().getTokenFactory().toString(ss.getBootstrapToken());
-            Message response = message.getReply(FBUtilities.getLocalAddress(), tokenString.getBytes(Charsets.UTF_8));
-            MessagingService.instance.sendOneWay(response, message.getFrom());
-        }
+    @Override
+    public final boolean lessThan(DocsAndPositionsEnum a, DocsAndPositionsEnum b) {
+      return a.docID() < b.docID();
+    }
+  }
+
+  private static final class IntQueue {
+    private int _arraySize = 16;
+    private int _index = 0;
+    private int _lastIndex = 0;
+    private int[] _array = new int[_arraySize];
+    
+    final void add(int i) {
+      if (_lastIndex == _arraySize)
+        growArray();
+
+      _array[_lastIndex++] = i;
     }
 
-    private static class BootstrapTokenCallback implements IAsyncCallback
-    {
-        private volatile Token<?> token;
-        private final Condition condition = new SimpleCondition();
-
-        public Token<?> getToken()
-        {
-            try
-            {
-                condition.await();
-            }
-            catch (InterruptedException e)
-            {
-                throw new RuntimeException(e);
-            }
-            return token;
-        }
-
-        public void response(Message msg)
-        {
-            token = StorageService.getPartitioner().getTokenFactory().fromString(new String(msg.getMessageBody(), Charsets.UTF_8));
-            condition.signalAll();
-        }
+    final int next() {
+      return _array[_index++];
     }
+
+    final void sort() {
+      Arrays.sort(_array, _index, _lastIndex);
+    }
+
+    final void clear() {
+      _index = 0;
+      _lastIndex = 0;
+    }
+
+    final int size() {
+      return (_lastIndex - _index);
+    }
+
+    private void growArray() {
+      int[] newArray = new int[_arraySize * 2];
+      System.arraycopy(_array, 0, newArray, 0, _arraySize);
+      _array = newArray;
+      _arraySize *= 2;
+    }
+  }
+
+  private int _doc;
+  private int _freq;
+  private DocsQueue _queue;
+  private IntQueue _posList;
+
+  public UnionDocsAndPositionsEnum(Bits liveDocs, AtomicReaderContext context, Term[] terms, Map<Term,TermContext> termContexts, TermsEnum termsEnum) throws IOException {
+    List<DocsAndPositionsEnum> docsEnums = new LinkedList<DocsAndPositionsEnum>();
+    for (int i = 0; i < terms.length; i++) {
+      final Term term = terms[i];
+      TermState termState = termContexts.get(term).get(context.ord);
+      if (termState == null) {
+        // Term doesn't exist in reader
+        continue;
+      }
+      termsEnum.seekExact(term.bytes(), termState);
+      DocsAndPositionsEnum postings = termsEnum.docsAndPositions(liveDocs, null, 0);
+      if (postings == null) {
+        // term does exist, but has no positions
+        throw new IllegalStateException("field \"" + term.field() + "\" was indexed without position data; cannot run PhraseQuery (term=" + term.text() + ")");
+      }
+      docsEnums.add(postings);
+    }
+
+    _queue = new DocsQueue(docsEnums);
+    _posList = new IntQueue();
+  }
+
+  @Override
+  public final int nextDoc() throws IOException {
+    if (_queue.size() == 0) {
+      return NO_MORE_DOCS;
+    }
+
+    // TODO: move this init into positions(): if the search
+    // doesn't need the positions for this doc then don't
+    // waste CPU merging them:
+    _posList.clear();
+    _doc = _queue.top().docID();
+
+    // merge sort all positions together
+    DocsAndPositionsEnum postings;
+    do {
+      postings = _queue.top();
+
+      final int freq = postings.freq();
+      for (int i = 0; i < freq; i++) {
+        _posList.add(postings.nextPosition());
+      }
+
+      if (postings.nextDoc() != NO_MORE_DOCS) {
+        _queue.updateTop();
+      } else {
+        _queue.pop();
+      }
+    } while (_queue.size() > 0 && _queue.top().docID() == _doc);
+
+    _posList.sort();
+    _freq = _posList.size();
+
+    return _doc;
+  }
+
+  @Override
+  public int nextPosition() {
+    return _posList.next();
+  }
+
+  @Override
+  public int startOffset() {
+    return -1;
+  }
+
+  @Override
+  public int endOffset() {
+    return -1;
+  }
+
+  @Override
+  public BytesRef getPayload() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean hasPayload() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public final int advance(int target) throws IOException {
+    while (_queue.top() != null && target > _queue.top().docID()) {
+      DocsAndPositionsEnum postings = _queue.pop();
+      if (postings.advance(target) != NO_MORE_DOCS) {
+        _queue.add(postings);
+      }
+    }
+    return nextDoc();
+  }
+
+  @Override
+  public final int freq() {
+    return _freq;
+  }
+
+  @Override
+  public final int docID() {
+    return _doc;
+  }
 }

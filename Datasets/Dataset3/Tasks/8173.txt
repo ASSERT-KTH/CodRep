@@ -1,4 +1,4 @@
-package org.jboss.as.connector.dynamicresource;
+import org.jboss.as.ejb3.logging.EjbLogger;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,46 +22,72 @@ package org.jboss.as.connector.dynamicresource;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.connector.dynamicresource.operations;
+package org.jboss.as.ejb3.remote.protocol.versionone;
 
-import org.jboss.as.connector.subsystems.resourceadapters.Constants;
-import org.jboss.as.connector.subsystems.resourceadapters.ResourceAdaptersExtension;
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationDefinition;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.OperationStepHandler;
-import org.jboss.as.controller.SimpleOperationDefinitionBuilder;
-import org.jboss.dmr.ModelNode;
-import org.jboss.jca.core.api.workmanager.WorkManager;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinateTransaction;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinationManager;
+import org.jboss.as.ejb3.EjbLogger;
+import org.jboss.as.ejb3.remote.EJBRemoteTransactionsRepository;
+import org.jboss.ejb.client.XidTransactionID;
+import org.jboss.marshalling.MarshallerFactory;
 
-import static org.jboss.as.connector.subsystems.resourceadapters.Constants.STATISTICS_NAME;
+import javax.transaction.Transaction;
+import javax.transaction.xa.XAException;
+import javax.transaction.xa.Xid;
 
 /**
- * Clear stats from passed plugins
- *
- * @author Stefano Maestri
+ * @author Jaikiran Pai
  */
-public class ClearWorkManagerStatisticsHandler implements OperationStepHandler {
+class XidTransactionForgetTask extends XidTransactionManagementTask {
 
-    public static final OperationDefinition DEFINITION = new SimpleOperationDefinitionBuilder(Constants.CLEAR_STATISTICS, ResourceAdaptersExtension.getResourceDescriptionResolver(STATISTICS_NAME))
-            .build();
-
-    private final WorkManager wm;
-    public ClearWorkManagerStatisticsHandler(final WorkManager wm) {
-        this.wm = wm;
+    XidTransactionForgetTask(final TransactionRequestHandler txRequestHandler, final EJBRemoteTransactionsRepository transactionsRepository,
+                             final MarshallerFactory marshallerFactory, final XidTransactionID xidTransactionID,
+                             final ChannelAssociation channelAssociation, final short invocationId) {
+        super(txRequestHandler, transactionsRepository, marshallerFactory, xidTransactionID, channelAssociation, invocationId);
     }
 
     @Override
-    public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
-
-        if (context.isNormalServer()) {
-            context.addStep(new OperationStepHandler() {
-                public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
-                    wm.getStatistics().clear();
-                    context.completeStep(OperationContext.RollbackHandler.NOOP_ROLLBACK_HANDLER);
+    protected void manageTransaction() throws Throwable {
+        // first associate the tx on this thread, by resuming the tx
+        final Transaction transaction = this.transactionsRepository.getImportedTransaction(this.xidTransactionID);
+        if(transaction == null) {
+            // check the recovery store - it's possible that the "forget" is coming in as part of recovery operation and the subordinate
+            // tx may not yet be in memory, but might be in the recovery store
+            final Transaction recoveredTransaction = tryRecoveryForImportedTransaction();
+            // still not found, so just return
+            if (recoveredTransaction == null) {
+                if(EjbLogger.EJB3_INVOCATION_LOGGER.isDebugEnabled()) {
+                    EjbLogger.EJB3_INVOCATION_LOGGER.debug("Not forgetting " + this.xidTransactionID + " as is was not found on the server");
                 }
-            }, OperationContext.Stage.RUNTIME);
+                return;
+            }
         }
-        context.stepCompleted();
+        this.resumeTransaction(transaction);
+
+        // "forget"
+        final Xid xid = this.xidTransactionID.getXid();
+        try {
+            // get the subordinate tx
+            final SubordinateTransaction subordinateTransaction = SubordinationManager.getTransactionImporter().getImportedTransaction(xid);
+
+            if (subordinateTransaction == null) {
+                throw new XAException(XAException.XAER_INVAL);
+            }
+            // invoke forget
+            subordinateTransaction.doForget();
+
+        } catch (Exception ex) {
+            final XAException xaException = new XAException(XAException.XAER_RMERR);
+            xaException.initCause(ex);
+            throw xaException;
+
+        } finally {
+            SubordinationManager.getTransactionImporter().removeImportedTransaction(xid);
+            // disassociate the tx that was associated (resumed) on this thread.
+            // This needs to be done explicitly because the SubOrdinationManager isn't responsible
+            // for clearing the tx context from the thread
+            this.transactionsRepository.getTransactionManager().suspend();
+
+        }
     }
 }

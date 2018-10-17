@@ -1,4 +1,4 @@
-import org.elasticsearch.util.inject.Inject;
+import org.elasticsearch.common.xcontent.XContentBuilder;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,251 +19,91 @@ import org.elasticsearch.util.inject.Inject;
  * under the License.
  */
 
-package org.elasticsearch.action.search.type;
+package org.elasticsearch.rest.action.support;
 
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.search.*;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.node.DiscoveryNodes;
-import org.elasticsearch.search.SearchShardTarget;
-import org.elasticsearch.search.action.SearchServiceListener;
-import org.elasticsearch.search.action.SearchServiceTransportAction;
-import org.elasticsearch.search.controller.SearchPhaseController;
-import org.elasticsearch.search.controller.ShardDoc;
-import org.elasticsearch.search.fetch.FetchSearchRequest;
-import org.elasticsearch.search.fetch.FetchSearchResult;
-import org.elasticsearch.search.internal.InternalSearchResponse;
-import org.elasticsearch.search.query.QuerySearchResult;
-import org.elasticsearch.search.query.QuerySearchResultProvider;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.util.Tuple;
-import org.elasticsearch.util.component.AbstractComponent;
-import org.elasticsearch.util.guice.inject.Inject;
-import org.elasticsearch.util.settings.Settings;
-import org.elasticsearch.util.trove.ExtTIntArrayList;
+import org.elasticsearch.ElasticSearchIllegalArgumentException;
+import org.elasticsearch.action.ShardOperationFailedException;
+import org.elasticsearch.action.support.broadcast.BroadcastOperationResponse;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.xcontent.builder.XContentBuilder;
+import org.elasticsearch.index.query.xcontent.QueryBuilders;
+import org.elasticsearch.index.query.xcontent.QueryStringQueryBuilder;
+import org.elasticsearch.rest.RestRequest;
 
-import java.util.Collection;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.elasticsearch.action.search.type.TransportSearchHelper.*;
+import java.io.IOException;
+import java.util.regex.Pattern;
 
 /**
- * @author kimchy (shay.banon)
+ * @author kimchy (Shay Banon)
  */
-public class TransportSearchScrollQueryThenFetchAction extends AbstractComponent {
+public class RestActions {
 
-    private final ThreadPool threadPool;
+    public final static Pattern indicesPattern = Pattern.compile(",");
+    public final static Pattern typesPattern = Pattern.compile(",");
+    public final static Pattern nodesIdsPattern = Pattern.compile(",");
 
-    private final ClusterService clusterService;
-
-    private final SearchServiceTransportAction searchService;
-
-    private final SearchPhaseController searchPhaseController;
-
-    private final TransportSearchCache searchCache;
-
-    @Inject public TransportSearchScrollQueryThenFetchAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
-                                                             TransportSearchCache searchCache,
-                                                             SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
-        super(settings);
-        this.threadPool = threadPool;
-        this.clusterService = clusterService;
-        this.searchCache = searchCache;
-        this.searchService = searchService;
-        this.searchPhaseController = searchPhaseController;
+    public static void buildBroadcastShardsHeader(XContentBuilder builder, BroadcastOperationResponse response) throws IOException {
+        builder.startObject("_shards");
+        builder.field("total", response.totalShards());
+        builder.field("successful", response.successfulShards());
+        builder.field("failed", response.failedShards());
+        if (!response.shardFailures().isEmpty()) {
+            builder.startArray("failures");
+            for (ShardOperationFailedException shardFailure : response.shardFailures()) {
+                builder.startObject();
+                if (shardFailure.index() != null) {
+                    builder.field("index", shardFailure.index());
+                }
+                if (shardFailure.shardId() != -1) {
+                    builder.field("shard", shardFailure.shardId());
+                }
+                builder.field("reason", shardFailure.reason());
+                builder.endObject();
+            }
+            builder.endArray();
+        }
+        builder.endObject();
     }
 
-    public void execute(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
-        new AsyncAction(request, scrollId, listener).start();
+    public static byte[] parseQuerySource(RestRequest request) {
+        String queryString = request.param("q");
+        if (queryString == null) {
+            throw new ElasticSearchIllegalArgumentException("No query to execute, not in body, and not bounded to 'q' parameter");
+        }
+        QueryStringQueryBuilder queryBuilder = QueryBuilders.queryString(queryString);
+        queryBuilder.defaultField(request.param("df"));
+        queryBuilder.analyzer(request.param("analyzer"));
+        String defaultOperator = request.param("default_operator");
+        if (defaultOperator != null) {
+            if ("OR".equals(defaultOperator)) {
+                queryBuilder.defaultOperator(QueryStringQueryBuilder.Operator.OR);
+            } else if ("AND".equals(defaultOperator)) {
+                queryBuilder.defaultOperator(QueryStringQueryBuilder.Operator.AND);
+            } else {
+                throw new ElasticSearchIllegalArgumentException("Unsupported defaultOperator [" + defaultOperator + "], can either be [OR] or [AND]");
+            }
+        }
+        return queryBuilder.buildAsBytes();
     }
 
-    private class AsyncAction {
-
-        private final SearchScrollRequest request;
-
-        private final ActionListener<SearchResponse> listener;
-
-        private final ParsedScrollId scrollId;
-
-        private final DiscoveryNodes nodes;
-
-        protected final Collection<ShardSearchFailure> shardFailures = searchCache.obtainShardFailures();
-
-        private final Map<SearchShardTarget, QuerySearchResultProvider> queryResults = searchCache.obtainQueryResults();
-
-        private final Map<SearchShardTarget, FetchSearchResult> fetchResults = searchCache.obtainFetchResults();
-
-        private volatile ShardDoc[] sortedShardList;
-
-        private final AtomicInteger successfulOps;
-
-        private AsyncAction(SearchScrollRequest request, ParsedScrollId scrollId, ActionListener<SearchResponse> listener) {
-            this.request = request;
-            this.listener = listener;
-            this.scrollId = scrollId;
-            this.nodes = clusterService.state().nodes();
-            this.successfulOps = new AtomicInteger(scrollId.values().length);
+    public static String[] splitIndices(String indices) {
+        if (indices == null) {
+            return Strings.EMPTY_ARRAY;
         }
+        return indicesPattern.split(indices);
+    }
 
-        public void start() {
-            if (scrollId.values().length == 0) {
-                invokeListener(new SearchPhaseExecutionException("query", "no nodes to search on", null));
-            }
-            final AtomicInteger counter = new AtomicInteger(scrollId.values().length);
-
-            int localOperations = 0;
-            for (Tuple<String, Long> target : scrollId.values()) {
-                DiscoveryNode node = nodes.get(target.v1());
-                if (node != null) {
-                    if (nodes.localNodeId().equals(node.id())) {
-                        localOperations++;
-                    } else {
-                        executeQueryPhase(counter, node, target.v2());
-                    }
-                } else {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Node [" + target.v1() + "] not available for scroll request [" + scrollId.source() + "]");
-                    }
-                    successfulOps.decrementAndGet();
-                    if (counter.decrementAndGet() == 0) {
-                        executeFetchPhase();
-                    }
-                }
-            }
-
-            if (localOperations > 0) {
-                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
-                    threadPool.execute(new Runnable() {
-                        @Override public void run() {
-                            for (Tuple<String, Long> target : scrollId.values()) {
-                                DiscoveryNode node = nodes.get(target.v1());
-                                if (node != null && nodes.localNodeId().equals(node.id())) {
-                                    executeQueryPhase(counter, node, target.v2());
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
-                    for (final Tuple<String, Long> target : scrollId.values()) {
-                        final DiscoveryNode node = nodes.get(target.v1());
-                        if (node != null && nodes.localNodeId().equals(node.id())) {
-                            if (localAsync) {
-                                threadPool.execute(new Runnable() {
-                                    @Override public void run() {
-                                        executeQueryPhase(counter, node, target.v2());
-                                    }
-                                });
-                            } else {
-                                executeQueryPhase(counter, node, target.v2());
-                            }
-                        }
-                    }
-                }
-            }
+    public static String[] splitTypes(String typeNames) {
+        if (typeNames == null) {
+            return Strings.EMPTY_ARRAY;
         }
+        return typesPattern.split(typeNames);
+    }
 
-        private void executeQueryPhase(final AtomicInteger counter, DiscoveryNode node, long searchId) {
-            searchService.sendExecuteQuery(node, internalScrollSearchRequest(searchId, request), new SearchServiceListener<QuerySearchResult>() {
-                @Override public void onResult(QuerySearchResult result) {
-                    queryResults.put(result.shardTarget(), result);
-                    if (counter.decrementAndGet() == 0) {
-                        executeFetchPhase();
-                    }
-                }
-
-                @Override public void onFailure(Throwable t) {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("Failed to execute query phase", t);
-                    }
-                    shardFailures.add(new ShardSearchFailure(t));
-                    successfulOps.decrementAndGet();
-                    if (counter.decrementAndGet() == 0) {
-                        executeFetchPhase();
-                    }
-                }
-            });
+    public static String[] splitNodes(String nodes) {
+        if (nodes == null) {
+            return Strings.EMPTY_ARRAY;
         }
-
-        private void executeFetchPhase() {
-            sortedShardList = searchPhaseController.sortDocs(queryResults.values());
-            Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad = searchPhaseController.docIdsToLoad(sortedShardList);
-
-            if (docIdsToLoad.isEmpty()) {
-                finishHim();
-            }
-
-            final AtomicInteger counter = new AtomicInteger(docIdsToLoad.size());
-
-            for (Map.Entry<SearchShardTarget, ExtTIntArrayList> entry : docIdsToLoad.entrySet()) {
-                SearchShardTarget shardTarget = entry.getKey();
-                ExtTIntArrayList docIds = entry.getValue();
-                FetchSearchRequest fetchSearchRequest = new FetchSearchRequest(queryResults.get(shardTarget).id(), docIds);
-                DiscoveryNode node = nodes.get(shardTarget.nodeId());
-                searchService.sendExecuteFetch(node, fetchSearchRequest, new SearchServiceListener<FetchSearchResult>() {
-                    @Override public void onResult(FetchSearchResult result) {
-                        fetchResults.put(result.shardTarget(), result);
-                        if (counter.decrementAndGet() == 0) {
-                            finishHim();
-                        }
-                    }
-
-                    @Override public void onFailure(Throwable t) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Failed to execute fetch phase", t);
-                        }
-                        successfulOps.decrementAndGet();
-                        if (counter.decrementAndGet() == 0) {
-                            finishHim();
-                        }
-                    }
-                });
-            }
-        }
-
-        private void finishHim() {
-            try {
-                innerFinishHim();
-            } catch (Exception e) {
-                invokeListener(new ReduceSearchPhaseException("fetch", "", e, buildShardFailures(shardFailures, searchCache)));
-            }
-        }
-
-        private void innerFinishHim() {
-            InternalSearchResponse internalResponse = searchPhaseController.merge(sortedShardList, queryResults, fetchResults);
-            String scrollId = null;
-            if (request.scroll() != null) {
-                scrollId = request.scrollId();
-            }
-            invokeListener(new SearchResponse(internalResponse, scrollId, this.scrollId.values().length, successfulOps.get(), buildShardFailures(shardFailures, searchCache)));
-            searchCache.releaseQueryResults(queryResults);
-            searchCache.releaseFetchResults(fetchResults);
-        }
-
-        protected void invokeListener(final SearchResponse response) {
-            if (request.listenerThreaded()) {
-                threadPool.execute(new Runnable() {
-                    @Override public void run() {
-                        listener.onResponse(response);
-                    }
-                });
-            } else {
-                listener.onResponse(response);
-            }
-        }
-
-        protected void invokeListener(final Throwable t) {
-            if (request.listenerThreaded()) {
-                threadPool.execute(new Runnable() {
-                    @Override public void run() {
-                        listener.onFailure(t);
-                    }
-                });
-            } else {
-                listener.onFailure(t);
-            }
-        }
+        return nodesIdsPattern.split(nodes);
     }
 }

@@ -1,8 +1,8 @@
-roleName = roleName.trim();
+if (!se.isLockTimeout()) {
 
 /*
 
-   Derby - Class org.apache.derby.iapi.util.IdUtil
+   Derby - Class org.apache.derby.impl.store.raw.data.ReclaimSpaceHelper
 
    Licensed to the Apache Software Foundation (ASF) under one or more
    contributor license agreements.  See the NOTICE file distributed with
@@ -21,764 +21,529 @@ roleName = roleName.trim();
 
  */
 
-package org.apache.derby.iapi.util;
+package org.apache.derby.impl.store.raw.data;
 
-import org.apache.derby.iapi.reference.Attribute;
-import org.apache.derby.iapi.reference.SQLState;
-import org.apache.derby.iapi.reference.Property;
+import org.apache.derby.impl.store.raw.data.BasePage;
+import org.apache.derby.impl.store.raw.data.ReclaimSpace;
+
+
+import org.apache.derby.iapi.services.daemon.DaemonService;
+import org.apache.derby.iapi.services.daemon.Serviceable;
+import org.apache.derby.iapi.services.sanity.SanityManager;
 import org.apache.derby.iapi.error.StandardException;
-import java.io.IOException;
-import java.io.StringReader;
-import java.util.Vector;
-import java.util.HashSet;
-import java.util.Properties;
-import org.apache.derby.iapi.reference.Limits;
+
+import org.apache.derby.iapi.store.access.TransactionController;
+
+import org.apache.derby.iapi.store.raw.ContainerKey;
+import org.apache.derby.iapi.store.raw.ContainerHandle;
+import org.apache.derby.iapi.store.raw.LockingPolicy;
+import org.apache.derby.iapi.store.raw.Page;
+import org.apache.derby.iapi.store.raw.PageKey;
+import org.apache.derby.iapi.store.raw.RecordHandle;
+import org.apache.derby.iapi.store.raw.Transaction;
+
+import org.apache.derby.iapi.store.raw.xact.RawTransaction;
+import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
+import org.apache.derby.shared.common.reference.SQLState;
+
 
 /**
-  Utility class for parsing and producing string representations of
-  ids. This class supports both delimited and un-delimited ids.
+	This class helps a BaseDataFactory reclaims unused space.
 
-  <P>The syntax for an id follows. 
-  <PRE>
-      id := delim-id | unDelim-id
+Space needs to be reclaimed in the following cases:
+<BR><NL>
+<LI> Row with long columns or overflow row pieces is deleted
+<LI> Insertion of a row that has long columns or overflows to other row pieces is rolled back
+<LI> Row is updated and the head row or some row pieces shrunk
+<LI> Row is updated and some long columns are orphaned because they are updated
+<LI> Row is updated and some long columns are created but the update rolled back
+<LI> Row is updated and some new row pieces are created but the update rolled back
+</NL> <P>
 
-	  delim-id := "[""|[any char but quote]]+"
-	  undelim-id := (a-z|A-Z|anyunicodeletter)[a-z|A-Z|_|0-9|anyunicodeletter|anyunicodedigit]*
+We can implement a lot of optimization if we know that btree does not overflow.
+However, since that is not the case and Raw Store cannot tell if it is dealing
+with a btree page or a heap page, they all have to be treated gingerly.  E.g.,
+in heap page, once a head row is deleted (via a delete operation or via a
+rollback of insert), all the long rows and long columns can be reclaimed - in
+fact, most of the head row can be removed and reclaimed, only a row stub needs
+to remain for locking purposes.  But in the btree, a deleted row still needs to
+contain the key values so it cannot be cleaned up until the row is purged.
 
-	  In the syntax braces show grouping. '*' means repeat 0 or more times.
-	  '|' means or. '+' means repeat 1 or more times. 
-  </PRE>
+<P><B>
+Row with long columns or long row is deleted
+</B><BR>
 
-  <P>In addition this class provides support for qualified names. A qualified name
-  is a dot (.) separated list of ids.
+When Access purge a committed deleted row, the purge operation will see if the
+row has overflowed row pieces or if it has long columns.  If it has, then all
+the long columns and row pieces are purged before the head row piece can be
+purged.  When a row is purged from an overflow page and it is the only row on
+the page, then the page is deallocated in the same transaction. Note that
+non-overflow pages are removed by Access but overflow pages are removed by Raw
+Store.  Note that page removal is done in the same transaction and not post
+commit.  This is, in general, dangerous because if the transaction does not
+commit for a long time, uncommit deallocated page slows down page allocation
+for this container.  However, we know that access only purges committed delete
+row in access post commit processing so we know the transaction will tend to
+commit relatively fast.  The alternative is to queue up a post commit
+ReclaimSpace.PAGE to reclaim the page after the purge commits.  In order to do
+that, the time stamp of the page must also be remembered because post commit
+work may be queued more than once, but in this case, it can only be done once.
+Also, doing the page deallocation post commit adds to the overall cost and
+tends to fill up the post commit queue. <BR>
 
-  <P>Limitations:
-  <OL>
-  <LI>Unicode escape sequences in ids are not supported.
-  <LI>Escape sequences (\n...) are not supported.
-  </OL>
-  */
-public abstract class IdUtil
+This approach is simple but has the drawback that the entire long row and all
+the long columns are logged in the purge operation.  The alternative is more
+complicated, we can remember all the long columns on the head row piece and
+where the row chain starts and clean them up during post commit.  During post
+commit, because the head row piece is already purged, there is no need to log
+the long column or the long rows, just wipe the page or just reuse the page if
+that is the only thing on the page.  The problem with this approach is that we
+need to make sure the purging of the head row does indeed commit (the
+transaction may commit but the purging may be rolled back due to savepoint).
+So, we need to find the head row in the post commit and only when we cannot
+find it can we be sure that the purge is committed.  However, in cases where
+the page can reuse its record Id (namely in btree), a new row may reuse the
+same recordId.  In that case, the post commit can purge the long columns or the
+rest of the row piece only if the head piece no longer points to it.  Because
+of the complexity of this latter approach, the first simple approach is used.
+However, if the performance due to extra logging becomes unbearble, we can
+consider implementing the second approach.  
+
+<P><B>
+Insertion of a row with long column or long row is rolled back.
+</B><BR>
+
+Insertion can be rolled back with either delete or purge.  If the row is rolled
+back with purge, then all the overflow columns pieces and row pieces are also
+rolled back with purge.  When a row is purged from an overflow page and it is
+the only row on the page, then a post commit ReclaimSpace.PAGE work is queued
+by Raw Store to reclaim that page.<BR>
+
+If the row is rolled back with delete, then all the overflow columns pieces and
+row pieces are also rolled back with delete.  Access will purge the deleted row
+in due time, see above.
+
+<P><B>
+Row is updated and the head row or some row pieces shrunk
+</B><BR>
+
+Every page that an update operation touches will see if the record on that page
+has any reserve space.  It it does, and if the reserve space plus the record
+size exceed the mininum record size, then a post commit ROW_RESERVE work will
+be queued to reclaim all unnecessary row reserved space for the entire row.
+
+<P><B>
+Row is updated and old long columns are orphaned
+</B><BR>
+
+The ground rule is, whether a column is a long column or not before an update
+has nothing to do with whether a column will be a long column or not after the
+update.  In other words, update can turn a non-long column into a long column,
+or it can turn a long column into a non-long column, or a long column can be
+updated to another long column and a non-long column can be updated to a
+non-long column.  The last case - update of a non-long column to another
+non-long column - is only of concern if it shrinks the row piece it is on (see
+above).<BR>
+
+So update can be looked at as 2 separate problems: A) a column is a long column
+before the update and the update will "orphaned" it.  B) a column is a long
+column after the update and the rollback of the update will "orphaned" it if it
+is rolled back with a delete.  This section deals with problem A, next section
+deals with problem B.<BR>
+
+Update specifies a set of columns to be updated.  If a row piece contains one
+or more columns to be updated, those columns are examined to see if they are
+actually long column chains.  If they are, then after the update, those long
+column chains will be orphaned.  So before the update happens, a post commit
+ReclaimSpace.COLUMN_CHAIN work is queued which contains the head rows id, the
+column number, the location of the first piece of the column chain, and the
+time stamp of the first page of the column chain. <BR>
+
+If the update transaction commits, the post commit work will walk the row until
+it finds the column number (note that it may not be on the page where the
+update happened because of subsequent row splitting), and if it doesn't point
+to the head of the column chain, we know the update operation has indeed
+committed (versus rolled back by a savepoint).  If a piece of the the column
+chain takes up an entire page, then the entire page can be reclaimed without
+first purging the row because the column chain is already orphaned.<BR>
+
+We need to page time stamp of the first page of the column chain because if the
+post commit ReclaimSpace.COLUMN_CHAIN is queued more than once, as can happen
+in repeated rollback to savepoint, then after the first time the column is
+reclaimed, the pages in the column chain can be reused.  Therefore, we cannot
+reclaim the column chain again.  Since there is no back pointer from the column
+chain to the head row, we need the timestamp to tell us if that column chain
+has already been touched (reclaimed) or not.
+
+<P><B> 
+Row is updated with new long columns and update is rolled back.
+</B><BR>
+
+When the update is rolled back, the new long columns, which got there by
+insertion, got rolled back either by delete or by purge.  If they were rolled
+back with delete, then they will be orphaned and need to be cleaned up with
+post abort work.  Therefore, insertion of long columns due to update must be
+rolled back with purge.<BR>
+
+This is safe because the moment the rollback of the head row piece happens, the
+new long column is orphaned anyway and nobody will be able to get to it.  Since
+we don't attempt to share long column pages, we know that nobody else could be
+on the page and it is safe to deallocate the page.
+
+<P><B>
+Row is updated with new long row piece and update is rolled back.
+</B><BR>
+
+When the update is rolled back, the new long row piece, which got there by
+insertion, got rolled back either by delete or by purge.  Like update with new
+long row, they should be rolled back with purge.  However, there is a problem
+in that the insert log record does not contain the head row handle.  It is
+possible that another long row emanating from the same head page overflows to
+this page.  That row may since have been deleted and is now in the middle of a
+purge, but the purge has not commit.  To the code that is rolling back the
+insert (caused by the update that split off a new row piece) the overflow page
+looks empty.  If it went ahead and deallocate the page, then the transaction
+which purged the row piece on this page won't be able to roll back.  For this
+reason, the rollback to insert of a long row piece due to update must be rolled
+back with delete.  Furthermore, there is no easy way to lodge a post
+termination work to reclaim this deleted row piece so it will be lost forever.
+<BR>
+
+RESOLVE: need to log the head row's handle in the insert log record, i.e., any
+insert due to update of long row or column piece should have the head row's
+handle on it so that when the insert is rolled back with purge, and there is no
+more row on the page, it can file a post commit to reclaim the page safely.
+The post commit reclaim page needs to lock the head row and latch the head page
+to make sure the entire row chain is stable.
+
+<P><B>
+*/
+public class ReclaimSpaceHelper
 {
 	/**
-     * Produce a delimited form of a normal value.
-	  @return the delimited identifier.
-	  */
-	public static String normalToDelimited(String id)
-	{
-        return StringUtil.quoteString(id, '"');
-	}
-
-	/**
-	  Produce a delimited two part qualified name from two
-	  un-delimited identifiers.
-	  @return the result.
-	  */
-	public static String mkQualifiedName(String id1,
-										 String id2)
-	{
-        if( null == id1)
-            return normalToDelimited(id2);
-		return
-        normalToDelimited(id1) +
-			"." +
-            normalToDelimited(id2);
-	}
-
-	/**
-	  Make a string form of a qualified name from the array of ids provided.
-	  */
-	public static String mkQualifiedName(String[] ids)
-	{
-		StringBuffer sb = new StringBuffer();
-		for (int ix=0; ix < ids.length; ix++)
-		{
-			if (ix!=0) sb.append(".");
-			sb.append(normalToDelimited(ids[ix]));
-		}
-		return sb.toString();
-	}
-
-	/**
-	  Parse a multi-part (dot separated) SQL identifier form the
-      String provided. Raise an excepion
-	  if the string does not contain valid SQL indentifiers.
-      The returned String array contains the normalized form of the
-      identifiers.
-      
-      @param s The string to be parsed
-      @return An array of strings made by breaking the input string at its dots, '.'.
-	  @exception StandardException Oops
-	  */
-	public static String[] parseMultiPartSQLIdentifier(String s)
-		 throws StandardException
-	{
-		StringReader r = new StringReader(s);
-		String[] qName = parseMultiPartSQLIdentifier(r);
-		verifyEmpty(r);
-		return qName;
-	}
-
-    /**
-    @param r The multi-part identifier to be parsed
-    @return An array of strings made by breaking the input string at its dots, '.'.
-      @exception StandardException Oops
-      */
-	private static String[] parseMultiPartSQLIdentifier(StringReader r)
-		 throws StandardException
-	{
-		Vector v = new Vector();
-		while (true)
-		{
-			String thisId = parseId(r,true);
-			v.addElement(thisId);
-			int dot;
-
-			try {
-				r.mark(0);
-				dot = r.read();
-				if (dot != '.')
-				{
-					if (dot!=-1) r.reset();
-					break;
-				}
-			}
-
-			catch (IOException ioe){
-				throw StandardException.newException(SQLState.ID_PARSE_ERROR,ioe);
-			}
-		}
-		String[] result = new String[v.size()];
-		v.copyInto(result);
-		return result;
-	}
-	
-	/**
-      Parse a SQL identifier from the String provided. Raise an excepion
-      if the string does not contain a valid SQL indentifier.
-      The returned String  contains the normalized form of the
-      identifier.
-        
-	  @exception StandardException Oops
-	  */
-	public static String parseSQLIdentifier(String s)
-		 throws StandardException
-	{
-		StringReader r = new StringReader(s);
-		String id = parseId(r,true);
-		verifyEmpty(r);
-		return id;
-	}
-
-	/**
-	  Read an id from the StringReader provided.
-
-
-	  @param normalize true means return ids in nomral form, false means
-	        return them as they were entered.
-
-	  <P>
-	  Raise an exception if the first thing in the StringReader
-	  is not a valid id.
-
-	  @exception StandardException Ooops.
-	  */
-	private static String parseId(StringReader r, boolean normalize)
-		 throws StandardException
-	{
-		try {
-			r.mark(0);
-			int c = r.read();
-			if (c == -1)  //id can't be 0-length
-				throw StandardException.newException(SQLState.ID_PARSE_ERROR);
- 			r.reset();
-			if (c == '"')
-				return parseQId(r,normalize);
-			else
-				return parseUnQId(r,normalize);
-		}
-
-		catch (IOException ioe){
-			throw StandardException.newException(SQLState.ID_PARSE_ERROR,ioe);
-		}
-	}
-
-
-	/**
-	 * Given a case normal form SQL authorization identifier, convert it to a
-	 * form that may be compared with the username of Derby builtin
-	 * authentication, which uses Java properties of the form
-	 * {@code derby.user.}&lt;username&gt;.
-	 * <p>
-	 * The returned form is suitable for comparing against the property string,
-	 * cf.  {@code systemPropertiesExistsBuiltinUser}.
-	 * <p>
-	 * E.g.:
-	 * <p>
-	 * <pre>
-	 *  Argument -> Return
-	 *  ------------------
-	 *  EVE      -> eve       [will match Java property: derby.user.eve]
-	 *  eVe      -> "eVe"     [will match Java property: derby.user."eVe"]
-	 *  "eve"    -> """eve""" [will match Java property: derby.user."""eVe"""]
-	 *  \eve\    -> "\eve\"   [will match Java property: derby.user."\eve\"]
-	 *
-	 * The latter could look this if specified on a Unix shell command line:
-	 *
-	 *                      -Dderby.user.'"\eve\"'=&lt;password&gt;
-	 *
-	 * Note: The processing of properties specified on the command line do not
-	 * interpret backslash as escape in the way done by the
-	 * java.util.Properties#load method, so no extra backslash is needed above.
-	 *
-	 * </pre>
-	 * Since parseSQLIdentifier maps many-to-one, the backward mapping is
-	 * non-unique, so the chosen lower case canonical form is arbitrary,
-	 * e.g. we will not be able to correctly match the non-canonical:
-	 * <p>
-     * <pre>
-	 *                      [Java property: derby.user.eVe]
-	 * </pre>
-	 * since this is internally EVE (but see DERBY-3150), and maps back as eve
-	 * after the rules above.
-	 * @see org.apache.derby.iapi.services.property.PropertyUtil#propertiesContainsBuiltinUser
-	 * @see org.apache.derby.iapi.services.property.PropertyUtil#systemPropertiesExistsBuiltinUser
+		Reclaim space based on work.
 	 */
-	public static String SQLIdentifier2CanonicalPropertyUsername(String authid){
-		boolean needsQuote = false;
-		String result;
-
-		for (int i=0; i < authid.length(); i++) {
-			char c = authid.charAt(i);
-			// The only external form that needs no quoting contains
-			// only uppercase ASCII, underscore, and if not the first
-			// character, a decimal number. In all other cases, we
-			// envelop in double quotes.
-			if (!( (c >= 'A' && c <= 'Z') ||
-				   (c == '_') ||
-				   (i > 0 && (c >= '0' && c <= '9')))) {
-				needsQuote = true;
-				break;
-			}
-		}
-
-		if (!needsQuote) {
-			result = authid.toLowerCase();
-		} else {
-			result = normalToDelimited(authid);
-		}
-
-		return result;
-	}
-
-    /**
-     * Parse a regular identifier (unquoted) returning returning either
-     * the value of the identifier or a delimited identifier. Ensures
-     * that all characters in the identifer are valid for a regular identifier.
-     * 
-     * @param r Regular identifier to parse.
-     * @param normalize If true return the identifer converted to a single case, otherwise return the identifier as entered.
-     * @return the value of the identifer or a delimited identifier
-     * @throws IOException Error accessing value
-     * @throws StandardException Error parsing identifier.
- 
-     */
-	private static String parseUnQId(StringReader r, boolean normalize)
-		 throws IOException,StandardException
+	public static int reclaimSpace(BaseDataFileFactory dataFactory,
+							RawTransaction tran,
+							ReclaimSpace work) 
+		 throws StandardException
 	{
-		StringBuffer b = new StringBuffer();
-		int c;
-		boolean first;
-		//
-		for(first = true; ; first=false)
+	
+		if (work.reclaimWhat() == ReclaimSpace.CONTAINER)
+			return reclaimContainer(dataFactory, tran, work);
+
+		// Else, not reclaiming container. Get a no-wait shared lock on the 
+		// container regardless of how the user transaction had the
+		// container opened. 
+
+		LockingPolicy container_rlock = 
+			tran.newLockingPolicy(LockingPolicy.MODE_RECORD,
+								  TransactionController.ISOLATION_SERIALIZABLE, 
+								  true /* stricter OK */ );
+
+		if (SanityManager.DEBUG)
+			SanityManager.ASSERT(container_rlock != null);
+
+		ContainerHandle containerHdl = 
+			openContainerNW(tran, container_rlock, work.getContainerId());
+
+		if (containerHdl == null)
 		{
-			r.mark(0);
-			if (idChar(first,c=r.read()))
-				b.append((char)c);
+			tran.abort();
+
+			if (SanityManager.DEBUG)
+            {
+                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                {
+                    SanityManager.DEBUG(
+                        DaemonService.DaemonTrace, " aborted " + work + 
+                        " because container is locked or dropped");
+                }
+            }
+
+			if (work.incrAttempts() < 3) // retry this for serveral times
+				// it is however, unlikely that three tries will be 
+				// enough because there is no delay between retries.
+				// See DERBY-4059 and DERBY-4055 for details.
+            {
+				return Serviceable.REQUEUE;
+            }
 			else
-				break;
-		}
-		if (c != -1) r.reset();
-        
-        String id = b.toString();
+            {
+                // If code gets here, the space will be lost forever, and
+                // can only be reclaimed by a full offline compress of the
+                // table/index.
 
-		if (normalize)
-			return StringUtil.SQLToUpperCase(id);
-		else
-			return id;
-	}
+                if (SanityManager.DEBUG)
+                {
+                    if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                    {
+                        SanityManager.DEBUG(
+                            DaemonService.DaemonTrace, 
+                            "  gave up after 3 tries to get container lock " + 
+                            work);
+                    }
+                }
 
+				return Serviceable.DONE;
+            }
+		}	
 
-	private static boolean idChar(boolean first,int c)
-	{
-		if (((c>='a' && c<='z') || (c>='A' && c<='Z')) ||
-			(!first &&(c>='0' && c<='9')) || (!first &&c =='_') )
-			return true;
-		else if (Character.isLetter((char) c))
-			return true;
-		else if (!first && Character.isDigit((char) c))
-			return true;
-		return false;
-	}
-    
-    /**
-     * Parse a delimited (quoted) identifier returning either
-     * the value of the identifier or a delimited identifier.
-     * @param r Quoted identifier to parse.
-     * @param normalize If true return a delimited identifer, otherwise return the identifier's value.
-     * @return the value of the identifer or a delimited identifier
-     * @throws IOException Error accessing value
-     * @throws StandardException Error parsing identifier.
-     */
-	private static String parseQId(StringReader r,boolean normalize)
-		 throws IOException,StandardException
-	{
-		StringBuffer b = new StringBuffer();
-		int c = r.read();
-		if (c != '"') throw StandardException.newException(SQLState.ID_PARSE_ERROR);
-		while (true)
+		// At this point, container is opened with IX lock.
+
+		if (work.reclaimWhat() == ReclaimSpace.PAGE)
 		{
-			c=r.read();
-			if (c == '"')
+			// Reclaiming a page - called by undo of insert which purged the
+			// last row off an overflow page. It is safe to reclaim the page
+			// without first locking the head row because unlike post commit
+			// work, this is post abort work.  Abort is guarenteed to happen
+			// and to happen only once, if at all.
+			Page p = containerHdl.getPageNoWait(work.getPageId().getPageNumber());
+			if (p != null)
+				containerHdl.removePage(p);
+
+			tran.commit();
+			return Serviceable.DONE;
+		}
+
+		// We are reclaiming row space or long column.  
+		// First get an xlock on the head row piece.
+		RecordHandle headRecord = work.getHeadRowHandle();
+
+		if (!container_rlock.lockRecordForWrite(
+                tran, headRecord, false /* not insert */, false /* nowait */))
+		{
+			// cannot get the row lock, retry
+			tran.abort();
+			if (work.incrAttempts() < 3)
+            {
+				return Serviceable.REQUEUE;
+            }
+			else
+            {
+                // If code gets here, the space will be lost forever, and
+                // can only be reclaimed by a full offline compress of the
+                // table/index.
+
+                if (SanityManager.DEBUG)
+                {
+                    if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                    {
+                        SanityManager.DEBUG(
+                            DaemonService.DaemonTrace, 
+                            "  gave up after 3 tries to get row lock " + 
+                            work);
+                    }
+                }
+				return Serviceable.DONE;
+            }
+		}
+
+		// The exclusive lock on the head row has been gotten.
+
+		if (work.reclaimWhat() == ReclaimSpace.ROW_RESERVE)
+		{
+			// This row may benefit from compaction.
+			containerHdl.compactRecord(headRecord);
+
+            // This work is being done - post commit, there is no user 
+            // transaction that depends on the commit being sync'd.  It is safe
+            // to commitNoSync() This do as one of 2 things will happen:
+            //
+            //     1) if any data page associated with this transaction is
+            //        moved from cache to disk, then the transaction log
+            //        must be sync'd to the log record for that change and
+            //        all log records including the commit of this xact must
+            //        be sync'd before returning.
+            //
+            //     2) if the data page is never written then the log record
+            //        for the commit may never be written, and the xact will
+            //        never make to disk.  This is ok as no subsequent action
+            //        depends on this operation being committed.
+            //
+			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+
+			return Serviceable.DONE;
+		}
+		else
+		{
+			if (SanityManager.DEBUG)
+				SanityManager.ASSERT(work.reclaimWhat() == ReclaimSpace.COLUMN_CHAIN);
+
+			// Reclaiming a long column chain due to update.  The long column
+			// chain being reclaimed is the before image of the update
+			// operation.  
+			// 
+			long headPageId = ((PageKey)headRecord.getPageId()).getPageNumber();
+			//DERBY-4050 - we wait for the page so we don't have to retry.
+			// prior to the 4050 fix, we called getPageNoWait and just 
+			// retried 3 times.  This left unreclaimed space if we were 
+			// not successful after three tries.
+			StoredPage headRowPage = 
+				(StoredPage)containerHdl.getPage(headPageId);
+			if (headRowPage == null)
 			{
-				r.mark(0);
-				int c2 = r.read();
-				if (c2 != '"')
+				// It is not clear why headRowPage would be null,
+				// but logging the failure in case it happens.
+				// If code gets here, the space will be lost forever, and
+				// can only be reclaimed by a full offline compress of the
+				// table/index.
+
+				if (SanityManager.DEBUG)
 				{
-					if (c2!=-1)r.reset();
-					break;
+					if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+					{
+						SanityManager.DEBUG(
+								DaemonService.DaemonTrace, 
+								"gave up because hadRowPage was null" + 
+								work);
+					}
 				}
+				tran.abort();
+				return Serviceable.DONE;
 			}
-			else if (c == -1)
-				throw StandardException.newException(SQLState.ID_PARSE_ERROR);
-			
-			b.append((char)c);
+			try
+			{
+				headRowPage.removeOrphanedColumnChain(work, containerHdl);
+			}
+			finally
+			{
+				headRowPage.unlatch();
+			}
+
+            // This work is being done - post commit, there is no user 
+            // transaction that depends on the commit being sync'd.  It is safe
+            // to commitNoSync() This do as one of 2 things will happen:
+            //
+            //     1) if any data page associated with this transaction is
+            //        moved from cache to disk, then the transaction log
+            //        must be sync'd to the log record for that change and
+            //        all log records including the commit of this xact must
+            //        be sync'd before returning.
+            //
+            //     2) if the data page is never written then the log record
+            //        for the commit may never be written, and the xact will
+            //        never make to disk.  This is ok as no subsequent action
+            //        depends on this operation being committed.
+            //
+			tran.commitNoSync(Transaction.RELEASE_LOCKS);
+
+			return Serviceable.DONE;
 		}
-
-		if (b.length() == 0) //id can't be 0-length
-			throw StandardException.newException(SQLState.ID_PARSE_ERROR);
-
-		if (normalize)
-			return b.toString();
-		else
-			return normalToDelimited(b.toString()); //Put the quotes back.
 	}
 
-    /**
-     * Verify the read is empty (no more characters in its stream).
-     * @param r
-     * @throws StandardException
-     */
-	private static void verifyEmpty(java.io.Reader r)
+	private static int reclaimContainer(BaseDataFileFactory dataFactory,
+										RawTransaction tran,
+										ReclaimSpace work) 
 		 throws StandardException
 	{
-		try {
-			if (r.read() != -1)
-				throw StandardException.newException(SQLState.ID_PARSE_ERROR);
-		}
+		// when we want to reclaim the whole container, gets an exclusive
+		// XLock on the container, wait for the lock.
 
-		catch (IOException ioe){
-			throw StandardException.newException(SQLState.ID_PARSE_ERROR,ioe);
-		}			
-	}
-	/**Index of the schema name in a jar name on a db classpath*/
-	public static final int DBCP_SCHEMA_NAME = 0;
-	/**Index of the sql jar name in a jar name on a db classpath*/
-	public static final int DBCP_SQL_JAR_NAME = 1;
-	
-	/**
-	  Scan a database classpath from the string provided. This returns
-	  an array with one qualified name per entry on the classpath. The
-	  constants above describe the content of the returned names. This 
-	  raises an an exception if the string does not contain a valid database 
-	  class path.
-  <PRE>
-      classpath := item[:item]*
-	  item := id.id
-	  
-	  In the syntax braces ([]) show grouping. '*' means repeat 0 or more times.
-	  The syntax for id is defined in IdUtil.
-  </PRE>
-	  <BR>
-	  Classpath returned is a two part name.	  <BR>
-	  If the class path is empty then this returns an array
-	  of zero length.
+		LockingPolicy container_xlock = 
+			tran.newLockingPolicy(LockingPolicy.MODE_CONTAINER,
+								  TransactionController.ISOLATION_SERIALIZABLE, 
+								  true /* stricter OK */ );
 
-	  @exception StandardException Oops
-	  */
-	public static String[][] parseDbClassPath(String input)
-		 throws StandardException
-	{
-		//As a special case we accept a zero length dbclasspath.
-		if (input.length() == 0)
-			return new String[0][];
+		if (SanityManager.DEBUG)
+			SanityManager.ASSERT(container_xlock != null);
 
-		Vector v = new Vector();
-		java.io.StringReader r = new java.io.StringReader(input);
-		//
-		while (true)
+		// Try to just get the container thru the transaction.
+		// Need to do this to transition the transaction to active state. 
+		RawContainerHandle containerHdl = tran.openDroppedContainer(
+								work.getContainerId(), 
+								container_xlock);
+
+		// if it can get lock but it is not deleted or has already been
+		// deleted, done work
+		if (containerHdl == null || 
+			containerHdl.getContainerStatus() == RawContainerHandle.NORMAL ||
+			containerHdl.getContainerStatus() == RawContainerHandle.COMMITTED_DROP)
 		{
-			try {
-				String[] thisQName = IdUtil.parseMultiPartSQLIdentifier(r);
-				if (thisQName.length != 2)
-					throw StandardException.newException(SQLState.DB_CLASS_PATH_PARSE_ERROR,input);
+			if (containerHdl != null)
+				containerHdl.close();
+			tran.abort();	// release xlock, if any
 
-				v.addElement(thisQName); 
-				int delim = r.read();
-				if (delim != ':')
-				{
-					if (delim!=-1)
-						throw StandardException.newException(SQLState.DB_CLASS_PATH_PARSE_ERROR,input);
-					break;
-				}
-			}
-			
-			catch (StandardException se){
-			    if (se.getMessageId().equals(SQLState.ID_PARSE_ERROR))
-					throw StandardException.newException(SQLState.DB_CLASS_PATH_PARSE_ERROR,
-														 se,input);
-				else
-					throw se;
-			}
-			
-			catch (IOException ioe){
-				throw StandardException.newException(SQLState.DB_CLASS_PATH_PARSE_ERROR,ioe,input);
-			}
-		}
-		String[][] result = new String[v.size()][];
-		v.copyInto(result);
-		return result;
-	}
-
-
-	/*
-	** Methods that operate on lists of identifiers.
-	*/
-
-
-	/**
-	  Scan a list of comma separated SQL identifiers from the string provided.
-      This returns an array with containing the normalized forms of the identifiers.
-      
-      This raises an an exception if
-	  the string does not contain a valid list of names.
-
-	  @exception StandardException Oops
-	  */
-	public static String[] parseIdList(String p)
-		 throws StandardException
-	{
-		if (p==null) return null;
-		StringReader r = new StringReader(p);
-		String[] result = parseIdList(r, true);
-		verifyEmpty(r);
-		return result;
-	}
-	
-	
-	/**
-	  Parse a list of comma separated SQL identifiers returning
-      them a as elements in an array.
-
-	  @param normalize true means return ids in nomral form, false means
-	        return them as they were entered.
-
-	  @exception StandardException Oops
-	  */
-	private static String[] parseIdList(StringReader r, boolean normalize)
-		 throws StandardException
-	{
-		Vector v = new Vector();
-		while (true)
-		{
-			int delim;
-			try {
-				String thisId = IdUtil.parseId(r,normalize);
-				v.addElement(thisId);
-				r.mark(0);
-				delim = r.read();
-				if (delim != ',')
-				{
-					if (delim!=-1) r.reset();
-					break;
-				}
-			}
-			
-			catch (StandardException se){
-				if (se.getMessageId().equals(SQLState.ID_LIST_PARSE_ERROR))
-					throw StandardException.newException(SQLState.ID_LIST_PARSE_ERROR,se);
-				else
-					throw se;
-			}
-			
-			catch (IOException ioe){
-				throw StandardException.newException(SQLState.ID_LIST_PARSE_ERROR,ioe);
-			}
-		}
-		if (v.size() == 0) return null;
-		String[] result = new String[v.size()];
-		v.copyInto(result);
-		return result;
-	}
-
-	/**
-	  Return an IdList with all the ids that in l1 and l2
-	  or null if not ids are on both lists.
-
-	  @param l1 An array of ids in normal form
-	  @param l2 An array of ids in nomral form
-	  */
-	public static String intersect(String[] l1, String[] l2)
-	{
-		if (l1 == null || l2 == null) return null;
-		HashSet h = new HashSet();
-		for(int ix=0;ix<l2.length;ix++) h.add(l2[ix]); 
-		Vector v = new Vector();
-		for(int ix=0;ix<l1.length;ix++) if (h.contains(l1[ix])) v.addElement(l1[ix]);
-		return vectorToIdList(v,true); 
-	}
-
-	/**
-	  Return an idList in external form with one id for every 
-	  element of v. If v has no elements, return null.
-
-	  @param normal True means the ids in v are in normal form
-	         and false means they are in external form.
-	  */
-	private static String vectorToIdList(Vector v,boolean normal)
-	{
-		if (v.size() == 0) return null;
-		String[] a = new String[v.size()];
-		v.copyInto(a);
-		if (normal)
-			return mkIdList(a);
+			if (SanityManager.DEBUG)
+            {
+                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                {
+                    SanityManager.DEBUG(
+                        DaemonService.DaemonTrace, "  aborted " + work);
+                }
+            }
+		}	
 		else
-			return mkIdListAsEntered(a);
+		{
+			// we got an xlock on a dropped container.  Must be committed.
+			// Get rid of the container now.
+			ContainerOperation lop = new
+				ContainerOperation(containerHdl, ContainerOperation.REMOVE);
+
+			// mark the container as pre-dirtied so that if a checkpoint
+			// happens after the log record is sent to the log stream, the
+			// cache cleaning will wait for this change.
+			containerHdl.preDirty(true);
+			try
+			{
+				tran.logAndDo(lop);
+			}
+			finally
+			{
+				// in case logAndDo fail, make sure the container is not
+				// stuck in preDirty state.
+				containerHdl.preDirty(false);
+			}
+
+
+			containerHdl.close();
+			tran.commit();
+
+			if (SanityManager.DEBUG)
+            {
+                if (SanityManager.DEBUG_ON(DaemonService.DaemonTrace))
+                {
+                    SanityManager.DEBUG(
+                        DaemonService.DaemonTrace, "  committed " + work);
+                }
+            }
+		}
+
+		return Serviceable.DONE;
+
 	}
 
+
 	/**
-	 * Map userName to authorizationId in its normal form.
+	 *	Open container shared no wait
+	 *
+	 * @param tran   Transaction
+	 * @param rlock  LockingPolicy
+	 * @param containerId container id.
 	 * 
-	 * @exception StandardException on error or userName is null
+	 * @return ContainerHandle or null if it could not obtain lock.
+	 * 
+	 * @throws StandardException
 	 */
-	public static String getUserAuthorizationId(String userName) throws StandardException
+	private static ContainerHandle openContainerNW(Transaction tran,
+		LockingPolicy rlock, ContainerKey containerId)
+		throws StandardException
 	{
+		ContainerHandle containerHdl = null;
 		try {
-            if (userName != null)
-			    return parseSQLIdentifier(userName);
-		}
-		catch (StandardException se) {
-		}
-        throw StandardException.newException(SQLState.AUTH_INVALID_USER_NAME, userName);
-	}
-
-	/**
-	 * Get user name from URL properties (key user) without any transformation.
-     * If the user property does not exist or is set to the empty string
-     * then Property.DEFAULT_USER_NAME is returned.
-     * 
-     * @see Property#DEFAULT_USER_NAME
-	 */
-	public static String getUserNameFromURLProps(Properties params)
-	{
-		String userName = params.getProperty(Attribute.USERNAME_ATTR,
-							Property.DEFAULT_USER_NAME);
-		if (userName.equals(""))
-			userName = Property.DEFAULT_USER_NAME;
-
-		return userName;
-	}
-
-	/**
-	  Return an IdList with all the ids that are repeated
-	  in l.
-
-	  @param l a list of ids in normal form.
-	  */
-	public static String dups(String[] l)
-	{
-		if (l == null) return null;
-		HashSet h = new HashSet();
-		Vector v = new Vector();
-		for(int ix=0;ix<l.length;ix++)
-		{
-			if (!h.contains(l[ix]))
-				h.add(l[ix]);
-			else
-				v.addElement(l[ix]);
-		}
-		return vectorToIdList(v,true);
-	}
-	
-	/**
-	  Return an IdList with all the duplicate ids removed
-	  @param l a list of ids in external form.
-	  @exception StandardException Oops.
-	  */
-	public static String pruneDups(String l) throws StandardException
-	{
-		if (l == null) return null;
-		String[] normal_a = parseIdList(l);
-		StringReader r = new StringReader(l);
-		String[] external_a = parseIdList(r,false);
-		HashSet h = new HashSet();
-		Vector v = new Vector();
-		for(int ix=0;ix<normal_a.length;ix++)
-		{
-			if (!h.contains(normal_a[ix]))
-			{
-				h.add(normal_a[ix]);
-				v.addElement(external_a[ix]);
+				containerHdl = tran.openContainer
+				(containerId, rlock,
+						ContainerHandle.MODE_FORUPDATE |
+						ContainerHandle.MODE_LOCK_NOWAIT); 
+		} catch (StandardException se) {
+			// DERBY-4059
+			// if this is a lock timeout just return null.
+			// otherwise throw the exception
+			if (!se.getSQLState().equals(SQLState.LOCK_TIMEOUT)) {
+				throw se;
 			}
 		}
-		return vectorToIdList(v,false);
+		return containerHdl;
 	}
 
-	/**
-	  Produce a string form of an idList from an array of
-	  normalized ids.
-	  */
-	public static String mkIdList(String[] ids)
-	{
-		StringBuffer sb = new StringBuffer();
-		for (int ix=0;ix<ids.length; ix++)
-		{
-			if (ix != 0) sb.append(",");
-			sb.append(IdUtil.normalToDelimited(ids[ix]));
-		}
-		return sb.toString();
-	}
-
-	/**
-	  Produce an id list from an array of ids in external form
-	  */
-	private static String mkIdListAsEntered(String[] externalIds )
-	{
-		StringBuffer sb = new StringBuffer();
-		for (int ix=0;ix<externalIds.length; ix++)
-		{
-			if (ix != 0) sb.append(",");
-			sb.append(externalIds[ix]);
-		}
-		return sb.toString();
-	}
-
-	/**
-	  Return true if the normalized value of an indentifier is on the list 
-      of SQL identifiers provided.
-	  @param id an id in normal form
-	  @param	list a list of ids in external form.
-	  @exception StandardException oops.
-	  */
-	public static boolean idOnList(String id, String list)
-		 throws StandardException
-	{
-		if (list==null) return false;
-		String[] list_a = parseIdList(list);
-		for (int ix=0; ix < list_a.length; ix++)
-			if (id.equals(list_a[ix])) return true;
-		return false;
-	}
-
-	/**
-	  Delete an normal value from a list of SQL identifiers.
-      The returned list maintains its remaining identifiers in the
-      format they were upon entry to the call.
-      
-      
-	  @param id an id in normal form (quotes removed, upshifted if regular)
-	  @param list a comma separated list of ids in external
-	         form (possibly delmited or not upshifted).
-	  @return the list with the id deleted or null if the
-	    resulting list has no ids. If 'id' is not on 'list'
-		this returns list unchanged. If list becomes empty after the removal
-        null is returned.
-				 
-	  @exception StandardException oops.
-	  */
-	public static String deleteId(String id, String list)
-		 throws StandardException
-	{
-		if (list==null) return null;
-		Vector v = new Vector();
-		StringReader r = new StringReader(list);
-		String[] enteredList_a = parseIdList(r,false);
-        
-		//
-		//Loop through enteredList element by element
-		//removing elements that match id. Before we
-		//compare we parse each SQL indentifier in list to convert
-		//to normal form.
-		for (int ix=0; ix < enteredList_a.length; ix++)
-			if (!id.equals(IdUtil.parseSQLIdentifier(enteredList_a[ix])))
-				v.addElement(enteredList_a[ix]);
-		if (v.size() == 0)
-			return null;
-		else
-			return vectorToIdList(v,false);
-	}
-
-
-	/**
-     * Append an identifier to a comma separated list
-     * of identifiers. The passed in identifier is its
-     * normal form, the list contains a list of SQL identifiers,
-     * either regular or delimited. This routine takes the easy
-     * way out and always appends a delimited identifier.
-	  @return the list with the id appended in its delimited form. 
-	  @exception StandardException oops
-	  */
-	public static String appendNormalToList(String id, String list)
-		 throws StandardException
-	{
-        String delimitedId = normalToDelimited(id);
-		if (list==null)
-			return delimitedId;
-		else
-			return list+","+delimitedId;
-	}
-
-	/**
-	 * Parse role identifier to internal, case normal form. It should not be
-	 * NONE nor exceed Limits.MAX_IDENTIFIER_LENGTH.
-	 *
-	 * @param roleName role identifier to check (SQL form, has possible quoting)
-	 * @return the role name to use (internal, case normal form).
-	 * @exception StandardException normal error policy
-	 */
-	public static String parseRoleId(String roleName) throws StandardException
-	{
-		roleName.trim();
-		// NONE is a special case and is not allowed with its special
-		// meaning in SET ROLE <value specification>. Even if there is
-		// a role with case normal form "NONE", we require it to be
-		// delimited here, since it would have had to be delimited to
-		// get created, too. We could have chosen to be lenient here,
-		// but it seems safer to be restrictive.
-		if (StringUtil.SQLToUpperCase(roleName).equals("NONE")) {
-			throw StandardException.newException(SQLState.ID_PARSE_ERROR);
-		}
-
-		roleName = parseSQLIdentifier(roleName);
-		checkIdentifierLengthLimit(roleName, Limits.MAX_IDENTIFIER_LENGTH);
-
-		return roleName;
-	}
-
-	/**
-	 * Check that identifier is not too long
-	 * @param identifier identifier (in case normal form) to check
-	 * @param identifier_length_limit maximum legal length
-	 * @exception StandardException normal error policy
-	 */
-	public static void checkIdentifierLengthLimit(String identifier,
-												  int identifier_length_limit)
-			throws StandardException
-	{
-		if (identifier.length() > identifier_length_limit)
-			throw StandardException.newException
-				(SQLState.LANG_IDENTIFIER_TOO_LONG,
-				 identifier,
-				 String.valueOf(identifier_length_limit));
-    }
 }

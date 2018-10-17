@@ -1,109 +1,126 @@
-public class StreamUtils {
+@Override protected ConcurrentMap<Object, DocSet> buildFilterMap() {
 
-/*******************************************************************************
- * Copyright 2011 See AUTHORS file.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- ******************************************************************************/
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.utils;
+package org.elasticsearch.index.cache.filter.soft;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
-import java.io.Closeable;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.StringWriter;
+import org.apache.lucene.search.Filter;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.common.base.Objects;
+import org.elasticsearch.common.collect.MapEvictionListener;
+import org.elasticsearch.common.collect.MapMaker;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.lucene.docset.DocSet;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.cache.filter.support.AbstractConcurrentMapFilterCache;
+import org.elasticsearch.index.settings.IndexSettings;
+import org.elasticsearch.index.settings.IndexSettingsService;
 
-/** Provides utility methods to copy streams */
-public final class StreamUtils {
-	public static final int DEFAULT_BUFFER_SIZE = 8192;
-	public static final byte[] EMPTY_BYTES = new byte[0];
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
-	/** Copy the data from an {@link InputStream} to an {@link OutputStream} without closing the stream.
-	 * @throws IOException */
-	public static void copyStream (InputStream input, OutputStream output) throws IOException {
-		copyStream(input, output, DEFAULT_BUFFER_SIZE);
-	}
+/**
+ * A soft reference based filter cache that has soft keys on the <tt>IndexReader</tt>.
+ *
+ * @author kimchy (shay.banon)
+ */
+public class SoftFilterCache extends AbstractConcurrentMapFilterCache implements MapEvictionListener<Filter, DocSet> {
 
-	/** Copy the data from an {@link InputStream} to an {@link OutputStream} without closing the stream.
-	 * @throws IOException */
-	public static void copyStream (InputStream input, OutputStream output, int bufferSize) throws IOException {
-		byte[] buffer = new byte[bufferSize];
-		int bytesRead;
-		while ((bytesRead = input.read(buffer)) != -1) {
-			output.write(buffer, 0, bytesRead);
-		}
-	}
+    private final IndexSettingsService indexSettingsService;
 
-	/** Copy the data from an {@link InputStream} to a byte array without closing the stream.
-	 * @throws IOException */
-	public static byte[] copyStreamToByteArray (InputStream input) throws IOException {
-		return copyStreamToByteArray(input, input.available());
-	}
+    private volatile int maxSize;
+    private volatile TimeValue expire;
 
-	/** Copy the data from an {@link InputStream} to a byte array without closing the stream.
-	 * @param estimatedSize Used to preallocate a possibly correct sized byte array to avoid an array copy.
-	 * @throws IOException */
-	public static byte[] copyStreamToByteArray (InputStream input, int estimatedSize) throws IOException {
-		ByteArrayOutputStream baos = new OptimizedByteArrayOutputStream(Math.max(0, estimatedSize));
-		copyStream(input, baos);
-		return baos.toByteArray();
-	}
+    private final AtomicLong evictions = new AtomicLong();
 
-	/** Copy the data from an {@link InputStream} to a string using the default charset without closing the stream.
-	 * @throws IOException */
-	public static String copyStreamToString (InputStream input) throws IOException {
-		return copyStreamToString(input, input.available());
-	}
+    private final ApplySettings applySettings = new ApplySettings();
 
-	/** Copy the data from an {@link InputStream} to a string using the default charset.
-	 * @param approxStringLength Used to preallocate a possibly correct sized StringBulder to avoid an array copy.
-	 * @throws IOException */
-	public static String copyStreamToString (InputStream input, int approxStringLength) throws IOException {
-		BufferedReader reader = new BufferedReader(new InputStreamReader(input));
-		StringWriter w = new StringWriter(Math.max(0, approxStringLength));
-		char[] buffer = new char[DEFAULT_BUFFER_SIZE];
+    @Inject public SoftFilterCache(Index index, @IndexSettings Settings indexSettings, IndexSettingsService indexSettingsService) {
+        super(index, indexSettings);
+        this.indexSettingsService = indexSettingsService;
+        this.maxSize = indexSettings.getAsInt("index.cache.filter.max_size", componentSettings.getAsInt("max_size", -1));
+        this.expire = indexSettings.getAsTime("index.cache.filter.expire", componentSettings.getAsTime("expire", null));
+        logger.debug("using [soft] filter cache with max_size [{}], expire [{}]", maxSize, expire);
 
-		int charsRead;
-		while ((charsRead = reader.read(buffer)) != -1) {
-			w.write(buffer, 0, charsRead);
-		}
+        indexSettingsService.addListener(applySettings);
+    }
 
-		return w.toString();
-	}
+    @Override public void close() {
+        indexSettingsService.removeListener(applySettings);
+        super.close();
+    }
 
-	/** Close and ignore all errors. */
-	public static void closeQuietly (Closeable c) {
-		if (c != null) try {
-			c.close();
-		} catch (Exception e) {
-			// ignore
-		}
-	}
+    @Override protected ConcurrentMap<Filter, DocSet> buildFilterMap() {
+        // DocSet are not really stored with strong reference only when searching on them...
+        // Filter might be stored in query cache
+        MapMaker mapMaker = new MapMaker().softValues();
+        if (maxSize != -1) {
+            mapMaker.maximumSize(maxSize);
+        }
+        if (expire != null && expire.nanos() > 0) {
+            mapMaker.expireAfterAccess(expire.nanos(), TimeUnit.NANOSECONDS);
+        }
+        mapMaker.evictionListener(this);
+        return mapMaker.makeMap();
+    }
 
-	/** A ByteArrayOutputStream which avoids copying of the byte array if not necessary. */
-	private static class OptimizedByteArrayOutputStream extends ByteArrayOutputStream {
-		OptimizedByteArrayOutputStream (int initialSize) {
-			super(initialSize);
-		}
+    @Override public String type() {
+        return "soft";
+    }
 
-		@Override
-		public synchronized byte[] toByteArray () {
-			if (count == buf.length) return buf;
-			return super.toByteArray();
-		}
-	}
+    @Override public long evictions() {
+        return evictions.get();
+    }
+
+    @Override public void onEviction(Filter filter, DocSet docSet) {
+        evictions.incrementAndGet();
+    }
+
+    static {
+        IndexMetaData.addDynamicSettings(
+                "index.cache.field.max_size",
+                "index.cache.field.expire"
+        );
+    }
+
+    class ApplySettings implements IndexSettingsService.Listener {
+        @Override public void onRefreshSettings(Settings settings) {
+            int maxSize = settings.getAsInt("index.cache.filter.max_size", SoftFilterCache.this.maxSize);
+            TimeValue expire = settings.getAsTime("index.cache.filter.expire", SoftFilterCache.this.expire);
+            boolean changed = false;
+            if (maxSize != SoftFilterCache.this.maxSize) {
+                logger.info("updating index.cache.filter.max_size from [{}] to [{}]", SoftFilterCache.this.maxSize, maxSize);
+                changed = true;
+                SoftFilterCache.this.maxSize = maxSize;
+            }
+            if (!Objects.equal(expire, SoftFilterCache.this.expire)) {
+                logger.info("updating index.cache.filter.expire from [{}] to [{}]", SoftFilterCache.this.expire, expire);
+                changed = true;
+                SoftFilterCache.this.expire = expire;
+            }
+            if (changed) {
+                clear();
+            }
+        }
+    }
 }

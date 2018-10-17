@@ -1,4 +1,4 @@
-throw new UnsupportedOperationException();
+request.index(state.metaData().concreteSingleIndex(request.index(), request.indicesOptions()));
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -19,114 +19,306 @@ throw new UnsupportedOperationException();
  * under the License.
  */
 
-package org.elasticsearch.script;
+package org.elasticsearch.action.support.single.instance;
 
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.search.Scorer;
-import org.elasticsearch.index.fielddata.ScriptDocValues;
-import org.elasticsearch.search.lookup.*;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.UnavailableShardsException;
+import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.TransportAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateObserver;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.ShardIterator;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.node.NodeClosedException;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
 
-import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A base class for any script type that is used during the search process (custom score, aggs, and so on).
- * <p/>
- * <p>If the script returns a specific numeric type, consider overriding the type specific base classes
- * such as {@link AbstractDoubleSearchScript}, {@link AbstractFloatSearchScript} and {@link AbstractLongSearchScript}
- * for better performance.
- * <p/>
- * <p>The use is required to implement the {@link #run()} method.
+ *
  */
-public abstract class AbstractSearchScript extends AbstractExecutableScript implements SearchScript {
+public abstract class TransportInstanceSingleOperationAction<Request extends InstanceShardOperationRequest, Response extends ActionResponse> extends TransportAction<Request, Response> {
 
-    private SearchLookup lookup;
+    protected final ClusterService clusterService;
 
-    /**
-     * Returns the doc lookup allowing to access field data (cached) values as well as the current document score
-     * (where applicable).
-     */
-    protected final DocLookup doc() {
-        return lookup.doc();
-    }
+    protected final TransportService transportService;
 
-    /**
-     * Returns field data strings access for the provided field.
-     */
-    protected ScriptDocValues.Strings docFieldStrings(String field) {
-        return (ScriptDocValues.Strings) doc().get(field);
-    }
+    final String executor;
 
-    /**
-     * Returns field data double (floating point) access for the provided field.
-     */
-    protected ScriptDocValues.Doubles docFieldDoubles(String field) {
-        return (ScriptDocValues.Doubles) doc().get(field);
-    }
+    protected TransportInstanceSingleOperationAction(Settings settings, String actionName, ThreadPool threadPool, ClusterService clusterService, TransportService transportService, ActionFilters actionFilters) {
+        super(settings, actionName, threadPool, actionFilters);
+        this.clusterService = clusterService;
+        this.transportService = transportService;
 
-    /**
-     * Returns field data long (integers) access for the provided field.
-     */
-    protected ScriptDocValues.Longs docFieldLongs(String field) {
-        return (ScriptDocValues.Longs) doc().get(field);
-    }
+        this.executor = executor();
 
-    /**
-     * Allows to access the actual source (loaded and parsed).
-     */
-    protected final SourceLookup source() {
-        return lookup.source();
-    }
-    
-    /**
-     * Allows to access statistics on terms and fields.
-     */
-    protected final IndexLookup indexLookup() {
-        return lookup.indexLookup();
-    }
-
-    /**
-     * Allows to access the *stored* fields.
-     */
-    protected final FieldsLookup fields() {
-        return lookup.fields();
-    }
-
-    void setLookup(SearchLookup lookup) {
-        this.lookup = lookup;
+        transportService.registerHandler(actionName, new TransportHandler());
     }
 
     @Override
-    public void setScorer(Scorer scorer) {
-        lookup.setScorer(scorer);
+    protected void doExecute(Request request, ActionListener<Response> listener) {
+        new AsyncSingleAction(request, listener).start();
     }
 
-    @Override
-    public void setNextReader(AtomicReaderContext context) {
-        lookup.setNextReader(context);
+    protected abstract String executor();
+
+    protected abstract void shardOperation(Request request, ActionListener<Response> listener) throws ElasticsearchException;
+
+    protected abstract Request newRequest();
+
+    protected abstract Response newResponse();
+
+    protected abstract ClusterBlockException checkGlobalBlock(ClusterState state, Request request);
+
+    protected abstract ClusterBlockException checkRequestBlock(ClusterState state, Request request);
+
+    /**
+     * Resolves the request, by default, simply setting the concrete index (if its aliased one). If the resolve
+     * means a different execution, then return false here to indicate not to continue and execute this request.
+     */
+    protected boolean resolveRequest(ClusterState state, Request request, ActionListener<Response> listener) {
+        request.index(state.metaData().concreteSingleIndex(request.index()));
+        return true;
     }
 
-    @Override
-    public void setNextDocId(int doc) {
-        lookup.setNextDocId(doc);
+    protected boolean retryOnFailure(Throwable e) {
+        return false;
     }
 
-    @Override
-    public void setNextSource(Map<String, Object> source) {
-        lookup.source().setNextSource(source);
+    protected TransportRequestOptions transportOptions() {
+        return TransportRequestOptions.EMPTY;
     }
 
-    @Override
-    public float runAsFloat() {
-        return ((Number) run()).floatValue();
+    /**
+     * Should return an iterator with a single shard!
+     */
+    protected abstract ShardIterator shards(ClusterState clusterState, Request request) throws ElasticsearchException;
+
+    class AsyncSingleAction {
+
+        private final ActionListener<Response> listener;
+
+        private final Request request;
+
+        private ShardIterator shardIt;
+
+        private DiscoveryNodes nodes;
+
+        private final AtomicBoolean operationStarted = new AtomicBoolean();
+
+        private volatile ClusterStateObserver observer;
+
+        private AsyncSingleAction(Request request, ActionListener<Response> listener) {
+            this.request = request;
+            this.listener = listener;
+        }
+
+        public void start() {
+            observer = new ClusterStateObserver(clusterService, request.timeout(), logger);
+            doStart();
+        }
+
+        protected boolean doStart() throws ElasticsearchException {
+            nodes = observer.observedState().nodes();
+            try {
+                ClusterBlockException blockException = checkGlobalBlock(observer.observedState(), request);
+                if (blockException != null) {
+                    if (blockException.retryable()) {
+                        retry(blockException);
+                        return false;
+                    } else {
+                        throw blockException;
+                    }
+                }
+                // check if we need to execute, and if not, return
+                if (!resolveRequest(observer.observedState(), request, listener)) {
+                    return true;
+                }
+                blockException = checkRequestBlock(observer.observedState(), request);
+                if (blockException != null) {
+                    if (blockException.retryable()) {
+                        retry(blockException);
+                        return false;
+                    } else {
+                        throw blockException;
+                    }
+                }
+                shardIt = shards(observer.observedState(), request);
+            } catch (Throwable e) {
+                listener.onFailure(e);
+                return true;
+            }
+
+            // no shardIt, might be in the case between index gateway recovery and shardIt initialization
+            if (shardIt.size() == 0) {
+                retry(null);
+                return false;
+            }
+
+            // this transport only make sense with an iterator that returns a single shard routing (like primary)
+            assert shardIt.size() == 1;
+
+            ShardRouting shard = shardIt.nextOrNull();
+            assert shard != null;
+
+            if (!shard.active()) {
+                retry(null);
+                return false;
+            }
+
+            if (!operationStarted.compareAndSet(false, true)) {
+                return true;
+            }
+
+            request.shardId = shardIt.shardId().id();
+            if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                request.beforeLocalFork();
+                try {
+                    threadPool.executor(executor).execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                shardOperation(request, listener);
+                            } catch (Throwable e) {
+                                if (retryOnFailure(e)) {
+                                    operationStarted.set(false);
+                                    // we already marked it as started when we executed it (removed the listener) so pass false
+                                    // to re-add to the cluster listener
+                                    retry(null);
+                                } else {
+                                    listener.onFailure(e);
+                                }
+                            }
+                        }
+                    });
+                } catch (Throwable e) {
+                    if (retryOnFailure(e)) {
+                        retry(null);
+                    } else {
+                        listener.onFailure(e);
+                    }
+                }
+            } else {
+                DiscoveryNode node = nodes.get(shard.currentNodeId());
+                transportService.sendRequest(node, actionName, request, transportOptions(), new BaseTransportResponseHandler<Response>() {
+
+                    @Override
+                    public Response newInstance() {
+                        return newResponse();
+                    }
+
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
+
+                    @Override
+                    public void handleResponse(Response response) {
+                        listener.onResponse(response);
+                    }
+
+                    @Override
+                    public void handleException(TransportException exp) {
+                        // if we got disconnected from the node, or the node / shard is not in the right state (being closed)
+                        if (exp.unwrapCause() instanceof ConnectTransportException || exp.unwrapCause() instanceof NodeClosedException ||
+                                retryOnFailure(exp)) {
+                            operationStarted.set(false);
+                            // we already marked it as started when we executed it (removed the listener) so pass false
+                            // to re-add to the cluster listener
+                            retry(null);
+                        } else {
+                            listener.onFailure(exp);
+                        }
+                    }
+                });
+            }
+            return true;
+        }
+
+        void retry(final @Nullable Throwable failure) {
+            if (observer.isTimedOut()) {
+                // we running as a last attempt after a timeout has happened. don't retry
+                return;
+            }
+
+            // make it threaded operation so we fork on the discovery listener thread
+            request.beforeLocalFork();
+            observer.waitForNextChange(new ClusterStateObserver.Listener() {
+                @Override
+                public void onNewClusterState(ClusterState state) {
+                    doStart();
+                }
+
+                @Override
+                public void onClusterServiceClose() {
+                    listener.onFailure(new NodeClosedException(nodes.localNode()));
+                }
+
+                @Override
+                public void onTimeout(TimeValue timeout) {
+                    // just to be on the safe side, see if we can start it now?
+                    if (!doStart()) {
+                        Throwable listenFailure = failure;
+                        if (listenFailure == null) {
+                            if (shardIt == null) {
+                                listenFailure = new UnavailableShardsException(new ShardId(request.index(), -1), "Timeout waiting for [" + timeout + "], request: " + request.toString());
+                            } else {
+                                listenFailure = new UnavailableShardsException(shardIt.shardId(), "[" + shardIt.size() + "] shardIt, [" + shardIt.sizeActive() + "] active : Timeout waiting for [" + timeout + "], request: " + request.toString());
+                            }
+                        }
+                        listener.onFailure(listenFailure);
+                    }
+                }
+            }, request.timeout());
+        }
     }
 
-    @Override
-    public long runAsLong() {
-        return ((Number) run()).longValue();
-    }
+    class TransportHandler extends BaseTransportRequestHandler<Request> {
 
-    @Override
-    public double runAsDouble() {
-        return ((Number) run()).doubleValue();
+        @Override
+        public Request newInstance() {
+            return newRequest();
+        }
+
+        @Override
+        public String executor() {
+            return ThreadPool.Names.SAME;
+        }
+
+        @Override
+        public void messageReceived(Request request, final TransportChannel channel) throws Exception {
+            // no need to have a threaded listener since we just send back a response
+            request.listenerThreaded(false);
+            execute(request, new ActionListener<Response>() {
+                @Override
+                public void onResponse(Response result) {
+                    try {
+                        channel.sendResponse(result);
+                    } catch (Throwable e) {
+                        onFailure(e);
+                    }
+                }
+
+                @Override
+                public void onFailure(Throwable e) {
+                    try {
+                        channel.sendResponse(e);
+                    } catch (Exception e1) {
+                        logger.warn("Failed to send response for get", e1);
+                    }
+                }
+            });
+        }
     }
 }

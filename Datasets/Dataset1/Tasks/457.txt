@@ -1,6 +1,6 @@
-public final void visitDocument(int n, StoredFieldVisitor visitor) throws IOException {
+IOContext context) {
 
-package org.apache.lucene.codecs.lucene40;
+package org.apache.lucene.codecs.lucene40.values;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,226 +18,240 @@ package org.apache.lucene.codecs.lucene40;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 import java.io.IOException;
 
 import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.StoredFieldsReader;
-import org.apache.lucene.index.CorruptIndexException;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.codecs.DocValuesArraySource;
+import org.apache.lucene.codecs.lucene40.values.FixedStraightBytesImpl.FixedBytesWriterBase;
+import org.apache.lucene.index.DocValues.Source;
+import org.apache.lucene.index.DocValues.Type;
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.StoredFieldVisitor;
-import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.Counter;
 import org.apache.lucene.util.IOUtils;
-
-import java.io.Closeable;
-
-import static org.apache.lucene.codecs.lucene40.Lucene40StoredFieldsWriter.*;
+import org.apache.lucene.util.packed.PackedInts;
 
 /**
- * Class responsible for access to stored document fields.
- * <p/>
- * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
+ * Stores integers using {@link PackedInts}
  * 
- * @see Lucene40StoredFieldsFormat
- * @lucene.internal
- */
-public final class Lucene40StoredFieldsReader extends StoredFieldsReader implements Cloneable, Closeable {
-  private final FieldInfos fieldInfos;
-  private final IndexInput fieldsStream;
-  private final IndexInput indexStream;
-  private int numTotalDocs;
-  private int size;
-  private boolean closed;
+ * @lucene.experimental
+ * */
+class PackedIntValues {
 
-  /** Returns a cloned FieldsReader that shares open
-   *  IndexInputs with the original one.  It is the caller's
-   *  job not to close the original FieldsReader until all
-   *  clones are called (eg, currently SegmentReader manages
-   *  this logic). */
-  @Override
-  public Lucene40StoredFieldsReader clone() {
-    ensureOpen();
-    return new Lucene40StoredFieldsReader(fieldInfos, numTotalDocs, size, (IndexInput)fieldsStream.clone(), (IndexInput)indexStream.clone());
-  }
-  
-  // Used only by clone
-  private Lucene40StoredFieldsReader(FieldInfos fieldInfos, int numTotalDocs, int size, IndexInput fieldsStream, IndexInput indexStream) {
-    this.fieldInfos = fieldInfos;
-    this.numTotalDocs = numTotalDocs;
-    this.size = size;
-    this.fieldsStream = fieldsStream;
-    this.indexStream = indexStream;
-  }
+  private static final String CODEC_NAME = "PackedInts";
+  private static final byte PACKED = 0x00;
+  private static final byte FIXED_64 = 0x01;
 
-  public Lucene40StoredFieldsReader(Directory d, SegmentInfo si, FieldInfos fn, IOContext context) throws IOException {
-    final String segment = si.name;
-    boolean success = false;
-    fieldInfos = fn;
-    try {
-      fieldsStream = d.openInput(IndexFileNames.segmentFileName(segment, "", FIELDS_EXTENSION), context);
-      final String indexStreamFN = IndexFileNames.segmentFileName(segment, "", FIELDS_INDEX_EXTENSION);
-      indexStream = d.openInput(indexStreamFN, context);
+  static final int VERSION_START = 0;
+  static final int VERSION_CURRENT = VERSION_START;
+
+  static class PackedIntsWriter extends FixedBytesWriterBase {
+
+    private long minValue;
+    private long maxValue;
+    private boolean started;
+    private int lastDocId = -1;
+
+    protected PackedIntsWriter(Directory dir, String id, Counter bytesUsed,
+        IOContext context) throws IOException {
+      super(dir, id, CODEC_NAME, VERSION_CURRENT, bytesUsed, context, Type.VAR_INTS);
+      bytesRef = new BytesRef(8);
+    }
+    
+    @Override
+    public void finish(int docCount) throws IOException {
+      boolean success = false;
+      final IndexOutput dataOut = getOrCreateDataOut();
+      try {
+        if (!started) {
+          minValue = maxValue = 0;
+        }
+        final long delta = maxValue - minValue;
+        // if we exceed the range of positive longs we must switch to fixed
+        // ints
+        if (delta <= (maxValue >= 0 && minValue <= 0 ? Long.MAX_VALUE
+            : Long.MAX_VALUE - 1) && delta >= 0) {
+          dataOut.writeByte(PACKED);
+          writePackedInts(dataOut, docCount);
+          return; // done
+        } else {
+          dataOut.writeByte(FIXED_64);
+        }
+        writeData(dataOut);
+        writeZeros(docCount - (lastDocID + 1), dataOut);
+        success = true;
+      } finally {
+        resetPool();
+        if (success) {
+          IOUtils.close(dataOut);
+        } else {
+          IOUtils.closeWhileHandlingException(dataOut);
+        }
+      }
+    }
+
+    private void writePackedInts(IndexOutput datOut, int docCount) throws IOException {
+      datOut.writeLong(minValue);
       
-      CodecUtil.checkHeader(indexStream, CODEC_NAME_IDX, VERSION_START, VERSION_CURRENT);
-      CodecUtil.checkHeader(fieldsStream, CODEC_NAME_DAT, VERSION_START, VERSION_CURRENT);
-      assert HEADER_LENGTH_DAT == fieldsStream.getFilePointer();
-      assert HEADER_LENGTH_IDX == indexStream.getFilePointer();
-      final long indexSize = indexStream.length() - HEADER_LENGTH_IDX;
-      this.size = (int) (indexSize >> 3);
-      // Verify two sources of "maxDoc" agree:
-      if (this.size != si.getDocCount()) {
-        throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + this.size + " but segmentInfo shows " + si.getDocCount());
+      // write a default value to recognize docs without a value for that
+      // field
+      final long defaultValue = maxValue >= 0 && minValue <= 0 ? 0 - minValue
+          : ++maxValue - minValue;
+      datOut.writeLong(defaultValue);
+      PackedInts.Writer w = PackedInts.getWriter(datOut, docCount,
+          PackedInts.bitsRequired(maxValue - minValue), PackedInts.DEFAULT);
+      for (int i = 0; i < lastDocID + 1; i++) {
+        set(bytesRef, i);
+        byte[] bytes = bytesRef.bytes;
+        int offset = bytesRef.offset;
+        long asLong =  
+           (((long)(bytes[offset+0] & 0xff) << 56) |
+            ((long)(bytes[offset+1] & 0xff) << 48) |
+            ((long)(bytes[offset+2] & 0xff) << 40) |
+            ((long)(bytes[offset+3] & 0xff) << 32) |
+            ((long)(bytes[offset+4] & 0xff) << 24) |
+            ((long)(bytes[offset+5] & 0xff) << 16) |
+            ((long)(bytes[offset+6] & 0xff) <<  8) |
+            ((long)(bytes[offset+7] & 0xff)));
+        w.add(asLong == 0 ? defaultValue : asLong - minValue);
       }
-      numTotalDocs = (int) (indexSize >> 3);
-      success = true;
-    } finally {
-      // With lock-less commits, it's entirely possible (and
-      // fine) to hit a FileNotFound exception above. In
-      // this case, we want to explicitly close any subset
-      // of things that were opened so that we don't have to
-      // wait for a GC to do so.
-      if (!success) {
-        close();
+      for (int i = lastDocID + 1; i < docCount; i++) {
+        w.add(defaultValue);
       }
+      w.finish();
     }
-  }
-
-  /**
-   * @throws AlreadyClosedException if this FieldsReader is closed
-   */
-  private void ensureOpen() throws AlreadyClosedException {
-    if (closed) {
-      throw new AlreadyClosedException("this FieldsReader is closed");
-    }
-  }
-
-  /**
-   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams.
-   * This means that the Fields values will not be accessible.
-   *
-   * @throws IOException
-   */
-  public final void close() throws IOException {
-    if (!closed) {
-      IOUtils.close(fieldsStream, indexStream);
-      closed = true;
-    }
-  }
-
-  public final int size() {
-    return size;
-  }
-
-  private void seekIndex(int docID) throws IOException {
-    indexStream.seek(HEADER_LENGTH_IDX + docID * 8L);
-  }
-
-  public final void visitDocument(int n, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
-    seekIndex(n);
-    fieldsStream.seek(indexStream.readLong());
-
-    final int numFields = fieldsStream.readVInt();
-    for (int fieldIDX = 0; fieldIDX < numFields; fieldIDX++) {
-      int fieldNumber = fieldsStream.readVInt();
-      FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
-      
-      int bits = fieldsStream.readByte() & 0xFF;
-      assert bits <= (FIELD_IS_NUMERIC_MASK | FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
-
-      switch(visitor.needsField(fieldInfo)) {
-        case YES:
-          readField(visitor, fieldInfo, bits);
-          break;
-        case NO: 
-          skipField(bits);
-          break;
-        case STOP: 
-          return;
-      }
-    }
-  }
-
-  private void readField(StoredFieldVisitor visitor, FieldInfo info, int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-          visitor.intField(info, fieldsStream.readInt());
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-          visitor.longField(info, fieldsStream.readLong());
-          return;
-        case FIELD_IS_NUMERIC_FLOAT:
-          visitor.floatField(info, Float.intBitsToFloat(fieldsStream.readInt()));
-          return;
-        case FIELD_IS_NUMERIC_DOUBLE:
-          visitor.doubleField(info, Double.longBitsToDouble(fieldsStream.readLong()));
-          return;
-        default:
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
-      }
-    } else { 
-      final int length = fieldsStream.readVInt();
-      byte bytes[] = new byte[length];
-      fieldsStream.readBytes(bytes, 0, length);
-      if ((bits & FIELD_IS_BINARY) != 0) {
-        visitor.binaryField(info, bytes, 0, bytes.length);
+    
+    @Override
+    public void add(int docID, IndexableField docValue) throws IOException {
+      final long v = docValue.numericValue().longValue();
+      assert lastDocId < docID;
+      if (!started) {
+        started = true;
+        minValue = maxValue = v;
       } else {
-        visitor.stringField(info, new String(bytes, 0, bytes.length, IOUtils.CHARSET_UTF_8));
+        if (v < minValue) {
+          minValue = v;
+        } else if (v > maxValue) {
+          maxValue = v;
+        }
       }
+      lastDocId = docID;
+      DocValuesArraySource.copyLong(bytesRef, v);
+      bytesSpareField.setBytesValue(bytesRef);
+      super.add(docID, bytesSpareField);
     }
   }
+
+  /**
+   * Opens all necessary files, but does not read any data in until you call
+   * {@link #load}.
+   */
+  static class PackedIntsReader extends DocValues {
+    private final IndexInput datIn;
+    private final byte type;
+    private final int numDocs;
+    private final DocValuesArraySource values;
+
+    protected PackedIntsReader(Directory dir, String id, int numDocs,
+        IOContext context) throws IOException {
+      datIn = dir.openInput(
+                IndexFileNames.segmentFileName(id, Bytes.DV_SEGMENT_SUFFIX, DocValuesWriterBase.DATA_EXTENSION),
+          context);
+      this.numDocs = numDocs;
+      boolean success = false;
+      try {
+        CodecUtil.checkHeader(datIn, CODEC_NAME, VERSION_START, VERSION_START);
+        type = datIn.readByte();
+        values = type == FIXED_64 ?  DocValuesArraySource.forType(Type.FIXED_INTS_64) : null;
+        success = true;
+      } finally {
+        if (!success) {
+          IOUtils.closeWhileHandlingException(datIn);
+        }
+      }
+    }
+
+
+    /**
+     * Loads the actual values. You may call this more than once, eg if you
+     * already previously loaded but then discarded the Source.
+     */
+    @Override
+    public Source load() throws IOException {
+      boolean success = false;
+      final Source source;
+      IndexInput input = null;
+      try {
+        input = (IndexInput) datIn.clone();
+        
+        if (values == null) {
+          source = new PackedIntsSource(input, false);
+        } else {
+          source = values.newFromInput(input, numDocs);
+        }
+        success = true;
+        return source;
+      } finally {
+        if (!success) {
+          IOUtils.closeWhileHandlingException(input, datIn);
+        }
+      }
+    }
+
+    @Override
+    public void close() throws IOException {
+      super.close();
+      datIn.close();
+    }
+
+
+    @Override
+    public Type getType() {
+      return Type.VAR_INTS;
+    }
+
+
+    @Override
+    public Source getDirectSource() throws IOException {
+      return values != null ? new FixedStraightBytesImpl.DirectFixedStraightSource((IndexInput) datIn.clone(), 8, Type.FIXED_INTS_64) : new PackedIntsSource((IndexInput) datIn.clone(), true);
+    }
+  }
+
   
-  private void skipField(int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-        case FIELD_IS_NUMERIC_FLOAT:
-          fieldsStream.readInt();
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-        case FIELD_IS_NUMERIC_DOUBLE:
-          fieldsStream.readLong();
-          return;
-        default: 
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
-      }
-    } else {
-      final int length = fieldsStream.readVInt();
-      fieldsStream.seek(fieldsStream.getFilePointer() + length);
+  static class PackedIntsSource extends Source {
+    private final long minValue;
+    private final long defaultValue;
+    private final PackedInts.Reader values;
+
+    public PackedIntsSource(IndexInput dataIn, boolean direct) throws IOException {
+      super(Type.VAR_INTS);
+      minValue = dataIn.readLong();
+      defaultValue = dataIn.readLong();
+      values = direct ? PackedInts.getDirectReader(dataIn) : PackedInts.getReader(dataIn);
+    }
+    
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.grow(8);
+      DocValuesArraySource.copyLong(ref, getInt(docID));
+      return ref;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      // TODO -- can we somehow avoid 2X method calls
+      // on each get? must push minValue down, and make
+      // PackedInts implement Ints.Source
+      assert docID >= 0;
+      final long value = values.get(docID);
+      return value == defaultValue ? 0 : minValue + value;
     }
   }
 
-  /** Returns the length in bytes of each raw document in a
-   *  contiguous range of length numDocs starting with
-   *  startDocID.  Returns the IndexInput (the fieldStream),
-   *  already seeked to the starting point for startDocID.*/
-  public final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
-    seekIndex(startDocID);
-    long startOffset = indexStream.readLong();
-    long lastOffset = startOffset;
-    int count = 0;
-    while (count < numDocs) {
-      final long offset;
-      final int docID = startDocID + count + 1;
-      assert docID <= numTotalDocs;
-      if (docID < numTotalDocs) 
-        offset = indexStream.readLong();
-      else
-        offset = fieldsStream.length();
-      lengths[count++] = (int) (offset-lastOffset);
-      lastOffset = offset;
-    }
-
-    fieldsStream.seek(startOffset);
-
-    return fieldsStream;
-  }
 }

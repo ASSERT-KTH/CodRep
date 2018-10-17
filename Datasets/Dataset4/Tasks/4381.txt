@@ -1,4 +1,4 @@
-import org.elasticsearch.search.facets.internal.InternalFacet;
+import org.elasticsearch.util.guice.inject.Inject;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,148 +19,233 @@ import org.elasticsearch.search.facets.internal.InternalFacet;
  * under the License.
  */
 
-package org.elasticsearch.search.facets.terms;
+package org.elasticsearch.client.transport;
 
-import org.elasticsearch.search.facets.Facet;
-import org.elasticsearch.search.facets.InternalFacet;
-import org.elasticsearch.util.BoundedTreeSet;
-import org.elasticsearch.util.ThreadLocals;
-import org.elasticsearch.util.collect.ImmutableList;
-import org.elasticsearch.util.collect.Lists;
-import org.elasticsearch.util.gnu.trove.TObjectIntHashMap;
-import org.elasticsearch.util.gnu.trove.TObjectIntIterator;
-import org.elasticsearch.util.io.stream.StreamInput;
-import org.elasticsearch.util.io.stream.StreamOutput;
-import org.elasticsearch.util.xcontent.builder.XContentBuilder;
+import org.elasticsearch.util.gcommon.collect.ImmutableList;
+import com.google.inject.Inject;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.TransportActions;
+import org.elasticsearch.action.admin.cluster.node.info.NodesInfoResponse;
+import org.elasticsearch.client.Requests;
+import org.elasticsearch.cluster.ClusterChangedEvent;
+import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.cluster.ClusterStateListener;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.BaseTransportResponseHandler;
+import org.elasticsearch.transport.ConnectTransportException;
+import org.elasticsearch.transport.RemoteTransportException;
+import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.util.TimeValue;
+import org.elasticsearch.util.component.AbstractComponent;
+import org.elasticsearch.util.settings.Settings;
+import org.elasticsearch.util.transport.TransportAddress;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.List;
+import java.util.HashSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.elasticsearch.util.TimeValue.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class InternalTermsFacet implements InternalFacet, TermsFacet {
+public class TransportClientNodesService extends AbstractComponent implements ClusterStateListener {
 
-    private String name;
+    private final TimeValue nodesSamplerInterval;
 
-    private int requiredSize;
+    private final ClusterName clusterName;
 
-    private Collection<Entry> entries = ImmutableList.of();
+    private final TransportService transportService;
 
-    private ComparatorType comparatorType;
+    private final ThreadPool threadPool;
 
-    private InternalTermsFacet() {
-    }
+    // nodes that are added to be discovered
+    private volatile ImmutableList<DiscoveryNode> listedNodes = ImmutableList.of();
 
-    public InternalTermsFacet(String name, ComparatorType comparatorType, int requiredSize, Collection<Entry> entries) {
-        this.name = name;
-        this.comparatorType = comparatorType;
-        this.requiredSize = requiredSize;
-        this.entries = entries;
-    }
+    private final Object transportMutex = new Object();
 
-    @Override public String name() {
-        return this.name;
-    }
+    private volatile ImmutableList<DiscoveryNode> nodes = ImmutableList.of();
 
-    @Override public String getName() {
-        return this.name;
-    }
+    private volatile DiscoveryNodes discoveredNodes;
 
-    @Override public Type type() {
-        return Type.TERMS;
-    }
+    private final AtomicInteger tempNodeIdGenerator = new AtomicInteger();
 
-    @Override public Type getType() {
-        return type();
-    }
+    private final ScheduledNodesSampler nodesSampler = new ScheduledNodesSampler();
 
-    @Override public List<Entry> entries() {
-        return Lists.newArrayList(this);
-    }
+    private final ScheduledFuture nodesSamplerFuture;
 
-    @Override public List<Entry> getEntries() {
-        return Lists.newArrayList(this);
-    }
+    private final AtomicInteger randomNodeGenerator = new AtomicInteger();
 
-    @Override public Iterator<Entry> iterator() {
-        return entries.iterator();
-    }
+    @Inject public TransportClientNodesService(Settings settings, ClusterName clusterName,
+                                               TransportService transportService, ThreadPool threadPool) {
+        super(settings);
+        this.clusterName = clusterName;
+        this.transportService = transportService;
+        this.threadPool = threadPool;
 
-    private static ThreadLocal<ThreadLocals.CleanableValue<TObjectIntHashMap<String>>> aggregateCache = new ThreadLocal<ThreadLocals.CleanableValue<TObjectIntHashMap<String>>>() {
-        @Override protected ThreadLocals.CleanableValue<TObjectIntHashMap<String>> initialValue() {
-            return new ThreadLocals.CleanableValue<TObjectIntHashMap<String>>(new TObjectIntHashMap<String>());
+        this.nodesSamplerInterval = componentSettings.getAsTime("nodes_sampler_interval", timeValueSeconds(1));
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("node_sampler_interval[" + nodesSamplerInterval + "]");
         }
-    };
 
-    @Override public Facet aggregate(Iterable<Facet> facets) {
-        TObjectIntHashMap<String> aggregated = aggregateCache.get().get();
-        aggregated.clear();
+        this.nodesSamplerFuture = threadPool.scheduleWithFixedDelay(nodesSampler, nodesSamplerInterval);
 
-        for (Facet facet : facets) {
-            if (!facet.name().equals(name)) {
-                continue;
+        // we want the transport service to throw connect exceptions, so we can retry
+        transportService.throwConnectException(true);
+    }
+
+    public ImmutableList<TransportAddress> transportAddresses() {
+        ImmutableList.Builder<TransportAddress> lstBuilder = ImmutableList.builder();
+        for (DiscoveryNode listedNode : listedNodes) {
+            lstBuilder.add(listedNode.address());
+        }
+        return lstBuilder.build();
+    }
+
+    public ImmutableList<DiscoveryNode> connectedNodes() {
+        return this.nodes;
+    }
+
+    public TransportClientNodesService addTransportAddress(TransportAddress transportAddress) {
+        synchronized (transportMutex) {
+            ImmutableList.Builder<DiscoveryNode> builder = ImmutableList.builder();
+            listedNodes = builder.addAll(listedNodes).add(new DiscoveryNode("#temp#-" + tempNodeIdGenerator.incrementAndGet(), transportAddress)).build();
+        }
+        nodesSampler.run();
+        return this;
+    }
+
+    public TransportClientNodesService removeTransportAddress(TransportAddress transportAddress) {
+        synchronized (transportMutex) {
+            ImmutableList.Builder<DiscoveryNode> builder = ImmutableList.builder();
+            for (DiscoveryNode otherNode : listedNodes) {
+                if (!otherNode.address().equals(transportAddress)) {
+                    builder.add(otherNode);
+                }
             }
-            TermsFacet mFacet = (TermsFacet) facet;
-            for (Entry entry : mFacet) {
-                aggregated.adjustOrPutValue(entry.term(), entry.count(), entry.count());
+            listedNodes = builder.build();
+        }
+        nodesSampler.run();
+        return this;
+    }
+
+    public <T> T execute(NodeCallback<T> callback) throws ElasticSearchException {
+        ImmutableList<DiscoveryNode> nodes = this.nodes;
+        if (nodes.isEmpty()) {
+            throw new NoNodeAvailableException();
+        }
+        int index = randomNodeGenerator.incrementAndGet();
+        for (int i = 0; i < nodes.size(); i++) {
+            DiscoveryNode node = nodes.get((index + i) % nodes.size());
+            try {
+                return callback.doWithNode(node);
+            } catch (ConnectTransportException e) {
+                // retry in this case
             }
         }
+        throw new NoNodeAvailableException();
+    }
 
-        BoundedTreeSet<Entry> ordered = new BoundedTreeSet<Entry>(comparatorType.comparator(), requiredSize);
-        for (TObjectIntIterator<String> it = aggregated.iterator(); it.hasNext();) {
-            it.advance();
-            ordered.add(new Entry(it.key(), it.value()));
+    public void close() {
+        nodesSamplerFuture.cancel(true);
+        for (DiscoveryNode listedNode : listedNodes)
+            transportService.disconnectFromNode(listedNode);
+    }
+
+    @Override public void clusterChanged(ClusterChangedEvent event) {
+        for (DiscoveryNode node : event.nodesDelta().addedNodes()) {
+            try {
+                transportService.connectToNode(node);
+            } catch (Exception e) {
+                logger.warn("Failed to connect to discovered node [" + node + "]", e);
+            }
         }
-
-        return new InternalTermsFacet(name, comparatorType, requiredSize, ordered);
-    }
-
-    @Override public void toXContent(XContentBuilder builder, Params params) throws IOException {
-        builder.startObject(name);
-        builder.field("_type", "terms");
-        builder.startArray("terms");
-        for (Entry entry : entries) {
-            builder.startObject();
-            builder.field("term", entry.term());
-            builder.field("count", entry.count());
-            builder.endObject();
-        }
-        builder.endArray();
-        builder.endObject();
-    }
-
-    public static InternalTermsFacet readTermsFacet(StreamInput in) throws IOException {
-        InternalTermsFacet facet = new InternalTermsFacet();
-        facet.readFrom(in);
-        return facet;
-    }
-
-    @Override public void readFrom(StreamInput in) throws IOException {
-        name = in.readUTF();
-        comparatorType = ComparatorType.fromId(in.readByte());
-        requiredSize = in.readVInt();
-
-        int size = in.readVInt();
-        entries = new ArrayList<Entry>(size);
-        for (int i = 0; i < size; i++) {
-            entries.add(new Entry(in.readUTF(), in.readVInt()));
+        this.discoveredNodes = event.state().nodes();
+        HashSet<DiscoveryNode> newNodes = new HashSet<DiscoveryNode>(nodes);
+        newNodes.addAll(discoveredNodes.nodes().values());
+        nodes = new ImmutableList.Builder<DiscoveryNode>().addAll(newNodes).build();
+        for (DiscoveryNode node : event.nodesDelta().removedNodes()) {
+            transportService.disconnectFromNode(node);
         }
     }
 
-    @Override public void writeTo(StreamOutput out) throws IOException {
-        out.writeUTF(name);
-        out.writeByte(comparatorType.id());
+    private class ScheduledNodesSampler implements Runnable {
 
-        out.writeVInt(requiredSize);
+        @Override public synchronized void run() {
+            ImmutableList<DiscoveryNode> listedNodes = TransportClientNodesService.this.listedNodes;
+            final CountDownLatch latch = new CountDownLatch(listedNodes.size());
+            final CopyOnWriteArrayList<NodesInfoResponse> nodesInfoResponses = new CopyOnWriteArrayList<NodesInfoResponse>();
+            for (final DiscoveryNode listedNode : listedNodes) {
+                threadPool.execute(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            transportService.connectToNode(listedNode); // make sure we are connected to it
+                            transportService.sendRequest(listedNode, TransportActions.Admin.Cluster.Node.INFO, Requests.nodesInfo("_local"), new BaseTransportResponseHandler<NodesInfoResponse>() {
 
-        out.writeVInt(entries.size());
-        for (Entry entry : entries) {
-            out.writeUTF(entry.term());
-            out.writeVInt(entry.count());
+                                @Override public NodesInfoResponse newInstance() {
+                                    return new NodesInfoResponse();
+                                }
+
+                                @Override public void handleResponse(NodesInfoResponse response) {
+                                    nodesInfoResponses.add(response);
+                                    latch.countDown();
+                                }
+
+                                @Override public void handleException(RemoteTransportException exp) {
+                                    logger.debug("Failed to get node info from " + listedNode + ", removed from nodes list", exp);
+                                    latch.countDown();
+                                }
+                            });
+                        } catch (Exception e) {
+                            logger.debug("Failed to get node info from " + listedNode + ", removed from nodes list", e);
+                            latch.countDown();
+                        }
+                    }
+                });
+            }
+
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            HashSet<DiscoveryNode> newNodes = new HashSet<DiscoveryNode>();
+            for (NodesInfoResponse nodesInfoResponse : nodesInfoResponses) {
+                if (nodesInfoResponse.nodes().length > 0) {
+                    DiscoveryNode node = nodesInfoResponse.nodes()[0].node();
+                    if (!clusterName.equals(nodesInfoResponse.clusterName())) {
+                        logger.warn("Node {} not part of the cluster {}, ignoring...", node, clusterName);
+                    } else {
+                        newNodes.add(node);
+                    }
+                } else {
+                    // should not really happen....
+                    logger.debug("No info returned from node...");
+                }
+            }
+            if (discoveredNodes != null) {
+                newNodes.addAll(discoveredNodes.nodes().values());
+            }
+            // now, make sure we are connected to all the updated nodes
+            for (DiscoveryNode node : newNodes) {
+                try {
+                    transportService.connectToNode(node);
+                } catch (Exception e) {
+                    logger.debug("Failed to connect to discovered node [" + node + "]", e);
+                }
+            }
+            nodes = new ImmutableList.Builder<DiscoveryNode>().addAll(newNodes).build();
         }
+    }
+
+    public static interface NodeCallback<T> {
+
+        T doWithNode(DiscoveryNode node) throws ElasticSearchException;
     }
 }

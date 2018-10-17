@@ -1,308 +1,421 @@
-if (synctype == XAResource.XA_RDONLY) { // xaretval of read-only, make sure flag agrees
+public class BufferedRandomAccessFile extends RandomAccessFile implements FileDataInput
 
-/*
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-   Derby - Class org.apache.derby.client.net.NetXAConnectionReply
+package org.apache.cassandra.io.util;
 
-   Copyright (c) 2001, 2005 The Apache Software Foundation or its licensors, where applicable.
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.util.Arrays;
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+/**
+ * A <code>BufferedRandomAccessFile</code> is like a
+ * <code>RandomAccessFile</code>, but it uses a private buffer so that most
+ * operations do not require a disk access.
+ * <P>
+ * 
+ * Note: The operations on this class are unmonitored. Also, the correct
+ * functioning of the <code>RandomAccessFile</code> methods that are not
+ * overridden here relies on the implementation of those methods in the
+ * superclass.
+ */
 
-      http://www.apache.org/licenses/LICENSE-2.0
+public final class BufferedRandomAccessFile extends RandomAccessFile implements FileDataInput
+{
+    static final int LogBuffSz_ = 16; // 64K buffer
+    public static final int BuffSz_ = (1 << LogBuffSz_);
+    static final long BuffMask_ = ~(((long) BuffSz_) - 1L);
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+    private String path_;
+    
+    /*
+     * This implementation is based on the buffer implementation in Modula-3's
+     * "Rd", "Wr", "RdClass", and "WrClass" interfaces.
+     */
+    private boolean dirty_; // true iff unflushed bytes exist
+    private boolean syncNeeded_; // dirty_ can be cleared by e.g. seek, so track sync separately
+    private long curr_; // current position in file
+    private long lo_, hi_; // bounds on characters in "buff"
+    private byte[] buff_; // local buffer
+    private long maxHi_; // this.lo + this.buff.length
+    private boolean hitEOF_; // buffer contains last file block?
+    private long diskPos_; // disk position
+    private long markedPointer;
 
-*/
-
-package org.apache.derby.client.net;
-
-import javax.transaction.xa.XAResource;
-import javax.transaction.xa.Xid;
-
-import org.apache.derby.client.am.ConnectionCallbackInterface;
-import org.apache.derby.client.am.DisconnectException;
-
-public class NetXAConnectionReply extends NetResultSetReply {
-    NetXAConnectionReply(NetAgent netAgent, int bufferSize) {
-        super(netAgent, bufferSize);
+    /*
+    * To describe the above fields, we introduce the following abstractions for
+    * the file "f":
+    *
+    * len(f) the length of the file curr(f) the current position in the file
+    * c(f) the abstract contents of the file disk(f) the contents of f's
+    * backing disk file closed(f) true iff the file is closed
+    *
+    * "curr(f)" is an index in the closed interval [0, len(f)]. "c(f)" is a
+    * character sequence of length "len(f)". "c(f)" and "disk(f)" may differ if
+    * "c(f)" contains unflushed writes not reflected in "disk(f)". The flush
+    * operation has the effect of making "disk(f)" identical to "c(f)".
+    *
+    * A file is said to be *valid* if the following conditions hold:
+    *
+    * V1. The "closed" and "curr" fields are correct:
+    *
+    * f.closed == closed(f) f.curr == curr(f)
+    *
+    * V2. The current position is either contained in the buffer, or just past
+    * the buffer:
+    *
+    * f.lo <= f.curr <= f.hi
+    *
+    * V3. Any (possibly) unflushed characters are stored in "f.buff":
+    *
+    * (forall i in [f.lo, f.curr): c(f)[i] == f.buff[i - f.lo])
+    *
+    * V4. For all characters not covered by V3, c(f) and disk(f) agree:
+    *
+    * (forall i in [f.lo, len(f)): i not in [f.lo, f.curr) => c(f)[i] ==
+    * disk(f)[i])
+    *
+    * V5. "f.dirty" is true iff the buffer contains bytes that should be
+    * flushed to the file; by V3 and V4, only part of the buffer can be dirty.
+    *
+    * f.dirty == (exists i in [f.lo, f.curr): c(f)[i] != f.buff[i - f.lo])
+    *
+    * V6. this.maxHi == this.lo + this.buff.length
+    *
+    * Note that "f.buff" can be "null" in a valid file, since the range of
+    * characters in V3 is empty when "f.lo == f.curr".
+    *
+    * A file is said to be *ready* if the buffer contains the current position,
+    * i.e., when:
+    *
+    * R1. !f.closed && f.buff != null && f.lo <= f.curr && f.curr < f.hi
+    *
+    * When a file is ready, reading or writing a single byte can be performed
+    * by reading or writing the in-memory buffer without performing a disk
+    * operation.
+    */
+    
+    /**
+     * Open a new <code>BufferedRandomAccessFile</code> on <code>file</code>
+     * in mode <code>mode</code>, which should be "r" for reading only, or
+     * "rw" for reading and writing.
+     */
+    public BufferedRandomAccessFile(File file, String mode) throws IOException
+    {
+        this(file, mode, 0);
     }
-    //----------------------------- entry points ---------------------------------
-
-
-    public void readLocalXAStart(ConnectionCallbackInterface connection) throws DisconnectException {
+    
+    public BufferedRandomAccessFile(File file, String mode, int size) throws IOException
+    {
+        super(file, mode);
+        path_ = file.getAbsolutePath();
+        this.init(size);
+    }
+    
+    /**
+     * Open a new <code>BufferedRandomAccessFile</code> on the file named
+     * <code>name</code> in mode <code>mode</code>, which should be "r" for
+     * reading only, or "rw" for reading and writing.
+     */
+    public BufferedRandomAccessFile(String name, String mode) throws IOException
+    {
+        this(name, mode, 0);
+    }
+    
+    public BufferedRandomAccessFile(String name, String mode, int size) throws FileNotFoundException
+    {
+        super(name, mode);
+        path_ = name;
+        this.init(size);
+    }
+    
+    private void init(int size)
+    {
+        this.dirty_ = false;
+        this.lo_ = this.curr_ = this.hi_ = 0;
+        this.buff_ = (size > BuffSz_) ? new byte[size] : new byte[BuffSz_];
+        this.maxHi_ = (long) BuffSz_;
+        this.hitEOF_ = false;
+        this.diskPos_ = 0L;
     }
 
-    public void readLocalXACommit(ConnectionCallbackInterface connection) throws DisconnectException {
-
-        startSameIdChainParse();
-        parseSYNCCTLreply(connection);
-        endOfSameIdChainData();
-
-        NetXACallInfo callInfo =
-                netAgent_.netConnection_.xares_.callInfoArray_[netAgent_.netConnection_.currXACallInfoOffset_];
-        callInfo.xaInProgress_ = false;
-        callInfo.xaWasSuspended = false;
-        connection.completeLocalCommit();
+    public String getPath()
+    {
+        return path_;
     }
 
-    public void readLocalXARollback(ConnectionCallbackInterface connection) throws DisconnectException {
-        startSameIdChainParse();
-        parseSYNCCTLreply(connection);
-        endOfSameIdChainData();
-        connection.completeLocalRollback();
-    }
-
-    protected void readXaStartUnitOfWork(NetConnection conn) throws DisconnectException {
-        startSameIdChainParse();
-        parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-    }
-
-    protected int readXaEndUnitOfWork(NetConnection conn) throws DisconnectException {
-        NetXACallInfo callInfo = conn.xares_.callInfoArray_[conn.currXACallInfoOffset_];
-        int xaFlags = callInfo.xaFlags_;
-
-        startSameIdChainParse();
-        parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-        if (xaFlags == XAResource.TMFAIL) {
-            return javax.transaction.xa.XAException.XA_RBROLLBACK;
+    public void sync() throws IOException
+    {
+        if (syncNeeded_)
+        {
+            flush();
+            getChannel().force(true); // true, because file length counts as "metadata"
+            syncNeeded_ = false;
         }
-        return javax.transaction.xa.XAResource.XA_OK;
     }
 
-    protected int readXaPrepare(NetConnection conn) throws DisconnectException {
-        startSameIdChainParse();
-        int synctype = parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-
-        NetXACallInfo callInfo = conn.xares_.callInfoArray_[conn.currXACallInfoOffset_];
-        if (synctype == NetXAResource.XARETVAL_XARDONLY) { // xaretval of read-only, make sure flag agrees
-            callInfo.setReadOnlyTransactionFlag(true);
-        } else { // xaretval NOT read-only, make sure flag agrees
-            callInfo.setReadOnlyTransactionFlag(false);
+    public void close() throws IOException
+    {
+        this.flush();
+        this.buff_ = null;
+        super.close();
+    }
+    
+    /**
+     * Flush any bytes in the file's buffer that have not yet been written to
+     * disk. If the file was created read-only, this method is a no-op.
+     */
+    public void flush() throws IOException
+    {        
+        this.flushBuffer();
+    }
+    
+    /* Flush any dirty bytes in the buffer to disk. */
+    private void flushBuffer() throws IOException
+    {   
+        if (this.dirty_)
+        {
+            if (this.diskPos_ != this.lo_)
+                super.seek(this.lo_);
+            int len = (int) (this.curr_ - this.lo_);
+            super.write(this.buff_, 0, len);
+            this.diskPos_ = this.curr_;             
+            this.dirty_ = false;
         }
-        return synctype;
     }
-
-    protected void readXaCommit(NetConnection conn) throws DisconnectException {
-        startSameIdChainParse();
-        parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-
-        NetXACallInfo callInfo = conn.xares_.callInfoArray_[conn.currXACallInfoOffset_];
-        callInfo.xaInProgress_ = false;
-        conn.completeLocalCommit();
+    
+    /*
+     * Read at most "this.buff.length" bytes into "this.buff", returning the
+     * number of bytes read. If the return result is less than
+     * "this.buff.length", then EOF was read.
+     */
+    private int fillBuffer() throws IOException
+    {
+        int cnt = 0;
+        int rem = this.buff_.length;
+        while (rem > 0)
+        {
+            int n = super.read(this.buff_, cnt, rem);
+            if (n < 0)
+                break;
+            cnt += n;
+            rem -= n;
+        }
+        if ( (cnt < 0) && (this.hitEOF_ = (cnt < this.buff_.length)) )
+        {
+            // make sure buffer that wasn't read is initialized with -1
+            Arrays.fill(this.buff_, cnt, this.buff_.length, (byte) 0xff);
+        }
+        this.diskPos_ += cnt;
+        return cnt;
     }
-
-    protected int readXaRollback(NetConnection conn) throws DisconnectException {
-        startSameIdChainParse();
-        parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-
-        NetXACallInfo callInfo = conn.xares_.callInfoArray_[conn.currXACallInfoOffset_];
-        callInfo.xaInProgress_ = false;
-        callInfo.xaWasSuspended = false;
-        conn.completeLocalRollback();
-
-        return javax.transaction.xa.XAResource.XA_OK;
-    }
-
-    protected void readXaRecover(NetConnection conn) throws DisconnectException {
-        startSameIdChainParse();
-        parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-    }
-
-    protected void readXaForget(NetConnection conn) throws DisconnectException {
-        startSameIdChainParse();
-        parseSYNCCTLreply(conn);
-        endOfSameIdChainData();
-    }
-    //----------------------helper methods----------------------------------------
-
-    //--------------------- parse DDM Reply Data--------------------------------------
-
-
-    // The SYNCCRD Reply Mesage
-    //
-    // Returned from Server:
-    //   XARETVAL - required
-    int parseSYNCCRD(ConnectionCallbackInterface connection) throws DisconnectException {
-        boolean svrcodReceived = false;
-        int svrcod = CodePoint.SVRCOD_INFO;
-        int xaretval = 0;
-        int synctype = 0;
-        java.util.Hashtable indoubtTransactions = null;
-        NetConnection conn = netAgent_.netConnection_;
-
-        parseLengthAndMatchCodePoint(CodePoint.SYNCCRD);
-        pushLengthOnCollectionStack();
-        int peekCP = peekCodePoint();
-
-        while (peekCP != Reply.END_OF_COLLECTION) {
-
-            boolean foundInPass = false;
-
-            if (peekCP == CodePoint.SVRCOD) {
-                foundInPass = true;
-                svrcodReceived = checkAndGetReceivedFlag(svrcodReceived);
-                svrcod = parseSVRCOD(CodePoint.SVRCOD_ERROR, CodePoint.SVRCOD_ERROR);
-                peekCP = peekCodePoint();
+    
+    /*
+     * This method positions <code>this.curr</code> at position <code>pos</code>.
+     * If <code>pos</code> does not fall in the current buffer, it flushes the
+     * current buffer and loads the correct one.<p>
+     * 
+     * On exit from this routine <code>this.curr == this.hi</code> iff <code>pos</code>
+     * is at or past the end-of-file, which can only happen if the file was
+     * opened in read-only mode.
+     */
+    public void seek(long pos) throws IOException
+    {
+        if (pos >= this.hi_ || pos < this.lo_)
+        {
+            // seeking outside of current buffer -- flush and read             
+            this.flushBuffer();
+            this.lo_ = pos & BuffMask_; // start at BuffSz boundary
+            this.maxHi_ = this.lo_ + (long) this.buff_.length;
+            if (this.diskPos_ != this.lo_)
+            {
+                super.seek(this.lo_);
+                this.diskPos_ = this.lo_;
             }
-
-            if (peekCP == CodePoint.XARETVAL) {
-                foundInPass = true;
-                xaretval = parseXARETVAL();
-                conn.xares_.callInfoArray_[conn.currXACallInfoOffset_].xaRetVal_ =
-                        xaretval;
-                peekCP = peekCodePoint();
-            }
-
-            if (peekCP == CodePoint.SYNCTYPE) {
-                foundInPass = true;
-                synctype = parseSYNCTYPE();
-                peekCP = peekCodePoint();
-            }
-
-            if (peekCP == CodePoint.PRPHRCLST) {
-                foundInPass = true;
-                indoubtTransactions = parseIndoubtList();
-                conn.setIndoubtTransactions(indoubtTransactions);
-                peekCP = peekCodePoint();
-            }
-
-            if (!foundInPass) {
-                doPrmnsprmSemantics(peekCP);
+            int n = this.fillBuffer();
+            this.hi_ = this.lo_ + (long) n;
+        }
+        else
+        {
+            // seeking inside current buffer -- no read required
+            if (pos < this.curr_)
+            {
+                // if seeking backwards, we must flush to maintain V4
+                this.flushBuffer();
             }
         }
-        popCollectionStack();
-
-
-        return xaretval;
-
+        this.curr_ = pos;
+    }
+    
+    public long getFilePointer()
+    {
+        return this.curr_;
     }
 
-    // Process XA return value
-    protected int parseXARETVAL() throws DisconnectException {
-        parseLengthAndMatchCodePoint(CodePoint.XARETVAL);
-        return readInt();
+    public long length() throws IOException
+    {
+        // max accounts for the case where we have written past the old file length, but not yet flushed our buffer
+        return Math.max(this.curr_, super.length());
     }
 
-    // Process XA return value
-    protected byte parseSYNCTYPE() throws DisconnectException {
-        parseLengthAndMatchCodePoint(CodePoint.SYNCTYPE);
-        return readByte();
-    }
-
-    // This method handles the parsing of all command replies and reply data
-    // for the SYNNCTL command.
-    protected int parseSYNCCTLreply(ConnectionCallbackInterface connection) throws DisconnectException {
-        int retval = 0;
-        int peekCP = peekCodePoint();
-
-        if (peekCP != CodePoint.SYNCCRD) {
-            parseSYNCCTLError(peekCP);
-            return -1;
+    public int read() throws IOException
+    {
+        if (this.curr_ >= this.hi_)
+        {
+            // test for EOF
+            // if (this.hi < this.maxHi) return -1;
+            if (this.hitEOF_)
+                return -1;
+            
+            // slow path -- read another buffer
+            this.seek(this.curr_);
+            if (this.curr_ == this.hi_)
+                return -1;
         }
-        retval = parseSYNCCRD(connection);
-
-        peekCP = peekCodePoint();
-        while (peekCP == CodePoint.SQLSTT) {
-            String s = parseSQLSTT();
-            //JCFTMP, need to null out the client list?
-            netAgent_.netConnection_.xares_.addSpecialRegisters(s);
-            peekCP = peekCodePoint();
+        byte res = this.buff_[(int) (this.curr_ - this.lo_)];
+        this.curr_++;
+        return ((int) res) & 0xFF; // convert byte -> int
+    }
+    
+    public int read(byte[] b) throws IOException
+    {
+        return this.read(b, 0, b.length);
+    }
+    
+    public int read(byte[] b, int off, int len) throws IOException
+    {
+        if (this.curr_ >= this.hi_)
+        {
+            // test for EOF
+            // if (this.hi < this.maxHi) return -1;
+            if (this.hitEOF_)
+                return -1;
+            
+            // slow path -- read another buffer
+            this.seek(this.curr_);
+            if (this.curr_ == this.hi_)
+                return -1;
         }
-
-        return retval;
+        len = Math.min(len, (int) (this.hi_ - this.curr_));
+        int buffOff = (int) (this.curr_ - this.lo_);
+        System.arraycopy(this.buff_, buffOff, b, off, len);
+        this.curr_ += len;
+        return len;
     }
-
-
-    //------------------------parse DDM Scalars-----------------------------
-
-
-
-
-    private String parseSQLSTT() throws DisconnectException {
-        parseLengthAndMatchCodePoint(CodePoint.SQLSTT);
-        return parseSQLSTTGRPNOCMorNOCS();
-    }
-
-    private String parseSQLSTTGRPNOCMorNOCS() throws DisconnectException {
-        int mixedNullInd = readUnsignedByte();
-        int singleNullInd = 0;
-        String sqlsttString = null;
-        int stringLength = 0;
-
-        if (mixedNullInd == CodePoint.NULLDATA) {
-            singleNullInd = readUnsignedByte();
-            if (singleNullInd == CodePoint.NULLDATA) {
-                // throw DTAMCHRM
-                doDtamchrmSemantics();
+    
+    public void write(int b) throws IOException
+    {
+        if (this.curr_ >= this.hi_)
+        {
+            if (this.hitEOF_ && this.hi_ < this.maxHi_)
+            {
+                // at EOF -- bump "hi"
+                this.hi_++;
             }
-            // read 4-byte length
-            stringLength = readInt();
-            // read sqlstt string
-            sqlsttString = readString(stringLength, netAgent_.targetTypdef_.getCcsidSbcEncoding());
-        } else {
-            // read 4-byte length
-            stringLength = readInt();
-            // read sqlstt string
-            sqlsttString = readString(stringLength, netAgent_.targetTypdef_.getCcsidMbcEncoding());
-            // read null indicator
-            singleNullInd = readUnsignedByte();
+            else
+            {
+                // slow path -- write current buffer; read next one
+                this.seek(this.curr_);
+                if (this.curr_ == this.hi_)
+                {
+                    // appending to EOF -- bump "hi"
+                    this.hi_++;
+                }
+            }
         }
-        return sqlsttString;
+        this.buff_[(int) (this.curr_ - this.lo_)] = (byte) b;
+        this.curr_++;
+        this.dirty_ = true;
+        syncNeeded_ = true;
     }
-
-
-    protected int parseXIDCNT() throws DisconnectException {
-        parseLengthAndMatchCodePoint(CodePoint.XIDCNT);
-        return readUnsignedShort();
+    
+    public void write(byte[] b) throws IOException
+    {
+        this.write(b, 0, b.length);
     }
-
-    protected Xid parseXID() throws DisconnectException {
-        parseLengthAndMatchCodePoint(CodePoint.XID);
-        int formatId = readInt();
-        int gtridLen = readInt();
-        int bqualLen = readInt();
-        byte[] gtrid = readBytes(gtridLen);
-        byte[] bqual = readBytes(bqualLen);
-
-        return new org.apache.derby.client.ClientXid(formatId, gtrid, bqual);
-    }
-
-    protected java.util.Hashtable parseIndoubtList() throws DisconnectException {
-        boolean found = false;
-        int port = 0;
-        int numXid = 0;
-        String sIpAddr = null;
-        int peekCP = peekCodePoint();
-        parseLengthAndMatchCodePoint(CodePoint.PRPHRCLST);
-        peekCP = peekCodePoint();
-        if (peekCP == CodePoint.XIDCNT) {
-            found = true;
-            numXid = parseXIDCNT();
-            peekCP = peekCodePoint();
+    
+    public void write(byte[] b, int off, int len) throws IOException
+    {        
+        while (len > 0)
+        {              
+            int n = this.writeAtMost(b, off, len);
+            off += n;
+            len -= n;
+            this.dirty_ = true;
+            syncNeeded_ = true;
         }
-
-        java.util.Hashtable indoubtTransactions = new java.util.Hashtable();
-        while (peekCP == CodePoint.XID) {
-            Xid xid = parseXID();
-            indoubtTransactions.put(xid, new NetIndoubtTransaction(xid, null, null, null, sIpAddr, port));
-            peekCP = peekCodePoint();
+    }
+    
+    /*
+     * Write at most "len" bytes to "b" starting at position "off", and return
+     * the number of bytes written.
+     */
+    private int writeAtMost(byte[] b, int off, int len) throws IOException
+    {        
+        if (this.curr_ >= this.hi_)
+        {
+            if (this.hitEOF_ && this.hi_ < this.maxHi_)
+            {
+                // at EOF -- bump "hi"
+                this.hi_ = this.maxHi_;
+            }
+            else
+            {                                
+                // slow path -- write current buffer; read next one                
+                this.seek(this.curr_);
+                if (this.curr_ == this.hi_)
+                {
+                    // appending to EOF -- bump "hi"
+                    this.hi_ = this.maxHi_;
+                }
+            }
         }
-
-        return indoubtTransactions;
+        len = Math.min(len, (int) (this.hi_ - this.curr_));
+        int buffOff = (int) (this.curr_ - this.lo_);
+        System.arraycopy(b, off, this.buff_, buffOff, len);
+        this.curr_ += len;
+        return len;
     }
 
+    public boolean isEOF() throws IOException
+    {
+        return getFilePointer() == length();
+    }
+
+    public void mark()
+    {
+        markedPointer = getFilePointer();
+    }
+
+    public void reset() throws IOException
+    {
+        seek(markedPointer);
+    }
+
+    public int bytesPastMark()
+    {
+        long bytes = getFilePointer() - markedPointer;
+        assert bytes >= 0;
+        if (bytes > Integer.MAX_VALUE)
+            throw new UnsupportedOperationException("Overflow: " + bytes);
+        return (int) bytes;
+    }
 }
-
-

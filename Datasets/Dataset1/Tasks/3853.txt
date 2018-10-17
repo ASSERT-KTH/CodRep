@@ -1,6 +1,7 @@
-CheckHits.checkHitCollector(random, query, PayloadHelper.NO_PAYLOAD_FIELD, searcher, results);
+return openInput(name, BufferedIndexInput.BUFFER_SIZE);
 
-package org.apache.lucene.search.payloads;
+package org.apache.lucene.store;
+
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -18,324 +19,606 @@ package org.apache.lucene.search.payloads;
  * limitations under the License.
  */
 
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.English;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.QueryUtils;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.CheckHits;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.DefaultSimilarity;
-import org.apache.lucene.search.spans.SpanTermQuery;
-import org.apache.lucene.search.spans.Spans;
-import org.apache.lucene.search.spans.TermSpans;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.MockTokenizer;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.analysis.TokenFilter;
-import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Payload;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.SlowMultiReaderWrapper;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-
-import java.io.Reader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Hashtable;
 
+import org.apache.lucene.index.IndexFileNameFilter;
+
+// Used only for WRITE_LOCK_NAME in deprecated create=true case:
+import org.apache.lucene.index.IndexWriter;
 
 /**
+ * Straightforward implementation of {@link Directory} as a directory of files.
+ * Locking implementation is by default the {@link SimpleFSLockFactory}, but
+ * can be changed either by passing in a {@link LockFactory} instance to
+ * <code>getDirectory</code>, or specifying the LockFactory class by setting
+ * <code>org.apache.lucene.store.FSDirectoryLockFactoryClass</code> Java system
+ * property, or by calling {@link #setLockFactory} after creating
+ * the Directory.
+
+ * <p>Directories are cached, so that, for a given canonical
+ * path, the same FSDirectory instance will always be
+ * returned by <code>getDirectory</code>.  This permits
+ * synchronization on directories.</p>
  *
- *
- **/
-public class TestPayloadTermQuery extends LuceneTestCase {
-  private IndexSearcher searcher;
-  private IndexReader reader;
-  private BoostingSimilarity similarity = new BoostingSimilarity();
-  private byte[] payloadField = new byte[]{1};
-  private byte[] payloadMultiField1 = new byte[]{2};
-  private byte[] payloadMultiField2 = new byte[]{4};
-  protected Directory directory;
+ * @see Directory
+ * @author Doug Cutting
+ */
+public class FSDirectory extends Directory {
+    
+  /** This cache of directories ensures that there is a unique Directory
+   * instance per path, so that synchronization on the Directory can be used to
+   * synchronize access between readers and writers.  We use
+   * refcounts to ensure when the last use of an FSDirectory
+   * instance for a given canonical path is closed, we remove the
+   * instance from the cache.  See LUCENE-776
+   * for some relevant discussion.
+   */
+  private static final Hashtable DIRECTORIES = new Hashtable();
 
-  private class PayloadAnalyzer extends Analyzer {
+  private static boolean disableLocks = false;
 
+  // TODO: should this move up to the Directory base class?  Also: should we
+  // make a per-instance (in addition to the static "default") version?
 
-    @Override
-    public TokenStream tokenStream(String fieldName, Reader reader) {
-      TokenStream result = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
-      result = new PayloadFilter(result, fieldName);
-      return result;
+  /**
+   * Set whether Lucene's use of lock files is disabled. By default, 
+   * lock files are enabled. They should only be disabled if the index
+   * is on a read-only medium like a CD-ROM.
+   */
+  public static void setDisableLocks(boolean doDisableLocks) {
+    FSDirectory.disableLocks = doDisableLocks;
+  }
+
+  /**
+   * Returns whether Lucene's use of lock files is disabled.
+   * @return true if locks are disabled, false if locks are enabled.
+   */
+  public static boolean getDisableLocks() {
+    return FSDirectory.disableLocks;
+  }
+
+  /**
+   * Directory specified by <code>org.apache.lucene.lockDir</code>
+   * or <code>java.io.tmpdir</code> system property.
+
+   * @deprecated As of 2.1, <code>LOCK_DIR</code> is unused
+   * because the write.lock is now stored by default in the
+   * index directory.  If you really want to store locks
+   * elsewhere you can create your own {@link
+   * SimpleFSLockFactory} (or {@link NativeFSLockFactory},
+   * etc.) passing in your preferred lock directory.  Then,
+   * pass this <code>LockFactory</code> instance to one of
+   * the <code>getDirectory</code> methods that take a
+   * <code>lockFactory</code> (for example, {@link #getDirectory(String, LockFactory)}).
+   */
+  public static final String LOCK_DIR = System.getProperty("org.apache.lucene.lockDir",
+                                                           System.getProperty("java.io.tmpdir"));
+
+  /** The default class which implements filesystem-based directories. */
+  private static Class IMPL;
+  static {
+    try {
+      String name =
+        System.getProperty("org.apache.lucene.FSDirectory.class",
+                           FSDirectory.class.getName());
+      IMPL = Class.forName(name);
+    } catch (ClassNotFoundException e) {
+      throw new RuntimeException("cannot load FSDirectory class: " + e.toString(), e);
+    } catch (SecurityException se) {
+      try {
+        IMPL = Class.forName(FSDirectory.class.getName());
+      } catch (ClassNotFoundException e) {
+        throw new RuntimeException("cannot load default FSDirectory class: " + e.toString(), e);
+      }
     }
   }
 
-  private class PayloadFilter extends TokenFilter {
-    String fieldName;
-    int numSeen = 0;
-    
-    PayloadAttribute payloadAtt;    
-    
-    public PayloadFilter(TokenStream input, String fieldName) {
-      super(input);
-      this.fieldName = fieldName;
-      payloadAtt = addAttribute(PayloadAttribute.class);
+  private static MessageDigest DIGESTER;
+
+  static {
+    try {
+      DIGESTER = MessageDigest.getInstance("MD5");
+    } catch (NoSuchAlgorithmException e) {
+        throw new RuntimeException(e.toString(), e);
     }
-    
-    @Override
-    public boolean incrementToken() throws IOException {
-      boolean hasNext = input.incrementToken();
-      if (hasNext) {
-        if (fieldName.equals("field")) {
-          payloadAtt.setPayload(new Payload(payloadField));
-        } else if (fieldName.equals("multiField")) {
-          if (numSeen % 2 == 0) {
-            payloadAtt.setPayload(new Payload(payloadMultiField1));
-          } else {
-            payloadAtt.setPayload(new Payload(payloadMultiField2));
-          }
-          numSeen++;
+  }
+
+  /** A buffer optionally used in renameTo method */
+  private byte[] buffer = null;
+
+  /** Returns the directory instance for the named location.
+   * @param path the path to the directory.
+   * @return the FSDirectory for the named file.  */
+  public static FSDirectory getDirectory(String path)
+      throws IOException {
+    return getDirectory(new File(path), null);
+  }
+
+  /** Returns the directory instance for the named location.
+   * @param path the path to the directory.
+   * @param lockFactory instance of {@link LockFactory} providing the
+   *        locking implementation.
+   * @return the FSDirectory for the named file.  */
+  public static FSDirectory getDirectory(String path, LockFactory lockFactory)
+      throws IOException {
+    return getDirectory(new File(path), lockFactory);
+  }
+
+  /** Returns the directory instance for the named location.
+   * @param file the path to the directory.
+   * @return the FSDirectory for the named file.  */
+  public static FSDirectory getDirectory(File file)
+    throws IOException {
+    return getDirectory(file, null);
+  }
+
+  /** Returns the directory instance for the named location.
+   * @param file the path to the directory.
+   * @param lockFactory instance of {@link LockFactory} providing the
+   *        locking implementation.
+   * @return the FSDirectory for the named file.  */
+  public static FSDirectory getDirectory(File file, LockFactory lockFactory)
+    throws IOException
+  {
+    file = new File(file.getCanonicalPath());
+
+    if (file.exists() && !file.isDirectory())
+      throw new IOException(file + " not a directory");
+
+    if (!file.exists())
+      if (!file.mkdirs())
+        throw new IOException("Cannot create directory: " + file);
+
+    FSDirectory dir;
+    synchronized (DIRECTORIES) {
+      dir = (FSDirectory)DIRECTORIES.get(file);
+      if (dir == null) {
+        try {
+          dir = (FSDirectory)IMPL.newInstance();
+        } catch (Exception e) {
+          throw new RuntimeException("cannot load FSDirectory class: " + e.toString(), e);
         }
-        return true;
+        dir.init(file, lockFactory);
+        DIRECTORIES.put(file, dir);
       } else {
-        return false;
+        // Catch the case where a Directory is pulled from the cache, but has a
+        // different LockFactory instance.
+        if (lockFactory != null && lockFactory != dir.getLockFactory()) {
+          throw new IOException("Directory was previously created with a different LockFactory instance; please pass null as the lockFactory instance and use setLockFactory to change it");
+        }
+      }
+    }
+    synchronized (dir) {
+      dir.refCount++;
+    }
+    return dir;
+  }
+
+
+  /** Returns the directory instance for the named location.
+   *
+   * @deprecated Use IndexWriter's create flag, instead, to
+   * create a new index.
+   *
+   * @param path the path to the directory.
+   * @param create if true, create, or erase any existing contents.
+   * @return the FSDirectory for the named file.  */
+  public static FSDirectory getDirectory(String path, boolean create)
+      throws IOException {
+    return getDirectory(new File(path), create);
+  }
+
+  /** Returns the directory instance for the named location.
+   *
+   * @deprecated Use IndexWriter's create flag, instead, to
+   * create a new index.
+   *
+   * @param file the path to the directory.
+   * @param create if true, create, or erase any existing contents.
+   * @return the FSDirectory for the named file.  */
+  public static FSDirectory getDirectory(File file, boolean create)
+    throws IOException
+  {
+    FSDirectory dir = getDirectory(file, null);
+
+    // This is now deprecated (creation should only be done
+    // by IndexWriter):
+    if (create) {
+      dir.create();
+    }
+
+    return dir;
+  }
+
+  private void create() throws IOException {
+    if (directory.exists()) {
+      String[] files = directory.list(IndexFileNameFilter.getFilter());            // clear old files
+      if (files == null)
+        throw new IOException("cannot read directory " + directory.getAbsolutePath() + ": list() returned null");
+      for (int i = 0; i < files.length; i++) {
+        File file = new File(directory, files[i]);
+        if (!file.delete())
+          throw new IOException("Cannot delete " + file);
+      }
+    }
+    lockFactory.clearLock(IndexWriter.WRITE_LOCK_NAME);
+  }
+
+  private File directory = null;
+  private int refCount;
+
+  protected FSDirectory() {};                     // permit subclassing
+
+  private void init(File path, LockFactory lockFactory) throws IOException {
+
+    // Set up lockFactory with cascaded defaults: if an instance was passed in,
+    // use that; else if locks are disabled, use NoLockFactory; else if the
+    // system property org.apache.lucene.store.FSDirectoryLockFactoryClass is set,
+    // instantiate that; else, use SimpleFSLockFactory:
+
+    directory = path;
+
+    boolean doClearLockID = false;
+
+    if (lockFactory == null) {
+
+      if (disableLocks) {
+        // Locks are disabled:
+        lockFactory = NoLockFactory.getNoLockFactory();
+      } else {
+        String lockClassName = System.getProperty("org.apache.lucene.store.FSDirectoryLockFactoryClass");
+
+        if (lockClassName != null && !lockClassName.equals("")) {
+          Class c;
+
+          try {
+            c = Class.forName(lockClassName);
+          } catch (ClassNotFoundException e) {
+            throw new IOException("unable to find LockClass " + lockClassName);
+          }
+
+          try {
+            lockFactory = (LockFactory) c.newInstance();          
+          } catch (IllegalAccessException e) {
+            throw new IOException("IllegalAccessException when instantiating LockClass " + lockClassName);
+          } catch (InstantiationException e) {
+            throw new IOException("InstantiationException when instantiating LockClass " + lockClassName);
+          } catch (ClassCastException e) {
+            throw new IOException("unable to cast LockClass " + lockClassName + " instance to a LockFactory");
+          }
+
+          if (lockFactory instanceof NativeFSLockFactory) {
+            ((NativeFSLockFactory) lockFactory).setLockDir(path);
+          } else if (lockFactory instanceof SimpleFSLockFactory) {
+            ((SimpleFSLockFactory) lockFactory).setLockDir(path);
+          }
+        } else {
+          // Our default lock is SimpleFSLockFactory;
+          // default lockDir is our index directory:
+          lockFactory = new SimpleFSLockFactory(path);
+          doClearLockID = true;
+        }
+      }
+    }
+
+    setLockFactory(lockFactory);
+
+    if (doClearLockID) {
+      // Clear the prefix because write.lock will be
+      // stored in our directory:
+      lockFactory.setLockPrefix(null);
+    }
+  }
+
+  /** Returns an array of strings, one for each Lucene index file in the directory. */
+  public String[] list() {
+    return directory.list(IndexFileNameFilter.getFilter());
+  }
+
+  /** Returns true iff a file with the given name exists. */
+  public boolean fileExists(String name) {
+    File file = new File(directory, name);
+    return file.exists();
+  }
+
+  /** Returns the time the named file was last modified. */
+  public long fileModified(String name) {
+    File file = new File(directory, name);
+    return file.lastModified();
+  }
+
+  /** Returns the time the named file was last modified. */
+  public static long fileModified(File directory, String name) {
+    File file = new File(directory, name);
+    return file.lastModified();
+  }
+
+  /** Set the modified time of an existing file to now. */
+  public void touchFile(String name) {
+    File file = new File(directory, name);
+    file.setLastModified(System.currentTimeMillis());
+  }
+
+  /** Returns the length in bytes of a file in the directory. */
+  public long fileLength(String name) {
+    File file = new File(directory, name);
+    return file.length();
+  }
+
+  /** Removes an existing file in the directory. */
+  public void deleteFile(String name) throws IOException {
+    File file = new File(directory, name);
+    if (!file.delete())
+      throw new IOException("Cannot delete " + file);
+  }
+
+  /** Renames an existing file in the directory. 
+   * Warning: This is not atomic.
+   * @deprecated 
+   */
+  public synchronized void renameFile(String from, String to)
+      throws IOException {
+    File old = new File(directory, from);
+    File nu = new File(directory, to);
+
+    /* This is not atomic.  If the program crashes between the call to
+       delete() and the call to renameTo() then we're screwed, but I've
+       been unable to figure out how else to do this... */
+
+    if (nu.exists())
+      if (!nu.delete())
+        throw new IOException("Cannot delete " + nu);
+
+    // Rename the old file to the new one. Unfortunately, the renameTo()
+    // method does not work reliably under some JVMs.  Therefore, if the
+    // rename fails, we manually rename by copying the old file to the new one
+    if (!old.renameTo(nu)) {
+      java.io.InputStream in = null;
+      java.io.OutputStream out = null;
+      try {
+        in = new FileInputStream(old);
+        out = new FileOutputStream(nu);
+        // see if the buffer needs to be initialized. Initialization is
+        // only done on-demand since many VM's will never run into the renameTo
+        // bug and hence shouldn't waste 1K of mem for no reason.
+        if (buffer == null) {
+          buffer = new byte[1024];
+        }
+        int len;
+        while ((len = in.read(buffer)) >= 0) {
+          out.write(buffer, 0, len);
+        }
+
+        // delete the old file.
+        old.delete();
+      }
+      catch (IOException ioe) {
+        IOException newExc = new IOException("Cannot rename " + old + " to " + nu);
+        newExc.initCause(ioe);
+        throw newExc;
+      }
+      finally {
+        try {
+          if (in != null) {
+            try {
+              in.close();
+            } catch (IOException e) {
+              throw new RuntimeException("Cannot close input stream: " + e.toString(), e);
+            }
+          }
+        } finally {
+          if (out != null) {
+            try {
+              out.close();
+            } catch (IOException e) {
+              throw new RuntimeException("Cannot close output stream: " + e.toString(), e);
+            }
+          }
+        }
       }
     }
   }
 
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    directory = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random, directory, 
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new PayloadAnalyzer())
-        .setSimilarity(similarity));
-    //writer.infoStream = System.out;
-    for (int i = 0; i < 1000; i++) {
-      Document doc = new Document();
-      Field noPayloadField = newField(PayloadHelper.NO_PAYLOAD_FIELD, English.intToEnglish(i), Field.Store.YES, Field.Index.ANALYZED);
-      //noPayloadField.setBoost(0);
-      doc.add(noPayloadField);
-      doc.add(newField("field", English.intToEnglish(i), Field.Store.YES, Field.Index.ANALYZED));
-      doc.add(newField("multiField", English.intToEnglish(i) + "  " + English.intToEnglish(i), Field.Store.YES, Field.Index.ANALYZED));
-      writer.addDocument(doc);
-    }
-    reader = writer.getReader();
-    writer.close();
+  /** Creates a new, empty file in the directory with the given name.
+      Returns a stream writing this file. */
+  public IndexOutput createOutput(String name) throws IOException {
 
-    searcher = new IndexSearcher(SlowMultiReaderWrapper.wrap(reader));
-    searcher.setSimilarity(similarity);
+    File file = new File(directory, name);
+    if (file.exists() && !file.delete())          // delete existing, if any
+      throw new IOException("Cannot overwrite: " + file);
+
+    return new FSIndexOutput(file);
   }
 
-  @Override
-  public void tearDown() throws Exception {
-    searcher.close();
-    reader.close();
-    directory.close();
-    super.tearDown();
+  // Inherit javadoc
+  public IndexInput openInput(String name) throws IOException {
+    return new FSIndexInput(new File(directory, name));
   }
 
-  public void test() throws IOException {
-    PayloadTermQuery query = new PayloadTermQuery(new Term("field", "seventy"),
-            new MaxPayloadFunction());
-    TopDocs hits = searcher.search(query, null, 100);
-    assertTrue("hits is null and it shouldn't be", hits != null);
-    assertTrue("hits Size: " + hits.totalHits + " is not: " + 100, hits.totalHits == 100);
-
-    //they should all have the exact same score, because they all contain seventy once, and we set
-    //all the other similarity factors to be 1
-
-    assertTrue(hits.getMaxScore() + " does not equal: " + 1, hits.getMaxScore() == 1);
-    for (int i = 0; i < hits.scoreDocs.length; i++) {
-      ScoreDoc doc = hits.scoreDocs[i];
-      assertTrue(doc.score + " does not equal: " + 1, doc.score == 1);
-    }
-    CheckHits.checkExplanations(query, PayloadHelper.FIELD, searcher, true);
-    Spans spans = query.getSpans(searcher.getIndexReader());
-    assertTrue("spans is null and it shouldn't be", spans != null);
-    assertTrue("spans is not an instanceof " + TermSpans.class, spans instanceof TermSpans);
-    /*float score = hits.score(0);
-    for (int i =1; i < hits.length(); i++)
-    {
-      assertTrue("scores are not equal and they should be", score == hits.score(i));
-    }*/
-
+  // Inherit javadoc
+  public IndexInput openInput(String name, int bufferSize) throws IOException {
+    return new FSIndexInput(new File(directory, name), bufferSize);
   }
+
+  /**
+   * So we can do some byte-to-hexchar conversion below
+   */
+  private static final char[] HEX_DIGITS =
+  {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
+
   
-  public void testQuery() {
-    PayloadTermQuery boostingFuncTermQuery = new PayloadTermQuery(new Term(PayloadHelper.MULTI_FIELD, "seventy"),
-        new MaxPayloadFunction());
-    QueryUtils.check(boostingFuncTermQuery);
-    
-    SpanTermQuery spanTermQuery = new SpanTermQuery(new Term(PayloadHelper.MULTI_FIELD, "seventy"));
+  public String getLockID() {
+    String dirName;                               // name to be hashed
+    try {
+      dirName = directory.getCanonicalPath();
+    } catch (IOException e) {
+      throw new RuntimeException(e.toString(), e);
+    }
 
-    assertTrue(boostingFuncTermQuery.equals(spanTermQuery) == spanTermQuery.equals(boostingFuncTermQuery));
-    
-    PayloadTermQuery boostingFuncTermQuery2 = new PayloadTermQuery(new Term(PayloadHelper.MULTI_FIELD, "seventy"),
-        new AveragePayloadFunction());
-    
-    QueryUtils.checkUnequal(boostingFuncTermQuery, boostingFuncTermQuery2);
+    byte digest[];
+    synchronized (DIGESTER) {
+      digest = DIGESTER.digest(dirName.getBytes());
+    }
+    StringBuffer buf = new StringBuffer();
+    buf.append("lucene-");
+    for (int i = 0; i < digest.length; i++) {
+      int b = digest[i];
+      buf.append(HEX_DIGITS[(b >> 4) & 0xf]);
+      buf.append(HEX_DIGITS[b & 0xf]);
+    }
+
+    return buf.toString();
   }
 
-  public void testMultipleMatchesPerDoc() throws Exception {
-    PayloadTermQuery query = new PayloadTermQuery(new Term(PayloadHelper.MULTI_FIELD, "seventy"),
-            new MaxPayloadFunction());
-    TopDocs hits = searcher.search(query, null, 100);
-    assertTrue("hits is null and it shouldn't be", hits != null);
-    assertTrue("hits Size: " + hits.totalHits + " is not: " + 100, hits.totalHits == 100);
-
-    //they should all have the exact same score, because they all contain seventy once, and we set
-    //all the other similarity factors to be 1
-
-    //System.out.println("Hash: " + seventyHash + " Twice Hash: " + 2*seventyHash);
-    assertTrue(hits.getMaxScore() + " does not equal: " + 4.0, hits.getMaxScore() == 4.0);
-    //there should be exactly 10 items that score a 4, all the rest should score a 2
-    //The 10 items are: 70 + i*100 where i in [0-9]
-    int numTens = 0;
-    for (int i = 0; i < hits.scoreDocs.length; i++) {
-      ScoreDoc doc = hits.scoreDocs[i];
-      if (doc.doc % 10 == 0) {
-        numTens++;
-        assertTrue(doc.score + " does not equal: " + 4.0, doc.score == 4.0);
-      } else {
-        assertTrue(doc.score + " does not equal: " + 2, doc.score == 2);
+  /** Closes the store to future operations. */
+  public synchronized void close() {
+    if (--refCount <= 0) {
+      synchronized (DIRECTORIES) {
+        DIRECTORIES.remove(directory);
       }
     }
-    assertTrue(numTens + " does not equal: " + 10, numTens == 10);
-    CheckHits.checkExplanations(query, "field", searcher, true);
-    Spans spans = query.getSpans(searcher.getIndexReader());
-    assertTrue("spans is null and it shouldn't be", spans != null);
-    assertTrue("spans is not an instanceof " + TermSpans.class, spans instanceof TermSpans);
-    //should be two matches per document
-    int count = 0;
-    //100 hits times 2 matches per hit, we should have 200 in count
-    while (spans.next()) {
-      count++;
-    }
-    assertTrue(count + " does not equal: " + 200, count == 200);
   }
 
-  //Set includeSpanScore to false, in which case just the payload score comes through.
-  public void testIgnoreSpanScorer() throws Exception {
-    PayloadTermQuery query = new PayloadTermQuery(new Term(PayloadHelper.MULTI_FIELD, "seventy"),
-            new MaxPayloadFunction(), false);
+  public File getFile() {
+    return directory;
+  }
 
-    IndexSearcher theSearcher = new IndexSearcher(directory, true);
-    theSearcher.setSimilarity(new FullSimilarity());
-    TopDocs hits = searcher.search(query, null, 100);
-    assertTrue("hits is null and it shouldn't be", hits != null);
-    assertTrue("hits Size: " + hits.totalHits + " is not: " + 100, hits.totalHits == 100);
+  /** For debug output. */
+  public String toString() {
+    return this.getClass().getName() + "@" + directory;
+  }
 
-    //they should all have the exact same score, because they all contain seventy once, and we set
-    //all the other similarity factors to be 1
-
-    //System.out.println("Hash: " + seventyHash + " Twice Hash: " + 2*seventyHash);
-    assertTrue(hits.getMaxScore() + " does not equal: " + 4.0, hits.getMaxScore() == 4.0);
-    //there should be exactly 10 items that score a 4, all the rest should score a 2
-    //The 10 items are: 70 + i*100 where i in [0-9]
-    int numTens = 0;
-    for (int i = 0; i < hits.scoreDocs.length; i++) {
-      ScoreDoc doc = hits.scoreDocs[i];
-      if (doc.doc % 10 == 0) {
-        numTens++;
-        assertTrue(doc.score + " does not equal: " + 4.0, doc.score == 4.0);
-      } else {
-        assertTrue(doc.score + " does not equal: " + 2, doc.score == 2);
+  protected static class FSIndexInput extends BufferedIndexInput {
+  
+    private static class Descriptor extends RandomAccessFile {
+      // remember if the file is open, so that we don't try to close it
+      // more than once
+      private boolean isOpen;
+      long position;
+      final long length;
+      
+      public Descriptor(File file, String mode) throws IOException {
+        super(file, mode);
+        isOpen=true;
+        length=length();
+      }
+  
+      public void close() throws IOException {
+        if (isOpen) {
+          isOpen=false;
+          super.close();
+        }
+      }
+  
+      protected void finalize() throws Throwable {
+        try {
+          close();
+        } finally {
+          super.finalize();
+        }
       }
     }
-    assertTrue(numTens + " does not equal: " + 10, numTens == 10);
-    CheckHits.checkExplanations(query, "field", searcher, true);
-    Spans spans = query.getSpans(searcher.getIndexReader());
-    assertTrue("spans is null and it shouldn't be", spans != null);
-    assertTrue("spans is not an instanceof " + TermSpans.class, spans instanceof TermSpans);
-    //should be two matches per document
-    int count = 0;
-    //100 hits times 2 matches per hit, we should have 200 in count
-    while (spans.next()) {
-      count++;
+  
+    private final Descriptor file;
+    boolean isClone;
+  
+    public FSIndexInput(File path) throws IOException {
+      this(path, BufferedIndexInput.BUFFER_SIZE);
     }
-    theSearcher.close();
-  }
-
-  public void testNoMatch() throws Exception {
-    PayloadTermQuery query = new PayloadTermQuery(new Term(PayloadHelper.FIELD, "junk"),
-            new MaxPayloadFunction());
-    TopDocs hits = searcher.search(query, null, 100);
-    assertTrue("hits is null and it shouldn't be", hits != null);
-    assertTrue("hits Size: " + hits.totalHits + " is not: " + 0, hits.totalHits == 0);
-
-  }
-
-  public void testNoPayload() throws Exception {
-    PayloadTermQuery q1 = new PayloadTermQuery(new Term(PayloadHelper.NO_PAYLOAD_FIELD, "zero"),
-            new MaxPayloadFunction());
-    PayloadTermQuery q2 = new PayloadTermQuery(new Term(PayloadHelper.NO_PAYLOAD_FIELD, "foo"),
-            new MaxPayloadFunction());
-    BooleanClause c1 = new BooleanClause(q1, BooleanClause.Occur.MUST);
-    BooleanClause c2 = new BooleanClause(q2, BooleanClause.Occur.MUST_NOT);
-    BooleanQuery query = new BooleanQuery();
-    query.add(c1);
-    query.add(c2);
-    TopDocs hits = searcher.search(query, null, 100);
-    assertTrue("hits is null and it shouldn't be", hits != null);
-    assertTrue("hits Size: " + hits.totalHits + " is not: " + 1, hits.totalHits == 1);
-    int[] results = new int[1];
-    results[0] = 0;//hits.scoreDocs[0].doc;
-    CheckHits.checkHitCollector(query, PayloadHelper.NO_PAYLOAD_FIELD, searcher, results);
-  }
-
-  // must be static for weight serialization tests 
-  static class BoostingSimilarity extends DefaultSimilarity {
-
-    // TODO: Remove warning after API has been finalized
-    @Override
-    public float scorePayload(int docId, String fieldName, int start, int end, byte[] payload, int offset, int length) {
-      //we know it is size 4 here, so ignore the offset/length
-      return payload[0];
+  
+    public FSIndexInput(File path, int bufferSize) throws IOException {
+      super(bufferSize);
+      file = new Descriptor(path, "r");
     }
-
-    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    //Make everything else 1 so we see the effect of the payload
-    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    @Override
-    public float lengthNorm(String fieldName, int numTerms) {
-      return 1;
+  
+    /** IndexInput methods */
+    protected void readInternal(byte[] b, int offset, int len)
+         throws IOException {
+      synchronized (file) {
+        long position = getFilePointer();
+        if (position != file.position) {
+          file.seek(position);
+          file.position = position;
+        }
+        int total = 0;
+        do {
+          int i = file.read(b, offset+total, len-total);
+          if (i == -1)
+            throw new IOException("read past EOF");
+          file.position += i;
+          total += i;
+        } while (total < len);
+      }
     }
-
-    @Override
-    public float queryNorm(float sumOfSquaredWeights) {
-      return 1;
+  
+    public void close() throws IOException {
+      // only close the file if this is not a clone
+      if (!isClone) file.close();
     }
-
-    @Override
-    public float sloppyFreq(int distance) {
-      return 1;
+  
+    protected void seekInternal(long position) {
     }
-
-    @Override
-    public float coord(int overlap, int maxOverlap) {
-      return 1;
+  
+    public long length() {
+      return file.length;
     }
-
-    @Override
-    public float idf(int docFreq, int numDocs) {
-      return 1;
+  
+    public Object clone() {
+      FSIndexInput clone = (FSIndexInput)super.clone();
+      clone.isClone = true;
+      return clone;
     }
-
-    @Override
-    public float tf(float freq) {
-      return freq == 0 ? 0 : 1;
+  
+    /** Method used for testing. Returns true if the underlying
+     *  file descriptor is valid.
+     */
+    boolean isFDValid() throws IOException {
+      return file.getFD().valid();
     }
   }
 
-  static class FullSimilarity extends DefaultSimilarity{
-    public float scorePayload(int docId, String fieldName, byte[] payload, int offset, int length) {
-      //we know it is size 4 here, so ignore the offset/length
-      return payload[0];
+  protected static class FSIndexOutput extends BufferedIndexOutput {
+    RandomAccessFile file = null;
+  
+    // remember if the file is open, so that we don't try to close it
+    // more than once
+    private boolean isOpen;
+
+    public FSIndexOutput(File path) throws IOException {
+      file = new RandomAccessFile(path, "rw");
+      isOpen = true;
+    }
+  
+    /** output methods: */
+    public void flushBuffer(byte[] b, int offset, int size) throws IOException {
+      file.write(b, offset, size);
+    }
+    public void close() throws IOException {
+      // only close the file if it has not been closed yet
+      if (isOpen) {
+        super.close();
+        file.close();
+        isOpen = false;
+      }
+    }
+  
+    /** Random-access methods */
+    public void seek(long pos) throws IOException {
+      super.seek(pos);
+      file.seek(pos);
+    }
+    public long length() throws IOException {
+      return file.length();
+    }
+    public void setLength(long length) throws IOException {
+      file.setLength(length);
     }
   }
-
 }

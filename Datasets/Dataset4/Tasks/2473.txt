@@ -1,13 +1,13 @@
-if (o == null || getClass() != o.getClass())
+values = indexFieldData.load(context).getBytesValues();
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,188 +19,291 @@ if (o == null || getClass() != o.getClass())
  * under the License.
  */
 
-package org.elasticsearch.common.lucene.search.function;
+package org.elasticsearch.search.facet.terms.strings;
 
+import com.google.common.collect.ImmutableSet;
 import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.*;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.ToStringUtils;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.UnicodeUtil;
+import org.elasticsearch.cache.recycler.CacheRecycler;
+import org.elasticsearch.common.collect.BoundedTreeSet;
+import org.elasticsearch.common.lease.Releasable;
+import org.elasticsearch.common.lease.Releasables;
+import org.elasticsearch.common.util.BigArrays;
+import org.elasticsearch.common.util.IntArray;
+import org.elasticsearch.index.fielddata.BytesValues;
+import org.elasticsearch.index.fielddata.IndexFieldData;
+import org.elasticsearch.index.fielddata.ordinals.Ordinals;
+import org.elasticsearch.search.facet.FacetExecutor;
+import org.elasticsearch.search.facet.InternalFacet;
+import org.elasticsearch.search.facet.terms.TermsFacet;
+import org.elasticsearch.search.facet.terms.support.EntryPriorityQueue;
+import org.elasticsearch.search.internal.SearchContext;
 
 import java.io.IOException;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * A query that allows for a pluggable boost function to be applied to it.
+ *
  */
-public class FunctionScoreQuery extends Query {
+public class TermsStringOrdinalsFacetExecutor extends FacetExecutor {
 
-    Query subQuery;
-    final ScoreFunction function;
-    float maxBoost = Float.MAX_VALUE;
-    CombineFunction combineFunction;
-    
-    public FunctionScoreQuery(Query subQuery, ScoreFunction function) {
-        this.subQuery = subQuery;
-        this.function = function;
-        this.combineFunction = function.getDefaultScoreCombiner();
-    }
+    private final IndexFieldData.WithOrdinals indexFieldData;
 
-    public void setCombineFunction(CombineFunction combineFunction) {
-        this.combineFunction = combineFunction;
-    }
-    
-    public void setMaxBoost(float maxBoost) {
-        this.maxBoost = maxBoost;
-    }
+    final CacheRecycler cacheRecycler;
+    final BigArrays bigArrays;
+    private final TermsFacet.ComparatorType comparatorType;
+    private final int size;
+    private final int shardSize;
+    private final int minCount;
+    private final ImmutableSet<BytesRef> excluded;
+    private final Matcher matcher;
+    final int ordinalsCacheAbove;
 
-    public float getMaxBoost() {
-        return this.maxBoost;
-    }
+    final List<ReaderAggregator> aggregators;
+    long missing;
+    long total;
 
-    public Query getSubQuery() {
-        return subQuery;
-    }
+    public TermsStringOrdinalsFacetExecutor(IndexFieldData.WithOrdinals indexFieldData, int size, int shardSize, TermsFacet.ComparatorType comparatorType, boolean allTerms, SearchContext context,
+                                            ImmutableSet<BytesRef> excluded, Pattern pattern, int ordinalsCacheAbove) {
+        this.indexFieldData = indexFieldData;
+        this.size = size;
+        this.shardSize = shardSize;
+        this.comparatorType = comparatorType;
+        this.ordinalsCacheAbove = ordinalsCacheAbove;
 
-    public ScoreFunction getFunction() {
-        return function;
+        if (excluded == null || excluded.isEmpty()) {
+            this.excluded = null;
+        } else {
+            this.excluded = excluded;
+        }
+        this.matcher = pattern != null ? pattern.matcher("") : null;
+
+        // minCount is offset by -1
+        if (allTerms) {
+            minCount = -1;
+        } else {
+            minCount = 0;
+        }
+
+        this.cacheRecycler = context.cacheRecycler();
+        this.bigArrays = context.bigArrays();
+
+        this.aggregators = new ArrayList<>(context.searcher().getIndexReader().leaves().size());
     }
 
     @Override
-    public Query rewrite(IndexReader reader) throws IOException {
-        Query newQ = subQuery.rewrite(reader);
-        if (newQ == subQuery) {
-            return this;
-        }
-        FunctionScoreQuery bq = (FunctionScoreQuery) this.clone();
-        bq.subQuery = newQ;
-        return bq;
+    public Collector collector() {
+        return new Collector();
     }
 
     @Override
-    public void extractTerms(Set<Term> terms) {
-        subQuery.extractTerms(terms);
-    }
-
-    @Override
-    public Weight createWeight(IndexSearcher searcher) throws IOException {
-        Weight subQueryWeight = subQuery.createWeight(searcher);
-        return new CustomBoostFactorWeight(subQueryWeight);
-    }
-
-    class CustomBoostFactorWeight extends Weight {
-
-        final Weight subQueryWeight;
-
-        public CustomBoostFactorWeight(Weight subQueryWeight) throws IOException {
-            this.subQueryWeight = subQueryWeight;
-        }
-
-        public Query getQuery() {
-            return FunctionScoreQuery.this;
-        }
-
-        @Override
-        public float getValueForNormalization() throws IOException {
-            float sum = subQueryWeight.getValueForNormalization();
-            sum *= getBoost() * getBoost();
-            return sum;
-        }
-
-        @Override
-        public void normalize(float norm, float topLevelBoost) {
-            subQueryWeight.normalize(norm, topLevelBoost * getBoost());
-        }
-
-        @Override
-        public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder, boolean topScorer, Bits acceptDocs) throws IOException {
-            Scorer subQueryScorer = subQueryWeight.scorer(context, scoreDocsInOrder, false, acceptDocs);
-            if (subQueryScorer == null) {
-                return null;
+    public InternalFacet buildFacet(String facetName) {
+        final CharsRef spare = new CharsRef();
+        AggregatorPriorityQueue queue = new AggregatorPriorityQueue(aggregators.size());
+        for (ReaderAggregator aggregator : aggregators) {
+            if (aggregator.nextPosition()) {
+                queue.add(aggregator);
             }
-            function.setNextReader(context);
-            return new CustomBoostFactorScorer(this, subQueryScorer, function, maxBoost, combineFunction);
         }
 
-        @Override
-        public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
-            Explanation subQueryExpl = subQueryWeight.explain(context, doc);
-            if (!subQueryExpl.isMatch()) {
-                return subQueryExpl;
+        // YACK, we repeat the same logic, but once with an optimizer priority queue for smaller sizes
+        if (shardSize < EntryPriorityQueue.LIMIT) {
+            // optimize to use priority size
+            EntryPriorityQueue ordered = new EntryPriorityQueue(shardSize, comparatorType.comparator());
+
+            while (queue.size() > 0) {
+                ReaderAggregator agg = queue.top();
+                BytesRef value = agg.copyCurrent(); // we need to makeSafe it, since we end up pushing it... (can we get around this?)
+                int count = 0;
+                do {
+                    count += agg.counts.get(agg.position);
+                    if (agg.nextPosition()) {
+                        agg = queue.updateTop();
+                    } else {
+                        // we are done with this reader
+                        queue.pop();
+                        agg = queue.top();
+                    }
+                } while (agg != null && value.equals(agg.current));
+
+                if (count > minCount) {
+                    if (excluded != null && excluded.contains(value)) {
+                        continue;
+                    }
+                    if (matcher != null) {
+                        UnicodeUtil.UTF8toUTF16(value, spare);
+                        assert spare.toString().equals(value.utf8ToString());
+                        if (!matcher.reset(spare).matches()) {
+                            continue;
+                        }
+                    }
+                    InternalStringTermsFacet.TermEntry entry = new InternalStringTermsFacet.TermEntry(value, count);
+                    ordered.insertWithOverflow(entry);
+                }
             }
-            function.setNextReader(context);
-            Explanation functionExplanation = function.explainScore(doc, subQueryExpl);
-            return combineFunction.explain(getBoost(), subQueryExpl, functionExplanation, maxBoost);
+            InternalStringTermsFacet.TermEntry[] list = new InternalStringTermsFacet.TermEntry[ordered.size()];
+            for (int i = ordered.size() - 1; i >= 0; i--) {
+                list[i] = (InternalStringTermsFacet.TermEntry) ordered.pop();
+            }
+
+            Releasables.close(aggregators);
+
+            return new InternalStringTermsFacet(facetName, comparatorType, size, Arrays.asList(list), missing, total);
+        }
+
+        BoundedTreeSet<InternalStringTermsFacet.TermEntry> ordered = new BoundedTreeSet<>(comparatorType.comparator(), shardSize);
+
+        while (queue.size() > 0) {
+            ReaderAggregator agg = queue.top();
+            BytesRef value = agg.copyCurrent(); // we need to makeSafe it, since we end up pushing it... (can we work around that?)
+            int count = 0;
+            do {
+                count += agg.counts.get(agg.position);
+                if (agg.nextPosition()) {
+                    agg = queue.updateTop();
+                } else {
+                    // we are done with this reader
+                    queue.pop();
+                    agg = queue.top();
+                }
+            } while (agg != null && value.equals(agg.current));
+
+            if (count > minCount) {
+                if (excluded != null && excluded.contains(value)) {
+                    continue;
+                }
+                if (matcher != null) {
+                    UnicodeUtil.UTF8toUTF16(value, spare);
+                    assert spare.toString().equals(value.utf8ToString());
+                    if (!matcher.reset(spare).matches()) {
+                        continue;
+                    }
+                }
+                InternalStringTermsFacet.TermEntry entry = new InternalStringTermsFacet.TermEntry(value, count);
+                ordered.add(entry);
+            }
+        }
+
+        Releasables.close(aggregators);
+
+        return new InternalStringTermsFacet(facetName, comparatorType, size, ordered, missing, total);
+    }
+
+    class Collector extends FacetExecutor.Collector {
+
+        private long missing;
+        private long total;
+        private BytesValues.WithOrdinals values;
+        private ReaderAggregator current;
+        private Ordinals.Docs ordinals;
+
+        @Override
+        public void setNextReader(AtomicReaderContext context) throws IOException {
+            if (current != null) {
+                missing += current.missing;
+                total += current.total;
+                if (current.values.ordinals().getMaxOrd() > Ordinals.MIN_ORDINAL) {
+                    aggregators.add(current);
+                } else {
+                    Releasables.close(current);
+                }
+            }
+            values = indexFieldData.load(context).getBytesValues(false);
+            current = new ReaderAggregator(values, ordinalsCacheAbove, cacheRecycler);
+            ordinals = values.ordinals();
+        }
+
+        @Override
+        public void collect(int doc) throws IOException {
+            final int length = ordinals.setDocument(doc);
+            int missing = 1;
+            for (int i = 0; i < length; i++) {
+                current.onOrdinal(doc, ordinals.nextOrd());
+                missing = 0;
+            }
+            current.incrementMissing(missing);
+        }
+
+        @Override
+        public void postCollection() {
+            if (current != null) {
+                missing += current.missing;
+                total += current.total;
+                // if we have values for this one, add it
+                if (current.values.ordinals().getMaxOrd() > Ordinals.MIN_ORDINAL) {
+                    aggregators.add(current);
+                } else {
+                    Releasables.close(current);
+                }
+                current = null;
+            }
+            TermsStringOrdinalsFacetExecutor.this.missing = missing;
+            TermsStringOrdinalsFacetExecutor.this.total = total;
         }
     }
 
-    static class CustomBoostFactorScorer extends Scorer {
+    public final class ReaderAggregator implements Releasable {
 
-        private final float subQueryBoost;
-        private final Scorer scorer;
-        private final ScoreFunction function;
-        private final float maxBoost;
-        private final CombineFunction scoreCombiner;
+        private final long maxOrd;
 
-        private CustomBoostFactorScorer(CustomBoostFactorWeight w, Scorer scorer, ScoreFunction function, float maxBoost, CombineFunction scoreCombiner)
-                throws IOException {
-            super(w);
-            this.subQueryBoost = w.getQuery().getBoost();
-            this.scorer = scorer;
-            this.function = function;
-            this.maxBoost = maxBoost;
-            this.scoreCombiner = scoreCombiner;
+        final BytesValues.WithOrdinals values;
+        final IntArray counts;
+        int missing = 0;
+        long position = Ordinals.MIN_ORDINAL - 1;
+        BytesRef current;
+        int total;
+
+
+        public ReaderAggregator(BytesValues.WithOrdinals values, int ordinalsCacheLimit, CacheRecycler cacheRecycler) {
+            this.values = values;
+            this.maxOrd = values.ordinals().getMaxOrd();
+            this.counts = bigArrays.newIntArray(maxOrd);
+        }
+
+        final void onOrdinal(int docId, long ordinal) {
+            counts.increment(ordinal, 1);
+            total++;
+        }
+
+        final void incrementMissing(int numMissing) {
+            missing += numMissing;
+        }
+
+        public boolean nextPosition() {
+            if (++position >= maxOrd) {
+                return false;
+            }
+            current = values.getValueByOrd(position);
+            return true;
+        }
+
+        public BytesRef copyCurrent() {
+            return values.copyShared();
         }
 
         @Override
-        public int docID() {
-            return scorer.docID();
+        public void close() {
+            Releasables.close(counts);
         }
 
-        @Override
-        public int advance(int target) throws IOException {
-            return scorer.advance(target);
-        }
-
-        @Override
-        public int nextDoc() throws IOException {
-            return scorer.nextDoc();
-        }
-
-        @Override
-        public float score() throws IOException {
-            return scoreCombiner.combine(subQueryBoost, scorer.score(),
-                    function.score(scorer.docID(), scorer.score()), maxBoost);
-        }
-
-        @Override
-        public int freq() throws IOException {
-            return scorer.freq();
-        }
-
-        @Override
-        public long cost() {
-            return scorer.cost();
-        }
     }
 
-    public String toString(String field) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("function score (").append(subQuery.toString(field)).append(",function=").append(function).append(')');
-        sb.append(ToStringUtils.boost(getBoost()));
-        return sb.toString();
-    }
+    public static class AggregatorPriorityQueue extends PriorityQueue<ReaderAggregator> {
 
-    public boolean equals(Object o) {
-        if (getClass() != o.getClass())
-            return false;
-        FunctionScoreQuery other = (FunctionScoreQuery) o;
-        return this.getBoost() == other.getBoost() && this.subQuery.equals(other.subQuery) && this.function.equals(other.function)
-                && this.maxBoost == other.maxBoost;
-    }
+        public AggregatorPriorityQueue(int size) {
+            super(size);
+        }
 
-    public int hashCode() {
-        return subQuery.hashCode() + 31 * function.hashCode() ^ Float.floatToIntBits(getBoost());
+        @Override
+        protected boolean lessThan(ReaderAggregator a, ReaderAggregator b) {
+            return a.current.compareTo(b.current) < 0;
+        }
     }
 }

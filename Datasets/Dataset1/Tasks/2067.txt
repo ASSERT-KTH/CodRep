@@ -1,6 +1,4 @@
-int len = docsGathered > offset ? docsGathered - offset : 0;
-
-package org.apache.solr.search;
+docsEnum = termsEnum.docs(liveDocs, docsEnum, false);
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,808 +17,559 @@ package org.apache.solr.search;
  * limitations under the License.
  */
 
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.queryParser.ParseException;
+package org.apache.solr.handler.component;
+
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.index.*;
 import org.apache.lucene.search.*;
-import org.apache.lucene.search.grouping.*;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.OpenBitSet;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.SentinelIntSet;
+import org.apache.solr.cloud.ZkController;
 import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.QueryElevationParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.util.DOMUtil;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.core.Config;
+import org.apache.solr.core.SolrCore;
 import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.response.transform.ElevatedMarkerFactory;
+import org.apache.solr.response.transform.ExcludedMarkerFactory;
 import org.apache.solr.schema.FieldType;
 import org.apache.solr.schema.SchemaField;
-import org.apache.solr.schema.StrFieldSource;
-import org.apache.solr.search.function.OrdFieldSource;
-import org.apache.solr.search.function.ReverseOrdFieldSource;
-import org.apache.solr.search.function.ValueSource;
-import org.apache.solr.search.grouping.collector.FilterCollector;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.search.SortSpec;
+import org.apache.solr.util.RefCounted;
+import org.apache.solr.util.VersionedFile;
+import org.apache.solr.util.plugin.SolrCoreAware;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.InputSource;
 
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathExpressionException;
+import javax.xml.xpath.XPathFactory;
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringReader;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.util.*;
 
 /**
- * Basic Solr Grouping infrastructure.
- * Warning NOT thread save!
+ * A component to elevate some documents to the top of the result set.
  *
- * @lucene.experimental
+ * @since solr 1.3
  */
-public class Grouping {
+public class QueryElevationComponent extends SearchComponent implements SolrCoreAware {
+  private static Logger log = LoggerFactory.getLogger(QueryElevationComponent.class);
 
-  private final static Logger logger = LoggerFactory.getLogger(Grouping.class);
+  // Constants used in solrconfig.xml
+  static final String FIELD_TYPE = "queryFieldType";
+  static final String CONFIG_FILE = "config-file";
+  static final String EXCLUDE = "exclude";
+  public static final String BOOSTED = "BOOSTED";
+  public static final String EXCLUDED = "EXCLUDED";
 
-  private final SolrIndexSearcher searcher;
-  private final SolrIndexSearcher.QueryResult qr;
-  private final SolrIndexSearcher.QueryCommand cmd;
-  private final List<Command> commands = new ArrayList<Command>();
-  private final boolean main;
-  private final boolean cacheSecondPassSearch;
-  private final int maxDocsPercentageToCache;
+  // Runtime param -- should be in common?
 
-  private Sort sort;
-  private Sort groupSort;
-  private int limitDefault;
-  private int docsPerGroupDefault;
-  private int groupOffsetDefault;
-  private Format defaultFormat;
-  private TotalCount defaultTotalCount;
+  private SolrParams initArgs = null;
+  private Analyzer analyzer = null;
+  private String idField = null;
+  private FieldType idSchemaFT;
 
-  private int maxDoc;
-  private boolean needScores;
-  private boolean getDocSet;
-  private boolean getGroupedDocSet;
-  private boolean getDocList; // doclist needed for debugging or highlighting
-  private Query query;
-  private DocSet filter;
-  private Filter luceneFilter;
-  private NamedList grouped = new SimpleOrderedMap();
-  private Set<Integer> idSet = new LinkedHashSet<Integer>();  // used for tracking unique docs when we need a doclist
-  private int maxMatches;  // max number of matches from any grouping command
-  private float maxScore = Float.NEGATIVE_INFINITY;  // max score seen in any doclist
-  private boolean signalCacheWarning = false;
-  private TimeLimitingCollector timeLimitingCollector;
+  boolean forceElevation = false;
+  // For each IndexReader, keep a query->elevation map
+  // When the configuration is loaded from the data directory.
+  // The key is null if loaded from the config directory, and
+  // is never re-loaded.
+  final Map<IndexReader, Map<String, ElevationObj>> elevationCache =
+      new WeakHashMap<IndexReader, Map<String, ElevationObj>>();
 
+  class ElevationObj {
+    final String text;
+    final String analyzed;
+    final TermQuery [] exclude;//just keep the term query, b/c we will not always explicitly exclude the item based on markExcludes query time param
+    final BooleanQuery include;
+    final Map<BytesRef, Integer> priority;
+    final Set<String> ids;
+    final Set<String> excludeIds;
 
-  public DocList mainResult;  // output if one of the grouping commands should be used as the main result.
+    ElevationObj(String qstr, List<String> elevate, List<String> exclude) throws IOException {
+      this.text = qstr;
+      this.analyzed = getAnalyzedQuery(this.text);
+      this.ids = new HashSet<String>();
+      this.excludeIds = new HashSet<String>();
 
-  /**
-   * @param searcher
-   * @param qr
-   * @param cmd
-   * @param cacheSecondPassSearch Whether to cache the documents and scores from the first pass search for the second
-   *                              pass search.
-   * @param maxDocsPercentageToCache The maximum number of documents in a percentage relative from maxdoc
-   *                                 that is allowed in the cache. When this threshold is met,
-   *                                 the cache is not used in the second pass search.
-   */
-  public Grouping(SolrIndexSearcher searcher,
-                  SolrIndexSearcher.QueryResult qr,
-                  SolrIndexSearcher.QueryCommand cmd,
-                  boolean cacheSecondPassSearch,
-                  int maxDocsPercentageToCache,
-                  boolean main) {
-    this.searcher = searcher;
-    this.qr = qr;
-    this.cmd = cmd;
-    this.cacheSecondPassSearch = cacheSecondPassSearch;
-    this.maxDocsPercentageToCache = maxDocsPercentageToCache;
-    this.main = main;
-  }
+      this.include = new BooleanQuery();
+      this.include.setBoost(0);
+      this.priority = new HashMap<BytesRef, Integer>();
+      int max = elevate.size() + 5;
+      for (String id : elevate) {
+        id = idSchemaFT.readableToIndexed(id);
+        ids.add(id);
+        TermQuery tq = new TermQuery(new Term(idField, id));
+        include.add(tq, BooleanClause.Occur.SHOULD);
+        this.priority.put(new BytesRef(id), max--);
+      }
 
-  public void add(Grouping.Command groupingCommand) {
-    commands.add(groupingCommand);
-  }
-
-  /**
-   * Adds a field command based on the specified field.
-   *
-   * @param field The fieldname to group by.
-   */
-  public void addFieldCommand(String field, SolrQueryRequest request) throws ParseException {
-    SchemaField schemaField = searcher.getSchema().getField(field); // Throws an exception when field doesn't exist. Bad request.
-    FieldType fieldType = schemaField.getType();
-    ValueSource valueSource = fieldType.getValueSource(schemaField, null);
-    if (!(valueSource instanceof OrdFieldSource
-        || valueSource instanceof ReverseOrdFieldSource
-        || valueSource instanceof StrFieldSource)) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Cannot group on non string like field.");
-    }
-
-    Grouping.CommandField gc = new CommandField();
-    gc.groupSort = groupSort;
-    gc.groupBy = field;
-    gc.key = field;
-    gc.numGroups = limitDefault;
-    gc.docsPerGroup = docsPerGroupDefault;
-    gc.groupOffset = groupOffsetDefault;
-    gc.offset = cmd.getOffset();
-    gc.sort = sort;
-    gc.format = defaultFormat;
-    gc.totalCount = defaultTotalCount;
-
-    if (main) {
-      gc.main = true;
-      gc.format = Grouping.Format.simple;
-    }
-
-    if (gc.format == Grouping.Format.simple) {
-      gc.groupOffset = 0;  // doesn't make sense
-    }
-    commands.add(gc);
-  }
-
-  public void addQueryCommand(String groupByStr, SolrQueryRequest request) throws ParseException {
-    QParser parser = QParser.getParser(groupByStr, null, request);
-    Query gq = parser.getQuery();
-    Grouping.CommandQuery gc = new CommandQuery();
-    gc.query = gq;
-    gc.groupSort = groupSort;
-    gc.key = groupByStr;
-    gc.numGroups = limitDefault;
-    gc.docsPerGroup = docsPerGroupDefault;
-    gc.groupOffset = groupOffsetDefault;
-
-    // these two params will only be used if this is for the main result set
-    gc.offset = cmd.getOffset();
-    gc.numGroups = limitDefault;
-    gc.format = defaultFormat;
-
-    if (main) {
-      gc.main = true;
-      gc.format = Grouping.Format.simple;
-    }
-    if (gc.format == Grouping.Format.simple) {
-      gc.docsPerGroup = gc.numGroups;  // doesn't make sense to limit to one
-      gc.groupOffset = gc.offset;
-    }
-
-    commands.add(gc);
-  }
-
-  public Grouping setSort(Sort sort) {
-    this.sort = sort;
-    return this;
-  }
-
-  public Grouping setGroupSort(Sort groupSort) {
-    this.groupSort = groupSort;
-    return this;
-  }
-
-  public Grouping setLimitDefault(int limitDefault) {
-    this.limitDefault = limitDefault;
-    return this;
-  }
-
-  public Grouping setDocsPerGroupDefault(int docsPerGroupDefault) {
-    this.docsPerGroupDefault = docsPerGroupDefault;
-    return this;
-  }
-
-  public Grouping setGroupOffsetDefault(int groupOffsetDefault) {
-    this.groupOffsetDefault = groupOffsetDefault;
-    return this;
-  }
-
-  public Grouping setDefaultFormat(Format defaultFormat) {
-    this.defaultFormat = defaultFormat;
-    return this;
-  }
-
-  public Grouping setDefaultTotalCount(TotalCount defaultTotalCount) {
-    this.defaultTotalCount = defaultTotalCount;
-    return this;
-  }
-
-  public Grouping setGetGroupedDocSet(boolean getGroupedDocSet) {
-    this.getGroupedDocSet = getGroupedDocSet;
-    return this;
-  }
-
-  public List<Command> getCommands() {
-    return commands;
-  }
-
-  public void execute() throws IOException {
-    if (commands.isEmpty()) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Specify at least one field, function or query to group by.");
-    }
-
-    DocListAndSet out = new DocListAndSet();
-    qr.setDocListAndSet(out);
-
-    SolrIndexSearcher.ProcessedFilter pf = searcher.getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
-    final Filter luceneFilter = pf.filter;
-    maxDoc = searcher.maxDoc();
-
-    needScores = (cmd.getFlags() & SolrIndexSearcher.GET_SCORES) != 0;
-    boolean cacheScores = false;
-    // NOTE: Change this when groupSort can be specified per group
-    if (cacheSecondPassSearch && !needScores && !commands.isEmpty()) {
-      if (commands.get(0).groupSort == null) {
-        cacheScores = true;
+      if (exclude == null || exclude.isEmpty()) {
+        this.exclude = null;
       } else {
-        for (SortField field : commands.get(0).groupSort.getSort()) {
-          if (field.getType() == SortField.SCORE) {
-            cacheScores = true;
-            break;
-          }
-        }
-      }
-    } else if (needScores) {
-      cacheScores = needScores;
-    }
-    getDocSet = (cmd.getFlags() & SolrIndexSearcher.GET_DOCSET) != 0;
-    getDocList = (cmd.getFlags() & SolrIndexSearcher.GET_DOCLIST) != 0;
-    query = QueryUtils.makeQueryable(cmd.getQuery());
-
-    for (Command cmd : commands) {
-      cmd.prepare();
-    }
-
-    AbstractAllGroupHeadsCollector<?> allGroupHeadsCollector = null;
-    List<Collector> collectors = new ArrayList<Collector>(commands.size());
-    for (Command cmd : commands) {
-      Collector collector = cmd.createFirstPassCollector();
-      if (collector != null) {
-        collectors.add(collector);
-      }
-      if (getGroupedDocSet && allGroupHeadsCollector == null) {
-        collectors.add(allGroupHeadsCollector = cmd.createAllGroupCollector());
-      }
-    }
-
-    Collector allCollectors = MultiCollector.wrap(collectors.toArray(new Collector[collectors.size()]));
-    DocSetCollector setCollector = null;
-    if (getDocSet && allGroupHeadsCollector == null) {
-      setCollector = new DocSetDelegateCollector(maxDoc >> 6, maxDoc, allCollectors);
-      allCollectors = setCollector;
-    }
-
-    CachingCollector cachedCollector = null;
-    if (cacheSecondPassSearch && allCollectors != null) {
-      int maxDocsToCache = (int) Math.round(maxDoc * (maxDocsPercentageToCache / 100.0d));
-      // Only makes sense to cache if we cache more than zero.
-      // Maybe we should have a minimum and a maximum, that defines the window we would like caching for.
-      if (maxDocsToCache > 0) {
-        allCollectors = cachedCollector = CachingCollector.create(allCollectors, cacheScores, maxDocsToCache);
-      }
-    }
-
-    if (pf.postFilter != null) {
-      pf.postFilter.setLastDelegate(allCollectors);
-      allCollectors = pf.postFilter;
-    }
-
-    if (allCollectors != null) {
-      searchWithTimeLimiter(luceneFilter, allCollectors);
-    }
-
-    if (getGroupedDocSet && allGroupHeadsCollector != null) {
-      FixedBitSet fixedBitSet = allGroupHeadsCollector.retrieveGroupHeads(maxDoc);
-      long[] bits = fixedBitSet.getBits();
-      OpenBitSet openBitSet = new OpenBitSet(bits, bits.length);
-      qr.setDocSet(new BitDocSet(openBitSet));
-    } else if (getDocSet) {
-      qr.setDocSet(setCollector.getDocSet());
-    }
-
-    collectors.clear();
-    for (Command cmd : commands) {
-      Collector collector = cmd.createSecondPassCollector();
-      if (collector != null)
-        collectors.add(collector);
-    }
-
-    if (!collectors.isEmpty()) {
-      Collector secondPhaseCollectors = MultiCollector.wrap(collectors.toArray(new Collector[collectors.size()]));
-      if (collectors.size() > 0) {
-        if (cachedCollector != null) {
-          if (cachedCollector.isCached()) {
-            cachedCollector.replay(secondPhaseCollectors);
-          } else {
-            signalCacheWarning = true;
-            logger.warn(String.format("The grouping cache is active, but not used because it exceeded the max cache limit of %d percent", maxDocsPercentageToCache));
-            logger.warn("Please increase cache size or disable group caching.");
-            searchWithTimeLimiter(luceneFilter, secondPhaseCollectors);
-          }
-        } else {
-          if (pf.postFilter != null) {
-            pf.postFilter.setLastDelegate(secondPhaseCollectors);
-            secondPhaseCollectors = pf.postFilter;
-          }
-          searchWithTimeLimiter(luceneFilter, secondPhaseCollectors);
+        this.exclude = new TermQuery[exclude.size()];
+        for (int i = 0; i < exclude.size(); i++) {
+          String id = idSchemaFT.readableToIndexed(exclude.get(i));
+          excludeIds.add(id);
+          this.exclude[i] = new TermQuery(new Term(idField, id));
         }
       }
     }
-
-    for (Command cmd : commands) {
-      cmd.finish();
-    }
-
-    qr.groupedResults = grouped;
-
-    if (getDocList) {
-      int sz = idSet.size();
-      int[] ids = new int[sz];
-      int idx = 0;
-      for (int val : idSet) {
-        ids[idx++] = val;
-      }
-      qr.setDocList(new DocSlice(0, sz, ids, null, maxMatches, maxScore));
-    }
   }
 
-  /**
-   * Invokes search with the specified filter and collector.  
-   * If a time limit has been specified, wrap the collector in a TimeLimitingCollector
-   */
-  private void searchWithTimeLimiter(final Filter luceneFilter, Collector collector) throws IOException {
-    if (cmd.getTimeAllowed() > 0) {
-      if (timeLimitingCollector == null) {
-        timeLimitingCollector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), cmd.getTimeAllowed());
-      } else {
-        /*
-         * This is so the same timer can be used for grouping's multiple phases.   
-         * We don't want to create a new TimeLimitingCollector for each phase because that would 
-         * reset the timer for each phase.  If time runs out during the first phase, the 
-         * second phase should timeout quickly.
-         */
-        timeLimitingCollector.setCollector(collector);
+  @Override
+  public void init(NamedList args) {
+    this.initArgs = SolrParams.toSolrParams(args);
+  }
+
+  public void inform(SolrCore core) {
+    String a = initArgs.get(FIELD_TYPE);
+    if (a != null) {
+      FieldType ft = core.getSchema().getFieldTypes().get(a);
+      if (ft == null) {
+        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+            "Unknown FieldType: '" + a + "' used in QueryElevationComponent");
       }
-      collector = timeLimitingCollector;
+      analyzer = ft.getQueryAnalyzer();
     }
+
+    SchemaField sf = core.getSchema().getUniqueKeyField();
+    if( sf == null) {
+      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, 
+          "QueryElevationComponent requires the schema to have a uniqueKeyField." );
+    }
+    idSchemaFT = sf.getType();
+    idField = sf.getName();
+    //register the EditorialMarkerFactory
+    String excludeName = initArgs.get(QueryElevationParams.EXCLUDE_MARKER_FIELD_NAME, "excluded");
+    if (excludeName == null || excludeName.equals("") == true){
+      excludeName = "excluded";
+    }
+    ExcludedMarkerFactory excludedMarkerFactory = new ExcludedMarkerFactory();
+    core.addTransformerFactory(excludeName, excludedMarkerFactory);
+    ElevatedMarkerFactory elevatedMarkerFactory = new ElevatedMarkerFactory();
+    String markerName = initArgs.get(QueryElevationParams.EDITORIAL_MARKER_FIELD_NAME, "elevated");
+    if (markerName == null || markerName.equals("") == true) {
+      markerName = "elevated";
+    }
+    core.addTransformerFactory(markerName, elevatedMarkerFactory);
+    forceElevation = initArgs.getBool(QueryElevationParams.FORCE_ELEVATION, forceElevation);
     try {
-      searcher.search(query, luceneFilter, collector);
-    } catch (TimeLimitingCollector.TimeExceededException x) {
-      logger.warn( "Query: " + query + "; " + x.getMessage() );
-      qr.setPartialResults(true);
-    }
-  }
-
-  /**
-   * Returns offset + len if len equals zero or higher. Otherwise returns max.
-   *
-   * @param offset The offset
-   * @param len The number of documents to return
-   * @param max The number of document to return if len < 0 or if offset + len < 0
-   * @return offset + len if len equals zero or higher. Otherwise returns max
-   */
-  int getMax(int offset, int len, int max) {
-    int v = len < 0 ? max : offset + len;
-    if (v < 0 || v > max) v = max;
-    return v;
-  }
-
-  /**
-   * Returns whether a cache warning should be send to the client.
-   * The value <code>true</code> is returned when the cache is emptied because the caching limits where met, otherwise
-   * <code>false</code> is returned.
-   *
-   * @return whether a cache warning should be send to the client
-   */
-  public boolean isSignalCacheWarning() {
-    return signalCacheWarning;
-  }
-
-  //======================================   Inner classes =============================================================
-
-  public static enum Format {
-
-    /**
-     * Grouped result. Each group has its own result set.
-     */
-    grouped,
-
-    /**
-     * Flat result. All documents of all groups are put in one list.
-     */
-    simple
-  }
-
-  public static enum TotalCount {
-    /**
-     * Computations should be based on groups.
-     */
-    grouped,
-
-    /**
-     * Computations should be based on plain documents, so not taking grouping into account.
-     */
-    ungrouped
-  }
-
-  /**
-   * General group command. A group command is responsible for creating the first and second pass collectors.
-   * A group command is also responsible for creating the response structure.
-   * <p/>
-   * Note: Maybe the creating the response structure should be done in something like a ReponseBuilder???
-   * Warning NOT thread save!
-   */
-  public abstract class Command<GROUP_VALUE_TYPE> {
-
-    public String key;       // the name to use for this group in the response
-    public Sort groupSort;   // the sort of the documents *within* a single group.
-    public Sort sort;        // the sort between groups
-    public int docsPerGroup; // how many docs in each group - from "group.limit" param, default=1
-    public int groupOffset;  // the offset within each group (for paging within each group)
-    public int numGroups;    // how many groups - defaults to the "rows" parameter
-    int actualGroupsToFind;  // How many groups should actually be found. Based on groupOffset and numGroups.
-    public int offset;       // offset into the list of groups
-    public Format format;
-    public boolean main;     // use as the main result in simple format (grouped.main=true param)
-    public TotalCount totalCount = TotalCount.ungrouped;
-
-    TopGroups<GROUP_VALUE_TYPE> result;
-
-
-    /**
-     * Prepare this <code>Command</code> for execution.
-     *
-     * @throws IOException If I/O related errors occur
-     */
-    protected abstract void prepare() throws IOException;
-
-    /**
-     * Returns one or more {@link Collector} instances that are needed to perform the first pass search.
-     * If multiple Collectors are returned then these wrapped in a {@link org.apache.lucene.search.MultiCollector}.
-     *
-     * @return one or more {@link Collector} instances that are need to perform the first pass search
-     * @throws IOException If I/O related errors occur
-     */
-    protected abstract Collector createFirstPassCollector() throws IOException;
-
-    /**
-     * Returns zero or more {@link Collector} instances that are needed to perform the second pass search.
-     * In the case when no {@link Collector} instances are created <code>null</code> is returned.
-     * If multiple Collectors are returned then these wrapped in a {@link org.apache.lucene.search.MultiCollector}.
-     *
-     * @return zero or more {@link Collector} instances that are needed to perform the second pass search
-     * @throws IOException If I/O related errors occur
-     */
-    protected Collector createSecondPassCollector() throws IOException {
-      return null;
-    }
-
-    /**
-     * Returns a collector that is able to return the most relevant document of all groups.
-     * Returns <code>null</code> if the command doesn't support this type of collector.
-     *
-     * @return a collector that is able to return the most relevant document of all groups.
-     * @throws IOException If I/O related errors occur
-     */
-    public AbstractAllGroupHeadsCollector<?> createAllGroupCollector() throws IOException {
-      return null;
-    }
-
-    /**
-     * Performs any necessary post actions to prepare the response.
-     *
-     * @throws IOException If I/O related errors occur
-     */
-    protected abstract void finish() throws IOException;
-
-    /**
-     * Returns the number of matches for this <code>Command</code>.
-     *
-     * @return the number of matches for this <code>Command</code>
-     */
-    public abstract int getMatches();
-
-    /**
-     * Returns the number of groups found for this <code>Command</code>.
-     * If the command doesn't support counting the groups <code>null</code> is returned.
-     *
-     * @return the number of groups found for this <code>Command</code>
-     */
-    protected Integer getNumberOfGroups() {
-      return null;
-    }
-
-    protected NamedList commonResponse() {
-      NamedList groupResult = new SimpleOrderedMap();
-      grouped.add(key, groupResult);  // grouped={ key={
-
-      int matches = getMatches();
-      groupResult.add("matches", matches);
-      if (totalCount == TotalCount.grouped) {
-        Integer totalNrOfGroups = getNumberOfGroups();
-        groupResult.add("ngroups", totalNrOfGroups == null ? 0 : totalNrOfGroups);
-      }
-      maxMatches = Math.max(maxMatches, matches);
-      return groupResult;
-    }
-
-    protected DocList getDocList(GroupDocs groups) {
-      int max = groups.totalHits;
-      int off = groupOffset;
-      int len = docsPerGroup;
-      if (format == Format.simple) {
-        off = offset;
-        len = numGroups;
-      }
-      int docsToCollect = getMax(off, len, max);
-
-      // TODO: implement a DocList impl that doesn't need to start at offset=0
-      int docsCollected = Math.min(docsToCollect, groups.scoreDocs.length);
-
-      int ids[] = new int[docsCollected];
-      float[] scores = needScores ? new float[docsCollected] : null;
-      for (int i = 0; i < ids.length; i++) {
-        ids[i] = groups.scoreDocs[i].doc;
-        if (scores != null)
-          scores[i] = groups.scoreDocs[i].score;
-      }
-
-      float score = groups.maxScore;
-      maxScore = Math.max(maxScore, score);
-      DocSlice docs = new DocSlice(off, Math.max(0, ids.length - off), ids, scores, groups.totalHits, score);
-
-      if (getDocList) {
-        DocIterator iter = docs.iterator();
-        while (iter.hasNext())
-          idSet.add(iter.nextDoc());
-      }
-      return docs;
-    }
-
-    protected void addDocList(NamedList rsp, GroupDocs groups) {
-      rsp.add("doclist", getDocList(groups));
-    }
-
-    // Flatten the groups and get up offset + rows documents
-    protected DocList createSimpleResponse() {
-      GroupDocs[] groups = result != null ? result.groups : new GroupDocs[0];
-
-      List<Integer> ids = new ArrayList<Integer>();
-      List<Float> scores = new ArrayList<Float>();
-      int docsToGather = getMax(offset, numGroups, maxDoc);
-      int docsGathered = 0;
-      float maxScore = Float.NEGATIVE_INFINITY;
-
-      outer:
-      for (GroupDocs group : groups) {
-        if (group.maxScore > maxScore) {
-          maxScore = group.maxScore;
+      synchronized (elevationCache) {
+        elevationCache.clear();
+        String f = initArgs.get(CONFIG_FILE);
+        if (f == null) {
+          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+              "QueryElevationComponent must specify argument: '" + CONFIG_FILE
+                  + "' -- path to elevate.xml");
         }
+        boolean exists = false;
 
-        for (ScoreDoc scoreDoc : group.scoreDocs) {
-          if (docsGathered >= docsToGather) {
-            break outer;
+        // check if using ZooKeeper
+        ZkController zkController = core.getCoreDescriptor().getCoreContainer().getZkController();
+        if (zkController != null) {
+          // TODO : shouldn't have to keep reading the config name when it has been read before
+          exists = zkController.configFileExists(zkController.readConfigName(core.getCoreDescriptor().getCloudDescriptor().getCollectionName()), f);
+        } else {
+          File fC = new File(core.getResourceLoader().getConfigDir(), f);
+          File fD = new File(core.getDataDir(), f);
+          if (fC.exists() == fD.exists()) {
+            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+                "QueryElevationComponent missing config file: '" + f + "\n"
+                    + "either: " + fC.getAbsolutePath() + " or " + fD.getAbsolutePath() + " must exist, but not both.");
           }
-
-          ids.add(scoreDoc.doc);
-          scores.add(scoreDoc.score);
-          docsGathered++;
+          if (fC.exists()) {
+            exists = true;
+            log.info("Loading QueryElevation from: " + fC.getAbsolutePath());
+            Config cfg = new Config(core.getResourceLoader(), f);
+            elevationCache.put(null, loadElevationMap(cfg));
+          }
+        }
+        //in other words, we think this is in the data dir, not the conf dir
+        if (!exists) {
+          // preload the first data
+          RefCounted<SolrIndexSearcher> searchHolder = null;
+          try {
+            searchHolder = core.getNewestSearcher(false);
+            IndexReader reader = searchHolder.get().getIndexReader();
+            getElevationMap(reader, core);
+          } finally {
+            if (searchHolder != null) searchHolder.decref();
+          }
         }
       }
-
-      int len = docsGathered - offset;
-      int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
-      float[] docScores = ArrayUtils.toPrimitive(scores.toArray(new Float[scores.size()]));
-      DocSlice docSlice = new DocSlice(offset, len, docs, docScores, getMatches(), maxScore);
-
-      if (getDocList) {
-        for (int i = offset; i < docs.length; i++) {
-          idSet.add(docs[i]);
-        }
-      }
-
-      return docSlice;
+    } catch (Exception ex) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+          "Error initializing QueryElevationComponent.", ex);
     }
+  }
 
+  //get the elevation map from the data dir
+  Map<String, ElevationObj> getElevationMap(IndexReader reader, SolrCore core) throws Exception {
+    synchronized (elevationCache) {
+      Map<String, ElevationObj> map = elevationCache.get(null);
+      if (map != null) return map;
+
+      map = elevationCache.get(reader);
+      if (map == null) {
+        String f = initArgs.get(CONFIG_FILE);
+        if (f == null) {
+          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+              "QueryElevationComponent must specify argument: " + CONFIG_FILE);
+        }
+        log.info("Loading QueryElevation from data dir: " + f);
+        
+        Config cfg;
+        
+        ZkController zkController = core.getCoreDescriptor().getCoreContainer().getZkController();
+        if (zkController != null) {
+          cfg = new Config(core.getResourceLoader(), f, null, null);
+        } else {
+          InputStream is = VersionedFile.getLatestFile(core.getDataDir(), f);
+          cfg = new Config(core.getResourceLoader(), f, new InputSource(is), null);
+        }
+  
+        map = loadElevationMap(cfg);
+        elevationCache.put(reader, map);
+      }
+      return map;
+    }
+  }
+
+  //load up the elevation map
+  private Map<String, ElevationObj> loadElevationMap(Config cfg) throws IOException {
+    XPath xpath = XPathFactory.newInstance().newXPath();
+    Map<String, ElevationObj> map = new HashMap<String, ElevationObj>();
+    NodeList nodes = (NodeList) cfg.evaluate("elevate/query", XPathConstants.NODESET);
+    for (int i = 0; i < nodes.getLength(); i++) {
+      Node node = nodes.item(i);
+      String qstr = DOMUtil.getAttr(node, "text", "missing query 'text'");
+
+      NodeList children = null;
+      try {
+        children = (NodeList) xpath.evaluate("doc", node, XPathConstants.NODESET);
+      } catch (XPathExpressionException e) {
+        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+            "query requires '<doc .../>' child");
+      }
+
+      ArrayList<String> include = new ArrayList<String>();
+      ArrayList<String> exclude = new ArrayList<String>();
+      for (int j = 0; j < children.getLength(); j++) {
+        Node child = children.item(j);
+        String id = DOMUtil.getAttr(child, "id", "missing 'id'");
+        String e = DOMUtil.getAttr(child, EXCLUDE, null);
+        if (e != null) {
+          if (Boolean.valueOf(e)) {
+            exclude.add(id);
+            continue;
+          }
+        }
+        include.add(id);
+      }
+
+      ElevationObj elev = new ElevationObj(qstr, include, exclude);
+      if (map.containsKey(elev.analyzed)) {
+        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+            "Boosting query defined twice for query: '" + elev.text + "' (" + elev.analyzed + "')");
+      }
+      map.put(elev.analyzed, elev);
+    }
+    return map;
   }
 
   /**
-   * A group command for grouping on a field.
+   * Helpful for testing without loading config.xml
+   *
+   * @throws IOException
    */
-  public class CommandField extends Command<String> {
-
-    public String groupBy;
-    TermFirstPassGroupingCollector firstPass;
-    TermSecondPassGroupingCollector secondPass;
-
-    TermAllGroupsCollector allGroupsCollector;
-
-    // If offset falls outside the number of documents a group can provide use this collector instead of secondPass
-    TotalHitCountCollector fallBackCollector;
-    Collection<SearchGroup<String>> topGroups;
-
-    /**
-     * {@inheritDoc}
-     */
-    protected void prepare() throws IOException {
-      actualGroupsToFind = getMax(offset, numGroups, maxDoc);
+  void setTopQueryResults(IndexReader reader, String query, String[] ids, String[] ex) throws IOException {
+    if (ids == null) {
+      ids = new String[0];
+    }
+    if (ex == null) {
+      ex = new String[0];
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    protected Collector createFirstPassCollector() throws IOException {
-      // Ok we don't want groups, but do want a total count
-      if (actualGroupsToFind <= 0) {
-        fallBackCollector = new TotalHitCountCollector();
-        return fallBackCollector;
-      }
+    Map<String, ElevationObj> elev = elevationCache.get(reader);
+    if (elev == null) {
+      elev = new HashMap<String, ElevationObj>();
+      elevationCache.put(reader, elev);
+    }
+    ElevationObj obj = new ElevationObj(query, Arrays.asList(ids), Arrays.asList(ex));
+    elev.put(obj.analyzed, obj);
+  }
 
-      sort = sort == null ? Sort.RELEVANCE : sort;
-      firstPass = new TermFirstPassGroupingCollector(groupBy, sort, actualGroupsToFind);
-      return firstPass;
+  String getAnalyzedQuery(String query) throws IOException {
+    if (analyzer == null) {
+      return query;
+    }
+    StringBuilder norm = new StringBuilder();
+    TokenStream tokens = analyzer.tokenStream("", new StringReader(query));
+    tokens.reset();
+
+    CharTermAttribute termAtt = tokens.addAttribute(CharTermAttribute.class);
+    while (tokens.incrementToken()) {
+      norm.append(termAtt.buffer(), 0, termAtt.length());
+    }
+    tokens.end();
+    tokens.close();
+    return norm.toString();
+  }
+
+  //---------------------------------------------------------------------------------
+  // SearchComponent
+  //---------------------------------------------------------------------------------
+
+  @Override
+  public void prepare(ResponseBuilder rb) throws IOException {
+    SolrQueryRequest req = rb.req;
+    SolrParams params = req.getParams();
+    // A runtime param can skip 
+    if (!params.getBool(QueryElevationParams.ENABLE, true)) {
+      return;
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    protected Collector createSecondPassCollector() throws IOException {
-      if (actualGroupsToFind <= 0) {
-        allGroupsCollector = new TermAllGroupsCollector(groupBy);
-        return totalCount == TotalCount.grouped ? allGroupsCollector : null;
-      }
+    boolean exclusive = params.getBool(QueryElevationParams.EXCLUSIVE, false);
+    // A runtime parameter can alter the config value for forceElevation
+    boolean force = params.getBool(QueryElevationParams.FORCE_ELEVATION, forceElevation);
+    boolean markExcludes = params.getBool(QueryElevationParams.MARK_EXCLUDES, false);
+    Query query = rb.getQuery();
+    String qstr = rb.getQueryString();
+    if (query == null || qstr == null) {
+      return;
+    }
 
-      topGroups = format == Format.grouped ? firstPass.getTopGroups(offset, false) : firstPass.getTopGroups(0, false);
-      if (topGroups == null) {
-        if (totalCount == TotalCount.grouped) {
-          allGroupsCollector = new TermAllGroupsCollector(groupBy);
-          fallBackCollector = new TotalHitCountCollector();
-          return MultiCollector.wrap(allGroupsCollector, fallBackCollector);
-        } else {
-          fallBackCollector = new TotalHitCountCollector();
-          return fallBackCollector;
-        }
-      }
+    qstr = getAnalyzedQuery(qstr);
+    IndexReader reader = req.getSearcher().getIndexReader();
+    ElevationObj booster = null;
+    try {
+      booster = getElevationMap(reader, req.getCore()).get(qstr);
+    } catch (Exception ex) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+          "Error loading elevation", ex);
+    }
 
-      int groupedDocsToCollect = getMax(groupOffset, docsPerGroup, maxDoc);
-      groupedDocsToCollect = Math.max(groupedDocsToCollect, 1);
-      secondPass = new TermSecondPassGroupingCollector(
-          groupBy, topGroups, sort, groupSort, groupedDocsToCollect, needScores, needScores, false
-      );
+    if (booster != null) {
+      rb.req.getContext().put(BOOSTED, booster.ids);
 
-      if (totalCount == TotalCount.grouped) {
-        allGroupsCollector = new TermAllGroupsCollector(groupBy);
-        return MultiCollector.wrap(secondPass, allGroupsCollector);
+      // Change the query to insert forced documents
+      if (exclusive == true) {
+        //we only want these results
+        rb.setQuery(booster.include);
       } else {
-        return secondPass;
-      }
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public AbstractAllGroupHeadsCollector<?> createAllGroupCollector() throws IOException {
-      Sort sortWithinGroup = groupSort != null ? groupSort : new Sort();
-      return TermAllGroupHeadsCollector.create(groupBy, sortWithinGroup);
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    protected void finish() throws IOException {
-      result = secondPass != null ? secondPass.getTopGroups(0) : null;
-      if (main) {
-        mainResult = createSimpleResponse();
-        return;
-      }
-
-      NamedList groupResult = commonResponse();
-
-      if (format == Format.simple) {
-        groupResult.add("doclist", createSimpleResponse());
-        return;
-      }
-
-      List groupList = new ArrayList();
-      groupResult.add("groups", groupList);        // grouped={ key={ groups=[
-
-      if (result == null) {
-        return;
-      }
-
-      // handle case of rows=0
-      if (numGroups == 0) return;
-
-      for (GroupDocs<String> group : result.groups) {
-        NamedList nl = new SimpleOrderedMap();
-        groupList.add(nl);                         // grouped={ key={ groups=[ {
-
-
-        // To keep the response format compatable with trunk.
-        // In trunk MutableValue can convert an indexed value to its native type. E.g. string to int
-        // The only option I currently see is the use the FieldType for this
-        if (group.groupValue != null) {
-          SchemaField schemaField = searcher.getSchema().getField(groupBy);
-          FieldType fieldType = schemaField.getType();
-          String readableValue = fieldType.indexedToReadable(group.groupValue);
-          Fieldable field = schemaField.createField(readableValue, 0.0f);
-          nl.add("groupValue", fieldType.toObject(field));
-        } else {
-          nl.add("groupValue", null);
+        BooleanQuery newq = new BooleanQuery(true);
+        newq.add(query, BooleanClause.Occur.SHOULD);
+        newq.add(booster.include, BooleanClause.Occur.SHOULD);
+        if (booster.exclude != null) {
+          if (markExcludes == false) {
+            for (TermQuery tq : booster.exclude) {
+              newq.add(new BooleanClause(tq, BooleanClause.Occur.MUST_NOT));
+            }
+          } else {
+            //we are only going to mark items as excluded, not actually exclude them.  This works
+            //with the EditorialMarkerFactory
+            rb.req.getContext().put(EXCLUDED, booster.excludeIds);
+            for (TermQuery tq : booster.exclude) {
+              newq.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
+            }
+          }
         }
+        rb.setQuery(newq);
+      }
 
-        addDocList(nl, group);
+      ElevationComparatorSource comparator = new ElevationComparatorSource(booster);
+      // if the sort is 'score desc' use a custom sorting method to 
+      // insert documents in their proper place 
+      SortSpec sortSpec = rb.getSortSpec();
+      if (sortSpec.getSort() == null) {
+        sortSpec.setSort(new Sort(new SortField[]{
+            new SortField("_elevate_", comparator, true),
+            new SortField(null, SortField.Type.SCORE, false)
+        }));
+      } else {
+        // Check if the sort is based on score
+        boolean modify = false;
+        SortField[] current = sortSpec.getSort().getSort();
+        ArrayList<SortField> sorts = new ArrayList<SortField>(current.length + 1);
+        // Perhaps force it to always sort by score
+        if (force && current[0].getType() != SortField.Type.SCORE) {
+          sorts.add(new SortField("_elevate_", comparator, true));
+          modify = true;
+        }
+        for (SortField sf : current) {
+          if (sf.getType() == SortField.Type.SCORE) {
+            sorts.add(new SortField("_elevate_", comparator, !sf.getReverse()));
+            modify = true;
+          }
+          sorts.add(sf);
+        }
+        if (modify) {
+          sortSpec.setSort(new Sort(sorts.toArray(new SortField[sorts.size()])));
+        }
       }
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    public int getMatches() {
-      if (result == null && fallBackCollector == null) {
+    // Add debugging information
+    if (rb.isDebug()) {
+      List<String> match = null;
+      if (booster != null) {
+        // Extract the elevated terms into a list
+        match = new ArrayList<String>(booster.priority.size());
+        for (Object o : booster.include.clauses()) {
+          TermQuery tq = (TermQuery) ((BooleanClause) o).getQuery();
+          match.add(tq.getTerm().text());
+        }
+      }
+
+      SimpleOrderedMap<Object> dbg = new SimpleOrderedMap<Object>();
+      dbg.add("q", qstr);
+      dbg.add("match", match);
+      if (rb.isDebugQuery()) {
+        rb.addDebugInfo("queryBoosting", dbg);
+      }
+    }
+  }
+
+  @Override
+  public void process(ResponseBuilder rb) throws IOException {
+    // Do nothing -- the real work is modifying the input query
+  }
+
+  //---------------------------------------------------------------------------------
+  // SolrInfoMBean
+  //---------------------------------------------------------------------------------
+
+  @Override
+  public String getDescription() {
+    return "Query Boosting -- boost particular documents for a given query";
+  }
+
+  @Override
+  public String getSource() {
+    return "$URL$";
+  }
+
+  @Override
+  public URL[] getDocs() {
+    try {
+      return new URL[]{
+          new URL("http://wiki.apache.org/solr/QueryElevationComponent")
+      };
+    } catch (MalformedURLException e) {
+      throw new RuntimeException(e);
+    }
+  }
+  class ElevationComparatorSource extends FieldComparatorSource {
+  private QueryElevationComponent.ElevationObj elevations;
+  private SentinelIntSet ordSet; //the key half of the map
+  private BytesRef[] termValues;//the value half of the map
+
+  public ElevationComparatorSource(final QueryElevationComponent.ElevationObj elevations) {
+    this.elevations = elevations;
+    int size = elevations.ids.size();
+    ordSet = new SentinelIntSet(size, -1);
+    termValues = new BytesRef[ordSet.keys.length];
+  }
+
+  @Override
+  public FieldComparator<Integer> newComparator(String fieldname, final int numHits, int sortPos, boolean reversed) throws IOException {
+    return new FieldComparator<Integer>() {
+      private final int[] values = new int[numHits];
+      private int bottomVal;
+      private TermsEnum termsEnum;
+      private DocsEnum docsEnum;
+      Set<String> seen = new HashSet<String>(elevations.ids.size());
+
+      @Override
+      public int compare(int slot1, int slot2) {
+        return values[slot1] - values[slot2];  // values will be small enough that there is no overflow concern
+      }
+
+      @Override
+      public void setBottom(int slot) {
+        bottomVal = values[slot];
+      }
+
+      private int docVal(int doc) {
+        if (ordSet.size() > 0) {
+          int slot = ordSet.find(doc);
+          if (slot >= 0) {
+            BytesRef id = termValues[slot];
+            Integer prio = elevations.priority.get(id);
+            return prio == null ? 0 : prio.intValue();
+          }
+        }
         return 0;
       }
 
-      return result != null ? result.totalHitCount : fallBackCollector.getTotalHits();
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    protected Integer getNumberOfGroups() {
-      return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
-    }
-  }
-
-  /**
-   * A group command for grouping on a query.
-   */
-  //NOTE: doesn't need to be generic. Maybe Command interface --> First / Second pass abstract impl.
-  public class CommandQuery extends Command {
-
-    public Query query;
-    TopDocsCollector topCollector;
-    FilterCollector collector;
-
-    /**
-     * {@inheritDoc}
-     */
-    protected void prepare() throws IOException {
-      actualGroupsToFind = getMax(offset, numGroups, maxDoc);
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    protected Collector createFirstPassCollector() throws IOException {
-      DocSet groupFilt = searcher.getDocSet(query);
-      topCollector = newCollector(groupSort, needScores);
-      collector = new FilterCollector(groupFilt, topCollector);
-      return collector;
-    }
-
-    TopDocsCollector newCollector(Sort sort, boolean needScores) throws IOException {
-      int groupDocsToCollect = getMax(groupOffset, docsPerGroup, maxDoc);
-      if (sort == null || sort == Sort.RELEVANCE) {
-        return TopScoreDocCollector.create(groupDocsToCollect, true);
-      } else {
-        return TopFieldCollector.create(searcher.weightSort(sort), groupDocsToCollect, false, needScores, needScores, true);
+      @Override
+      public int compareBottom(int doc) {
+        return bottomVal - docVal(doc);
       }
-    }
 
-    /**
-     * {@inheritDoc}
-     */
-    protected void finish() throws IOException {
-      TopDocsCollector topDocsCollector = (TopDocsCollector) collector.getDelegate();
-      TopDocs topDocs = topDocsCollector.topDocs();
-      GroupDocs<String> groupDocs = new GroupDocs<String>(topDocs.getMaxScore(), topDocs.totalHits, topDocs.scoreDocs, query.toString(), null);
-      if (main) {
-        mainResult = getDocList(groupDocs);
-      } else {
-        NamedList rsp = commonResponse();
-        addDocList(rsp, groupDocs);
+      @Override
+      public void copy(int slot, int doc) {
+        values[slot] = docVal(doc);
       }
-    }
 
-    /**
-     * {@inheritDoc}
-     */
-    public int getMatches() {
-      return collector.getMatches();
-    }
+      @Override
+      public FieldComparator setNextReader(AtomicReaderContext context) throws IOException {
+        //convert the ids to Lucene doc ids, the ordSet and termValues needs to be the same size as the number of elevation docs we have
+        ordSet.clear();
+        Fields fields = context.reader().fields();
+        if (fields == null) return this;
+        Terms terms = fields.terms(idField);
+        if (terms == null) return this;
+        termsEnum = terms.iterator(termsEnum);
+        BytesRef term = new BytesRef();
+        Bits liveDocs = context.reader().getLiveDocs();
+
+        for (String id : elevations.ids) {
+          term.copyChars(id);
+          if (seen.contains(id) == false  && termsEnum.seekExact(term, false)) {
+            docsEnum = termsEnum.docs(liveDocs, docsEnum, 0);
+            if (docsEnum != null) {
+              int docId = docsEnum.nextDoc();
+              if (docId == DocIdSetIterator.NO_MORE_DOCS ) continue;  // must have been deleted
+              termValues[ordSet.put(docId)] = BytesRef.deepCopyOf(term);
+              seen.add(id);
+              assert docsEnum.nextDoc() == DocIdSetIterator.NO_MORE_DOCS;
+            }
+          }
+        }
+        return this;
+      }
+
+      @Override
+      public Integer value(int slot) {
+        return values[slot];
+      }
+
+      @Override
+      public int compareDocToValue(int doc, Integer valueObj) {
+        final int value = valueObj.intValue();
+        final int docValue = docVal(doc);
+        return docValue - value;  // values will be small enough that there is no overflow concern
+      }
+    };
   }
-
+  }
 }

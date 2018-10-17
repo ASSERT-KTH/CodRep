@@ -1,270 +1,300 @@
-List<Object> textsToHighlight = HighlightUtils.loadFieldValues(fieldMapper, context, hitContext, field.forceSource());
+public Scorer scorer(AtomicReaderContext context, Bits acceptDocs) throws IOException {
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
- * or more contributor license agreements. See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations under
- * the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
+package org.elasticsearch.index.search.child;
 
-package org.elasticsearch.search.highlight;
-
-import com.google.common.collect.Maps;
-import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.AtomicReaderContext;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.*;
-import org.apache.lucene.search.highlight.Encoder;
-import org.apache.lucene.search.postingshighlight.CustomPassageFormatter;
-import org.apache.lucene.search.postingshighlight.CustomPostingsHighlighter;
-import org.apache.lucene.search.postingshighlight.Snippet;
-import org.apache.lucene.search.postingshighlight.WholeBreakIterator;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CollectionUtil;
-import org.apache.lucene.util.UnicodeUtil;
-import org.elasticsearch.ElasticSearchIllegalArgumentException;
-import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.text.StringText;
-import org.elasticsearch.index.mapper.FieldMapper;
-import org.elasticsearch.search.fetch.FetchPhaseExecutionException;
-import org.elasticsearch.search.fetch.FetchSubPhase;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.common.lease.Releasable;
+import org.elasticsearch.common.lease.Releasables;
+import org.elasticsearch.common.lucene.docset.DocIdSets;
+import org.elasticsearch.common.lucene.search.ApplyAcceptedDocsFilter;
+import org.elasticsearch.common.lucene.search.NoopCollector;
+import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.common.util.BytesRefHash;
+import org.elasticsearch.index.fielddata.BytesValues;
+import org.elasticsearch.index.fielddata.ordinals.Ordinals;
+import org.elasticsearch.index.fielddata.plain.ParentChildIndexFieldData;
 import org.elasticsearch.search.internal.SearchContext;
+import org.elasticsearch.search.internal.SearchContext.Lifetime;
 
 import java.io.IOException;
-import java.text.BreakIterator;
-import java.util.*;
+import java.util.Set;
 
-public class PostingsHighlighter implements Highlighter {
+/**
+ * A query that only return child documents that are linked to the parent documents that matched with the inner query.
+ */
+public class ParentConstantScoreQuery extends Query {
 
-    private static final String CACHE_KEY = "highlight-postings";
+    private final ParentChildIndexFieldData parentChildIndexFieldData;
+    private Query originalParentQuery;
+    private final String parentType;
+    private final Filter childrenFilter;
 
-    @Override
-    public String[] names() {
-        return new String[]{"postings", "postings-highlighter"};
+    private Query rewrittenParentQuery;
+    private IndexReader rewriteIndexReader;
+
+    public ParentConstantScoreQuery(ParentChildIndexFieldData parentChildIndexFieldData, Query parentQuery, String parentType, Filter childrenFilter) {
+        this.parentChildIndexFieldData = parentChildIndexFieldData;
+        this.originalParentQuery = parentQuery;
+        this.parentType = parentType;
+        this.childrenFilter = childrenFilter;
     }
 
     @Override
-    public HighlightField highlight(HighlighterContext highlighterContext) {
-
-        FieldMapper<?> fieldMapper = highlighterContext.mapper;
-        SearchContextHighlight.Field field = highlighterContext.field;
-        if (fieldMapper.fieldType().indexOptions() != FieldInfo.IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) {
-            throw new ElasticSearchIllegalArgumentException("the field [" + field.field() + "] should be indexed with positions and offsets in the postings list to be used with postings highlighter");
+    // See TopChildrenQuery#rewrite
+    public Query rewrite(IndexReader reader) throws IOException {
+        if (rewrittenParentQuery == null) {
+            rewrittenParentQuery = originalParentQuery.rewrite(reader);
+            rewriteIndexReader = reader;
         }
+        return this;
+    }
 
-        SearchContext context = highlighterContext.context;
-        FetchSubPhase.HitContext hitContext = highlighterContext.hitContext;
+    @Override
+    public void extractTerms(Set<Term> terms) {
+        rewrittenParentQuery.extractTerms(terms);
+    }
 
-        if (!hitContext.cache().containsKey(CACHE_KEY)) {
-            //get the non rewritten query and rewrite it
-            Query query;
-            try {
-                query = rewrite(highlighterContext, hitContext.topLevelReader());
-            } catch (IOException e) {
-                throw new FetchPhaseExecutionException(context, "Failed to highlight field [" + highlighterContext.fieldName + "]", e);
-            }
-            SortedSet<Term> queryTerms = extractTerms(query);
-            hitContext.cache().put(CACHE_KEY, new HighlighterEntry(queryTerms));
+    @Override
+    public Query clone() {
+        ParentConstantScoreQuery q = (ParentConstantScoreQuery) super.clone();
+        q.originalParentQuery = originalParentQuery.clone();
+        if (q.rewrittenParentQuery != null) {
+            q.rewrittenParentQuery = rewrittenParentQuery.clone();
         }
+        return q;
+    }
 
-        HighlighterEntry highlighterEntry = (HighlighterEntry) hitContext.cache().get(CACHE_KEY);
-        MapperHighlighterEntry mapperHighlighterEntry = highlighterEntry.mappers.get(fieldMapper);
-
-        if (mapperHighlighterEntry == null) {
-            Encoder encoder = field.encoder().equals("html") ? HighlightUtils.Encoders.HTML : HighlightUtils.Encoders.DEFAULT;
-            CustomPassageFormatter passageFormatter = new CustomPassageFormatter(field.preTags()[0], field.postTags()[0], encoder);
-            BytesRef[] filteredQueryTerms = filterTerms(highlighterEntry.queryTerms, fieldMapper.names().indexName(), field.requireFieldMatch());
-            mapperHighlighterEntry = new MapperHighlighterEntry(passageFormatter, filteredQueryTerms);
-        }
-
-        //we merge back multiple values into a single value using the paragraph separator, unless we have to highlight every single value separately (number_of_fragments=0).
-        boolean mergeValues = field.numberOfFragments() != 0;
-        List<Snippet> snippets = new ArrayList<Snippet>();
-        int numberOfFragments;
-
+    @Override
+    public Weight createWeight(IndexSearcher searcher) throws IOException {
+        final SearchContext searchContext = SearchContext.current();
+        final BytesRefHash parentIds = new BytesRefHash(512, searchContext.bigArrays());
+        boolean releaseParentIds = true;
         try {
-            //we manually load the field values (from source if needed)
-            List<Object> textsToHighlight = HighlightUtils.loadFieldValues(fieldMapper, context, hitContext);
-            CustomPostingsHighlighter highlighter = new CustomPostingsHighlighter(mapperHighlighterEntry.passageFormatter, textsToHighlight, mergeValues, Integer.MAX_VALUE-1, field.noMatchSize());
+            ParentIdsCollector collector = new ParentIdsCollector(parentType, parentChildIndexFieldData, parentIds);
+            assert rewrittenParentQuery != null;
+            assert rewriteIndexReader == searcher.getIndexReader() : "not equal, rewriteIndexReader=" + rewriteIndexReader + " searcher.getIndexReader()=" + searcher.getIndexReader();
+            final Query parentQuery = rewrittenParentQuery;
+            IndexSearcher indexSearcher = new IndexSearcher(searcher.getIndexReader());
+            indexSearcher.setSimilarity(searcher.getSimilarity());
+            indexSearcher.search(parentQuery, collector);
 
-             if (field.numberOfFragments() == 0) {
-                highlighter.setBreakIterator(new WholeBreakIterator());
-                numberOfFragments = 1; //1 per value since we highlight per value
-            } else {
-                numberOfFragments = field.numberOfFragments();
+            if (parentIds.size() == 0) {
+                return Queries.newMatchNoDocsQuery().createWeight(searcher);
             }
 
-            //we highlight every value separately calling the highlight method multiple times, only if we need to have back a snippet per value (whole value)
-            int values = mergeValues ? 1 : textsToHighlight.size();
-            for (int i = 0; i < values; i++) {
-                Snippet[] fieldSnippets = highlighter.highlightDoc(fieldMapper.names().indexName(), mapperHighlighterEntry.filteredQueryTerms, hitContext.searcher(), hitContext.docId(), numberOfFragments);
-                if (fieldSnippets != null) {
-                    for (Snippet fieldSnippet : fieldSnippets) {
-                        if (Strings.hasText(fieldSnippet.getText())) {
-                            snippets.add(fieldSnippet);
-                        }
+            final ChildrenWeight childrenWeight = new ChildrenWeight(childrenFilter, parentIds);
+            searchContext.addReleasable(childrenWeight, Lifetime.COLLECTION);
+            releaseParentIds = false;
+            return childrenWeight;
+        } finally {
+            if (releaseParentIds) {
+                Releasables.close(parentIds);
+            }
+        }
+    }
+
+    private final class ChildrenWeight extends Weight implements Releasable {
+
+        private final Filter childrenFilter;
+        private final BytesRefHash parentIds;
+
+        private float queryNorm;
+        private float queryWeight;
+
+        private FixedBitSet seenOrdinalsCache;
+        private FixedBitSet seenMatchedOrdinalsCache;
+
+        private ChildrenWeight(Filter childrenFilter, BytesRefHash parentIds) {
+            this.childrenFilter = new ApplyAcceptedDocsFilter(childrenFilter);
+            this.parentIds = parentIds;
+        }
+
+        @Override
+        public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
+            return new Explanation(getBoost(), "not implemented yet...");
+        }
+
+        @Override
+        public Query getQuery() {
+            return ParentConstantScoreQuery.this;
+        }
+
+        @Override
+        public float getValueForNormalization() throws IOException {
+            queryWeight = getBoost();
+            return queryWeight * queryWeight;
+        }
+
+        @Override
+        public void normalize(float norm, float topLevelBoost) {
+            this.queryNorm = norm * topLevelBoost;
+            queryWeight *= this.queryNorm;
+        }
+
+        @Override
+        public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder, boolean topScorer, Bits acceptDocs) throws IOException {
+            DocIdSet childrenDocIdSet = childrenFilter.getDocIdSet(context, acceptDocs);
+            if (DocIdSets.isEmpty(childrenDocIdSet)) {
+                return null;
+            }
+
+            BytesValues.WithOrdinals bytesValues = parentChildIndexFieldData.load(context).getBytesValues(parentType);
+            if (bytesValues != null) {
+                DocIdSetIterator innerIterator = childrenDocIdSet.iterator();
+                if (innerIterator != null) {
+                    Ordinals.Docs ordinals = bytesValues.ordinals();
+                    int maxOrd = (int) ordinals.getMaxOrd();
+                    if (seenOrdinalsCache == null || seenOrdinalsCache.length() < maxOrd) {
+                        seenOrdinalsCache = new FixedBitSet(maxOrd);
+                        seenMatchedOrdinalsCache = new FixedBitSet(maxOrd);
+                    } else {
+                        seenOrdinalsCache.clear(0, maxOrd);
+                        seenMatchedOrdinalsCache.clear(0, maxOrd);
                     }
+                    ChildrenDocIdIterator childrenDocIdIterator = new ChildrenDocIdIterator(
+                            innerIterator, parentIds, bytesValues, ordinals, seenOrdinalsCache, seenMatchedOrdinalsCache
+                    );
+                    return ConstantScorer.create(childrenDocIdIterator, this, queryWeight);
                 }
             }
-
-        } catch(IOException e) {
-            throw new FetchPhaseExecutionException(context, "Failed to highlight field [" + highlighterContext.fieldName + "]", e);
+            return null;
         }
 
-        snippets = filterSnippets(snippets, field.numberOfFragments());
+        @Override
+        public void close() throws ElasticsearchException {
+            Releasables.close(parentIds);
+        }
 
-        if (field.scoreOrdered()) {
-            //let's sort the snippets by score if needed
-            CollectionUtil.introSort(snippets, new Comparator<Snippet>() {
-                public int compare(Snippet o1, Snippet o2) {
-                    return (int) Math.signum(o2.getScore() - o1.getScore());
+        private final class ChildrenDocIdIterator extends FilteredDocIdSetIterator {
+
+            private final BytesRefHash parentIds;
+            private final BytesValues.WithOrdinals bytesValues;
+            private final Ordinals.Docs ordinals;
+
+            // This remembers what ordinals have already been emitted in the current segment
+            // and prevents from fetch the actual id from FD and checking if it exists in parentIds
+            private final FixedBitSet seenOrdinals;
+            private final FixedBitSet seenMatchedOrdinals;
+
+            ChildrenDocIdIterator(DocIdSetIterator innerIterator, BytesRefHash parentIds, BytesValues.WithOrdinals bytesValues, Ordinals.Docs ordinals, FixedBitSet seenOrdinals, FixedBitSet seenMatchedOrdinals) {
+                super(innerIterator);
+                this.parentIds = parentIds;
+                this.bytesValues = bytesValues;
+                this.ordinals = ordinals;
+                this.seenOrdinals = seenOrdinals;
+                this.seenMatchedOrdinals = seenMatchedOrdinals;
+            }
+
+            @Override
+            protected boolean match(int doc) {
+                int ord = (int) ordinals.getOrd(doc);
+                if (ord == Ordinals.MISSING_ORDINAL) {
+                    return false;
                 }
-            });
-        }
 
-        String[] fragments = new String[snippets.size()];
-        for (int i = 0; i < fragments.length; i++) {
-            fragments[i] = snippets.get(i).getText();
-        }
-
-        if (fragments.length > 0) {
-            return new HighlightField(highlighterContext.fieldName, StringText.convertFromStringArray(fragments));
-        }
-
-        return null;
-    }
-
-    private static Query rewrite(HighlighterContext highlighterContext, IndexReader reader) throws IOException {
-        //rewrite is expensive: if the query was already rewritten we try not to rewrite
-        boolean mustRewrite = !highlighterContext.query.queryRewritten();
-
-        Query original = highlighterContext.query.originalQuery();
-
-        MultiTermQuery originalMultiTermQuery = null;
-        MultiTermQuery.RewriteMethod originalRewriteMethod = null;
-        if (original instanceof MultiTermQuery) {
-            originalMultiTermQuery = (MultiTermQuery) original;
-            if (!allowsForTermExtraction(originalMultiTermQuery.getRewriteMethod())) {
-                originalRewriteMethod = originalMultiTermQuery.getRewriteMethod();
-                originalMultiTermQuery.setRewriteMethod(new MultiTermQuery.TopTermsScoringBooleanQueryRewrite(50));
-                //we need to rewrite anyway if it is a multi term query which was rewritten with the wrong rewrite method
-                mustRewrite = true;
-            }
-        }
-
-        if (!mustRewrite) {
-            //return the rewritten query
-            return highlighterContext.query.query();
-        }
-
-        Query query = original;
-        for (Query rewrittenQuery = query.rewrite(reader); rewrittenQuery != query;
-             rewrittenQuery = query.rewrite(reader)) {
-            query = rewrittenQuery;
-        }
-
-        if (originalMultiTermQuery != null) {
-            if (originalRewriteMethod != null) {
-                //set back the original rewrite method after the rewrite is done
-                originalMultiTermQuery.setRewriteMethod(originalRewriteMethod);
-            }
-        }
-
-        return query;
-    }
-
-    private static boolean allowsForTermExtraction(MultiTermQuery.RewriteMethod rewriteMethod) {
-        return rewriteMethod instanceof TopTermsRewrite || rewriteMethod instanceof ScoringRewrite;
-    }
-
-    private static SortedSet<Term> extractTerms(Query query) {
-        SortedSet<Term> queryTerms = new TreeSet<Term>();
-        query.extractTerms(queryTerms);
-        return queryTerms;
-    }
-
-    private static BytesRef[] filterTerms(SortedSet<Term> queryTerms, String field, boolean requireFieldMatch) {
-        SortedSet<Term> fieldTerms;
-        if (requireFieldMatch) {
-            Term floor = new Term(field, "");
-            Term ceiling = new Term(field, UnicodeUtil.BIG_TERM);
-            fieldTerms = queryTerms.subSet(floor, ceiling);
-        } else {
-            fieldTerms = queryTerms;
-        }
-
-        BytesRef terms[] = new BytesRef[fieldTerms.size()];
-        int termUpto = 0;
-        for(Term term : fieldTerms) {
-            terms[termUpto++] = term.bytes();
-        }
-
-        return terms;
-    }
-
-    private static List<Snippet> filterSnippets(List<Snippet> snippets, int numberOfFragments) {
-
-        //We need to filter the snippets as due to no_match_size we could have
-        //either highlighted snippets together non highlighted ones
-        //We don't want to mix those up
-        List<Snippet> filteredSnippets = new ArrayList<Snippet>(snippets.size());
-        for (Snippet snippet : snippets) {
-            if (snippet.isHighlighted()) {
-                filteredSnippets.add(snippet);
-            }
-        }
-
-        //if there's at least one highlighted snippet, we return all the highlighted ones
-        //otherwise we return the first non highlighted one if available
-        if (filteredSnippets.size() == 0) {
-            if (snippets.size() > 0) {
-                Snippet snippet = snippets.get(0);
-                //if we did discrete per value highlighting using whole break iterator (as number_of_fragments was 0)
-                //we need to obtain the first sentence of the first value
-                if (numberOfFragments == 0) {
-                    BreakIterator bi = BreakIterator.getSentenceInstance(Locale.ROOT);
-                    String text = snippet.getText();
-                    bi.setText(text);
-                    int next = bi.next();
-                    if (next != BreakIterator.DONE) {
-                        String newText = text.substring(0, next).trim();
-                        snippet = new Snippet(newText, snippet.getScore(), snippet.isHighlighted());
+                if (!seenOrdinals.get(ord)) {
+                    seenOrdinals.set(ord);
+                    if (parentIds.find(bytesValues.getValueByOrd(ord), bytesValues.currentValueHash()) >= 0) {
+                        seenMatchedOrdinals.set(ord);
+                        return true;
+                    } else {
+                        return false;
                     }
+                } else {
+                    return seenMatchedOrdinals.get(ord);
                 }
-                filteredSnippets.add(snippet);
+            }
+
+        }
+    }
+
+    private final static class ParentIdsCollector extends NoopCollector {
+
+        private final BytesRefHash parentIds;
+        private final ParentChildIndexFieldData indexFieldData;
+        private final String parentType;
+
+        private BytesValues values;
+
+        ParentIdsCollector(String parentType, ParentChildIndexFieldData indexFieldData, BytesRefHash parentIds) {
+            this.parentIds = parentIds;
+            this.indexFieldData = indexFieldData;
+            this.parentType = parentType;
+        }
+
+        public void collect(int doc) throws IOException {
+            // It can happen that for particular segment no document exist for an specific type. This prevents NPE
+            if (values != null) {
+                values.setDocument(doc);
+                parentIds.add(values.nextValue(), values.currentValueHash());
             }
         }
 
-        return filteredSnippets;
-    }
-
-    private static class HighlighterEntry {
-        final SortedSet<Term> queryTerms;
-        Map<FieldMapper<?>, MapperHighlighterEntry> mappers = Maps.newHashMap();
-
-        private HighlighterEntry(SortedSet<Term> queryTerms) {
-            this.queryTerms = queryTerms;
+        @Override
+        public void setNextReader(AtomicReaderContext readerContext) throws IOException {
+            values = indexFieldData.load(readerContext).getBytesValues(parentType);
         }
     }
 
-    private static class MapperHighlighterEntry {
-        final CustomPassageFormatter passageFormatter;
-        final BytesRef[] filteredQueryTerms;
-
-        private MapperHighlighterEntry(CustomPassageFormatter passageFormatter, BytesRef[] filteredQueryTerms) {
-            this.passageFormatter = passageFormatter;
-            this.filteredQueryTerms = filteredQueryTerms;
-        }
+    @Override
+    public int hashCode() {
+        int result = originalParentQuery.hashCode();
+        result = 31 * result + parentType.hashCode();
+        result = 31 * result + Float.floatToIntBits(getBoost());
+        return result;
     }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (obj == null || obj.getClass() != this.getClass()) {
+            return false;
+        }
+
+        ParentConstantScoreQuery that = (ParentConstantScoreQuery) obj;
+        if (!originalParentQuery.equals(that.originalParentQuery)) {
+            return false;
+        }
+        if (!parentType.equals(that.parentType)) {
+            return false;
+        }
+        if (this.getBoost() != that.getBoost()) {
+            return false;
+        }
+        return true;
+    }
+
+    @Override
+    public String toString(String field) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("parent_filter[").append(parentType).append("](").append(originalParentQuery).append(')');
+        return sb.toString();
+    }
+
 }

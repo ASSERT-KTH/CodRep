@@ -22,154 +22,72 @@ import org.jboss.as.ejb3.EjbLogger;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.ejb3.component.messagedriven;
+package org.jboss.as.ejb3.remote.protocol.versionone;
 
-import java.util.Properties;
-
-import javax.resource.spi.ActivationSpec;
-import javax.resource.spi.ResourceAdapter;
-
-import org.jboss.as.connector.util.ConnectorServices;
-import org.jboss.as.ee.component.BasicComponent;
-import org.jboss.as.ee.component.ComponentConfiguration;
 import org.jboss.as.ejb3.logging.EjbLogger;
-import org.jboss.as.ejb3.component.EJBComponentCreateService;
-import org.jboss.as.ejb3.component.EJBUtilities;
-import org.jboss.as.ejb3.component.pool.PoolConfig;
-import org.jboss.as.ejb3.deployment.ApplicationExceptions;
-import org.jboss.as.ejb3.inflow.EndpointDeployer;
-import org.jboss.jca.core.spi.rar.Endpoint;
-import org.jboss.msc.inject.Injector;
-import org.jboss.msc.service.StartContext;
-import org.jboss.msc.service.StartException;
-import org.jboss.msc.value.InjectedValue;
+import org.jboss.as.ejb3.remote.EJBRemoteTransactionsRepository;
+import org.jboss.ejb.client.UserTransactionID;
+import org.jboss.marshalling.MarshallerFactory;
+import org.xnio.IoUtils;
+
+import javax.transaction.Transaction;
+import javax.transaction.TransactionManager;
+import java.io.IOException;
 
 /**
- * @author Stuart Douglas
+ * @author Jaikiran Pai
  */
-public class MessageDrivenComponentCreateService extends EJBComponentCreateService {
+abstract class UserTransactionManagementTask implements Runnable {
 
-    private final Class<?> messageListenerInterface;
-    private final Properties activationProps;
-    private final String resourceAdapterName;
-    private final boolean deliveryActive;
-    private final InjectedValue<ResourceAdapter> resourceAdapterInjectedValue = new InjectedValue<ResourceAdapter>();
-    private final InjectedValue<PoolConfig> poolConfig = new InjectedValue<PoolConfig>();
-    private final InjectedValue<DefaultResourceAdapterService> defaultResourceAdapterServiceInjectedValue = new InjectedValue<DefaultResourceAdapterService>();
-    private final InjectedValue<EJBUtilities> ejbUtilitiesInjectedValue = new InjectedValue<EJBUtilities>();
-    private final ClassLoader moduleClassLoader;
+    protected final short invocationId;
+    protected final ChannelAssociation channelAssociation;
+    protected final EJBRemoteTransactionsRepository transactionsRepository;
+    protected final UserTransactionID userTransactionID;
+    protected final MarshallerFactory marshallerFactory;
+    protected final TransactionRequestHandler transactionRequestHandler;
 
-    /**
-     * Construct a new instance.
-     *
-     * @param componentConfiguration the component configuration
-     */
-    public MessageDrivenComponentCreateService(final ComponentConfiguration componentConfiguration, final ApplicationExceptions ejbJarConfiguration, final Class<?> messageListenerInterface) {
-        super(componentConfiguration, ejbJarConfiguration);
-
-        final MessageDrivenComponentDescription componentDescription = (MessageDrivenComponentDescription) componentConfiguration.getComponentDescription();
-        this.resourceAdapterName = componentDescription.getResourceAdapterName();
-        this.deliveryActive = componentDescription.isDeliveryActive();
-        // see MessageDrivenComponentDescription.<init>
-        this.messageListenerInterface = messageListenerInterface;
-
-        this.activationProps = componentDescription.getActivationProps();
-        this.moduleClassLoader = componentConfiguration.getModuleClassLoader();
+    UserTransactionManagementTask(final TransactionRequestHandler transactionRequestHandler, final EJBRemoteTransactionsRepository transactionsRepository,
+                                  final MarshallerFactory marshallerFactory, final UserTransactionID userTransactionID,
+                                  final ChannelAssociation channelAssociation, final short invocationId) {
+        this.transactionRequestHandler = transactionRequestHandler;
+        this.channelAssociation = channelAssociation;
+        this.marshallerFactory = marshallerFactory;
+        this.invocationId = invocationId;
+        this.transactionsRepository = transactionsRepository;
+        this.userTransactionID = userTransactionID;
     }
 
     @Override
-    public void start(StartContext context) throws StartException {
-        super.start(context);
-        // AS7-3073 just log a message about the MDB being started
-        EjbLogger.ROOT_LOGGER.logMDBStart(this.getComponentName(), this.resourceAdapterName);
-    }
-
-    @Override
-    protected BasicComponent createComponent() {
-        String configuredResourceAdapterName;
-        if (resourceAdapterName == null) {
-            configuredResourceAdapterName = defaultResourceAdapterServiceInjectedValue.getValue().getDefaultResourceAdapterName();
-        } else {
-            configuredResourceAdapterName = resourceAdapterName;
-        }
-
-        // Match configured value to the actual RA names
-        final String activeResourceAdapterName = searchActiveResourceAdapterName(configuredResourceAdapterName);
-
-
-        final ActivationSpec activationSpec = getEndpointDeployer().createActivationSpecs(activeResourceAdapterName, messageListenerInterface, activationProps, getDeploymentClassLoader());
-        final MessageDrivenComponent component = new MessageDrivenComponent(this, messageListenerInterface, activationSpec, deliveryActive);
-        // set the resource adapter
-        final ResourceAdapter resourceAdapter = this.resourceAdapterInjectedValue.getValue();
-        component.setResourceAdapter(resourceAdapter);
-        // set the endpoint
-        final EJBUtilities ejbUtilities = this.ejbUtilitiesInjectedValue.getValue();
-        final Endpoint endpoint = ejbUtilities.getEndpoint(activeResourceAdapterName);
-
-        component.setEndpoint(endpoint);
-
-        return component;
-    }
-
-    private String searchActiveResourceAdapterName(String configuredResourceAdapterName) {
-        // Use the configured value unless it doesn't match and some variant of it does
-        String result = configuredResourceAdapterName;
-        if (ConnectorServices.getRegisteredResourceAdapterIdentifier(configuredResourceAdapterName) == null) {
-            // No direct match. See if we have a match with .rar removed or appended
-            String amended = stripDotRarSuffix(configuredResourceAdapterName);
-            if (configuredResourceAdapterName.equals(amended)) {
-                // There was no .rar to strip; try appending
-                amended = configuredResourceAdapterName + ".rar";
+    public final void run() {
+        try {
+            this.manageTransaction();
+        } catch (Throwable t) {
+            try {
+                // write out a failure message to the channel to let the client know that
+                // the transaction operation failed
+                transactionRequestHandler.writeException(this.channelAssociation, this.marshallerFactory, this.invocationId, t, null);
+            } catch (IOException e) {
+                EjbLogger.ROOT_LOGGER.couldNotWriteOutToChannel(e);
+                // close the channel
+                IoUtils.safeClose(this.channelAssociation.getChannel());
             }
-            if (ConnectorServices.getRegisteredResourceAdapterIdentifier(amended) != null) {
-                result = amended;
-            }
+            return;
         }
 
-        return result;
-    }
-
-
-    Injector<DefaultResourceAdapterService> getDefaultResourceAdapterServiceInjector() {
-        return defaultResourceAdapterServiceInjectedValue;
-    }
-
-    PoolConfig getPoolConfig() {
-        return this.poolConfig.getOptionalValue();
-    }
-
-    public InjectedValue<PoolConfig> getPoolConfigInjector() {
-        return this.poolConfig;
-    }
-
-    private ClassLoader getDeploymentClassLoader() {
-        return getComponentClass().getClassLoader();
-    }
-
-    private EndpointDeployer getEndpointDeployer() {
-        return getEJBUtilities();
-    }
-
-    public InjectedValue<ResourceAdapter> getResourceAdapterInjector() {
-        return this.resourceAdapterInjectedValue;
-    }
-
-    public Injector<EJBUtilities> getEJBUtilitiesInjector() {
-        return this.ejbUtilitiesInjectedValue;
-    }
-
-    public ClassLoader getModuleClassLoader() {
-        return moduleClassLoader;
-    }
-
-    private String stripDotRarSuffix(final String raName) {
-        if (raName == null) {
-            return null;
+        try {
+            // write out invocation success message to the channel
+            transactionRequestHandler.writeTxInvocationResponseMessage(this.channelAssociation, this.invocationId);
+        } catch (IOException e) {
+            EjbLogger.ROOT_LOGGER.couldNotWriteInvocationSuccessMessage(e);
+            // close the channel
+            IoUtils.safeClose(this.channelAssociation.getChannel());
         }
-        // See RaDeploymentParsingProcessor
-        if (raName.endsWith(".rar")) {
-            return raName.substring(0, raName.indexOf(".rar"));
-        }
-        return raName;
+    }
+
+    protected abstract void manageTransaction() throws Throwable;
+
+    protected void resumeTransaction(final Transaction transaction) throws Exception {
+        final TransactionManager transactionManager = this.transactionsRepository.getTransactionManager();
+        transactionManager.resume(transaction);
     }
 }

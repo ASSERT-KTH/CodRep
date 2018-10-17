@@ -1,4 +1,4 @@
-public static final int version_ = 1;
+public void move(String newToken) throws IOException, InterruptedException
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,570 +18,648 @@ public static final int version_ = 1;
  * limitations under the License.
  */
 
-package org.apache.cassandra.net;
+package org.apache.cassandra.tools;
 
-import java.io.IOError;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.lang.management.ManagementFactory;
-import java.net.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.AsynchronousCloseException;
-import java.nio.channels.ServerSocketChannel;
-import java.security.MessageDigest;
-import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import javax.management.MBeanServer;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
+import java.lang.management.RuntimeMXBean;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import javax.management.JMX;
+import javax.management.MBeanServerConnection;
+import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
+import javax.management.remote.JMXConnector;
+import javax.management.remote.JMXConnectorFactory;
+import javax.management.remote.JMXServiceURL;
 
-import com.google.common.base.Function;
-import com.google.common.collect.ArrayListMultimap;
-import com.google.common.collect.Multimap;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.concurrent.IExecutorMBean;
+import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+import org.apache.cassandra.db.CompactionManager;
+import org.apache.cassandra.db.CompactionManagerMBean;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.service.StorageServiceMBean;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
+import org.apache.commons.cli.PosixParser;
 
-import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.locator.ILatencySubscriber;
-import org.apache.cassandra.net.io.SerializerType;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.service.GCInspector;
-import org.apache.cassandra.service.ReadCallback;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.streaming.FileStreamTask;
-import org.apache.cassandra.streaming.StreamHeader;
-import org.apache.cassandra.utils.ExpiringMap;
-import org.apache.cassandra.utils.GuidGenerator;
-import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.utils.SimpleCondition;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-import org.cliffc.high_scale_lib.NonBlockingHashSet;
-
-public final class MessagingService implements MessagingServiceMBean
+/**
+ * JMX client operations for Cassandra.
+ */
+public class NodeProbe
 {
-    private static final int version_ = 1;
-    //TODO: make this parameter dynamic somehow.  Not sure if config is appropriate.
-    private SerializerType serializerType_ = SerializerType.BINARY;
-
-    /** we preface every message with this number so the recipient can validate the sender is sane */
-    private static final int PROTOCOL_MAGIC = 0xCA552DFA;
-
-    /* This records all the results mapped by message Id */
-    private final ExpiringMap<String, Pair<InetAddress, IMessageCallback>> callbacks;
-
-    /* Lookup table for registering message handlers based on the verb. */
-    private final Map<StorageService.Verb, IVerbHandler> verbHandlers_;
-
-    /* Thread pool to handle messaging write activities */
-    private final ExecutorService streamExecutor_;
+    private static final String fmtUrl = "service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi";
+    private static final String ssObjName = "org.apache.cassandra.service:type=StorageService";
+    private static final String HOST_OPTION = "host";
+    private static final String PORT_OPTION = "port";
+    private static final int defaultPort = 8080;
+    private static Options options = null;
+    private CommandLine cmd = null;
+    private String host;
+    private int port;
     
-    private final NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool> connectionManagers_ = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
+    private MBeanServerConnection mbeanServerConn;
+    private StorageServiceMBean ssProxy;
+    private MemoryMXBean memProxy;
+    private RuntimeMXBean runtimeProxy;
+    private CompactionManagerMBean mcmProxy;
+
+    static
+    {
+        options = new Options();
+        Option optHost = new Option(HOST_OPTION, true, "node hostname or ip address");
+        optHost.setRequired(true);
+        options.addOption(optHost);
+        options.addOption(PORT_OPTION, true, "remote jmx agent port number");
+    }
     
-    private static final Logger logger_ = LoggerFactory.getLogger(MessagingService.class);
-    private static final int LOG_DROPPED_INTERVAL_IN_MS = 5000;
-
-    private SocketThread socketThread;
-    private final SimpleCondition listenGate;
-    private final Map<StorageService.Verb, AtomicInteger> droppedMessages = new EnumMap<StorageService.Verb, AtomicInteger>(StorageService.Verb.class);
-    private final List<ILatencySubscriber> subscribers = new ArrayList<ILatencySubscriber>();
-
+    /**
+     * Creates a NodeProbe using command-line arguments.
+     * 
+     * @param cmdArgs list of arguments passed on the command line
+     * @throws ParseException for missing required, or unrecognized options
+     * @throws IOException on connection failures
+     */
+    private NodeProbe(String[] cmdArgs) throws ParseException, IOException, InterruptedException
     {
-        for (StorageService.Verb verb : StorageService.Verb.values())
-            droppedMessages.put(verb, new AtomicInteger());
-    }
-
-    private static class MSHandle
-    {
-        public static final MessagingService instance = new MessagingService();
-    }
-    public static MessagingService instance()
-    {
-        return MSHandle.instance;
-    }
-
-    private MessagingService()
-    {
-        listenGate = new SimpleCondition();
-        verbHandlers_ = new EnumMap<StorageService.Verb, IVerbHandler>(StorageService.Verb.class);
-        streamExecutor_ = new DebuggableThreadPoolExecutor("Streaming", DatabaseDescriptor.getCompactionThreadPriority());
-        Runnable logDropped = new Runnable()
+        parseArgs(cmdArgs);
+        this.host = cmd.getOptionValue(HOST_OPTION);
+        
+        String portNum = cmd.getOptionValue(PORT_OPTION);
+        if (portNum != null)
         {
-            public void run()
+            try
             {
-                logDroppedMessages();
+                this.port = Integer.parseInt(portNum);
             }
-        };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(logDropped, LOG_DROPPED_INTERVAL_IN_MS, LOG_DROPPED_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
-
-        Function<Pair<String, Pair<InetAddress, IMessageCallback>>, ?> timeoutReporter = new Function<Pair<String, Pair<InetAddress, IMessageCallback>>, Object>()
+            catch (NumberFormatException e)
+            {
+                throw new ParseException("Port must be a number");
+            }
+        }
+        else
         {
-            public Object apply(Pair<String, Pair<InetAddress, IMessageCallback>> pair)
-            {
-                Pair<InetAddress, IMessageCallback> expiredValue = pair.right;
-                maybeAddLatency(expiredValue.right, expiredValue.left, (double) DatabaseDescriptor.getRpcTimeout());
-                return null;
-            }
-        };
-        callbacks = new ExpiringMap<String, Pair<InetAddress, IMessageCallback>>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()), timeoutReporter);
-
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            this.port = defaultPort;
+        }
+        
+        connect();
+    }
+    
+    /**
+     * Creates a NodeProbe using the specified JMX host and port.
+     * 
+     * @param host hostname or IP address of the JMX agent
+     * @param port TCP port of the remote JMX agent
+     * @throws IOException on connection failures
+     */
+    public NodeProbe(String host, int port) throws IOException, InterruptedException
+    {
+        this.host = host;
+        this.port = port;
+        connect();
+    }
+    
+    /**
+     * Creates a NodeProbe using the specified JMX host and default port.
+     * 
+     * @param host hostname or IP address of the JMX agent
+     * @throws IOException on connection failures
+     */
+    public NodeProbe(String host) throws IOException, InterruptedException
+    {
+        this.host = host;
+        this.port = defaultPort;
+        connect();
+    }
+    
+    /**
+     * Create a connection to the JMX agent and setup the M[X]Bean proxies.
+     * 
+     * @throws IOException on connection failures
+     */
+    private void connect() throws IOException
+    {
+        JMXServiceURL jmxUrl = new JMXServiceURL(String.format(fmtUrl, host, port));
+        JMXConnector jmxc = JMXConnectorFactory.connect(jmxUrl, null);
+        mbeanServerConn = jmxc.getMBeanServerConnection();
+        
         try
         {
-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.net:type=MessagingService"));
-        }
-        catch (Exception e)
+            ObjectName name = new ObjectName(ssObjName);
+            ssProxy = JMX.newMBeanProxy(mbeanServerConn, name, StorageServiceMBean.class);
+            name = new ObjectName(CompactionManager.MBEAN_OBJECT_NAME);
+            mcmProxy = JMX.newMBeanProxy(mbeanServerConn, name, CompactionManagerMBean.class);
+        } catch (MalformedObjectNameException e)
         {
-            throw new RuntimeException(e);
+            throw new RuntimeException(
+                    "Invalid ObjectName? Please report this as a bug.", e);
         }
+        
+        memProxy = ManagementFactory.newPlatformMXBeanProxy(mbeanServerConn, 
+                ManagementFactory.MEMORY_MXBEAN_NAME, MemoryMXBean.class);
+        runtimeProxy = ManagementFactory.newPlatformMXBeanProxy(
+                mbeanServerConn, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+    }
+
+    public void forceTableCleanup() throws IOException
+    {
+        ssProxy.forceTableCleanup();
+    }
+    
+    public void forceTableCompaction() throws IOException
+    {
+        ssProxy.forceTableCompaction();
+    }
+
+    public void forceTableFlush(String tableName, String... columnFamilies) throws IOException
+    {
+        ssProxy.forceTableFlush(tableName, columnFamilies);
+    }
+
+    public void forceTableRepair(String tableName, String... columnFamilies) throws IOException
+    {
+        ssProxy.forceTableRepair(tableName, columnFamilies);
     }
 
     /**
-     * Track latency information for the dynamic snitch
-     * @param cb: the callback associated with this message -- this lets us know if it's a message type we're interested in
-     * @param address: the host that replied to the message
-     * @param latency
+     * Write a textual representation of the Cassandra ring.
+     * 
+     * @param outs the stream to write to
      */
-    public void maybeAddLatency(IMessageCallback cb, InetAddress address, double latency)
+    public void printRing(PrintStream outs)
     {
-        if (cb instanceof ReadCallback || cb instanceof AsyncResult)
-            addLatency(address, latency);
-    }
+        Map<Range, List<String>> rangeMap = ssProxy.getRangeToEndPointMap();
+        List<Range> ranges = new ArrayList<Range>(rangeMap.keySet());
+        Collections.sort(ranges);
+        Set<String> liveNodes = ssProxy.getLiveNodes();
+        Set<String> deadNodes = ssProxy.getUnreachableNodes();
+        Map<String, String> loadMap = ssProxy.getLoadMap();
 
-    public void addLatency(InetAddress address, double latency)
-    {
-        for (ILatencySubscriber subscriber : subscribers)
-            subscriber.receiveTiming(address, latency);
-    }
-
-    public static byte[] hash(String type, byte data[])
-    {
-        byte result[];
-        try
+        // Print range-to-endpoint mapping
+        int counter = 0;
+        outs.print(String.format("%-14s", "Address"));
+        outs.print(String.format("%-11s", "Status"));
+        outs.print(String.format("%-14s", "Load"));
+        outs.print(String.format("%-43s", "Range"));
+        outs.println("Ring");
+        // emphasize that we're showing the right part of each range
+        if (ranges.size() > 1)
         {
-            MessageDigest messageDigest = MessageDigest.getInstance(type);
-            result = messageDigest.digest(data);
+            outs.println(String.format("%-14s%-11s%-14s%-43s", "", "", "", ranges.get(0).left()));
         }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-        return result;
-    }
+        // normal range & node info
+        for (Range range : ranges) {
+            List<String> endpoints = rangeMap.get(range);
+            String primaryEndpoint = endpoints.get(0);
 
-    /** called from gossiper when it notices a node is not responding. */
-    public void convict(InetAddress ep)
-    {
-        logger_.debug("Resetting pool for " + ep);
-        getConnectionPool(ep).reset();
-    }
+            outs.print(String.format("%-14s", primaryEndpoint));
 
-    /**
-     * Listen on the specified port.
-     * @param localEp InetAddress whose port to listen on.
-     */
-    public void listen(InetAddress localEp) throws IOException, ConfigurationException
-    {        
-        ServerSocketChannel serverChannel = ServerSocketChannel.open();
-        final ServerSocket ss = serverChannel.socket();
-        ss.setReuseAddress(true);
-        InetSocketAddress address = new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort());
-        try
-        {
-            ss.bind(address);
-        }
-        catch (BindException e)
-        {
-            if (e.getMessage().contains("in use"))
-                throw new ConfigurationException(address + " is in use by another process.  Change listen_address:storage_port in cassandra.yaml to values that do not conflict with other services");
-            else if (e.getMessage().contains("Cannot assign requested address"))
-                throw new ConfigurationException("Unable to bind to address " + address + ". Set listen_address in cassandra.yaml to an interface you can bind to, e.g., your private IP address on EC2");
+            String status = liveNodes.contains(primaryEndpoint)
+                          ? "Up"
+                          : deadNodes.contains(primaryEndpoint)
+                            ? "Down"
+                            : "?";
+            outs.print(String.format("%-11s", status));
+
+            String load = loadMap.containsKey(primaryEndpoint) ? loadMap.get(primaryEndpoint) : "?";
+            outs.print(String.format("%-14s", load));
+
+            outs.print(String.format("%-43s", range.right()));
+
+            String asciiRingArt;
+            if (counter == 0)
+            {
+                asciiRingArt = "|<--|";
+            }
+            else if (counter == (rangeMap.size() - 1))
+            {
+                asciiRingArt = "|-->|";
+            }
             else
-                throw e;
-        }
-        socketThread = new SocketThread(ss, "ACCEPT-" + localEp);
-        socketThread.start();
-        listenGate.signalAll();
-    }
-
-    public void waitUntilListening()
-    {
-        try
-        {
-            listenGate.await();
-        }
-        catch (InterruptedException ie)
-        {
-            logger_.debug("await interrupted");
-        }
-    }
-
-    public OutboundTcpConnectionPool getConnectionPool(InetAddress to)
-    {
-        OutboundTcpConnectionPool cp = connectionManagers_.get(to);
-        if (cp == null)
-        {
-            connectionManagers_.putIfAbsent(to, new OutboundTcpConnectionPool(to));
-            cp = connectionManagers_.get(to);
-        }
-        return cp;
-    }
-
-    public OutboundTcpConnection getConnection(InetAddress to, Message msg)
-    {
-        return getConnectionPool(to).getConnection(msg);
-    }
-        
-    /**
-     * Register a verb and the corresponding verb handler with the
-     * Messaging Service.
-     * @param verb
-     * @param verbHandler handler for the specified verb
-     */
-    public void registerVerbHandlers(StorageService.Verb verb, IVerbHandler verbHandler)
-    {
-    	assert !verbHandlers_.containsKey(verb);
-    	verbHandlers_.put(verb, verbHandler);
-    }
-        
-    /**
-     * This method returns the verb handler associated with the registered
-     * verb. If no handler has been registered then null is returned.
-     * @param type for which the verb handler is sought
-     * @return a reference to IVerbHandler which is the handler for the specified verb
-     */
-    public IVerbHandler getVerbHandler(StorageService.Verb type)
-    {
-        return verbHandlers_.get(type);
-    }
-
-    private void addCallback(IMessageCallback cb, String messageId, InetAddress to)
-    {
-        callbacks.put(messageId, new Pair<InetAddress, IMessageCallback>(to, cb));
-    }
-
-    /**
-     * Send a message to a given endpoint. This method specifies a callback
-     * which is invoked with the actual response.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occurred to the invoker of the send().
-     *           suggest that a timeout occurred to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message message, InetAddress to, IAsyncCallback cb)
-    {        
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId, to);
-        sendOneWay(message, to);
-        return messageId;
-    }
-
-    /**
-     * Send a message to a given endpoint. This method adheres to the fire and forget
-     * style messaging.
-     * @param message messages to be sent.
-     * @param to endpoint to which the message needs to be sent
-     */
-    public void sendOneWay(Message message, InetAddress to)
-    {
-        // do local deliveries
-        if ( message.getFrom().equals(to) )
-        {
-            receive(message);
-            return;
-        }
-
-        // message sinks are a testing hook
-        Message processedMessage = SinkManager.processClientMessage(message, to);
-        if (processedMessage == null)
-        {
-            return;
-        }
-
-        // get pooled connection (really, connection queue)
-        OutboundTcpConnection connection = getConnection(to, message);
-
-        // pack message with header in a bytebuffer
-        byte[] data;
-        try
-        {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            Message.serializer().serialize(message, buffer);
-            data = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert data.length > 0;
-        ByteBuffer buffer = packIt(data , false);
-
-        // write it
-        connection.write(buffer);
-    }
-    
-    public IAsyncResult sendRR(Message message, InetAddress to)
-    {
-        IAsyncResult iar = new AsyncResult();
-        addCallback(iar, message.getMessageId(), to);
-        sendOneWay(message, to);
-        return iar;
-    }
-    
-    /**
-     * Stream a file from source to destination. This is highly optimized
-     * to not hold any of the contents of the file in memory.
-     * @param header Header contains file to stream and other metadata.
-     * @param to endpoint to which we need to stream the file.
-    */
-
-    public void stream(StreamHeader header, InetAddress to)
-    {
-        /* Streaming asynchronously on streamExector_ threads. */
-        streamExecutor_.execute(new FileStreamTask(header, to));
-    }
-    
-    public void register(ILatencySubscriber subcriber)
-    {
-        subscribers.add(subcriber);
-    }
-
-    /** blocks until the processing pools are empty and done. */
-    public void waitFor() throws InterruptedException
-    {
-        while (!streamExecutor_.isTerminated())
-            streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
-    }
-
-    public void shutdown()
-    {
-        logger_.info("Shutting down MessageService...");
-
-        try
-        {
-            socketThread.close();
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
-
-        streamExecutor_.shutdownNow();
-        callbacks.shutdown();
-
-        logger_.info("Shutdown complete (no further commands will be processed)");
-    }
-
-    public void receive(Message message)
-    {
-        message = SinkManager.processServerMessage(message);
-        if (message == null)
-            return;
-
-        Runnable runnable = new MessageDeliveryTask(message);
-        ExecutorService stage = StageManager.getStage(message.getMessageType());
-        assert stage != null : "No stage for message type " + message.getMessageType();
-        stage.execute(runnable);
-    }
-
-    public Pair<InetAddress, IMessageCallback> removeRegisteredCallback(String messageId)
-    {
-        return callbacks.remove(messageId);
-    }
-
-    public long getRegisteredCallbackAge(String messageId)
-    {
-        return callbacks.getAge(messageId);
-    }
-
-    public static void validateMagic(int magic) throws IOException
-    {
-        if (magic != PROTOCOL_MAGIC)
-            throw new IOException("invalid protocol header");
-    }
-
-    public static int getBits(int x, int p, int n)
-    {
-        return x >>> (p + 1) - n & ~(-1 << n);
-    }
-        
-    public ByteBuffer packIt(byte[] bytes, boolean compress)
-    {
-        /*
-             Setting up the protocol header. This is 4 bytes long
-             represented as an integer. The first 2 bits indicate
-             the serializer type. The 3rd bit indicates if compression
-             is turned on or off. It is turned off by default. The 4th
-             bit indicates if we are in streaming mode. It is turned off
-             by default. The 5th-8th bits are reserved for future use.
-             The next 8 bits indicate a version number. Remaining 15 bits 
-             are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if (compress)
-            header |= 4;
-        // Setting up the version bit
-        header |= (version_ << 8);
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-        
-    public ByteBuffer constructStreamHeader(StreamHeader streamHeader, boolean compress)
-    {
-        /* 
-        Setting up the protocol header. This is 4 bytes long
-        represented as an integer. The first 2 bits indicate
-        the serializer type. The 3rd bit indicates if compression
-        is turned on or off. It is turned off by default. The 4th
-        bit indicates if we are in streaming mode. It is turned off
-        by default. The following 4 bits are reserved for future use. 
-        The next 8 bits indicate a version number. Remaining 15 bits 
-        are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if ( compress )
-            header |= 4;
-        // set streaming bit
-        header |= 8;
-        // Setting up the version bit
-        header |= (version_ << 8);
-        /* Finished the protocol header setup */
-
-        /* Adding the StreamHeader which contains the session Id along
-         * with the pendingfile info for the stream.
-         * | Session Id | Pending File Size | Pending File | Bool more files |
-         * | No. of Pending files | Pending Files ... |
-         */
-        byte[] bytes;
-        try
-        {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            StreamHeader.serializer().serialize(streamHeader, buffer);
-            bytes = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert bytes.length > 0;
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-
-    public int incrementDroppedMessages(StorageService.Verb verb)
-    {
-        return droppedMessages.get(verb).incrementAndGet();
-    }
-               
-    private void logDroppedMessages()
-    {
-        boolean logTpstats = false;
-        for (Map.Entry<StorageService.Verb, AtomicInteger> entry : droppedMessages.entrySet())
-        {
-            AtomicInteger dropped = entry.getValue();
-            if (dropped.get() > 0)
             {
-                logTpstats = true;
-                logger_.warn("Dropped {} {} messages in the last {}ms",
-                             new Object[] {dropped, entry.getKey(), LOG_DROPPED_INTERVAL_IN_MS});
+                if ((rangeMap.size() > 4) && ((counter % 2) == 0))
+                    asciiRingArt = "v   |";
+                else if ((rangeMap.size() > 4) && ((counter % 2) != 0))
+                    asciiRingArt = "|   ^";
+                else
+                    asciiRingArt = "|   |";
             }
-            dropped.set(0);
+            outs.println(asciiRingArt);
+            
+            counter++;
         }
-
-        if (logTpstats)
-            GCInspector.instance.logStats();
     }
+    
+    public void printColumnFamilyStats(PrintStream outs) {
 
-    private static class SocketThread extends Thread
-    {
-        private final ServerSocket server;
-        
-        SocketThread(ServerSocket server, String name)
-        {
-            super(name);
-            this.server = server;
-        }
-
-        public void run()
-        {
-            while (true)
-            {
-                try
-                {
-                    Socket socket = server.accept();
-                    new IncomingTcpConnection(socket).start();
-                }
-                catch (AsynchronousCloseException e)
-                {
-                    // this happens when another thread calls close().
-                    logger_.info("MessagingService shutting down server thread.");
-                    break;
-                }
-                catch (IOException e)
-                {
-                    throw new RuntimeException(e);
+        ObjectName query;
+        try {
+            Map <String, List <ColumnFamilyStoreMBean>> cfstoreMap = new HashMap <String, List <ColumnFamilyStoreMBean>>();
+            
+            // get a list of column family stores
+            query = new ObjectName("org.apache.cassandra.db:type=ColumnFamilyStores,*");
+            Set<ObjectName> result = mbeanServerConn.queryNames(query, null);
+            for (ObjectName objectName: result) {
+                String tableName = objectName.getKeyProperty("name");
+                ColumnFamilyStoreMBean cfsProxy = JMX.newMBeanProxy(
+                        mbeanServerConn, objectName, ColumnFamilyStoreMBean.class);
+                
+                if (!cfstoreMap.containsKey(tableName)) {
+                    List <ColumnFamilyStoreMBean> columnFamilies = new ArrayList<ColumnFamilyStoreMBean>();
+                    columnFamilies.add(cfsProxy);
+                    cfstoreMap.put(tableName, columnFamilies);
+                } 
+                else {
+                    cfstoreMap.get(tableName).add(cfsProxy);
                 }
             }
+
+            // print out the table statistics
+            for (String tableName: cfstoreMap.keySet()) {
+                List <ColumnFamilyStoreMBean> columnFamilies = cfstoreMap.get(tableName);
+                int tableReadCount = 0;
+                int tableWriteCount = 0;
+                int tablePendingTasks = 0;
+                double tableTotalReadTime = 0.0f;
+                double tableTotalWriteTime = 0.0f;
+                
+                outs.println("Keyspace: " + tableName);
+                for (ColumnFamilyStoreMBean cfstore: columnFamilies) {
+                    int writeCount = cfstore.getWriteCount();
+                    int readCount = cfstore.getReadCount();
+                    
+                    if (readCount > 0)
+                    {
+                        tableReadCount += readCount;
+                        tableTotalReadTime += cfstore.getReadLatency() * readCount;
+                    }
+                    if (writeCount > 0)
+                    {
+                        tableWriteCount += writeCount;
+                        tableTotalWriteTime += cfstore.getWriteLatency() * writeCount;
+                    }
+                    tablePendingTasks += cfstore.getPendingTasks();
+                }
+                
+                double tableReadLatency = tableReadCount > 0 ? tableTotalReadTime / tableReadCount : Double.NaN;
+                double tableWriteLatency = tableWriteCount > 0 ? tableTotalWriteTime / tableWriteCount : Double.NaN;
+                
+                outs.println("\tRead Count: " + tableReadCount);
+                outs.println("\tRead Latency: " + String.format("%01.3f", tableReadLatency) + " ms.");
+                outs.println("\tWrite Count: " + tableWriteCount);
+                outs.println("\tWrite Latency: " + String.format("%01.3f", tableWriteLatency) + " ms.");
+                outs.println("\tPending Tasks: " + tablePendingTasks);
+                // print out column family statistic for this table
+                for (ColumnFamilyStoreMBean cfstore: columnFamilies) {
+                    outs.println("\t\tColumn Family: " + cfstore.getColumnFamilyName());
+                    outs.println("\t\tMemtable Columns Count: " + cfstore.getMemtableColumnsCount());
+                    outs.println("\t\tMemtable Data Size: " + cfstore.getMemtableDataSize());
+                    outs.println("\t\tMemtable Switch Count: " + cfstore.getMemtableSwitchCount());
+                    outs.println("\t\tRead Count: " + cfstore.getReadCount());
+                    outs.println("\t\tRead Latency: " + String.format("%01.3f", cfstore.getReadLatency()) + " ms.");
+                    outs.println("\t\tWrite Count: " + cfstore.getWriteCount());
+                    outs.println("\t\tWrite Latency: " + String.format("%01.3f", cfstore.getWriteLatency()) + " ms.");
+                    outs.println("\t\tPending Tasks: " + cfstore.getPendingTasks());
+                    outs.println("");
+                }
+                outs.println("----------------");
+            }
+        } catch (MalformedObjectNameException e) {
+            throw new RuntimeException("Invalid ObjectName? Please report this as a bug.", e);
+        } catch (IOException e) {
+            throw new RuntimeException("Could not retrieve list of stat mbeans.", e);
         }
         
-        void close() throws IOException
+    }
+
+    /**
+     * Write node information.
+     * 
+     * @param outs the stream to write to
+     */
+    public void printInfo(PrintStream outs)
+    {
+        outs.println(ssProxy.getToken());
+        outs.println(String.format("%-17s: %s", "Load", ssProxy.getLoadString()));
+        outs.println(String.format("%-17s: %s", "Generation No", ssProxy.getCurrentGenerationNumber()));
+        
+        // Uptime
+        long secondsUp = runtimeProxy.getUptime() / 1000;
+        outs.println(String.format("%-17s: %d", "Uptime (seconds)", secondsUp));
+
+        // Memory usage
+        MemoryUsage heapUsage = memProxy.getHeapMemoryUsage();
+        double memUsed = (double)heapUsage.getUsed() / (1024 * 1024);
+        double memMax = (double)heapUsage.getMax() / (1024 * 1024);
+        outs.println(String.format("%-17s: %.2f / %.2f", "Heap Memory (MB)", memUsed, memMax));
+    }
+    
+    /**
+     * Take a snapshot of all the tables.
+     * 
+     * @param snapshotName the name of the snapshot.
+     */
+    public void takeSnapshot(String snapshotName) throws IOException
+    {
+        ssProxy.takeAllSnapshot(snapshotName);
+    }
+
+    /**
+     * Remove all the existing snapshots.
+     */
+    public void clearSnapshot() throws IOException
+    {
+        ssProxy.clearSnapshot();
+    }
+
+    public void decommission() throws InterruptedException
+    {
+        ssProxy.decommission();
+    }
+
+    public void loadBalance() throws IOException, InterruptedException
+    {
+        ssProxy.loadBalance();
+    }
+
+    public void move(String newToken) throws InterruptedException
+    {
+        ssProxy.move(newToken);
+    }
+
+    public void removeToken(String token)
+    {
+        ssProxy.removeToken(token);
+    }
+
+    /**
+     * Print out the size of the queues in the thread pools
+     *
+     * @param outs Output stream to generate the output on.
+     */
+    public void printThreadPoolStats(PrintStream outs)
+    {
+        ObjectName query;
+        try
         {
-            server.close();
+            outs.print(String.format("%-25s", "Pool Name"));
+            outs.print(String.format("%10s", "Active"));
+            outs.print(String.format("%10s", "Pending"));
+            outs.print(String.format("%15s", "Completed"));
+            outs.println();
+
+            query = new ObjectName("org.apache.cassandra.concurrent:type=*");
+            Set<ObjectName> result = mbeanServerConn.queryNames(query, null);
+            for (ObjectName objectName : result)
+            {
+                String poolName = objectName.getKeyProperty("type");
+                IExecutorMBean threadPoolProxy = JMX.newMBeanProxy(mbeanServerConn, objectName, IExecutorMBean.class);
+                outs.print(String.format("%-25s", poolName));
+                outs.print(String.format("%10d", threadPoolProxy.getActiveCount()));
+                outs.print(String.format("%10d", threadPoolProxy.getPendingTasks()));
+                outs.print(String.format("%15d", threadPoolProxy.getCompletedTasks()));
+                outs.println();
+            }
+        }
+        catch (MalformedObjectNameException e)
+        {
+            throw new RuntimeException("Invalid ObjectName? Please report this as a bug.", e);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Could not retrieve list of stat mbeans.", e);
         }
     }
 
-    public Map<String, Integer> getCommandPendingTasks()
+    /**
+     * Get the compaction threshold
+     *
+     * @param outs the stream to write to
+     */
+    public void getCompactionThreshold(PrintStream outs)
     {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getPendingMessages());
-        return pendingTasks;
+        outs.println("Current compaction threshold: Min=" +  mcmProxy.getMinimumCompactionThreshold() +
+            ", Max=" +  mcmProxy.getMaximumCompactionThreshold());
     }
 
-    public Map<String, Long> getCommandCompletedTasks()
+    /**
+     * Set the compaction threshold
+     *
+     * @param minimumCompactionThreshold minimum compaction threshold
+     * @param maximumCompactionThreshold maximum compaction threshold
+     */
+    public void setCompactionThreshold(int minimumCompactionThreshold, int maximumCompactionThreshold)
     {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getCompletedMesssages());
-        return completedTasks;
+        mcmProxy.setMinimumCompactionThreshold(minimumCompactionThreshold);
+        if (maximumCompactionThreshold >= 0)
+        {
+             mcmProxy.setMaximumCompactionThreshold(maximumCompactionThreshold);
+        }
     }
 
-    public Map<String, Integer> getResponsePendingTasks()
+    /**
+     * Parse the supplied command line arguments.
+     * 
+     * @param args arguments passed on the command line
+     * @throws ParseException for missing required, or unrecognized options
+     */
+    private void parseArgs(String[] args) throws ParseException
     {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getPendingMessages());
-        return pendingTasks;
+        CommandLineParser parser = new PosixParser();
+        cmd = parser.parse(options, args);
+    }
+    
+    /**
+     * Retrieve any non-option arguments passed on the command line.
+     * 
+     * @return non-option command args
+     */
+    private String[] getArgs()
+    {
+        return cmd.getArgs();
+    }
+    
+    /**
+     * Prints usage information to stdout.
+     */
+    private static void printUsage()
+    {
+        HelpFormatter hf = new HelpFormatter();
+        String header = String.format(
+                "%nAvailable commands: ring, info, cleanup, compact, cfstats, snapshot [name], clearsnapshot, " +
+                "tpstats, flush, repair, decommission, move, loadbalance, removetoken, " +
+                " getcompactionthreshold, setcompactionthreshold [minthreshold] ([maxthreshold])");
+        String usage = String.format("java %s -host <arg> <command>%n", NodeProbe.class.getName());
+        hf.printHelp(usage, "", options, header);
     }
 
-    public Map<String, Long> getResponseCompletedTasks()
+    /**
+     * @param args
+     */
+    public static void main(String[] args) throws IOException, InterruptedException
     {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getCompletedMesssages());
-        return completedTasks;
+        NodeProbe probe = null;
+        try
+        {
+            probe = new NodeProbe(args);
+        }
+        catch (ParseException pe)
+        {
+            System.err.println(pe.getMessage());
+            NodeProbe.printUsage();
+            System.exit(1);
+        }
+        catch (IOException ioe)
+        {
+            System.err.println("Error connecting to remote JMX agent!");
+            ioe.printStackTrace();
+            System.exit(3);
+        }
+        
+        if (probe.getArgs().length < 1)
+        {
+            System.err.println("Missing argument for command.");
+            NodeProbe.printUsage();
+            System.exit(1);
+        }
+        
+        // Execute the requested command.
+        String[] arguments = probe.getArgs();
+        String cmdName = arguments[0];
+        if (cmdName.equals("ring"))
+        {
+            probe.printRing(System.out);
+        }
+        else if (cmdName.equals("info"))
+        {
+            probe.printInfo(System.out);
+        }
+        else if (cmdName.equals("cleanup"))
+        {
+            probe.forceTableCleanup();
+        }
+        else if (cmdName.equals("compact"))
+        {
+            probe.forceTableCompaction();
+        }
+        else if (cmdName.equals("cfstats"))
+        {
+            probe.printColumnFamilyStats(System.out);
+        }
+        else if (cmdName.equals("decommission"))
+        {
+            probe.decommission();
+        }
+        else if (cmdName.equals("loadbalance"))
+        {
+            probe.loadBalance();
+        }
+        else if (cmdName.equals("move"))
+        {
+            if (arguments.length <= 1)
+            {
+                System.err.println("missing token argument");
+            }
+            probe.move(arguments[1]);
+        }
+        else if (cmdName.equals("removetoken"))
+        {
+            if (arguments.length <= 1)
+            {
+                System.err.println("missing token argument");
+            }
+            probe.removeToken(arguments[1]);
+        }
+        else if (cmdName.equals("snapshot"))
+        {
+            String snapshotName = "";
+            if (arguments.length > 1)
+            {
+                snapshotName = arguments[1];
+            }
+            probe.takeSnapshot(snapshotName);
+        }
+        else if (cmdName.equals("clearsnapshot"))
+        {
+            probe.clearSnapshot();
+        }
+        else if (cmdName.equals("tpstats"))
+        {
+            probe.printThreadPoolStats(System.out);
+        }
+        else if (cmdName.equals("flush") || cmdName.equals("repair"))
+        {
+            if (probe.getArgs().length < 2)
+            {
+                System.err.println("Missing keyspace argument.");
+                NodeProbe.printUsage();
+                System.exit(1);
+            }
+
+            String[] columnFamilies = new String[probe.getArgs().length - 2];
+            for (int i = 0; i < columnFamilies.length; i++)
+            {
+                columnFamilies[i] = probe.getArgs()[i + 2];
+            }
+            if (cmdName.equals("flush"))
+                probe.forceTableFlush(probe.getArgs()[1], columnFamilies);
+            else // cmdName.equals("repair")
+                probe.forceTableRepair(probe.getArgs()[1], columnFamilies);
+        }
+        else if (cmdName.equals("getcompactionthreshold"))
+        {
+            probe.getCompactionThreshold(System.out);
+        }
+        else if (cmdName.equals("setcompactionthreshold"))
+        {
+            if (arguments.length < 2)
+            {
+                System.err.println("Missing threshold value(s)");
+                NodeProbe.printUsage();
+                System.exit(1);
+            }
+            int minthreshold = Integer.parseInt(arguments[1]);
+            int maxthreshold = CompactionManager.instance().getMaximumCompactionThreshold();
+            if (arguments.length > 2)
+            {
+                maxthreshold = Integer.parseInt(arguments[2]);
+            }
+
+            if (minthreshold > maxthreshold)
+            {
+                System.err.println("Min threshold can't be greater than Max threshold");
+                NodeProbe.printUsage();
+                System.exit(1);
+            }
+
+            if (minthreshold < 2 && maxthreshold != 0)
+            {
+                System.err.println("Min threshold must be at least 2");
+                NodeProbe.printUsage();
+                System.exit(1);
+            }
+            probe.setCompactionThreshold(minthreshold, maxthreshold);
+        }
+        else
+        {
+            System.err.println("Unrecognized command: " + cmdName + ".");
+            NodeProbe.printUsage();
+            System.exit(1);
+        }
+
+        System.exit(0);
     }
+
 }

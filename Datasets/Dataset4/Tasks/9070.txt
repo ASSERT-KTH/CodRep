@@ -1,10 +1,10 @@
-import org.elasticsearch.util.inject.Inject;
+} catch (Throwable e) {
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
+ * regarding copyright ownership. Elastic Search licenses this 
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,77 +19,160 @@ import org.elasticsearch.util.inject.Inject;
  * under the License.
  */
 
-package org.elasticsearch.index.query.xcontent;
+package org.elasticsearch.action.support.replication;
 
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.Filter;
-import org.apache.lucene.search.PublicTermsFilter;
-import org.apache.lucene.search.TermsFilter;
-import org.elasticsearch.index.AbstractIndexComponent;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.index.mapper.FieldMapper;
-import org.elasticsearch.index.mapper.MapperService;
-import org.elasticsearch.index.query.QueryParsingException;
-import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.util.guice.inject.Inject;
-import org.elasticsearch.util.settings.Settings;
-import org.elasticsearch.util.xcontent.XContentParser;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ActionRequest;
+import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.support.TransportAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.BaseTransportRequestHandler;
+import org.elasticsearch.transport.TransportChannel;
+import org.elasticsearch.transport.TransportService;
 
-import java.io.IOException;
-
-import static org.elasticsearch.index.query.support.QueryParsers.*;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
- * @author kimchy (shay.banon)
  */
-public class TermsFilterParser extends AbstractIndexComponent implements XContentFilterParser {
+public abstract class TransportIndicesReplicationOperationAction<Request extends IndicesReplicationOperationRequest, Response extends ActionResponse, IndexRequest extends IndexReplicationOperationRequest, IndexResponse extends ActionResponse,
+        ShardRequest extends ShardReplicationOperationRequest, ShardReplicaRequest extends ActionRequest, ShardResponse extends ActionResponse>
+        extends TransportAction<Request, Response> {
 
-    public static final String NAME = "terms";
+    protected final ClusterService clusterService;
 
-    @Inject public TermsFilterParser(Index index, @IndexSettings Settings settings) {
-        super(index, settings);
+    protected final TransportIndexReplicationOperationAction<IndexRequest, IndexResponse, ShardRequest, ShardReplicaRequest, ShardResponse> indexAction;
+
+
+    final String transportAction;
+
+    @Inject
+    public TransportIndicesReplicationOperationAction(Settings settings, TransportService transportService, ClusterService clusterService, ThreadPool threadPool,
+                                                      TransportIndexReplicationOperationAction<IndexRequest, IndexResponse, ShardRequest, ShardReplicaRequest, ShardResponse> indexAction) {
+        super(settings, threadPool);
+        this.clusterService = clusterService;
+        this.indexAction = indexAction;
+
+        this.transportAction = transportAction();
+
+        transportService.registerHandler(transportAction, new TransportHandler());
     }
 
-    @Override public String[] names() {
-        return new String[]{NAME};
+
+    protected abstract Map<String, Set<String>> resolveRouting(ClusterState clusterState, Request request) throws ElasticSearchException;
+
+    @Override
+    protected void doExecute(final Request request, final ActionListener<Response> listener) {
+        ClusterState clusterState = clusterService.state();
+        ClusterBlockException blockException = checkGlobalBlock(clusterState, request);
+        if (blockException != null) {
+            throw blockException;
+        }
+        // get actual indices
+        String[] concreteIndices = clusterState.metaData().concreteIndices(request.indices(), request.ignoreIndices(), false);
+        blockException = checkRequestBlock(clusterState, request, concreteIndices);
+        if (blockException != null) {
+            throw blockException;
+        }
+
+        final AtomicInteger indexCounter = new AtomicInteger();
+        final AtomicInteger completionCounter = new AtomicInteger(concreteIndices.length);
+        final AtomicReferenceArray<Object> indexResponses = new AtomicReferenceArray<Object>(concreteIndices.length);
+
+        Map<String, Set<String>> routingMap = resolveRouting(clusterState, request);
+        if (concreteIndices == null || concreteIndices.length == 0) {
+            listener.onResponse(newResponseInstance(request, indexResponses));
+        } else {
+            for (final String index : concreteIndices) {
+                Set<String> routing = null;
+                if (routingMap != null) {
+                    routing = routingMap.get(index);
+                }
+                IndexRequest indexRequest = newIndexRequestInstance(request, index, routing);
+                // no threading needed, all is done on the index replication one
+                indexRequest.listenerThreaded(false);
+                indexAction.execute(indexRequest, new ActionListener<IndexResponse>() {
+                    @Override
+                    public void onResponse(IndexResponse result) {
+                        indexResponses.set(indexCounter.getAndIncrement(), result);
+                        if (completionCounter.decrementAndGet() == 0) {
+                            listener.onResponse(newResponseInstance(request, indexResponses));
+                        }
+                    }
+    
+                    @Override
+                    public void onFailure(Throwable e) {
+                        e.printStackTrace();
+                        int index = indexCounter.getAndIncrement();
+                        if (accumulateExceptions()) {
+                            indexResponses.set(index, e);
+                        }
+                        if (completionCounter.decrementAndGet() == 0) {
+                            listener.onResponse(newResponseInstance(request, indexResponses));
+                        }
+                    }
+                });
+            }
+        }
     }
 
-    @Override public Filter parse(QueryParseContext parseContext) throws IOException, QueryParsingException {
-        XContentParser parser = parseContext.parser();
+    protected abstract Request newRequestInstance();
 
-        XContentParser.Token token = parser.nextToken();
-        assert token == XContentParser.Token.FIELD_NAME;
-        String fieldName = parser.currentName();
+    protected abstract Response newResponseInstance(Request request, AtomicReferenceArray indexResponses);
 
-        FieldMapper fieldMapper = null;
-        MapperService.SmartNameFieldMappers smartNameFieldMappers = parseContext.smartFieldMappers(fieldName);
-        if (smartNameFieldMappers != null) {
-            if (smartNameFieldMappers.hasMapper()) {
-                fieldMapper = smartNameFieldMappers.mapper();
-                fieldName = fieldMapper.names().indexName();
-            }
+    protected abstract String transportAction();
+
+    protected abstract IndexRequest newIndexRequestInstance(Request request, String index, Set<String> routing);
+
+    protected abstract boolean accumulateExceptions();
+
+    protected abstract ClusterBlockException checkGlobalBlock(ClusterState state, Request request);
+
+    protected abstract ClusterBlockException checkRequestBlock(ClusterState state, Request request, String[] concreteIndices);
+
+    private class TransportHandler extends BaseTransportRequestHandler<Request> {
+
+        @Override
+        public Request newInstance() {
+            return newRequestInstance();
         }
 
-        token = parser.nextToken();
-        if (token != XContentParser.Token.START_ARRAY) {
-            throw new QueryParsingException(index, "Terms filter must define the terms to filter on as an array");
+        @Override
+        public String executor() {
+            return ThreadPool.Names.SAME;
         }
 
-        TermsFilter termsFilter = new PublicTermsFilter();
-        while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
-            String value = parser.text();
-            if (value == null) {
-                throw new QueryParsingException(index, "No value specified for term filter");
-            }
-            if (fieldMapper != null) {
-                value = fieldMapper.indexedValue(value);
-            }
-            termsFilter.addTerm(new Term(fieldName, value));
+        @Override
+        public void messageReceived(final Request request, final TransportChannel channel) throws Exception {
+            // no need for a threaded listener, since we just send a response
+            request.listenerThreaded(false);
+            execute(request, new ActionListener<Response>() {
+                @Override
+                public void onResponse(Response result) {
+                    try {
+                        channel.sendResponse(result);
+                    } catch (Exception e) {
+                        onFailure(e);
+                    }
+                }
+
+                @Override
+                public void onFailure(Throwable e) {
+                    try {
+                        channel.sendResponse(e);
+                    } catch (Exception e1) {
+                        logger.warn("Failed to send error response for action [" + transportAction + "] and request [" + request + "]", e1);
+                    }
+                }
+            });
         }
-        parser.nextToken();
-
-
-        Filter filter = parseContext.cacheFilterIfPossible(termsFilter);
-        return wrapSmartNameFilter(filter, smartNameFieldMappers, parseContext.indexCache());
     }
 }

@@ -1,12 +1,13 @@
-Parameters params = new Parameters(context.getConfiguration().get(PFPGrowth.PFP_PARAMETERS, ""));
+if (row == null || row.cf == null)
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,69 +18,201 @@ Parameters params = new Parameters(context.getConfiguration().get(PFPGrowth.PFP_
  * limitations under the License.
  */
 
-package org.apache.mahout.fpm.pfpgrowth;
+package org.apache.cassandra.db;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
+import java.nio.ByteBuffer;
+import java.net.InetAddress;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
-import java.util.regex.Pattern;
+import java.util.LinkedList;
 
-import org.apache.hadoop.io.LongWritable;
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.mahout.common.Pair;
-import org.apache.mahout.common.Parameters;
-import org.apache.mahout.math.map.OpenObjectIntHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- *  maps each transaction to all unique items groups in the transaction.
- * mapper outputs the group id as key and the transaction as value
- * 
- */
-public class TransactionSortingMapper extends Mapper<LongWritable,Text,LongWritable,TransactionTree> {
-  
-  private final OpenObjectIntHashMap<String> fMap = new OpenObjectIntHashMap<String>();
-  
-  private Pattern splitter;
-  
-  @Override
-  protected void map(LongWritable offset, Text input, Context context) throws IOException,
-                                                                      InterruptedException {
-    
-    String[] items = splitter.split(input.toString());
-    Iterable<String> uniqueItems = new HashSet<String>(Arrays.asList(items));
-    
-    List<Integer> itemSet = new ArrayList<Integer>();
-    for (String item : uniqueItems) { // remove items not in the fList
-      if (fMap.containsKey(item) && item.trim().length() != 0) {
-        itemSet.add(fMap.get(item));
-      }
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.db.marshal.AbstractCommutativeType;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.ICompactSerializer;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.thrift.ConsistencyLevel;
+
+public class CounterMutation implements IMutation
+{
+    private static final Logger logger = LoggerFactory.getLogger(CounterMutation.class);
+    private static final CounterMutationSerializer serializer = new CounterMutationSerializer();
+
+    private final RowMutation rowMutation;
+    private final ConsistencyLevel consistency;
+
+    public CounterMutation(RowMutation rowMutation, ConsistencyLevel consistency)
+    {
+        this.rowMutation = rowMutation;
+        this.consistency = consistency;
     }
-    
-    Collections.sort(itemSet);
-    
-    Integer[] prunedItems = itemSet.toArray(new Integer[itemSet.size()]);
-    
-    if (prunedItems.length > 0) {
-      context.write(new LongWritable(prunedItems[0]), new TransactionTree(prunedItems, 1L));
+
+    public String getTable()
+    {
+        return rowMutation.getTable();
     }
-    
-  }
-  
-  @Override
-  protected void setup(Context context) throws IOException, InterruptedException {
-    super.setup(context);
-    Parameters params = Parameters.fromString(context.getConfiguration().get(PFPGrowth.PFP_PARAMETERS, ""));
-    
-    int i = 0;
-    for (Pair<String,Long> e : PFPGrowth.deserializeList(params, PFPGrowth.F_LIST, context.getConfiguration())) {
-      fMap.put(e.getFirst(), i++);
+
+    public ByteBuffer key()
+    {
+        return rowMutation.key();
     }
-    
-    splitter = Pattern.compile(params.get(PFPGrowth.SPLIT_PATTERN, PFPGrowth.SPLITTER.toString()));
-    
-  }
+
+    public RowMutation rowMutation()
+    {
+        return rowMutation;
+    }
+
+    public ConsistencyLevel consistency()
+    {
+        return consistency;
+    }
+
+    public static CounterMutationSerializer serializer()
+    {
+        return serializer;
+    }
+
+    public RowMutation makeReplicationMutation() throws IOException
+    {
+        List<ReadCommand> readCommands = new LinkedList<ReadCommand>();
+        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
+        {
+            if (!columnFamily.metadata().getReplicateOnWrite())
+                continue;
+
+            // CF type: regular
+            if (!columnFamily.isSuper())
+            {
+                QueryPath queryPath = new QueryPath(columnFamily.metadata().cfName);
+                ReadCommand readCommand = new SliceByNamesReadCommand(rowMutation.getTable(), rowMutation.key(), queryPath, columnFamily.getColumnNames());
+                readCommands.add(readCommand);
+                continue;
+            }
+
+            // CF type: super
+            for (IColumn superColumn : columnFamily.getSortedColumns())
+            {
+                QueryPath queryPath = new QueryPath(columnFamily.metadata().cfName, superColumn.name());
+
+                // construct set of sub-column names
+                Collection<IColumn> subColumns = superColumn.getSubColumns();
+                Collection<ByteBuffer> subColNames = new HashSet<ByteBuffer>(subColumns.size());
+                for (IColumn subCol : subColumns)
+                {
+                    subColNames.add(subCol.name());
+                }
+
+                ReadCommand readCommand = new SliceByNamesReadCommand(rowMutation.getTable(), rowMutation.key(), queryPath, subColNames);
+                readCommands.add(readCommand);
+            }
+        }
+
+        // replicate to non-local replicas
+        List<InetAddress> foreignReplicas = StorageService.instance.getLiveNaturalEndpoints(rowMutation.getTable(), rowMutation.key());
+        foreignReplicas.remove(FBUtilities.getLocalAddress()); // remove local replica
+
+        // create a replication RowMutation
+        RowMutation replicationMutation = new RowMutation(rowMutation.getTable(), rowMutation.key());
+        for (ReadCommand readCommand : readCommands)
+        {
+            Table table = Table.open(readCommand.table);
+            Row row = readCommand.getRow(table);
+            if (null == row)
+                continue;
+            AbstractType defaultValidator = row.cf.metadata().getDefaultValidator();
+            if (defaultValidator.isCommutative())
+            {
+                /**
+                 * Clean out contexts for all nodes we're sending the repair to, otherwise,
+                 * we could send a context which is local to one of the foreign replicas,
+                 * which would then incorrectly add that to its own count, because
+                 * local resolution aggregates.
+                 */
+                // note: the following logic could be optimized
+                for (InetAddress foreignNode : foreignReplicas)
+                {
+                    ((AbstractCommutativeType)defaultValidator).cleanContext(row.cf, foreignNode);
+                }
+            }
+            replicationMutation.add(row.cf);
+        }
+        return replicationMutation;
+    }
+
+    public Message makeMutationMessage(int version) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        serializer().serialize(this, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.COUNTER_MUTATION, bos.toByteArray(), version);
+    }
+
+    public boolean shouldReplicateOnWrite()
+    {
+        for (ColumnFamily cf : rowMutation.getColumnFamilies())
+            if (cf.metadata().getReplicateOnWrite())
+                return true;
+        return false;
+    }
+
+    public void apply() throws IOException
+    {
+        // We need to transform all CounterUpdateColumn to CounterColumn and we need to deepCopy. Both are done 
+        // below since CUC.asCounterColumn() does a deep copy.
+        RowMutation rm = new RowMutation(rowMutation.getTable(), ByteBufferUtil.clone(rowMutation.key()));
+        Table table = Table.open(rm.getTable());
+
+        for (ColumnFamily cf_ : rowMutation.getColumnFamilies())
+        {
+            ColumnFamily cf = cf_.cloneMeShallow();
+            ColumnFamilyStore cfs = table.getColumnFamilyStore(cf.id());
+            for (IColumn column : cf_.getColumnsMap().values())
+            {
+                cf.addColumn(column.localCopy(cfs));
+            }
+            rm.add(cf);
+        }
+        rm.apply();
+    }
+
+    @Override
+    public String toString()
+    {
+        return toString(false);
+    }
+
+    public String toString(boolean shallow)
+    {
+        StringBuilder buff = new StringBuilder("CounterMutation(");
+        buff.append(rowMutation.toString(shallow));
+        buff.append(", ").append(consistency.toString());
+        return buff.append(")").toString();
+    }
+}
+
+class CounterMutationSerializer implements ICompactSerializer<CounterMutation>
+{
+    public void serialize(CounterMutation cm, DataOutputStream dos, int version) throws IOException
+    {
+        RowMutation.serializer().serialize(cm.rowMutation(), dos, version);
+        dos.writeUTF(cm.consistency().name());
+    }
+
+    public CounterMutation deserialize(DataInputStream dis, int version) throws IOException
+    {
+        RowMutation rm = RowMutation.serializer().deserialize(dis, version);
+        ConsistencyLevel consistency = Enum.valueOf(ConsistencyLevel.class, dis.readUTF());
+        return new CounterMutation(rm, consistency);
+    }
 }

@@ -1,4 +1,4 @@
-.toString(), (int)featureCount, value.getNumNondefaultElements());
+throw new IllegalStateException("No input clusters found in " + clustersIn + ". Check your -c argument.");
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,99 +17,313 @@
  * limitations under the License.
  */
 
-package org.apache.mahout.utils.vectors.tfidf;
+package org.apache.mahout.clustering.fuzzykmeans;
+
+import static org.apache.mahout.clustering.topdown.PathDirectory.CLUSTERED_POINTS_DIRECTORY;
 
 import java.io.IOException;
-import java.net.URI;
-import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.List;
 
-import org.apache.hadoop.filecache.DistributedCache;
-import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.LongWritable;
-import org.apache.hadoop.io.SequenceFile;
-import org.apache.hadoop.io.WritableComparable;
-import org.apache.hadoop.mapred.JobConf;
-import org.apache.hadoop.mapred.MapReduceBase;
-import org.apache.hadoop.mapred.OutputCollector;
-import org.apache.hadoop.mapred.Reducer;
-import org.apache.hadoop.mapred.Reporter;
-import org.apache.mahout.math.RandomAccessSparseVector;
-import org.apache.mahout.math.Vector;
-import org.apache.mahout.math.VectorWritable;
-import org.apache.mahout.math.Vector.Element;
-import org.apache.mahout.math.map.OpenIntLongHashMap;
-import org.apache.mahout.utils.vectors.TFIDF;
+import org.apache.hadoop.util.ToolRunner;
+import org.apache.mahout.clustering.Cluster;
+import org.apache.mahout.clustering.classify.ClusterClassificationDriver;
+import org.apache.mahout.clustering.classify.ClusterClassifier;
+import org.apache.mahout.clustering.iterator.ClusterIterator;
+import org.apache.mahout.clustering.iterator.ClusteringPolicy;
+import org.apache.mahout.clustering.iterator.FuzzyKMeansClusteringPolicy;
+import org.apache.mahout.clustering.kmeans.RandomSeedGenerator;
+import org.apache.mahout.common.AbstractJob;
+import org.apache.mahout.common.ClassUtils;
+import org.apache.mahout.common.HadoopUtil;
+import org.apache.mahout.common.commandline.DefaultOptionCreator;
+import org.apache.mahout.common.distance.DistanceMeasure;
+import org.apache.mahout.common.distance.SquaredEuclideanDistanceMeasure;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * Converts a document in to a sparse vector
- */
-public class TFIDFPartialVectorReducer extends MapReduceBase
-    implements
-    Reducer<WritableComparable<?>,VectorWritable,WritableComparable<?>,VectorWritable> {
-  
-  private final OpenIntLongHashMap dictionary = new OpenIntLongHashMap();
-  private final VectorWritable vectorWritable = new VectorWritable();
-  private final TFIDF tfidf = new TFIDF();
-  private int minDf = 1;
-  private int maxDfPercent = 99;
-  private long vectorCount = 1;
-  private long featureCount = 0;
-  
+public class FuzzyKMeansDriver extends AbstractJob {
+
+  public static final String M_OPTION = "m";
+
+  private static final Logger log = LoggerFactory.getLogger(FuzzyKMeansDriver.class);
+
+  public static void main(String[] args) throws Exception {
+    ToolRunner.run(new Configuration(), new FuzzyKMeansDriver(), args);
+  }
+
   @Override
-  public void reduce(WritableComparable<?> key,
-                     Iterator<VectorWritable> values,
-                     OutputCollector<WritableComparable<?>,VectorWritable> output,
-                     Reporter reporter) throws IOException {
-    if (!values.hasNext()) return;
-    Vector value = values.next().get();
-    Iterator<Element> it = value.iterateNonZero();
-    Vector vector = new RandomAccessSparseVector(key
-        .toString(), Integer.MAX_VALUE, value.getNumNondefaultElements());
-    while (it.hasNext()) {
-      Element e = it.next();
-      if (!dictionary.containsKey(e.index())) continue;
-      long df = dictionary.get(e.index());
-      if (df / vectorCount > maxDfPercent) continue;
-      if (df < minDf) df = minDf;
-      vector.setQuick(e.index(), tfidf.calculate((int) e.get(), (int) df,
-        (int) featureCount, (int) vectorCount));
+  public int run(String[] args) throws Exception {
+
+    addInputOption();
+    addOutputOption();
+    addOption(DefaultOptionCreator.distanceMeasureOption().create());
+    addOption(DefaultOptionCreator.clustersInOption()
+        .withDescription("The input centroids, as Vectors.  Must be a SequenceFile of Writable, Cluster/Canopy.  "
+            + "If k is also specified, then a random set of vectors will be selected"
+            + " and written out to this path first")
+        .create());
+    addOption(DefaultOptionCreator.numClustersOption()
+        .withDescription("The k in k-Means.  If specified, then a random selection of k Vectors will be chosen"
+            + " as the Centroid and written to the clusters input path.").create());
+    addOption(DefaultOptionCreator.convergenceOption().create());
+    addOption(DefaultOptionCreator.maxIterationsOption().create());
+    addOption(DefaultOptionCreator.overwriteOption().create());
+    addOption(M_OPTION, M_OPTION, "coefficient normalization factor, must be greater than 1", true);
+    addOption(DefaultOptionCreator.clusteringOption().create());
+    addOption(DefaultOptionCreator.emitMostLikelyOption().create());
+    addOption(DefaultOptionCreator.thresholdOption().create());
+    addOption(DefaultOptionCreator.methodOption().create());
+
+    if (parseArguments(args) == null) {
+      return -1;
+    }
+
+    Path input = getInputPath();
+    Path clusters = new Path(getOption(DefaultOptionCreator.CLUSTERS_IN_OPTION));
+    Path output = getOutputPath();
+    String measureClass = getOption(DefaultOptionCreator.DISTANCE_MEASURE_OPTION);
+    if (measureClass == null) {
+      measureClass = SquaredEuclideanDistanceMeasure.class.getName();
+    }
+    double convergenceDelta = Double.parseDouble(getOption(DefaultOptionCreator.CONVERGENCE_DELTA_OPTION));
+    float fuzziness = Float.parseFloat(getOption(M_OPTION));
+
+    int maxIterations = Integer.parseInt(getOption(DefaultOptionCreator.MAX_ITERATIONS_OPTION));
+    if (hasOption(DefaultOptionCreator.OVERWRITE_OPTION)) {
+      HadoopUtil.delete(getConf(), output);
+    }
+    boolean emitMostLikely = Boolean.parseBoolean(getOption(DefaultOptionCreator.EMIT_MOST_LIKELY_OPTION));
+    double threshold = Double.parseDouble(getOption(DefaultOptionCreator.THRESHOLD_OPTION));
+    DistanceMeasure measure = ClassUtils.instantiateAs(measureClass, DistanceMeasure.class);
+
+    if (hasOption(DefaultOptionCreator.NUM_CLUSTERS_OPTION)) {
+      clusters = RandomSeedGenerator.buildRandom(getConf(),
+                                                 input,
+                                                 clusters,
+                                                 Integer.parseInt(getOption(DefaultOptionCreator.NUM_CLUSTERS_OPTION)),
+                                                 measure);
+    }
+    boolean runClustering = hasOption(DefaultOptionCreator.CLUSTERING_OPTION);
+    boolean runSequential = getOption(DefaultOptionCreator.METHOD_OPTION).equalsIgnoreCase(
+        DefaultOptionCreator.SEQUENTIAL_METHOD);
+    run(getConf(),
+        input,
+        clusters,
+        output,
+        measure,
+        convergenceDelta,
+        maxIterations,
+        fuzziness,
+        runClustering,
+        emitMostLikely,
+        threshold,
+        runSequential);
+    return 0;
+  }
+
+  /**
+   * Iterate over the input vectors to produce clusters and, if requested, use the
+   * results of the final iteration to cluster the input vectors.
+   * 
+   * @param input
+   *          the directory pathname for input points
+   * @param clustersIn
+   *          the directory pathname for initial & computed clusters
+   * @param output
+   *          the directory pathname for output points
+   * @param convergenceDelta
+   *          the convergence delta value
+   * @param maxIterations
+   *          the maximum number of iterations
+   * @param m
+   *          the fuzzification factor, see
+   *          http://en.wikipedia.org/wiki/Data_clustering#Fuzzy_c-means_clustering
+   * @param runClustering 
+   *          true if points are to be clustered after iterations complete
+   * @param emitMostLikely
+   *          a boolean if true emit only most likely cluster for each point
+   * @param threshold 
+   *          a double threshold value emits all clusters having greater pdf (emitMostLikely = false)
+   * @param runSequential if true run in sequential execution mode
+   */
+  public static void run(Path input,
+                         Path clustersIn,
+                         Path output,
+                         DistanceMeasure measure,
+                         double convergenceDelta,
+                         int maxIterations,
+                         float m,
+                         boolean runClustering,
+                         boolean emitMostLikely,
+                         double threshold,
+                         boolean runSequential) throws IOException, ClassNotFoundException, InterruptedException {
+    Path clustersOut = buildClusters(new Configuration(),
+                                     input,
+                                     clustersIn,
+                                     output,
+                                     measure,
+                                     convergenceDelta,
+                                     maxIterations,
+                                     m,
+                                     runSequential);
+    if (runClustering) {
+      log.info("Clustering ");
+      clusterData(input,
+                  clustersOut,
+                  output,
+                  measure,
+                  convergenceDelta,
+                  m,
+                  emitMostLikely,
+                  threshold,
+                  runSequential);
+    }
+  }
+
+  /**
+   * Iterate over the input vectors to produce clusters and, if requested, use the
+   * results of the final iteration to cluster the input vectors.
+   * @param input
+   *          the directory pathname for input points
+   * @param clustersIn
+   *          the directory pathname for initial & computed clusters
+   * @param output
+   *          the directory pathname for output points
+   * @param convergenceDelta
+   *          the convergence delta value
+   * @param maxIterations
+   *          the maximum number of iterations
+   * @param m
+   *          the fuzzification factor, see
+   *          http://en.wikipedia.org/wiki/Data_clustering#Fuzzy_c-means_clustering
+   * @param runClustering 
+   *          true if points are to be clustered after iterations complete
+   * @param emitMostLikely
+   *          a boolean if true emit only most likely cluster for each point
+   * @param threshold 
+   *          a double threshold value emits all clusters having greater pdf (emitMostLikely = false)
+   * @param runSequential if true run in sequential execution mode
+   */
+  public static void run(Configuration conf,
+                         Path input,
+                         Path clustersIn,
+                         Path output,
+                         DistanceMeasure measure,
+                         double convergenceDelta,
+                         int maxIterations,
+                         float m,
+                         boolean runClustering,
+                         boolean emitMostLikely,
+                         double threshold,
+                         boolean runSequential)
+    throws IOException, ClassNotFoundException, InterruptedException {
+    Path clustersOut =
+        buildClusters(conf, input, clustersIn, output, measure, convergenceDelta, maxIterations, m, runSequential);
+    if (runClustering) {
+      log.info("Clustering");
+      clusterData(input,
+                  clustersOut,
+                  output,
+                  measure,
+                  convergenceDelta,
+                  m,
+                  emitMostLikely,
+                  threshold,
+                  runSequential);
+    }
+  }
+
+  /**
+   * Iterate over the input vectors to produce cluster directories for each iteration
+   * @param input
+   *          the directory pathname for input points
+   * @param clustersIn
+   *          the file pathname for initial cluster centers
+   * @param output
+   *          the directory pathname for output points
+   * @param measure
+   *          the classname of the DistanceMeasure
+   * @param convergenceDelta
+   *          the convergence delta value
+   * @param maxIterations
+   *          the maximum number of iterations
+   * @param m
+   *          the fuzzification factor, see
+   *          http://en.wikipedia.org/wiki/Data_clustering#Fuzzy_c-means_clustering
+   * @param runSequential if true run in sequential execution mode
+   * 
+   * @return the Path of the final clusters directory
+   */
+  public static Path buildClusters(Configuration conf,
+                                   Path input,
+                                   Path clustersIn,
+                                   Path output,
+                                   DistanceMeasure measure,
+                                   double convergenceDelta,
+                                   int maxIterations,
+                                   float m,
+                                   boolean runSequential)
+    throws IOException, InterruptedException, ClassNotFoundException {
+    
+    List<Cluster> clusters = new ArrayList<Cluster>();
+    FuzzyKMeansUtil.configureWithClusterInfo(conf, clustersIn, clusters);
+    
+    if (conf==null) {
+      conf = new Configuration();
     }
     
-    vectorWritable.set(vector);
-    output.collect(key, vectorWritable);
-  }
-  
-  @Override
-  public void configure(JobConf job) {
-    super.configure(job);
-    try {
-      
-      URI[] localFiles = DistributedCache.getCacheFiles(job);
-      if (localFiles == null || localFiles.length < 1) {
-        throw new IllegalArgumentException(
-            "missing paths from the DistributedCache");
-      }
-      
-      vectorCount = job.getLong(TFIDFConverter.VECTOR_COUNT, 1);
-      featureCount = job.getLong(TFIDFConverter.FEATURE_COUNT, 1);
-      minDf = job.getInt(TFIDFConverter.MIN_DF, 1);
-      maxDfPercent = job.getInt(TFIDFConverter.MAX_DF_PERCENTAGE, 99);
-      
-      Path dictionaryFile = new Path(localFiles[0].getPath());
-      FileSystem fs = dictionaryFile.getFileSystem(job);
-      SequenceFile.Reader reader = new SequenceFile.Reader(fs, dictionaryFile,
-          job);
-      IntWritable key = new IntWritable();
-      LongWritable value = new LongWritable();
-      
-      // key is feature, value is the document frequency
-      while (reader.next(key, value)) {
-        dictionary.put(key.get(), value.get());
-      }
-    } catch (IOException e) {
-      throw new IllegalStateException(e);
+    if (clusters.isEmpty()) {
+      throw new IllegalStateException("No input clusters found. Check your -c argument.");
     }
+    
+    Path priorClustersPath = new Path(output, Cluster.INITIAL_CLUSTERS_DIR);   
+    ClusteringPolicy policy = new FuzzyKMeansClusteringPolicy(m, convergenceDelta);
+    ClusterClassifier prior = new ClusterClassifier(clusters, policy);
+    prior.writeToSeqFiles(priorClustersPath);
+    
+    if (runSequential) {
+      new ClusterIterator().iterateSeq(conf, input, priorClustersPath, output, maxIterations);
+    } else {
+      new ClusterIterator().iterateMR(conf, input, priorClustersPath, output, maxIterations);
+    }
+    return output;
+  }
+
+  /**
+   * Run the job using supplied arguments
+   * 
+   * @param input
+   *          the directory pathname for input points
+   * @param clustersIn
+   *          the directory pathname for input clusters
+   * @param output
+   *          the directory pathname for output points
+   * @param measure
+   *          the classname of the DistanceMeasure
+   * @param convergenceDelta
+   *          the convergence delta value
+   * @param emitMostLikely
+   *          a boolean if true emit only most likely cluster for each point
+   * @param threshold
+   *          a double threshold value emits all clusters having greater pdf (emitMostLikely = false)
+   * @param runSequential if true run in sequential execution mode
+   */
+  public static void clusterData(Path input,
+                                 Path clustersIn,
+                                 Path output,
+                                 DistanceMeasure measure,
+                                 double convergenceDelta,
+                                 float m,
+                                 boolean emitMostLikely,
+                                 double threshold,
+                                 boolean runSequential)
+    throws IOException, ClassNotFoundException, InterruptedException {
+    
+    ClusterClassifier.writePolicy(new FuzzyKMeansClusteringPolicy(m, convergenceDelta), clustersIn);
+    ClusterClassificationDriver.run(input, output, new Path(output, CLUSTERED_POINTS_DIRECTORY), threshold, true,
+        runSequential);
   }
 }

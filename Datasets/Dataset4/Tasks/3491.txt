@@ -1,13 +1,13 @@
-public Query termQuery(String value, QueryParseContext context) {
+item.index(clusterState.metaData().concreteSingleIndex(item.index()));
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,289 +19,152 @@ public Query termQuery(String value, QueryParseContext context) {
  * under the License.
  */
 
-package org.elasticsearch.index.mapper.internal;
+package org.elasticsearch.action.get;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermQuery;
-import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.lucene.Lucene;
-import org.elasticsearch.common.lucene.all.AllField;
-import org.elasticsearch.common.lucene.all.AllTermQuery;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.index.analysis.NamedAnalyzer;
-import org.elasticsearch.index.codec.postingsformat.PostingsFormatProvider;
-import org.elasticsearch.index.mapper.*;
-import org.elasticsearch.index.mapper.core.AbstractFieldMapper;
-import org.elasticsearch.index.query.QueryParseContext;
-import org.elasticsearch.index.similarity.SimilarityProvider;
+import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.support.TransportAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.AtomicArray;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.BaseTransportRequestHandler;
+import org.elasticsearch.transport.TransportChannel;
+import org.elasticsearch.transport.TransportService;
 
-import java.io.IOException;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.elasticsearch.common.xcontent.support.XContentMapValues.nodeBooleanValue;
-import static org.elasticsearch.index.mapper.MapperBuilders.all;
-import static org.elasticsearch.index.mapper.core.TypeParsers.parseField;
+public class TransportMultiGetAction extends TransportAction<MultiGetRequest, MultiGetResponse> {
 
-/**
- *
- */
-public class AllFieldMapper extends AbstractFieldMapper<Void> implements InternalMapper, RootMapper {
+    private final ClusterService clusterService;
 
-    public interface IncludeInAll extends Mapper {
+    private final TransportShardMultiGetAction shardAction;
 
-        void includeInAll(Boolean includeInAll);
+    @Inject
+    public TransportMultiGetAction(Settings settings, ThreadPool threadPool, TransportService transportService, ClusterService clusterService, TransportShardMultiGetAction shardAction) {
+        super(settings, threadPool);
+        this.clusterService = clusterService;
+        this.shardAction = shardAction;
 
-        void includeInAllIfNotSet(Boolean includeInAll);
+        transportService.registerHandler(MultiGetAction.NAME, new TransportHandler());
     }
 
-    public static final String NAME = "_all";
+    @Override
+    protected void doExecute(final MultiGetRequest request, final ActionListener<MultiGetResponse> listener) {
+        ClusterState clusterState = clusterService.state();
 
-    public static final String CONTENT_TYPE = "_all";
+        clusterState.blocks().globalBlockedRaiseException(ClusterBlockLevel.READ);
 
-    public static class Defaults extends AbstractFieldMapper.Defaults {
-        public static final String NAME = AllFieldMapper.NAME;
-        public static final String INDEX_NAME = AllFieldMapper.NAME;
-        public static final boolean ENABLED = true;
+        final AtomicArray<MultiGetItemResponse> responses = new AtomicArray<>(request.items.size());
 
-        public static final FieldType FIELD_TYPE = new FieldType();
+        Map<ShardId, MultiGetShardRequest> shardRequests = new HashMap<>();
+        for (int i = 0; i < request.items.size(); i++) {
+            MultiGetRequest.Item item = request.items.get(i);
+            if (!clusterState.metaData().hasConcreteIndex(item.index())) {
+                responses.set(i, new MultiGetItemResponse(null, new MultiGetResponse.Failure(item.index(), item.type(), item.id(), "[" + item.index() + "] missing")));
+                continue;
+            }
+            if (item.routing() == null && clusterState.getMetaData().routingRequired(item.index(), item.type())) {
+                responses.set(i, new MultiGetItemResponse(null, new MultiGetResponse.Failure(item.index(), item.type(), item.id(), "routing is required, but hasn't been specified")));
+                continue;
+            }
 
-        static {
-            FIELD_TYPE.setIndexed(true);
-            FIELD_TYPE.setTokenized(true);
-            FIELD_TYPE.freeze();
+            item.routing(clusterState.metaData().resolveIndexRouting(item.routing(), item.index()));
+            item.index(clusterState.metaData().concreteIndex(item.index()));
+            ShardId shardId = clusterService.operationRouting()
+                    .getShards(clusterState, item.index(), item.type(), item.id(), item.routing(), null).shardId();
+            MultiGetShardRequest shardRequest = shardRequests.get(shardId);
+            if (shardRequest == null) {
+                shardRequest = new MultiGetShardRequest(shardId.index().name(), shardId.id());
+                shardRequest.preference(request.preference);
+                shardRequest.realtime(request.realtime);
+                shardRequest.refresh(request.refresh);
+
+                shardRequests.put(shardId, shardRequest);
+            }
+            shardRequest.add(i, item.type(), item.id(), item.fields(), item.version(), item.versionType(), item.fetchSourceContext());
+        }
+
+        if (shardRequests.size() == 0) {
+            // only failures..
+            listener.onResponse(new MultiGetResponse(responses.toArray(new MultiGetItemResponse[responses.length()])));
+        }
+
+        final AtomicInteger counter = new AtomicInteger(shardRequests.size());
+
+        for (final MultiGetShardRequest shardRequest : shardRequests.values()) {
+            shardAction.execute(shardRequest, new ActionListener<MultiGetShardResponse>() {
+                @Override
+                public void onResponse(MultiGetShardResponse response) {
+                    for (int i = 0; i < response.locations.size(); i++) {
+                        responses.set(response.locations.get(i), new MultiGetItemResponse(response.responses.get(i), response.failures.get(i)));
+                    }
+                    if (counter.decrementAndGet() == 0) {
+                        finishHim();
+                    }
+                }
+
+                @Override
+                public void onFailure(Throwable e) {
+                    // create failures for all relevant requests
+                    String message = ExceptionsHelper.detailedMessage(e);
+                    for (int i = 0; i < shardRequest.locations.size(); i++) {
+                        responses.set(shardRequest.locations.get(i), new MultiGetItemResponse(null,
+                                new MultiGetResponse.Failure(shardRequest.index(), shardRequest.types.get(i), shardRequest.ids.get(i), message)));
+                    }
+                    if (counter.decrementAndGet() == 0) {
+                        finishHim();
+                    }
+                }
+
+                private void finishHim() {
+                    listener.onResponse(new MultiGetResponse(responses.toArray(new MultiGetItemResponse[responses.length()])));
+                }
+            });
         }
     }
 
-    public static class Builder extends AbstractFieldMapper.Builder<Builder, AllFieldMapper> {
+    class TransportHandler extends BaseTransportRequestHandler<MultiGetRequest> {
 
-        private boolean enabled = Defaults.ENABLED;
-
-        // an internal flag, automatically set if we encounter boosting
-        boolean autoBoost = false;
-
-        public Builder() {
-            super(Defaults.NAME, new FieldType(Defaults.FIELD_TYPE));
-            builder = this;
-            indexName = Defaults.INDEX_NAME;
-        }
-
-        public Builder enabled(boolean enabled) {
-            this.enabled = enabled;
-            return this;
+        @Override
+        public MultiGetRequest newInstance() {
+            return new MultiGetRequest();
         }
 
         @Override
-        public AllFieldMapper build(BuilderContext context) {
-            // In case the mapping overrides these
-            fieldType.setIndexed(true);
-            fieldType.setTokenized(true);
+        public void messageReceived(final MultiGetRequest request, final TransportChannel channel) throws Exception {
+            // no need to use threaded listener, since we just send a response
+            request.listenerThreaded(false);
+            execute(request, new ActionListener<MultiGetResponse>() {
+                @Override
+                public void onResponse(MultiGetResponse response) {
+                    try {
+                        channel.sendResponse(response);
+                    } catch (Throwable e) {
+                        onFailure(e);
+                    }
+                }
 
-            return new AllFieldMapper(name, fieldType, indexAnalyzer, searchAnalyzer, enabled, autoBoost, provider, similarity);
+                @Override
+                public void onFailure(Throwable e) {
+                    try {
+                        channel.sendResponse(e);
+                    } catch (Exception e1) {
+                        logger.warn("Failed to send error response for action [" + MultiGetAction.NAME + "] and request [" + request + "]", e1);
+                    }
+                }
+            });
         }
-    }
 
-    public static class TypeParser implements Mapper.TypeParser {
         @Override
-        public Mapper.Builder parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
-            AllFieldMapper.Builder builder = all();
-            parseField(builder, builder.name, node, parserContext);
-            for (Map.Entry<String, Object> entry : node.entrySet()) {
-                String fieldName = Strings.toUnderscoreCase(entry.getKey());
-                Object fieldNode = entry.getValue();
-                if (fieldName.equals("enabled")) {
-                    builder.enabled(nodeBooleanValue(fieldNode));
-                } else if (fieldName.equals("auto_boost")) {
-                    builder.autoBoost = nodeBooleanValue(fieldNode);
-                }
-            }
-            return builder;
+        public String executor() {
+            return ThreadPool.Names.SAME;
         }
-    }
-
-
-    private boolean enabled;
-    // The autoBoost flag is automatically set based on indexed docs on the mappings
-    // if a doc is indexed with a specific boost value and part of _all, it is automatically
-    // set to true. This allows to optimize (automatically, which we like) for the common case
-    // where fields don't usually have boost associated with them, and we don't need to use the
-    // special SpanTermQuery to look at payloads
-    private volatile boolean autoBoost;
-
-    public AllFieldMapper() {
-        this(Defaults.NAME, new FieldType(Defaults.FIELD_TYPE), null, null, Defaults.ENABLED, false, null, null);
-    }
-
-    protected AllFieldMapper(String name, FieldType fieldType, NamedAnalyzer indexAnalyzer, NamedAnalyzer searchAnalyzer,
-                             boolean enabled, boolean autoBoost, PostingsFormatProvider provider, SimilarityProvider similarity) {
-        super(new Names(name, name, name, name), 1.0f, fieldType, indexAnalyzer, searchAnalyzer, provider, similarity);
-        this.enabled = enabled;
-        this.autoBoost = autoBoost;
-
-    }
-
-    public boolean enabled() {
-        return this.enabled;
-    }
-
-    @Override
-    public FieldType defaultFieldType() {
-        return Defaults.FIELD_TYPE;
-    }
-
-    @Override
-    public Query queryStringTermQuery(Term term) {
-        if (!autoBoost) {
-            return new TermQuery(term);
-        }
-        if (fieldType.indexOptions() == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
-            return new AllTermQuery(term);
-        }
-        return new TermQuery(term);
-    }
-
-    @Override
-    public Query fieldQuery(String value, QueryParseContext context) {
-        return queryStringTermQuery(names().createIndexNameTerm(value));
-
-    }
-
-    @Override
-    public void preParse(ParseContext context) throws IOException {
-    }
-
-    @Override
-    public void postParse(ParseContext context) throws IOException {
-        super.parse(context);
-    }
-
-    @Override
-    public void parse(ParseContext context) throws IOException {
-        // we parse in post parse
-    }
-
-    @Override
-    public void validate(ParseContext context) throws MapperParsingException {
-    }
-
-    @Override
-    public boolean includeInObject() {
-        return true;
-    }
-
-    @Override
-    protected Field parseCreateField(ParseContext context) throws IOException {
-        if (!enabled) {
-            return null;
-        }
-        // reset the entries
-        context.allEntries().reset();
-
-        // if the autoBoost flag is not set, and we indexed a doc with custom boost, make
-        // sure to update the flag, and notify mappings on change
-        if (!autoBoost && context.allEntries().customBoost()) {
-            autoBoost = true;
-            context.setMappingsModified();
-        }
-
-        Analyzer analyzer = findAnalyzer(context);
-        return new AllField(names.indexName(), context.allEntries(), analyzer, fieldType);
-    }
-
-    private Analyzer findAnalyzer(ParseContext context) {
-        Analyzer analyzer = indexAnalyzer;
-        if (analyzer == null) {
-            analyzer = context.analyzer();
-            if (analyzer == null) {
-                analyzer = context.docMapper().indexAnalyzer();
-                if (analyzer == null) {
-                    // This should not happen, should we log warn it?
-                    analyzer = Lucene.STANDARD_ANALYZER;
-                }
-            }
-        }
-        return analyzer;
-    }
-
-    @Override
-    public Void value(Object value) {
-        return null;
-    }
-
-    @Override
-    public Void valueFromString(String value) {
-        return null;
-    }
-
-    @Override
-    public String valueAsString(Object value) {
-        return null;
-    }
-
-    @Override
-    public Object valueForSearch(Object value) {
-        return null;
-    }
-
-    @Override
-    protected String contentType() {
-        return CONTENT_TYPE;
-    }
-
-    @Override
-    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        // if all are defaults, no need to write it at all
-        if (enabled == Defaults.ENABLED && fieldType.stored() == Defaults.FIELD_TYPE.stored() &&
-                fieldType.storeTermVectors() == Defaults.FIELD_TYPE.storeTermVectors() &&
-                indexAnalyzer == null && searchAnalyzer == null) {
-            return builder;
-        }
-        builder.startObject(CONTENT_TYPE);
-        if (enabled != Defaults.ENABLED) {
-            builder.field("enabled", enabled);
-        }
-        if (autoBoost != false) {
-            builder.field("auto_boost", autoBoost);
-        }
-        if (fieldType.stored() != Defaults.FIELD_TYPE.stored()) {
-            builder.field("store", fieldType.stored());
-        }
-        if (fieldType.storeTermVectors() != Defaults.FIELD_TYPE.storeTermVectors()) {
-            builder.field("store_term_vector", fieldType.storeTermVectors());
-        }
-        if (fieldType.storeTermVectorOffsets() != Defaults.FIELD_TYPE.storeTermVectorOffsets()) {
-            builder.field("store_term_vector_offsets", fieldType.storeTermVectorOffsets());
-        }
-        if (fieldType.storeTermVectorPositions() != Defaults.FIELD_TYPE.storeTermVectorPositions()) {
-            builder.field("store_term_vector_positions", fieldType.storeTermVectorPositions());
-        }
-        if (fieldType.storeTermVectorPayloads() != Defaults.FIELD_TYPE.storeTermVectorPayloads()) {
-            builder.field("store_term_vector_payloads", fieldType.storeTermVectorPayloads());
-        }
-        if (indexAnalyzer != null && searchAnalyzer != null && indexAnalyzer.name().equals(searchAnalyzer.name()) && !indexAnalyzer.name().startsWith("_")) {
-            // same analyzers, output it once
-            builder.field("analyzer", indexAnalyzer.name());
-        } else {
-            if (indexAnalyzer != null && !indexAnalyzer.name().startsWith("_")) {
-                builder.field("index_analyzer", indexAnalyzer.name());
-            }
-            if (searchAnalyzer != null && !searchAnalyzer.name().startsWith("_")) {
-                builder.field("search_analyzer", searchAnalyzer.name());
-            }
-        }
-        if (similarity() != null) {
-            builder.field("similarity", similarity().name());
-        }
-        builder.endObject();
-        return builder;
-    }
-
-    @Override
-    public void merge(Mapper mergeWith, MergeContext mergeContext) throws MergeMappingException {
-        // do nothing here, no merging, but also no exception
     }
 }

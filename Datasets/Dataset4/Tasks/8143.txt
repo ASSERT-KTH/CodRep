@@ -1,4 +1,4 @@
-shard.relocated("to " + request.targetNode());
+Node[] nodes = new Node[1];
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -9,7 +9,7 @@ shard.relocated("to " + request.targetNode());
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -19,289 +19,143 @@ shard.relocated("to " + request.targetNode());
  * under the License.
  */
 
-package org.elasticsearch.index.shard.recovery;
+package org.elasticsearch.benchmark.percolator;
 
-import org.apache.lucene.store.IndexInput;
-import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthStatus;
+import org.elasticsearch.action.percolate.PercolateResponse;
+import org.elasticsearch.client.Client;
 import org.elasticsearch.common.StopWatch;
-import org.elasticsearch.common.collect.Lists;
-import org.elasticsearch.common.collect.Sets;
-import org.elasticsearch.common.component.AbstractComponent;
-import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.ByteSizeUnit;
-import org.elasticsearch.common.unit.ByteSizeValue;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.util.concurrent.DynamicExecutors;
-import org.elasticsearch.common.util.concurrent.EsExecutors;
-import org.elasticsearch.index.deletionpolicy.SnapshotIndexCommit;
-import org.elasticsearch.index.engine.Engine;
-import org.elasticsearch.index.shard.IllegalIndexShardStateException;
-import org.elasticsearch.index.shard.IndexShardClosedException;
-import org.elasticsearch.index.shard.IndexShardState;
-import org.elasticsearch.index.shard.service.InternalIndexShard;
-import org.elasticsearch.index.store.StoreFileMetaData;
-import org.elasticsearch.index.translog.Translog;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.*;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.node.Node;
 
 import java.io.IOException;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
+
+import static org.elasticsearch.client.Requests.createIndexRequest;
+import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_NUMBER_OF_REPLICAS;
+import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_NUMBER_OF_SHARDS;
+import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+import static org.elasticsearch.index.query.QueryBuilders.rangeQuery;
+import static org.elasticsearch.index.query.QueryBuilders.termQuery;
+import static org.elasticsearch.node.NodeBuilder.nodeBuilder;
 
 /**
- * The source recovery accepts recovery requests from other peer shards and start the recovery process from this
- * source shard to the target shard.
  *
- * @author kimchy (shay.banon)
  */
-public class RecoverySource extends AbstractComponent {
+public class PercolatorStressBenchmark {
 
-    public static class Actions {
-        public static final String START_RECOVERY = "index/shard/recovery/startRecovery";
-    }
+    public static void main(String[] args) throws Exception {
+        Settings settings = settingsBuilder()
+                .put("cluster.routing.schedule", 200, TimeUnit.MILLISECONDS)
+                .put("gateway.type", "none")
+                .put(SETTING_NUMBER_OF_SHARDS, 4)
+                .put(SETTING_NUMBER_OF_REPLICAS, 0)
+                .build();
 
-    private final ThreadPool threadPool;
-
-    private final TransportService transportService;
-
-    private final IndicesService indicesService;
-
-
-    private final ByteSizeValue fileChunkSize;
-
-    private final boolean compress;
-
-    private final int translogBatchSize;
-
-    private final ExecutorService concurrentStreamPool;
-
-    @Inject public RecoverySource(Settings settings, ThreadPool threadPool, TransportService transportService, IndicesService indicesService) {
-        super(settings);
-        this.threadPool = threadPool;
-        this.transportService = transportService;
-        this.indicesService = indicesService;
-
-        int concurrentStreams = componentSettings.getAsInt("concurrent_streams", 5);
-        this.concurrentStreamPool = DynamicExecutors.newScalingThreadPool(1, concurrentStreams, TimeValue.timeValueSeconds(5).millis(), EsExecutors.daemonThreadFactory(settings, "[recovery_stream]"));
-
-        this.fileChunkSize = componentSettings.getAsBytesSize("file_chunk_size", new ByteSizeValue(100, ByteSizeUnit.KB));
-        this.translogBatchSize = componentSettings.getAsInt("translog_batch_size", 100);
-        this.compress = componentSettings.getAsBoolean("compress", true);
-
-        logger.debug("using concurrent_streams [{}], file_chunk_size [{}], translog_batch_size [{}], and compress [{}]", concurrentStreams, fileChunkSize, translogBatchSize, compress);
-
-        transportService.registerHandler(Actions.START_RECOVERY, new StartRecoveryTransportRequestHandler());
-    }
-
-    public void close() {
-        concurrentStreamPool.shutdown();
-    }
-
-    private RecoveryResponse recover(final StartRecoveryRequest request) {
-        final InternalIndexShard shard = (InternalIndexShard) indicesService.indexServiceSafe(request.shardId().index().name()).shardSafe(request.shardId().id());
-        logger.trace("[{}][{}] starting recovery to {}, mark_as_relocated {}", request.shardId().index().name(), request.shardId().id(), request.targetNode(), request.markAsRelocated());
-        final RecoveryResponse response = new RecoveryResponse();
-        shard.recover(new Engine.RecoveryHandler() {
-            @Override public void phase1(final SnapshotIndexCommit snapshot) throws ElasticSearchException {
-                long totalSize = 0;
-                long existingTotalSize = 0;
-                try {
-                    StopWatch stopWatch = new StopWatch().start();
-
-                    for (String name : snapshot.getFiles()) {
-                        StoreFileMetaData md = shard.store().metaData(name);
-                        boolean useExisting = false;
-                        if (request.existingFiles().containsKey(name)) {
-                            // we don't compute checksum for segments, so always recover them
-                            if (!name.startsWith("segments") && md.isSame(request.existingFiles().get(name))) {
-                                response.phase1ExistingFileNames.add(name);
-                                response.phase1ExistingFileSizes.add(md.length());
-                                existingTotalSize += md.length();
-                                useExisting = true;
-                                if (logger.isTraceEnabled()) {
-                                    logger.trace("[{}][{}] recovery [phase1] to {}: not recovering [{}], exists in local store and has checksum [{}], size [{}]", request.shardId().index().name(), request.shardId().id(), request.targetNode(), name, md.checksum(), md.length());
-                                }
-                            }
-                        }
-                        if (!useExisting) {
-                            if (request.existingFiles().containsKey(name)) {
-                                logger.trace("[{}][{}] recovery [phase1] to {}: recovering [{}], exists in local store, but is different: remote [{}], local [{}]", request.shardId().index().name(), request.shardId().id(), request.targetNode(), name, request.existingFiles().get(name), md);
-                            } else {
-                                logger.trace("[{}][{}] recovery [phase1] to {}: recovering [{}], does not exists in remote", request.shardId().index().name(), request.shardId().id(), request.targetNode(), name);
-                            }
-                            response.phase1FileNames.add(name);
-                            response.phase1FileSizes.add(md.length());
-                            totalSize += md.length();
-                        }
-                    }
-                    response.phase1TotalSize = totalSize;
-                    response.phase1ExistingTotalSize = existingTotalSize;
-
-                    logger.trace("[{}][{}] recovery [phase1] to {}: recovering_files [{}] with total_size [{}], reusing_files [{}] with total_size [{}]", request.shardId().index().name(), request.shardId().id(), request.targetNode(), response.phase1FileNames.size(), new ByteSizeValue(totalSize), response.phase1ExistingFileNames.size(), new ByteSizeValue(existingTotalSize));
-
-                    RecoveryFilesInfoRequest recoveryInfoFilesRequest = new RecoveryFilesInfoRequest(request.shardId(), response.phase1FileNames, response.phase1FileSizes,
-                            response.phase1ExistingFileNames, response.phase1ExistingFileSizes, response.phase1TotalSize, response.phase1ExistingTotalSize);
-                    transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.FILES_INFO, recoveryInfoFilesRequest, VoidTransportResponseHandler.INSTANCE).txGet();
-
-                    final CountDownLatch latch = new CountDownLatch(response.phase1FileNames.size());
-                    final AtomicReference<Exception> lastException = new AtomicReference<Exception>();
-                    for (final String name : response.phase1FileNames) {
-                        concurrentStreamPool.execute(new Runnable() {
-                            @Override public void run() {
-                                IndexInput indexInput = null;
-                                try {
-                                    final int BUFFER_SIZE = (int) fileChunkSize.bytes();
-                                    byte[] buf = new byte[BUFFER_SIZE];
-                                    StoreFileMetaData md = shard.store().metaData(name);
-                                    indexInput = snapshot.getDirectory().openInput(name);
-                                    long len = indexInput.length();
-                                    long readCount = 0;
-                                    while (readCount < len) {
-                                        if (shard.state() == IndexShardState.CLOSED) { // check if the shard got closed on us
-                                            throw new IndexShardClosedException(shard.shardId());
-                                        }
-                                        int toRead = readCount + BUFFER_SIZE > len ? (int) (len - readCount) : BUFFER_SIZE;
-                                        long position = indexInput.getFilePointer();
-                                        indexInput.readBytes(buf, 0, toRead, false);
-                                        transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.FILE_CHUNK, new RecoveryFileChunkRequest(request.shardId(), name, position, len, md.checksum(), buf, toRead),
-                                                TransportRequestOptions.options().withCompress(compress).withLowType(), VoidTransportResponseHandler.INSTANCE).txGet();
-                                        readCount += toRead;
-                                    }
-                                    indexInput.close();
-                                } catch (Exception e) {
-                                    lastException.set(e);
-                                } finally {
-                                    if (indexInput != null) {
-                                        try {
-                                            indexInput.close();
-                                        } catch (IOException e) {
-                                            // ignore
-                                        }
-                                    }
-                                    latch.countDown();
-                                }
-                            }
-                        });
-                    }
-
-                    latch.await();
-
-                    if (lastException.get() != null) {
-                        throw lastException.get();
-                    }
-
-                    // now, set the clean files request
-                    Set<String> snapshotFiles = Sets.newHashSet(snapshot.getFiles());
-                    transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.CLEAN_FILES, new RecoveryCleanFilesRequest(shard.shardId(), snapshotFiles), VoidTransportResponseHandler.INSTANCE).txGet();
-
-                    stopWatch.stop();
-                    logger.trace("[{}][{}] recovery [phase1] to {}: took [{}]", request.shardId().index().name(), request.shardId().id(), request.targetNode(), stopWatch.totalTime());
-                    response.phase1Time = stopWatch.totalTime().millis();
-                } catch (Throwable e) {
-                    throw new RecoverFilesRecoveryException(request.shardId(), response.phase1FileNames.size(), new ByteSizeValue(totalSize), e);
-                }
-            }
-
-            @Override public void phase2(Translog.Snapshot snapshot) throws ElasticSearchException {
-                if (shard.state() == IndexShardState.CLOSED) {
-                    throw new IndexShardClosedException(request.shardId());
-                }
-                logger.trace("[{}][{}] recovery [phase2] to {}: sending transaction log operations", request.shardId().index().name(), request.shardId().id(), request.targetNode());
-                StopWatch stopWatch = new StopWatch().start();
-
-                transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.PREPARE_TRANSLOG, new RecoveryPrepareForTranslogOperationsRequest(request.shardId()), VoidTransportResponseHandler.INSTANCE).txGet();
-
-                int totalOperations = sendSnapshot(snapshot);
-
-                stopWatch.stop();
-                logger.trace("[{}][{}] recovery [phase2] to {}: took [{}]", request.shardId().index().name(), request.shardId().id(), request.targetNode(), stopWatch.totalTime());
-                response.phase2Time = stopWatch.totalTime().millis();
-                response.phase2Operations = totalOperations;
-            }
-
-            @Override public void phase3(Translog.Snapshot snapshot) throws ElasticSearchException {
-                if (shard.state() == IndexShardState.CLOSED) {
-                    throw new IndexShardClosedException(request.shardId());
-                }
-                logger.trace("[{}][{}] recovery [phase3] to {}: sending transaction log operations", request.shardId().index().name(), request.shardId().id(), request.targetNode());
-                StopWatch stopWatch = new StopWatch().start();
-                int totalOperations = sendSnapshot(snapshot);
-                transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.FINALIZE, new RecoveryFinalizeRecoveryRequest(request.shardId()), VoidTransportResponseHandler.INSTANCE).txGet();
-                if (request.markAsRelocated()) {
-                    // TODO what happens if the recovery process fails afterwards, we need to mark this back to started
-                    try {
-                        shard.relocated();
-                    } catch (IllegalIndexShardStateException e) {
-                        // we can ignore this exception since, on the other node, when it moved to phase3
-                        // it will also send shard started, which might cause the index shard we work against
-                        // to move be closed by the time we get to the the relocated method
-                    }
-                }
-                stopWatch.stop();
-                logger.trace("[{}][{}] recovery [phase3] to {}: took [{}]", request.shardId().index().name(), request.shardId().id(), request.targetNode(), stopWatch.totalTime());
-                response.phase3Time = stopWatch.totalTime().millis();
-                response.phase3Operations = totalOperations;
-            }
-
-            private int sendSnapshot(Translog.Snapshot snapshot) throws ElasticSearchException {
-                int counter = 0;
-                int totalOperations = 0;
-                List<Translog.Operation> operations = Lists.newArrayList();
-                while (snapshot.hasNext()) {
-                    if (shard.state() == IndexShardState.CLOSED) {
-                        throw new IndexShardClosedException(request.shardId());
-                    }
-                    operations.add(snapshot.next());
-                    totalOperations++;
-                    if (++counter == translogBatchSize) {
-                        RecoveryTranslogOperationsRequest translogOperationsRequest = new RecoveryTranslogOperationsRequest(request.shardId(), operations);
-                        transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.TRANSLOG_OPS, translogOperationsRequest, TransportRequestOptions.options().withCompress(compress).withLowType(), VoidTransportResponseHandler.INSTANCE).txGet();
-                        counter = 0;
-                        operations = Lists.newArrayList();
-                    }
-                }
-                // send the leftover
-                if (!operations.isEmpty()) {
-                    RecoveryTranslogOperationsRequest translogOperationsRequest = new RecoveryTranslogOperationsRequest(request.shardId(), operations);
-                    transportService.submitRequest(request.targetNode(), RecoveryTarget.Actions.TRANSLOG_OPS, translogOperationsRequest, TransportRequestOptions.options().withCompress(compress).withLowType(), VoidTransportResponseHandler.INSTANCE).txGet();
-                }
-                return totalOperations;
-            }
-        });
-        return response;
-    }
-
-    class StartRecoveryTransportRequestHandler extends BaseTransportRequestHandler<StartRecoveryRequest> {
-
-        @Override public StartRecoveryRequest newInstance() {
-            return new StartRecoveryRequest();
+        Node[] nodes = new Node[2];
+        for (int i = 0; i < nodes.length; i++) {
+            nodes[i] = nodeBuilder().settings(settingsBuilder().put(settings).put("name", "node" + i)).node();
         }
 
-        @Override public void messageReceived(final StartRecoveryRequest request, final TransportChannel channel) throws Exception {
-            // we don't spawn, but we execute the expensive recovery process on a cached thread pool
-            threadPool.cached().execute(new Runnable() {
-                @Override public void run() {
-                    try {
-                        RecoveryResponse response = recover(request);
-                        channel.sendResponse(response);
-                    } catch (Exception e) {
-                        try {
-                            channel.sendResponse(e);
-                        } catch (Exception e1) {
-                            // ignore
-                        }
-                    }
-                }
-            });
+        Node clientNode = nodeBuilder().settings(settingsBuilder().put(settings).put("name", "client")).client(true).node();
+        Client client = clientNode.client();
+
+        client.admin().indices().create(createIndexRequest("test")).actionGet();
+        ClusterHealthResponse healthResponse = client.admin().cluster().prepareHealth("test")
+                .setWaitForGreenStatus()
+                .execute().actionGet();
+        if (healthResponse.isTimedOut()) {
+            System.err.println("Quiting, because cluster health requested timed out...");
+            return;
+        } else if (healthResponse.getStatus() != ClusterHealthStatus.GREEN) {
+            System.err.println("Quiting, because cluster state isn't green...");
+            return;
         }
 
-        @Override public boolean spawn() {
-            return false;
+        int COUNT = 200000;
+        int QUERIES = 100;
+        int TERM_QUERIES = QUERIES / 2;
+        int RANGE_QUERIES = QUERIES - TERM_QUERIES;
+
+        client.prepareIndex("test", "type1", "1").setSource(jsonBuilder().startObject().field("numeric1", 1).endObject()).execute().actionGet();
+
+        // register queries
+        int i = 0;
+        for (; i < TERM_QUERIES; i++) {
+            client.prepareIndex("test", "_percolator", Integer.toString(i))
+                    .setSource(jsonBuilder().startObject()
+                            .field("query", termQuery("name", "value"))
+                            .endObject())
+                    .execute().actionGet();
         }
+
+        int[] numbers = new int[RANGE_QUERIES];
+        for (; i < QUERIES; i++) {
+            client.prepareIndex("test", "_percolator", Integer.toString(i))
+                    .setSource(jsonBuilder().startObject()
+                            .field("query", rangeQuery("numeric1").from(i).to(i))
+                            .endObject())
+                    .execute().actionGet();
+            numbers[i - TERM_QUERIES] = i;
+        }
+
+        StopWatch stopWatch = new StopWatch().start();
+        System.out.println("Percolating [" + COUNT + "] ...");
+        for (i = 1; i <= COUNT; i++) {
+            XContentBuilder source;
+            int expectedMatches;
+            if (i % 2 == 0) {
+                source = source(Integer.toString(i), "value");
+                expectedMatches = TERM_QUERIES;
+            } else {
+                int number = numbers[i % RANGE_QUERIES];
+                source = source(Integer.toString(i), number);
+                expectedMatches = 1;
+            }
+            PercolateResponse percolate = client.preparePercolate()
+                    .setIndices("test").setDocumentType("type1")
+                    .setSource(source)
+                    .execute().actionGet();
+            if (percolate.getMatches().length != expectedMatches) {
+                System.err.println("No matching number of queries");
+            }
+
+            if ((i % 10000) == 0) {
+                System.out.println("Percolated " + i + " took " + stopWatch.stop().lastTaskTime());
+                stopWatch.start();
+            }
+        }
+        System.out.println("Percolation took " + stopWatch.totalTime() + ", TPS " + (((double) COUNT) / stopWatch.totalTime().secondsFrac()));
+
+        clientNode.close();
+        for (Node node : nodes) {
+            node.close();
+        }
+    }
+
+    private static XContentBuilder source(String id, String nameValue) throws IOException {
+        return jsonBuilder().startObject().startObject("doc")
+                .field("id", id)
+                .field("name", nameValue)
+                .endObject().endObject();
+    }
+
+    private static XContentBuilder source(String id, int number) throws IOException {
+        return jsonBuilder().startObject().startObject("doc")
+                .field("id", id)
+                .field("numeric1", number)
+                .field("numeric2", number)
+                .field("numeric3", number)
+                .field("numeric4", number)
+                .field("numeric5", number)
+                .field("numeric6", number)
+                .field("numeric7", number)
+                .field("numeric8", number)
+                .field("numeric9", number)
+                .field("numeric10", number)
+                .endObject().endObject();
     }
 }

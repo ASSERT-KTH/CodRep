@@ -1,13 +1,13 @@
-import static org.elasticsearch.common.util.concurrent.EsExecutors.*;
+ClusterBlocks.Builder blocks = ClusterBlocks.builder().blocks(currentState.blocks()).removeGlobalBlock(discoverySettings.getNoMasterBlock());
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,355 +19,364 @@ import static org.elasticsearch.common.util.concurrent.EsExecutors.*;
  * under the License.
  */
 
-package org.elasticsearch.discovery.zen.ping.multicast;
+package org.elasticsearch.discovery.local;
 
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchIllegalStateException;
-import org.elasticsearch.cluster.ClusterName;
+import com.google.common.base.Objects;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.ElasticsearchIllegalStateException;
+import org.elasticsearch.Version;
+import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.block.ClusterBlocks;
 import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodeService;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.allocation.AllocationService;
+import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
-import org.elasticsearch.common.io.stream.*;
-import org.elasticsearch.common.network.NetworkService;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.inject.internal.Nullable;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.discovery.DiscoveryException;
-import org.elasticsearch.discovery.zen.DiscoveryNodesProvider;
-import org.elasticsearch.discovery.zen.ping.ZenPing;
-import org.elasticsearch.discovery.zen.ping.ZenPingException;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.*;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.discovery.*;
+import org.elasticsearch.node.service.NodeService;
+import org.elasticsearch.transport.TransportService;
 
-import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.InetAddress;
-import java.net.MulticastSocket;
-import java.net.SocketTimeoutException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.elasticsearch.cluster.node.DiscoveryNode.*;
-import static org.elasticsearch.common.settings.ImmutableSettings.Builder.*;
-import static org.elasticsearch.common.util.concurrent.ConcurrentCollections.*;
-import static org.elasticsearch.common.util.concurrent.Executors.*;
+import static com.google.common.collect.Sets.newHashSet;
+import static org.elasticsearch.cluster.ClusterState.Builder;
 
 /**
- * @author kimchy (shay.banon)
+ *
  */
-public class MulticastZenPing extends AbstractLifecycleComponent<ZenPing> implements ZenPing {
+public class LocalDiscovery extends AbstractLifecycleComponent<Discovery> implements Discovery {
 
-    private final String address;
-
-    private final int port;
-
-    private final String group;
-
-    private final int bufferSize;
-
-    private final int ttl;
-
-    private final ThreadPool threadPool;
+    private static final LocalDiscovery[] NO_MEMBERS = new LocalDiscovery[0];
 
     private final TransportService transportService;
-
+    private final ClusterService clusterService;
+    private final DiscoveryNodeService discoveryNodeService;
+    private AllocationService allocationService;
     private final ClusterName clusterName;
+    private final Version version;
 
-    private final NetworkService networkService;
+    private final DiscoverySettings discoverySettings;
 
+    private DiscoveryNode localNode;
 
-    private volatile DiscoveryNodesProvider nodesProvider;
+    private volatile boolean master = false;
 
-    private volatile Receiver receiver;
+    private final AtomicBoolean initialStateSent = new AtomicBoolean();
 
-    private volatile Thread receiverThread;
+    private final CopyOnWriteArrayList<InitialStateDiscoveryListener> initialStateListeners = new CopyOnWriteArrayList<>();
 
-    private MulticastSocket multicastSocket;
+    private static final ConcurrentMap<ClusterName, ClusterGroup> clusterGroups = ConcurrentCollections.newConcurrentMap();
 
-    private DatagramPacket datagramPacketSend;
-
-    private DatagramPacket datagramPacketReceive;
-
-    private final AtomicInteger pingIdGenerator = new AtomicInteger();
-
-    private final Map<Integer, ConcurrentMap<DiscoveryNode, PingResponse>> receivedResponses = newConcurrentMap();
-
-    private final Object sendMutex = new Object();
-
-    private final Object receiveMutex = new Object();
-
-    public MulticastZenPing(ThreadPool threadPool, TransportService transportService, ClusterName clusterName) {
-        this(EMPTY_SETTINGS, threadPool, transportService, clusterName, new NetworkService(EMPTY_SETTINGS));
-    }
-
-    public MulticastZenPing(Settings settings, ThreadPool threadPool, TransportService transportService, ClusterName clusterName, NetworkService networkService) {
+    @Inject
+    public LocalDiscovery(Settings settings, ClusterName clusterName, TransportService transportService, ClusterService clusterService,
+                          DiscoveryNodeService discoveryNodeService, Version version, DiscoverySettings discoverySettings) {
         super(settings);
-        this.threadPool = threadPool;
-        this.transportService = transportService;
         this.clusterName = clusterName;
-        this.networkService = networkService;
-
-        this.address = componentSettings.get("address");
-        this.port = componentSettings.getAsInt("port", 54328);
-        this.group = componentSettings.get("group", "224.2.2.4");
-        this.bufferSize = componentSettings.getAsInt("buffer_size", 2048);
-        this.ttl = componentSettings.getAsInt("ttl", 3);
-
-        logger.debug("Using group [{}], with port [{}], ttl [{}], and address [{}]", group, port, ttl, address);
-
-        this.transportService.registerHandler(MulticastPingResponseRequestHandler.ACTION, new MulticastPingResponseRequestHandler());
+        this.clusterService = clusterService;
+        this.transportService = transportService;
+        this.discoveryNodeService = discoveryNodeService;
+        this.version = version;
+        this.discoverySettings = discoverySettings;
     }
 
-    @Override public void setNodesProvider(DiscoveryNodesProvider nodesProvider) {
-        if (lifecycle.started()) {
-            throw new ElasticSearchIllegalStateException("Can't set nodes provider when started");
-        }
-        this.nodesProvider = nodesProvider;
+    @Override
+    public void setNodeService(@Nullable NodeService nodeService) {
+        // nothing to do here
     }
 
-    @Override protected void doStart() throws ElasticSearchException {
-        try {
-            this.datagramPacketReceive = new DatagramPacket(new byte[bufferSize], bufferSize);
-            this.datagramPacketSend = new DatagramPacket(new byte[bufferSize], bufferSize, InetAddress.getByName(group), port);
-        } catch (Exception e) {
-            throw new DiscoveryException("Failed to set datagram packets", e);
-        }
-
-        try {
-            MulticastSocket multicastSocket;
-//            if (NetworkUtils.canBindToMcastAddress()) {
-//                try {
-//                    multicastSocket = new MulticastSocket(new InetSocketAddress(group, port));
-//                } catch (Exception e) {
-//                    logger.debug("Failed to create multicast socket by binding to group address, binding to port", e);
-//                    multicastSocket = new MulticastSocket(port);
-//                }
-//            } else {
-            multicastSocket = new MulticastSocket(port);
-//            }
-
-            multicastSocket.setTimeToLive(ttl);
-
-            // set the send interface
-            InetAddress multicastInterface = networkService.resolvePublishHostAddress(address);
-            multicastSocket.setInterface(multicastInterface);
-            multicastSocket.joinGroup(InetAddress.getByName(group));
-
-            multicastSocket.setReceiveBufferSize(bufferSize);
-            multicastSocket.setSendBufferSize(bufferSize);
-            multicastSocket.setSoTimeout(60000);
-
-            this.multicastSocket = multicastSocket;
-        } catch (Exception e) {
-            throw new DiscoveryException("Failed to setup multicast socket", e);
-        }
-
-        this.receiver = new Receiver();
-        this.receiverThread = daemonThreadFactory(settings, "discovery#multicast#received").newThread(receiver);
-        this.receiverThread.start();
+    @Override
+    public void setAllocationService(AllocationService allocationService) {
+        this.allocationService = allocationService;
     }
 
-    @Override protected void doStop() throws ElasticSearchException {
-        receiver.stop();
-        receiverThread.interrupt();
-        multicastSocket.close();
-    }
-
-    @Override protected void doClose() throws ElasticSearchException {
-    }
-
-    public PingResponse[] pingAndWait(TimeValue timeout) {
-        final AtomicReference<PingResponse[]> response = new AtomicReference<PingResponse[]>();
-        final CountDownLatch latch = new CountDownLatch(1);
-        ping(new PingListener() {
-            @Override public void onPing(PingResponse[] pings) {
-                response.set(pings);
-                latch.countDown();
+    @Override
+    protected void doStart() throws ElasticsearchException {
+        synchronized (clusterGroups) {
+            ClusterGroup clusterGroup = clusterGroups.get(clusterName);
+            if (clusterGroup == null) {
+                clusterGroup = new ClusterGroup();
+                clusterGroups.put(clusterName, clusterGroup);
             }
-        }, timeout);
-        try {
-            latch.await();
-            return response.get();
-        } catch (InterruptedException e) {
-            return null;
-        }
-    }
+            logger.debug("Connected to cluster [{}]", clusterName);
+            this.localNode = new DiscoveryNode(settings.get("name"), DiscoveryService.generateNodeId(settings), transportService.boundAddress().publishAddress(),
+                    discoveryNodeService.buildAttributes(), version);
 
-    @Override public void ping(final PingListener listener, final TimeValue timeout) {
-        final int id = pingIdGenerator.incrementAndGet();
-        receivedResponses.put(id, new ConcurrentHashMap<DiscoveryNode, PingResponse>());
-        sendPingRequest(id);
-        // try and send another ping request halfway through (just in case someone woke up during it...)
-        // this can be a good trade-off to nailing the initial lookup or un-delivered messages
-        threadPool.schedule(new Runnable() {
-            @Override public void run() {
-                try {
-                    sendPingRequest(id);
-                } catch (Exception e) {
-                    logger.debug("[{}] Failed to send second ping request", e, id);
+            clusterGroup.members().add(this);
+
+            LocalDiscovery firstMaster = null;
+            for (LocalDiscovery localDiscovery : clusterGroup.members()) {
+                if (localDiscovery.localNode().masterNode()) {
+                    firstMaster = localDiscovery;
+                    break;
                 }
             }
-        }, timeout.millis() / 2, TimeUnit.MILLISECONDS);
-        threadPool.schedule(new Runnable() {
-            @Override public void run() {
-                ConcurrentMap<DiscoveryNode, PingResponse> responses = receivedResponses.remove(id);
-                listener.onPing(responses.values().toArray(new PingResponse[responses.size()]));
-            }
-        }, timeout);
-    }
 
-    private void sendPingRequest(int id) {
-        synchronized (sendMutex) {
-            try {
-                HandlesStreamOutput out = BytesStreamOutput.Cached.cachedHandles();
-                out.writeInt(id);
-                clusterName.writeTo(out);
-                nodesProvider.nodes().localNode().writeTo(out);
-                datagramPacketSend.setData(((BytesStreamOutput) out.wrappedOut()).copiedByteArray());
-            } catch (IOException e) {
-                receivedResponses.remove(id);
-                throw new ZenPingException("Failed to serialize ping request", e);
-            }
-            try {
-                multicastSocket.send(datagramPacketSend);
-                if (logger.isTraceEnabled()) {
-                    logger.trace("[{}] Sending ping request", id);
-                }
-            } catch (IOException e) {
-                receivedResponses.remove(id);
-                throw new ZenPingException("Failed to send ping request over multicast", e);
-            }
-        }
-    }
-
-    class MulticastPingResponseRequestHandler extends BaseTransportRequestHandler<MulticastPingResponse> {
-
-        static final String ACTION = "discovery/zen/multicast";
-
-        @Override public MulticastPingResponse newInstance() {
-            return new MulticastPingResponse();
-        }
-
-        @Override public void messageReceived(MulticastPingResponse request, TransportChannel channel) throws Exception {
-            if (logger.isTraceEnabled()) {
-                logger.trace("[{}] Received {}", request.id, request.pingResponse);
-            }
-            ConcurrentMap<DiscoveryNode, PingResponse> responses = receivedResponses.get(request.id);
-            if (responses == null) {
-                logger.warn("Received ping response with no matching id [{}]", request.id);
-            } else {
-                responses.put(request.pingResponse.target(), request.pingResponse);
-            }
-            channel.sendResponse(VoidStreamable.INSTANCE);
-        }
-    }
-
-    static class MulticastPingResponse implements Streamable {
-
-        int id;
-
-        PingResponse pingResponse;
-
-        MulticastPingResponse() {
-        }
-
-        @Override public void readFrom(StreamInput in) throws IOException {
-            id = in.readInt();
-            pingResponse = PingResponse.readPingResponse(in);
-        }
-
-        @Override public void writeTo(StreamOutput out) throws IOException {
-            out.writeInt(id);
-            pingResponse.writeTo(out);
-        }
-    }
-
-
-    private class Receiver implements Runnable {
-
-        private volatile boolean running = true;
-
-        public void stop() {
-            running = false;
-        }
-
-        @Override public void run() {
-            while (running) {
-                try {
-                    int id;
-                    DiscoveryNode requestingNodeX;
-                    ClusterName clusterName;
-                    synchronized (receiveMutex) {
-                        try {
-                            multicastSocket.receive(datagramPacketReceive);
-                        } catch (SocketTimeoutException ignore) {
-                            continue;
-                        } catch (Exception e) {
-                            if (running) {
-                                logger.warn("Failed to receive packet", e);
-                            }
-                            continue;
+            if (firstMaster != null && firstMaster.equals(this)) {
+                // we are the first master (and the master)
+                master = true;
+                final LocalDiscovery master = firstMaster;
+                clusterService.submitStateUpdateTask("local-disco-initial_connect(master)", new ProcessedClusterStateUpdateTask() {
+                    @Override
+                    public ClusterState execute(ClusterState currentState) {
+                        DiscoveryNodes.Builder nodesBuilder = DiscoveryNodes.builder();
+                        for (LocalDiscovery discovery : clusterGroups.get(clusterName).members()) {
+                            nodesBuilder.put(discovery.localNode);
                         }
-                        try {
-                            StreamInput input = HandlesStreamInput.Cached.cached(new BytesStreamInput(datagramPacketReceive.getData(), datagramPacketReceive.getOffset(), datagramPacketReceive.getLength()));
-                            id = input.readInt();
-                            clusterName = ClusterName.readClusterName(input);
-                            requestingNodeX = readNode(input);
-                        } catch (Exception e) {
-                            logger.warn("Failed to read requesting node from {}", e, datagramPacketReceive.getSocketAddress());
-                            continue;
+                        nodesBuilder.localNodeId(master.localNode().id()).masterNodeId(master.localNode().id());
+                        // remove the NO_MASTER block in this case
+                        ClusterBlocks.Builder blocks = ClusterBlocks.builder().blocks(currentState.blocks()).removeGlobalBlock(Discovery.NO_MASTER_BLOCK);
+                        return ClusterState.builder(currentState).nodes(nodesBuilder).blocks(blocks).build();
+                    }
+
+                    @Override
+                    public void onFailure(String source, Throwable t) {
+                        logger.error("unexpected failure during [{}]", t, source);
+                    }
+
+                    @Override
+                    public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                        sendInitialStateEventIfNeeded();
+                    }
+                });
+            } else if (firstMaster != null) {
+                // update as fast as we can the local node state with the new metadata (so we create indices for example)
+                final ClusterState masterState = firstMaster.clusterService.state();
+                clusterService.submitStateUpdateTask("local-disco(detected_master)", new ClusterStateUpdateTask() {
+                    @Override
+                    public ClusterState execute(ClusterState currentState) {
+                        // make sure we have the local node id set, we might need it as a result of the new metadata
+                        DiscoveryNodes.Builder nodesBuilder = DiscoveryNodes.builder(currentState.nodes()).put(localNode).localNodeId(localNode.id());
+                        return ClusterState.builder(currentState).metaData(masterState.metaData()).nodes(nodesBuilder).build();
+                    }
+
+                    @Override
+                    public void onFailure(String source, Throwable t) {
+                        logger.error("unexpected failure during [{}]", t, source);
+                    }
+                });
+
+                // tell the master to send the fact that we are here
+                final LocalDiscovery master = firstMaster;
+                firstMaster.clusterService.submitStateUpdateTask("local-disco-receive(from node[" + localNode + "])", new ProcessedClusterStateUpdateTask() {
+                    @Override
+                    public ClusterState execute(ClusterState currentState) {
+                        DiscoveryNodes.Builder nodesBuilder = DiscoveryNodes.builder();
+                        for (LocalDiscovery discovery : clusterGroups.get(clusterName).members()) {
+                            nodesBuilder.put(discovery.localNode);
                         }
-                    }
-                    DiscoveryNodes discoveryNodes = nodesProvider.nodes();
-                    final DiscoveryNode requestingNode = requestingNodeX;
-                    if (requestingNode.id().equals(discoveryNodes.localNodeId())) {
-                        // that's me, ignore
-                        continue;
-                    }
-                    if (!clusterName.equals(MulticastZenPing.this.clusterName)) {
-                        // not our cluster, ignore it...
-                        continue;
-                    }
-                    final MulticastPingResponse multicastPingResponse = new MulticastPingResponse();
-                    multicastPingResponse.id = id;
-                    multicastPingResponse.pingResponse = new PingResponse(discoveryNodes.localNode(), discoveryNodes.masterNode(), clusterName);
-
-                    if (logger.isTraceEnabled()) {
-                        logger.trace("[{}] Received ping_request from [{}], sending {}", id, requestingNode, multicastPingResponse.pingResponse);
+                        nodesBuilder.localNodeId(master.localNode().id()).masterNodeId(master.localNode().id());
+                        return ClusterState.builder(currentState).nodes(nodesBuilder).build();
                     }
 
-                    if (!transportService.nodeConnected(requestingNode)) {
-                        // do the connect and send on a thread pool
-                        threadPool.execute(new Runnable() {
-                            @Override public void run() {
-                                // connect to the node if possible
-                                try {
-                                    transportService.connectToNode(requestingNode);
-                                } catch (Exception e) {
-                                    logger.warn("Failed to connect to requesting node {}", e, requestingNode);
-                                }
-                                transportService.sendRequest(requestingNode, MulticastPingResponseRequestHandler.ACTION, multicastPingResponse, new VoidTransportResponseHandler(false) {
-                                    @Override public void handleException(RemoteTransportException exp) {
-                                        logger.warn("Failed to receive confirmation on sent ping response to [{}]", exp, requestingNode);
-                                    }
-                                });
-                            }
-                        });
-                    } else {
-                        transportService.sendRequest(requestingNode, MulticastPingResponseRequestHandler.ACTION, multicastPingResponse, new VoidTransportResponseHandler(false) {
-                            @Override public void handleException(RemoteTransportException exp) {
-                                logger.warn("Failed to receive confirmation on sent ping response to [{}]", exp, requestingNode);
-                            }
-                        });
+                    @Override
+                    public void onFailure(String source, Throwable t) {
+                        logger.error("unexpected failure during [{}]", t, source);
                     }
-                } catch (Exception e) {
-                    logger.warn("Unexpected exception in multicast receiver", e);
+
+                    @Override
+                    public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                        sendInitialStateEventIfNeeded();
+                    }
+                });
+            }
+        } // else, no master node, the next node that will start will fill things in...
+    }
+
+    @Override
+    protected void doStop() throws ElasticsearchException {
+        synchronized (clusterGroups) {
+            ClusterGroup clusterGroup = clusterGroups.get(clusterName);
+            if (clusterGroup == null) {
+                logger.warn("Illegal state, should not have an empty cluster group when stopping, I should be there at teh very least...");
+                return;
+            }
+            clusterGroup.members().remove(this);
+            if (clusterGroup.members().isEmpty()) {
+                // no more members, remove and return
+                clusterGroups.remove(clusterName);
+                return;
+            }
+
+            LocalDiscovery firstMaster = null;
+            for (LocalDiscovery localDiscovery : clusterGroup.members()) {
+                if (localDiscovery.localNode().masterNode()) {
+                    firstMaster = localDiscovery;
+                    break;
                 }
             }
+
+            if (firstMaster != null) {
+                // if the removed node is the master, make the next one as the master
+                if (master) {
+                    firstMaster.master = true;
+                }
+
+                final Set<String> newMembers = newHashSet();
+                for (LocalDiscovery discovery : clusterGroup.members()) {
+                    newMembers.add(discovery.localNode.id());
+                }
+
+                final LocalDiscovery master = firstMaster;
+                master.clusterService.submitStateUpdateTask("local-disco-update", new ClusterStateUpdateTask() {
+                    @Override
+                    public ClusterState execute(ClusterState currentState) {
+                        DiscoveryNodes newNodes = currentState.nodes().removeDeadMembers(newMembers, master.localNode.id());
+                        DiscoveryNodes.Delta delta = newNodes.delta(currentState.nodes());
+                        if (delta.added()) {
+                            logger.warn("No new nodes should be created when a new discovery view is accepted");
+                        }
+                        // reroute here, so we eagerly remove dead nodes from the routing
+                        ClusterState updatedState = ClusterState.builder(currentState).nodes(newNodes).build();
+                        RoutingAllocation.Result routingResult = master.allocationService.reroute(ClusterState.builder(updatedState).build());
+                        return ClusterState.builder(updatedState).routingResult(routingResult).build();
+                    }
+
+                    @Override
+                    public void onFailure(String source, Throwable t) {
+                        logger.error("unexpected failure during [{}]", t, source);
+                    }
+                });
+            }
+        }
+    }
+
+    @Override
+    protected void doClose() throws ElasticsearchException {
+    }
+
+    @Override
+    public DiscoveryNode localNode() {
+        return localNode;
+    }
+
+    @Override
+    public void addListener(InitialStateDiscoveryListener listener) {
+        this.initialStateListeners.add(listener);
+    }
+
+    @Override
+    public void removeListener(InitialStateDiscoveryListener listener) {
+        this.initialStateListeners.remove(listener);
+    }
+
+    @Override
+    public String nodeDescription() {
+        return clusterName.value() + "/" + localNode.id();
+    }
+
+    public void publish(ClusterState clusterState, final Discovery.AckListener ackListener) {
+        if (!master) {
+            throw new ElasticsearchIllegalStateException("Shouldn't publish state when not master");
+        }
+        LocalDiscovery[] members = members();
+        if (members.length > 0) {
+            publish(members, clusterState, new AckClusterStatePublishResponseHandler(members.length - 1, ackListener));
+        }
+    }
+
+    private LocalDiscovery[] members() {
+        ClusterGroup clusterGroup = clusterGroups.get(clusterName);
+        if (clusterGroup == null) {
+            return NO_MEMBERS;
+        }
+        Queue<LocalDiscovery> members = clusterGroup.members();
+        return members.toArray(new LocalDiscovery[members.size()]);
+    }
+
+    private void publish(LocalDiscovery[] members, ClusterState clusterState, final ClusterStatePublishResponseHandler publishResponseHandler) {
+
+        try {
+            // we do the marshaling intentionally, to check it works well...
+            final byte[] clusterStateBytes = Builder.toBytes(clusterState);
+
+            for (final LocalDiscovery discovery : members) {
+                if (discovery.master) {
+                    continue;
+                }
+                final ClusterState nodeSpecificClusterState = ClusterState.Builder.fromBytes(clusterStateBytes, discovery.localNode);
+                nodeSpecificClusterState.status(ClusterState.ClusterStateStatus.RECEIVED);
+                // ignore cluster state messages that do not include "me", not in the game yet...
+                if (nodeSpecificClusterState.nodes().localNode() != null) {
+                    discovery.clusterService.submitStateUpdateTask("local-disco-receive(from master)", new ProcessedClusterStateUpdateTask() {
+                        @Override
+                        public ClusterState execute(ClusterState currentState) {
+                            if (nodeSpecificClusterState.version() < currentState.version() && Objects.equal(nodeSpecificClusterState.nodes().masterNodeId(), currentState.nodes().masterNodeId())) {
+                                return currentState;
+                            }
+
+                            ClusterState.Builder builder = ClusterState.builder(nodeSpecificClusterState);
+                            // if the routing table did not change, use the original one
+                            if (nodeSpecificClusterState.routingTable().version() == currentState.routingTable().version()) {
+                                builder.routingTable(currentState.routingTable());
+                            }
+                            if (nodeSpecificClusterState.metaData().version() == currentState.metaData().version()) {
+                                builder.metaData(currentState.metaData());
+                            }
+
+                            return builder.build();
+                        }
+
+                        @Override
+                        public void onFailure(String source, Throwable t) {
+                            logger.error("unexpected failure during [{}]", t, source);
+                            publishResponseHandler.onFailure(discovery.localNode, t);
+                        }
+
+                        @Override
+                        public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                            sendInitialStateEventIfNeeded();
+                            publishResponseHandler.onResponse(discovery.localNode);
+                        }
+                    });
+                } else {
+                    publishResponseHandler.onResponse(discovery.localNode);
+                }
+            }
+
+            TimeValue publishTimeout = discoverySettings.getPublishTimeout();
+            if (publishTimeout.millis() > 0) {
+                try {
+                    boolean awaited = publishResponseHandler.awaitAllNodes(publishTimeout);
+                    if (!awaited) {
+                        logger.debug("awaiting all nodes to process published state {} timed out, timeout {}", clusterState.version(), publishTimeout);
+                    }
+                } catch (InterruptedException e) {
+                    // ignore & restore interrupt
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+
+        } catch (Exception e) {
+            // failure to marshal or un-marshal
+            throw new ElasticsearchIllegalStateException("Cluster state failed to serialize", e);
+        }
+    }
+
+    private void sendInitialStateEventIfNeeded() {
+        if (initialStateSent.compareAndSet(false, true)) {
+            for (InitialStateDiscoveryListener listener : initialStateListeners) {
+                listener.initialStateProcessed();
+            }
+        }
+    }
+
+    private class ClusterGroup {
+
+        private Queue<LocalDiscovery> members = ConcurrentCollections.newQueue();
+
+        Queue<LocalDiscovery> members() {
+            return members;
         }
     }
 }

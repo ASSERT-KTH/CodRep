@@ -1,217 +1,126 @@
-import org.elasticsearch.index.field.data.FieldData;
+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;
 
-/*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+package org.elasticsearch.percolator;
 
-package org.elasticsearch.index.mapper.xcontent;
+import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;
+import org.elasticsearch.action.get.GetResponse;
+import org.elasticsearch.action.percolate.PercolateResponse;
+import org.elasticsearch.client.Client;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.test.AbstractIntegrationTest;
+import org.elasticsearch.test.AbstractIntegrationTest.ClusterScope;
+import org.elasticsearch.test.AbstractIntegrationTest.Scope;
+import org.junit.Test;
 
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.search.*;
-import org.apache.lucene.util.NumericUtils;
-import org.elasticsearch.index.analysis.NamedAnalyzer;
-import org.elasticsearch.index.analysis.NumericIntegerAnalyzer;
-import org.elasticsearch.index.field.FieldData;
-import org.elasticsearch.index.mapper.MapperParsingException;
-import org.elasticsearch.util.Numbers;
-import org.elasticsearch.util.Strings;
-import org.elasticsearch.util.xcontent.XContentParser;
-import org.elasticsearch.util.xcontent.builder.XContentBuilder;
-
-import java.io.IOException;
-import java.util.Map;
-
-import static org.elasticsearch.index.mapper.xcontent.XContentMapperBuilders.*;
-import static org.elasticsearch.index.mapper.xcontent.XContentTypeParsers.*;
-import static org.elasticsearch.util.xcontent.support.XContentMapValues.*;
+import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+import static org.elasticsearch.percolator.PercolatorTests.convertFromTextArray;
+import static org.elasticsearch.test.hamcrest.ElasticSearchAssertions.assertNoFailures;
+import static org.hamcrest.Matchers.*;
 
 /**
- * @author kimchy (shay.banon)
  */
-public class XContentIntegerFieldMapper extends XContentNumberFieldMapper<Integer> {
+@ClusterScope(scope=Scope.TEST)
+public class TTLPercolatorTests extends AbstractIntegrationTest {
 
-    public static final String CONTENT_TYPE = "integer";
+    private static final long PURGE_INTERVAL = 200;
 
-    public static class Defaults extends XContentNumberFieldMapper.Defaults {
-        public static final Integer NULL_VALUE = null;
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        return settingsBuilder()
+                .put(super.nodeSettings(nodeOrdinal))
+                .put("indices.ttl.interval", PURGE_INTERVAL)
+                .build();
     }
 
-    public static class Builder extends XContentNumberFieldMapper.Builder<Builder, XContentIntegerFieldMapper> {
+    @Test
+    public void testPercolatingWithTimeToLive() throws Exception {
+        Client client = client();
+        client.admin().indices().prepareDelete().execute().actionGet();
+        ensureGreen();
 
-        protected Integer nullValue = Defaults.NULL_VALUE;
+        String mapping = XContentFactory.jsonBuilder().startObject().startObject("_percolator")
+                .startObject("_ttl").field("enabled", true).endObject()
+                .startObject("_timestamp").field("enabled", true).endObject()
+                .endObject().endObject().string();
 
-        public Builder(String name) {
-            super(name);
-            builder = this;
+        client.admin().indices().prepareCreate("test")
+                .setSettings(settingsBuilder().put("index.number_of_shards", 2))
+                .addMapping("_percolator", mapping)
+                .addMapping("type1", mapping)
+                .execute().actionGet();
+        ensureGreen();
+
+        long ttl = 1500;
+        long now = System.currentTimeMillis();
+        client.prepareIndex("test", "_percolator", "kuku").setSource(jsonBuilder()
+                .startObject()
+                .startObject("query")
+                .startObject("term")
+                .field("field1", "value1")
+                .endObject()
+                .endObject()
+                .endObject()
+        ).setRefresh(true).setTTL(ttl).execute().actionGet();
+
+        IndicesStatsResponse response = client.admin().indices().prepareStats("test")
+                .clear().setIndexing(true)
+                .execute().actionGet();
+        assertThat(response.getIndices().get("test").getTotal().getIndexing().getTotal().getIndexCount(), equalTo(2l));
+
+        PercolateResponse percolateResponse = client.preparePercolate()
+                .setIndices("test").setDocumentType("type1")
+                .setSource(jsonBuilder()
+                .startObject()
+                .startObject("doc")
+                .field("field1", "value1")
+                .endObject()
+                .endObject()
+        ).execute().actionGet();
+        assertNoFailures(percolateResponse);
+        if (percolateResponse.getMatches().length == 0) {
+            // OK, ttl + purgeInterval has passed (slow machine or many other tests were running at the same time
+            GetResponse getResponse = client.prepareGet("test", "_percolator", "kuku").execute().actionGet();
+            assertThat(getResponse.isExists(), equalTo(false));
+            response = client.admin().indices().prepareStats("test")
+                    .clear().setIndexing(true)
+                    .execute().actionGet();
+            long currentDeleteCount = response.getIndices().get("test").getTotal().getIndexing().getTotal().getDeleteCount();
+            assertThat(currentDeleteCount, equalTo(2l));
+            return;
         }
 
-        public Builder nullValue(int nullValue) {
-            this.nullValue = nullValue;
-            return this;
+        assertThat(convertFromTextArray(percolateResponse.getMatches(), "test"), arrayContaining("kuku"));
+        long timeSpent = System.currentTimeMillis() - now;
+        long waitTime = ttl + PURGE_INTERVAL - timeSpent;
+        if (waitTime >= 0) {
+            Thread.sleep(waitTime); // Doesn't make sense to check the deleteCount before ttl has expired
         }
 
-        @Override public XContentIntegerFieldMapper build(BuilderContext context) {
-            XContentIntegerFieldMapper fieldMapper = new XContentIntegerFieldMapper(buildNames(context),
-                    precisionStep, index, store, boost, omitNorms, omitTermFreqAndPositions, nullValue);
-            fieldMapper.includeInAll(includeInAll);
-            return fieldMapper;
-        }
+        // See comment in SimpleTTLTests
+        logger.info("Checking if the ttl purger has run");
+        long currentDeleteCount;
+        do {
+            response = client.admin().indices().prepareStats("test")
+                    .clear().setIndexing(true)
+                    .execute().actionGet();
+            // This returns the number of delete operations stats (not Lucene delete count)
+            currentDeleteCount = response.getIndices().get("test").getTotal().getIndexing().getTotal().getDeleteCount();
+        } while (currentDeleteCount < 2); // TTL deletes one doc, but it is indexed in the primary shard and replica shard.
+        assertThat(currentDeleteCount, equalTo(2l));
+
+        percolateResponse = client.preparePercolate()
+                .setIndices("test").setDocumentType("type1")
+                .setSource(jsonBuilder()
+                .startObject()
+                .startObject("doc")
+                .field("field1", "value1")
+                .endObject()
+                .endObject()
+        ).execute().actionGet();
+        assertNoFailures(percolateResponse);
+        assertThat(percolateResponse.getMatches(), emptyArray());
     }
 
-    public static class TypeParser implements XContentTypeParser {
-        @Override public XContentMapper.Builder parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
-            XContentIntegerFieldMapper.Builder builder = integerField(name);
-            parseNumberField(builder, name, node, parserContext);
-            for (Map.Entry<String, Object> entry : node.entrySet()) {
-                String propName = Strings.toUnderscoreCase(entry.getKey());
-                Object propNode = entry.getValue();
-                if (propName.equals("null_value")) {
-                    builder.nullValue(nodeIntegerValue(propNode));
-                }
-            }
-            return builder;
-        }
-    }
-
-    private final Integer nullValue;
-
-    private final String nullValueAsString;
-
-    protected XContentIntegerFieldMapper(Names names, int precisionStep, Field.Index index, Field.Store store,
-                                         float boost, boolean omitNorms, boolean omitTermFreqAndPositions,
-                                         Integer nullValue) {
-        super(names, precisionStep, index, store, boost, omitNorms, omitTermFreqAndPositions,
-                new NamedAnalyzer("_int/" + precisionStep, new NumericIntegerAnalyzer(precisionStep)),
-                new NamedAnalyzer("_int/max", new NumericIntegerAnalyzer(Integer.MAX_VALUE)));
-        this.nullValue = nullValue;
-        this.nullValueAsString = nullValue == null ? null : nullValue.toString();
-    }
-
-    @Override protected int maxPrecisionStep() {
-        return 32;
-    }
-
-    @Override public Integer value(Fieldable field) {
-        byte[] value = field.getBinaryValue();
-        if (value == null) {
-            return null;
-        }
-        return Numbers.bytesToInt(value);
-    }
-
-    @Override public String indexedValue(String value) {
-        return indexedValue(Integer.parseInt(value));
-    }
-
-    @Override public String indexedValue(Integer value) {
-        return NumericUtils.intToPrefixCoded(value);
-    }
-
-    @Override public Object valueFromTerm(String term) {
-        final int shift = term.charAt(0) - NumericUtils.SHIFT_START_INT;
-        if (shift > 0 && shift <= 31) {
-            return null;
-        }
-        return NumericUtils.prefixCodedToInt(term);
-    }
-
-    @Override public Object valueFromString(String text) {
-        return Integer.parseInt(text);
-    }
-
-    @Override public Query rangeQuery(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper) {
-        return NumericRangeQuery.newIntRange(names.indexName(), precisionStep,
-                lowerTerm == null ? null : Integer.parseInt(lowerTerm),
-                upperTerm == null ? null : Integer.parseInt(upperTerm),
-                includeLower, includeUpper);
-    }
-
-    @Override public Filter rangeFilter(String lowerTerm, String upperTerm, boolean includeLower, boolean includeUpper) {
-        return NumericRangeFilter.newIntRange(names.indexName(), precisionStep,
-                lowerTerm == null ? null : Integer.parseInt(lowerTerm),
-                upperTerm == null ? null : Integer.parseInt(upperTerm),
-                includeLower, includeUpper);
-    }
-
-    @Override protected Field parseCreateField(ParseContext context) throws IOException {
-        int value;
-        if (context.externalValueSet()) {
-            Object externalValue = context.externalValue();
-            if (externalValue == null) {
-                if (nullValue == null) {
-                    return null;
-                }
-                value = nullValue;
-            } else {
-                value = ((Number) externalValue).intValue();
-            }
-            if (includeInAll == null || includeInAll) {
-                context.allEntries().addText(names.fullName(), Integer.toString(value), boost);
-            }
-        } else {
-            if (context.parser().currentToken() == XContentParser.Token.VALUE_NULL) {
-                if (nullValue == null) {
-                    return null;
-                }
-                value = nullValue;
-                if (nullValueAsString != null && (includeInAll == null || includeInAll)) {
-                    context.allEntries().addText(names.fullName(), nullValueAsString, boost);
-                }
-            } else {
-                value = context.parser().intValue();
-                if (includeInAll == null || includeInAll) {
-                    context.allEntries().addText(names.fullName(), context.parser().text(), boost);
-                }
-            }
-        }
-
-        Field field = null;
-        if (stored()) {
-            field = new Field(names.indexName(), Numbers.intToBytes(value), store);
-            if (indexed()) {
-                field.setTokenStream(popCachedStream(precisionStep).setIntValue(value));
-            }
-        } else if (indexed()) {
-            field = new Field(names.indexName(), popCachedStream(precisionStep).setIntValue(value));
-        }
-        return field;
-    }
-
-    @Override public int sortType() {
-        return SortField.INT;
-    }
-
-    @Override public FieldData.Type fieldDataType() {
-        return FieldData.Type.INT;
-    }
-
-    @Override protected String contentType() {
-        return CONTENT_TYPE;
-    }
-
-    @Override protected void doXContentBody(XContentBuilder builder) throws IOException {
-        super.doXContentBody(builder);
-        if (nullValue != null) {
-            builder.field("null_value", nullValue);
-        }
-        if (includeInAll != null) {
-            builder.field("include_in_all", includeInAll);
-        }
-    }
 }

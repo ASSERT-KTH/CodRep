@@ -1,10 +1,10 @@
-script.setNextReader(context);
+.getShards(clusterState, request.index(), request.type(), request.id(), request.routing());
 
 /*
- * Licensed to ElasticSearch and Shay Banon under one
+ * Licensed to Elastic Search and Shay Banon under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
+ * regarding copyright ownership. Elastic Search licenses this
  * file to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -19,221 +19,290 @@ script.setNextReader(context);
  * under the License.
  */
 
-package org.elasticsearch.search.facet.terms.ip;
+package org.elasticsearch.action.support.single;
 
-import com.google.common.collect.ImmutableList;
-import gnu.trove.iterator.TLongIntIterator;
-import gnu.trove.map.hash.TLongIntHashMap;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.search.Scorer;
-import org.elasticsearch.ElasticSearchIllegalArgumentException;
-import org.elasticsearch.common.CacheRecycler;
-import org.elasticsearch.common.collect.BoundedTreeSet;
-import org.elasticsearch.index.cache.field.data.FieldDataCache;
-import org.elasticsearch.index.field.data.FieldDataType;
-import org.elasticsearch.index.field.data.longs.LongFieldData;
-import org.elasticsearch.index.mapper.MapperService;
-import org.elasticsearch.script.SearchScript;
-import org.elasticsearch.search.facet.AbstractFacetCollector;
-import org.elasticsearch.search.facet.Facet;
-import org.elasticsearch.search.facet.FacetPhaseExecutionException;
-import org.elasticsearch.search.facet.terms.TermsFacet;
-import org.elasticsearch.search.facet.terms.support.EntryPriorityQueue;
-import org.elasticsearch.search.internal.SearchContext;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.NoShardAvailableActionException;
+import org.elasticsearch.action.support.BaseAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.routing.ShardsIterator;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Streamable;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
 
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Map;
 
 /**
- *
+ * @author kimchy (shay.banon)
  */
-public class TermsIpFacetCollector extends AbstractFacetCollector {
+public abstract class TransportSingleOperationAction<Request extends SingleOperationRequest, Response extends ActionResponse> extends BaseAction<Request, Response> {
 
-    private final FieldDataCache fieldDataCache;
+    protected final ClusterService clusterService;
 
-    private final String indexFieldName;
+    protected final TransportService transportService;
 
-    private final TermsFacet.ComparatorType comparatorType;
+    protected final IndicesService indicesService;
 
-    private final int size;
+    protected final ThreadPool threadPool;
 
-    private final int numberOfShards;
+    protected TransportSingleOperationAction(Settings settings, ThreadPool threadPool, ClusterService clusterService, TransportService transportService, IndicesService indicesService) {
+        super(settings);
+        this.clusterService = clusterService;
+        this.transportService = transportService;
+        this.threadPool = threadPool;
+        this.indicesService = indicesService;
 
-    private final FieldDataType fieldDataType;
+        transportService.registerHandler(transportAction(), new TransportHandler());
+        transportService.registerHandler(transportShardAction(), new ShardTransportHandler());
+    }
 
-    private LongFieldData fieldData;
+    @Override protected void doExecute(Request request, ActionListener<Response> listener) {
+        new AsyncSingleAction(request, listener).start();
+    }
 
-    private final StaticAggregatorValueProc aggregator;
+    protected abstract String transportAction();
 
-    private final SearchScript script;
+    protected abstract String transportShardAction();
 
-    public TermsIpFacetCollector(String facetName, String fieldName, int size, TermsFacet.ComparatorType comparatorType, boolean allTerms, SearchContext context,
-                                 String scriptLang, String script, Map<String, Object> params) {
-        super(facetName);
-        this.fieldDataCache = context.fieldDataCache();
-        this.size = size;
-        this.comparatorType = comparatorType;
-        this.numberOfShards = context.numberOfShards();
+    protected abstract Response shardOperation(Request request, int shardId) throws ElasticSearchException;
 
-        MapperService.SmartNameFieldMappers smartMappers = context.smartFieldMappers(fieldName);
-        if (smartMappers == null || !smartMappers.hasMapper()) {
-            throw new ElasticSearchIllegalArgumentException("Field [" + fieldName + "] doesn't have a type, can't run terms long facet collector on it");
+    protected abstract Request newRequest();
+
+    protected abstract Response newResponse();
+
+    protected void checkBlock(Request request, ClusterState state) {
+
+    }
+
+    private class AsyncSingleAction {
+
+        private final ActionListener<Response> listener;
+
+        private final ShardsIterator shardsIt;
+
+        private final Request request;
+
+        private final DiscoveryNodes nodes;
+
+        private AsyncSingleAction(Request request, ActionListener<Response> listener) {
+            this.request = request;
+            this.listener = listener;
+
+            ClusterState clusterState = clusterService.state();
+
+            nodes = clusterState.nodes();
+
+            // update to the concrete shard to use
+            request.index(clusterState.metaData().concreteIndex(request.index()));
+
+            checkBlock(request, clusterState);
+
+            this.shardsIt = clusterService.operationRouting()
+                    .getShards(clusterState, request.index(), request.type(), request.id());
         }
-        // add type filter if there is exact doc mapper associated with it
-        if (smartMappers.explicitTypeInNameWithDocMapper()) {
-            setFilter(context.filterCache().cache(smartMappers.docMapper().typeFilter()));
+
+        public void start() {
+            performFirst();
         }
 
-        if (smartMappers.mapper().fieldDataType() != FieldDataType.DefaultTypes.LONG) {
-            throw new ElasticSearchIllegalArgumentException("Field [" + fieldName + "] is not of long type, can't run terms long facet collector on it");
+        private void onFailure(ShardRouting shardRouting, Exception e) {
+            if (logger.isTraceEnabled() && e != null) {
+                logger.trace(shardRouting.shortSummary() + ": Failed to get [" + request.type() + "#" + request.id() + "]", e);
+            }
+            perform(e);
         }
 
-        this.indexFieldName = smartMappers.mapper().names().indexName();
-        this.fieldDataType = smartMappers.mapper().fieldDataType();
-
-        if (script != null) {
-            this.script = context.scriptService().search(context.lookup(), scriptLang, script, params);
-        } else {
-            this.script = null;
-        }
-
-        if (this.script == null) {
-            aggregator = new StaticAggregatorValueProc(CacheRecycler.popLongIntMap());
-        } else {
-            aggregator = new AggregatorValueProc(CacheRecycler.popLongIntMap(), this.script);
-        }
-
-        if (allTerms) {
-            try {
-                for (AtomicReaderContext readerContext : context.searcher().getTopReaderContext().leaves()) {
-                    LongFieldData fieldData = (LongFieldData) fieldDataCache.cache(fieldDataType, readerContext.reader(), indexFieldName);
-                    fieldData.forEachValue(aggregator);
+        /**
+         * First get should try and use a shard that exists on a local node for better performance
+         */
+        private void performFirst() {
+            while (shardsIt.hasNextActive()) {
+                final ShardRouting shard = shardsIt.nextActive();
+                if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                    if (request.operationThreaded()) {
+                        threadPool.execute(new Runnable() {
+                            @Override public void run() {
+                                try {
+                                    Response response = shardOperation(request, shard.id());
+                                    listener.onResponse(response);
+                                } catch (Exception e) {
+                                    onFailure(shard, e);
+                                }
+                            }
+                        });
+                        return;
+                    } else {
+                        try {
+                            final Response response = shardOperation(request, shard.id());
+                            if (request.listenerThreaded()) {
+                                threadPool.execute(new Runnable() {
+                                    @Override public void run() {
+                                        listener.onResponse(response);
+                                    }
+                                });
+                            } else {
+                                listener.onResponse(response);
+                            }
+                            return;
+                        } catch (Exception e) {
+                            onFailure(shard, e);
+                        }
+                    }
                 }
-            } catch (Exception e) {
-                throw new FacetPhaseExecutionException(facetName, "failed to load all terms", e);
+            }
+            if (!shardsIt.hasNextActive()) {
+                // no local node get, go remote
+                shardsIt.reset();
+                perform(null);
             }
         }
-    }
 
-    @Override
-    public void setScorer(Scorer scorer) throws IOException {
-        if (script != null) {
-            script.setScorer(scorer);
-        }
-    }
+        private void perform(final Exception lastException) {
+            while (shardsIt.hasNextActive()) {
+                final ShardRouting shard = shardsIt.nextActive();
+                // no need to check for local nodes, we tried them already in performFirstGet
+                if (!shard.currentNodeId().equals(nodes.localNodeId())) {
+                    DiscoveryNode node = nodes.get(shard.currentNodeId());
+                    transportService.sendRequest(node, transportShardAction(), new ShardSingleOperationRequest(request, shard.id()), new BaseTransportResponseHandler<Response>() {
+                        @Override public Response newInstance() {
+                            return newResponse();
+                        }
 
-    @Override
-    protected void doSetNextReader(AtomicReaderContext context) throws IOException {
-        fieldData = (LongFieldData) fieldDataCache.cache(fieldDataType, context.reader(), indexFieldName);
-        if (script != null) {
-            script.setNextReader(context.reader());
-        }
-    }
+                        @Override public void handleResponse(final Response response) {
+                            if (request.listenerThreaded()) {
+                                threadPool.execute(new Runnable() {
+                                    @Override public void run() {
+                                        listener.onResponse(response);
+                                    }
+                                });
+                            } else {
+                                listener.onResponse(response);
+                            }
+                        }
 
-    @Override
-    protected void doCollect(int doc) throws IOException {
-        fieldData.forEachValueInDoc(doc, aggregator);
-    }
+                        @Override public void handleException(RemoteTransportException exp) {
+                            onFailure(shard, exp);
+                        }
 
-    @Override
-    public Facet facet() {
-        TLongIntHashMap facets = aggregator.facets();
-        if (facets.isEmpty()) {
-            CacheRecycler.pushLongIntMap(facets);
-            return new InternalIpTermsFacet(facetName, comparatorType, size, ImmutableList.<InternalIpTermsFacet.LongEntry>of(), aggregator.missing(), aggregator.total());
-        } else {
-            if (size < EntryPriorityQueue.LIMIT) {
-                EntryPriorityQueue ordered = new EntryPriorityQueue(size, comparatorType.comparator());
-                for (TLongIntIterator it = facets.iterator(); it.hasNext(); ) {
-                    it.advance();
-                    ordered.insertWithOverflow(new InternalIpTermsFacet.LongEntry(it.key(), it.value()));
-                }
-                InternalIpTermsFacet.LongEntry[] list = new InternalIpTermsFacet.LongEntry[ordered.size()];
-                for (int i = ordered.size() - 1; i >= 0; i--) {
-                    list[i] = (InternalIpTermsFacet.LongEntry) ordered.pop();
-                }
-                CacheRecycler.pushLongIntMap(facets);
-                return new InternalIpTermsFacet(facetName, comparatorType, size, Arrays.asList(list), aggregator.missing(), aggregator.total());
-            } else {
-                BoundedTreeSet<InternalIpTermsFacet.LongEntry> ordered = new BoundedTreeSet<InternalIpTermsFacet.LongEntry>(comparatorType.comparator(), size);
-                for (TLongIntIterator it = facets.iterator(); it.hasNext(); ) {
-                    it.advance();
-                    ordered.add(new InternalIpTermsFacet.LongEntry(it.key(), it.value()));
-                }
-                CacheRecycler.pushLongIntMap(facets);
-                return new InternalIpTermsFacet(facetName, comparatorType, size, ordered, aggregator.missing(), aggregator.total());
-            }
-        }
-    }
-
-    public static class AggregatorValueProc extends StaticAggregatorValueProc {
-
-        private final SearchScript script;
-
-        public AggregatorValueProc(TLongIntHashMap facets, SearchScript script) {
-            super(facets);
-            this.script = script;
-        }
-
-        @Override
-        public void onValue(int docId, long value) {
-            if (script != null) {
-                script.setNextDocId(docId);
-                script.setNextVar("term", value);
-                Object scriptValue = script.run();
-                if (scriptValue == null) {
+                        @Override public boolean spawn() {
+                            // no need to spawn, we will execute the listener on a different thread if needed in handleResponse
+                            return false;
+                        }
+                    });
                     return;
                 }
-                if (scriptValue instanceof Boolean) {
-                    if (!((Boolean) scriptValue)) {
-                        return;
-                    }
+            }
+            if (!shardsIt.hasNextActive()) {
+                Exception failure = lastException;
+                if (failure == null) {
+                    failure = new NoShardAvailableActionException(shardsIt.shardId(), "No shard available for [" + request.type() + "#" + request.id() + "]");
                 } else {
-                    value = ((Number) scriptValue).longValue();
+                    if (logger.isDebugEnabled()) {
+                        logger.debug(shardsIt.shardId() + ": Failed to get [" + request.type() + "#" + request.id() + "]", failure);
+                    }
+                }
+                if (request.listenerThreaded()) {
+                    final Exception fFailure = failure;
+                    threadPool.execute(new Runnable() {
+                        @Override public void run() {
+                            listener.onFailure(fFailure);
+                        }
+                    });
+                } else {
+                    listener.onFailure(failure);
                 }
             }
-            super.onValue(docId, value);
         }
     }
 
-    public static class StaticAggregatorValueProc implements LongFieldData.ValueInDocProc, LongFieldData.ValueProc {
+    private class TransportHandler extends BaseTransportRequestHandler<Request> {
 
-        private final TLongIntHashMap facets;
-
-        private int missing;
-        private int total;
-
-        public StaticAggregatorValueProc(TLongIntHashMap facets) {
-            this.facets = facets;
+        @Override public Request newInstance() {
+            return newRequest();
         }
 
-        @Override
-        public void onValue(long value) {
-            facets.putIfAbsent(value, 0);
+        @Override public void messageReceived(Request request, final TransportChannel channel) throws Exception {
+            // no need to have a threaded listener since we just send back a response
+            request.listenerThreaded(false);
+            // if we have a local operation, execute it on a thread since we don't spawn
+            request.operationThreaded(true);
+            execute(request, new ActionListener<Response>() {
+                @Override public void onResponse(Response result) {
+                    try {
+                        channel.sendResponse(result);
+                    } catch (Exception e) {
+                        onFailure(e);
+                    }
+                }
+
+                @Override public void onFailure(Throwable e) {
+                    try {
+                        channel.sendResponse(e);
+                    } catch (Exception e1) {
+                        logger.warn("Failed to send response for get", e1);
+                    }
+                }
+            });
         }
 
-        @Override
-        public void onValue(int docId, long value) {
-            facets.adjustOrPutValue(value, 1, 1);
-            total++;
+        @Override public boolean spawn() {
+            return false;
+        }
+    }
+
+    private class ShardTransportHandler extends BaseTransportRequestHandler<ShardSingleOperationRequest> {
+
+        @Override public ShardSingleOperationRequest newInstance() {
+            return new ShardSingleOperationRequest();
         }
 
-        @Override
-        public void onMissing(int docId) {
-            missing++;
+        @Override public void messageReceived(ShardSingleOperationRequest request, TransportChannel channel) throws Exception {
+            Response response = shardOperation(request.request(), request.shardId());
+            channel.sendResponse(response);
+        }
+    }
+
+    protected class ShardSingleOperationRequest implements Streamable {
+
+        private Request request;
+
+        private int shardId;
+
+        ShardSingleOperationRequest() {
         }
 
-        public final TLongIntHashMap facets() {
-            return facets;
+        public ShardSingleOperationRequest(Request request, int shardId) {
+            this.request = request;
+            this.shardId = shardId;
         }
 
-        public final int missing() {
-            return this.missing;
+        public Request request() {
+            return request;
         }
 
-        public final int total() {
-            return this.total;
+        public int shardId() {
+            return shardId;
+        }
+
+        @Override public void readFrom(StreamInput in) throws IOException {
+            request = newRequest();
+            request.readFrom(in);
+            shardId = in.readVInt();
+        }
+
+        @Override public void writeTo(StreamOutput out) throws IOException {
+            request.writeTo(out);
+            out.writeVInt(shardId);
         }
     }
 }

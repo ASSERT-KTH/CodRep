@@ -1,6 +1,6 @@
-public IColumnIterator getSSTableColumnIterator(SSTableReader sstable, DecoratedKey key)
+cfs.maybeBuildSecondaryIndexes(cfs.getSSTables(), cfs.getIndexedColumns());
 
-package org.apache.cassandra.db.filter;
+package org.apache.cassandra.io.sstable;
 /*
  * 
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -23,184 +23,77 @@ package org.apache.cassandra.db.filter;
  */
 
 
-import java.util.*;
+import static org.junit.Assert.*;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.apache.commons.collections.comparators.ReverseComparator;
-import org.apache.commons.collections.iterators.ReverseListIterator;
-import org.apache.commons.collections.IteratorUtils;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
 
-import com.google.common.collect.Collections2;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.CleanupHelper;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.IFilter;
+import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.streaming.OperationType;
+import org.apache.cassandra.thrift.IndexClause;
+import org.apache.cassandra.thrift.IndexExpression;
+import org.apache.cassandra.thrift.IndexOperator;
+import org.junit.Test;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
-import com.google.common.base.Predicate;
-import com.google.common.base.Predicates;
-import com.google.common.collect.Iterators;
+public class SSTableWriterTest extends CleanupHelper {
 
-public class SliceQueryFilter implements IFilter
-{
-    private static Logger logger = LoggerFactory.getLogger(SliceQueryFilter.class);
-
-    public final byte[] start;
-    public final byte[] finish;
-    public final List<byte[]> bitmasks;
-    public final boolean reversed;
-    public final int count;
-
-    public SliceQueryFilter(byte[] start, byte[] finish, List<byte[]> bitmasks, boolean reversed, int count)
+    @Test
+    public void testRecoverAndOpen() throws IOException, ExecutionException, InterruptedException
     {
-        this.start = start;
-        this.finish = finish;
-        this.reversed = reversed;
-        this.count = count;
-        this.bitmasks = bitmasks;
-    }
+        // add data via the usual write path
+        RowMutation rm = new RowMutation("Keyspace1", ByteBufferUtil.bytes("k1"));
+        rm.add(new QueryPath("Indexed1", null, ByteBufferUtil.bytes("birthdate")), ByteBufferUtil.bytes(1L), 0);
+        rm.apply();
+        
+        // and add an sstable outside the right path (as if via streaming)
+        Map<String, ColumnFamily> entries = new HashMap<String, ColumnFamily>();
+        ColumnFamily cf;
+        // "k2"
+        cf = ColumnFamily.create("Keyspace1", "Indexed1");        
+        cf.addColumn(new Column(ByteBufferUtil.bytes("birthdate"), ByteBufferUtil.bytes(1L), 0));
+        cf.addColumn(new Column(ByteBufferUtil.bytes("anydate"), ByteBufferUtil.bytes(1L), 0));
+        entries.put("k2", cf);        
+        
+        // "k3"
+        cf = ColumnFamily.create("Keyspace1", "Indexed1");        
+        cf.addColumn(new Column(ByteBufferUtil.bytes("anydate"), ByteBufferUtil.bytes(1L), 0));
+        entries.put("k3", cf);        
+        
+        SSTableReader orig = SSTableUtils.prepare().cf("Indexed1").write(entries);        
+        // whack the index to trigger the recover
+        FileUtils.deleteWithConfirm(orig.descriptor.filenameFor(Component.PRIMARY_INDEX));
+        FileUtils.deleteWithConfirm(orig.descriptor.filenameFor(Component.FILTER));
 
-    public IColumnIterator getMemtableColumnIterator(ColumnFamily cf, DecoratedKey key, AbstractType comparator)
-    {
-        return Memtable.getSliceIterator(key, cf, this, comparator);
-    }
-
-    public IColumnIterator getSSTableColumnIterator(SSTableReader sstable, String key)
-    {
-        return new SSTableSliceIterator(sstable, key, start, finish, getPredicate(), reversed);
-    }
-    
-    public IColumnIterator getSSTableColumnIterator(SSTableReader sstable, FileDataInput file, DecoratedKey key, long dataStart)
-    {
-        return new SSTableSliceIterator(sstable, file, key, start, finish, getPredicate(), reversed);
-    }
-    
-    private Predicate<IColumn> getPredicate()
-    {
-        return (bitmasks == null || bitmasks.isEmpty())
-               ? Predicates.<IColumn>alwaysTrue()
-               : getBitmaskMatchColumnPredicate();
-    }
-
-
-    public SuperColumn filterSuperColumn(SuperColumn superColumn, int gcBefore)
-    {
-        // we clone shallow, then add, under the theory that generally we're interested in a relatively small number of subcolumns.
-        // this may be a poor assumption.
-        SuperColumn scFiltered = superColumn.cloneMeShallow();
-        Iterator<IColumn> subcolumns;
-        if (reversed)
-        {
-            List<IColumn> columnsAsList = new ArrayList<IColumn>(superColumn.getSubColumns());
-            subcolumns = new ReverseListIterator(columnsAsList);
-        }
-        else
-        {
-            subcolumns = superColumn.getSubColumns().iterator();
-        }
-
-        // now apply the predicate
-        if (bitmasks != null && !bitmasks.isEmpty())
-        {
-            subcolumns = Iterators.filter(subcolumns, getBitmaskMatchColumnPredicate());
-        }
-
-        // iterate until we get to the "real" start column
-        Comparator<byte[]> comparator = reversed ? superColumn.getComparator().getReverseComparator() : superColumn.getComparator();
-        while (subcolumns.hasNext())
-        {
-            IColumn column = subcolumns.next();
-            if (comparator.compare(column.name(), start) >= 0)
-            {
-                subcolumns = IteratorUtils.chainedIterator(IteratorUtils.singletonIterator(column), subcolumns);
-                break;
-            }
-        }
-        // subcolumns is either empty now, or has been redefined in the loop above.  either is ok.
-        collectReducedColumns(scFiltered, subcolumns, gcBefore);
-        return scFiltered;
-    }
-
-    public Comparator<IColumn> getColumnComparator(AbstractType comparator)
-    {
-        return reversed ? new ReverseComparator(QueryFilter.getColumnComparator(comparator)) : QueryFilter.getColumnComparator(comparator);
-    }
-
-    public void collectReducedColumns(IColumnContainer container, Iterator<IColumn> reducedColumns, int gcBefore)
-    {
-        int liveColumns = 0;
-        AbstractType comparator = container.getComparator();
-
-        while (reducedColumns.hasNext())
-        {
-            if (liveColumns >= count)
-                break;
-
-            IColumn column = reducedColumns.next();
-            if (logger.isDebugEnabled())
-                logger.debug(String.format("collecting %s of %s: %s",
-                                           liveColumns, count, column.getString(comparator)));
-
-            if (finish.length > 0
-                && ((!reversed && comparator.compare(column.name(), finish) > 0))
-                    || (reversed && comparator.compare(column.name(), finish) < 0))
-                break;
-
-            // only count live columns towards the `count` criteria
-            if (!column.isMarkedForDelete()
-                && (!container.isMarkedForDelete()
-                    || column.mostRecentLiveChangeAt() > container.getMarkedForDeleteAt()))
-            {
-                liveColumns++;
-            }
-
-            // but we need to add all non-gc-able columns to the result for read repair:
-            if (QueryFilter.isRelevant(column, container, gcBefore))
-                container.addColumn(column);
-        }
-    }
-
-    public Collection<IColumn> applyPredicate(Collection<IColumn> columns)
-    {
-        if (bitmasks == null || bitmasks.isEmpty())
-            return columns;
-
-        return Collections2.filter(columns, getBitmaskMatchColumnPredicate());
-    }
-
-    @SuppressWarnings("unchecked")
-    private Predicate<IColumn> getBitmaskMatchColumnPredicate()
-    {
-        Predicate<IColumn>[] predicates = new Predicate[bitmasks.size()];
-        for (int i = 0; i < bitmasks.size(); i++)
-        {
-            final byte[] bitmask = bitmasks.get(i);
-            predicates[i] = new Predicate<IColumn>()
-            {
-                public boolean apply(IColumn col)
-                {
-                    return matchesBitmask(bitmask, col.name());
-                }
-            };
-        }
-        return Predicates.or(predicates);
-    }
-
-    public static boolean matchesBitmask(byte[] bitmask, byte[] name)
-    {
-        assert name != null;
-        assert bitmask != null;
-
-        int len = Math.min(bitmask.length, name.length);
-
-        for (int i = 0; i < len; i++)
-        {
-            if ((bitmask[i] & name[i]) == 0)
-            {
-                return false;
-            }
-        }
-
-        return true;
+        SSTableReader sstr = CompactionManager.instance.submitSSTableBuild(orig.descriptor, OperationType.AES).get();
+        assert sstr != null;
+        ColumnFamilyStore cfs = Table.open("Keyspace1").getColumnFamilyStore("Indexed1");
+        cfs.addSSTable(sstr);
+        cfs.buildSecondaryIndexes(cfs.getSSTables(), cfs.getIndexedColumns());
+        
+        IndexExpression expr = new IndexExpression(ByteBufferUtil.bytes("birthdate"), IndexOperator.EQ, ByteBufferUtil.bytes(1L));
+        IndexClause clause = new IndexClause(Arrays.asList(expr), ByteBufferUtil.EMPTY_BYTE_BUFFER, 100);
+        IFilter filter = new IdentityQueryFilter();
+        IPartitioner p = StorageService.getPartitioner();
+        Range range = new Range(p.getMinimumToken(), p.getMinimumToken());
+        List<Row> rows = cfs.scan(clause, range, filter);
+        
+        assertEquals("IndexExpression should return two rows on recoverAndOpen", 2, rows.size());
+        assertTrue("First result should be 'k1'",ByteBufferUtil.bytes("k1").equals(rows.get(0).key.key));
     }
 }

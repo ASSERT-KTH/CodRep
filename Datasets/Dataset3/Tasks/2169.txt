@@ -1,8 +1,8 @@
-package org.jboss.as.test.smoke.messaging.jms;
+import org.wildfly.security.manager.SetContextClassLoaderAction;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2010, Red Hat, Inc., and individual contributors
+ * Copyright (c) 2011, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -21,143 +21,166 @@ package org.jboss.as.test.smoke.messaging.jms;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.jboss.as.test.smoke.embedded.demos.jms;
+package org.jboss.as.ejb3.inflow;
 
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import javax.resource.ResourceException;
+import javax.resource.spi.ApplicationServerInternalException;
+import javax.resource.spi.LocalTransactionException;
+import javax.resource.spi.endpoint.MessageEndpoint;
+import javax.transaction.HeuristicMixedException;
+import javax.transaction.HeuristicRollbackException;
+import javax.transaction.InvalidTransactionException;
+import javax.transaction.RollbackException;
+import javax.transaction.Status;
+import javax.transaction.SystemException;
+import javax.transaction.Transaction;
+import javax.transaction.TransactionManager;
+import javax.transaction.xa.XAResource;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.jboss.as.util.security.SetContextClassLoaderAction;
 
-import javax.jms.Message;
-import javax.jms.MessageListener;
-import javax.jms.Queue;
-import javax.jms.QueueConnection;
-import javax.jms.QueueConnectionFactory;
-import javax.jms.QueueReceiver;
-import javax.jms.QueueSender;
-import javax.jms.QueueSession;
-import javax.jms.TextMessage;
-import javax.naming.InitialContext;
-
-import junit.framework.Assert;
-
-import org.jboss.arquillian.container.test.api.Deployment;
-import org.jboss.arquillian.junit.Arquillian;
-import org.jboss.logging.Logger;
-import org.jboss.modules.ModuleClassLoader;
-import org.jboss.modules.ModuleIdentifier;
-import org.jboss.shrinkwrap.api.ShrinkWrap;
-import org.jboss.shrinkwrap.api.spec.JavaArchive;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import static java.lang.System.getSecurityManager;
+import static java.security.AccessController.doPrivileged;
+import static org.jboss.as.ejb3.EjbMessages.MESSAGES;
 
 /**
- * [TODO]
- *
- * @author <a href="kabir.khan@jboss.com">Kabir Khan</a>
+ * @author <a href="mailto:cdewolf@redhat.com">Carlo de Wolf</a>
  */
-@RunWith(Arquillian.class)
-public class JmsTestCase {
-    static final Logger log = Logger.getLogger(JmsTestCase.class);
+public class MessageEndpointInvocationHandler extends AbstractInvocationHandler implements MessageEndpoint {
+    private final MessageEndpointService service;
+    private final Object delegate;
+    private final XAResource xaRes;
+    private final AtomicBoolean released = new AtomicBoolean(false);
 
-    private QueueConnection conn;
-    private Queue queue;
-    private QueueSession session;
+    private Transaction currentTx;
+    private ClassLoader previousClassLoader;
+    private Transaction previousTx;
 
-    CountDownLatch latch = new CountDownLatch(1);
-    private volatile String received;
-
-
-    @Deployment
-    public static JavaArchive createDeployment() throws Exception {
-        JavaArchive archive = ShrinkWrap.create(JavaArchive.class, "jms-example.jar")
-        .addPackage(JmsTestCase.class.getPackage());
-        return archive;
+    MessageEndpointInvocationHandler(final MessageEndpointService service, final Object delegate, final XAResource xaResource) {
+        this.service = service;
+        this.delegate = delegate;
+        this.xaRes = xaResource;
     }
 
-    @Before
-    public void start() throws Exception {
-        //FIXME Arquillian Alpha bug - it also wants to execute this on the client despite this test being IN_CONTAINER
-        if (!isInContainer()) {
-            return;
-        }
-
-        InitialContext ctx = new InitialContext();
-
-        QueueConnectionFactory qcf = (QueueConnectionFactory)ctx.lookup("java:/ConnectionFactory");
-        conn = qcf.createQueueConnection();
-        conn.start();
-        queue = (Queue)ctx.lookup("queue/test");
-        session = conn.createQueueSession(false, QueueSession.AUTO_ACKNOWLEDGE);
-
-        // Set the async listener
-        QueueReceiver recv = session.createReceiver(queue);
-        recv.setMessageListener(new ExampeMessageListener());
-    }
-
-    @After
-    public void stop() throws Exception {
-        //FIXME Arquillian Alpha bug - it also wants to execute this on the client despite this test being IN_CONTAINER
-        if (!isInContainer()) {
-            return;
-        }
-
-        if (conn != null) {
-            conn.stop();
-        }
-        if (session != null) {
-            session.close();
-        }
-        if (conn != null) {
-            conn.close();
-        }
-    }
-
-    @Test
-    public void testJms() throws Exception {
-        sendMessage("Test");
-        Assert.assertTrue(latch.await(3, TimeUnit.SECONDS));
-        Assert.assertEquals("Test", received);
-    }
-
-    private void sendMessage(String txt) throws Exception {
-        QueueSender send = null;
+    @Override
+    public void afterDelivery() throws ResourceException {
+        final TransactionManager tm = getTransactionManager();
         try {
-            // Send a text msg
-            send = session.createSender(queue);
-            TextMessage tm = session.createTextMessage(txt);
-            send.send(tm);
-            log.info("-----> sent text=" + tm.getText());
+            if (currentTx != null) {
+                if (currentTx.getStatus() == Status.STATUS_MARKED_ROLLBACK)
+                    tm.rollback();
+                else
+                    tm.commit();
+                currentTx = null;
+            }
+            if (previousTx != null) {
+                tm.resume(previousTx);
+                previousTx = null;
+            }
+        } catch (InvalidTransactionException e) {
+            throw new LocalTransactionException(e);
+        } catch (HeuristicMixedException e) {
+            throw new LocalTransactionException(e);
+        } catch (SystemException e) {
+            throw new LocalTransactionException(e);
+        } catch (HeuristicRollbackException e) {
+            throw new LocalTransactionException(e);
+        } catch (RollbackException e) {
+            throw new LocalTransactionException(e);
         } finally {
-            send.close();
+            if (getSecurityManager() == null) {
+                Thread.currentThread().setContextClassLoader(previousClassLoader);
+            } else {
+                doPrivileged(new SetContextClassLoaderAction(previousClassLoader));
+            }
+            previousClassLoader = null;
         }
     }
 
-    private class ExampeMessageListener implements MessageListener {
-
-        @Override
-        public void onMessage(Message message) {
-            TextMessage msg = (TextMessage)message;
-            try {
-                log.info("-----> on message: " + msg.getText());
-                received = msg.getText();
-                latch.countDown();
-            } catch (Throwable t) {
-                t.printStackTrace();
+    @Override
+    public void beforeDelivery(Method method) throws NoSuchMethodException, ResourceException {
+        // JCA 1.6 FR 13.5.6
+        // The application server must set the thread context class loader to the endpoint
+        // application class loader during the beforeDelivery call.
+        final Thread thread = Thread.currentThread();
+        if (getSecurityManager() == null) {
+            previousClassLoader = thread.getContextClassLoader();
+            thread.setContextClassLoader(getApplicationClassLoader());
+        } else {
+            previousClassLoader = doPrivileged(new SetContextClassLoaderAction(getApplicationClassLoader()));
+        }
+        try {
+            final TransactionManager tm = getTransactionManager();
+            // TODO: in violation of JCA 1.6 FR 13.5.9?
+            previousTx = tm.suspend();
+            boolean isTransacted = service.isDeliveryTransacted(method);
+            if (isTransacted) {
+                tm.begin();
+                currentTx = tm.getTransaction();
+                if (xaRes != null)
+                    currentTx.enlistResource(xaRes);
             }
         }
+        catch(Throwable t) {
+            if (getSecurityManager() == null) {
+                thread.setContextClassLoader(previousClassLoader);
+            } else {
+                doPrivileged(new SetContextClassLoaderAction(previousClassLoader));
+            }
+            throw new ApplicationServerInternalException(t);
+        }
     }
 
-    private boolean isInContainer() {
-        ClassLoader cl = this.getClass().getClassLoader();
-        if (cl instanceof ModuleClassLoader == false) {
+    @Override
+    protected boolean doEquals(Object obj) {
+        if (!(obj instanceof MessageEndpointInvocationHandler))
             return false;
+
+        return delegate.equals(((MessageEndpointInvocationHandler) obj).delegate);
+    }
+
+    @Override
+    protected Object doInvoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // Are we still usable?
+        if (released.get())
+            throw MESSAGES.messageEndpointAlreadyReleased(this);
+
+        // TODO: check for concurrent invocation
+
+        if (method.getDeclaringClass().equals(MessageEndpoint.class))
+            return handle(method, args);
+
+        // TODO: Option A
+        try {
+            return method.invoke(delegate, args);
         }
-        ModuleClassLoader mcl = (ModuleClassLoader)cl;
-        ModuleIdentifier surefireModule = ModuleIdentifier.fromString("jboss.surefire.module");
-        if (surefireModule.equals(mcl.getModule().getIdentifier())) {
-            return false;
+        catch (InvocationTargetException e) {
+            throw e.getCause();
         }
-        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        return delegate.hashCode();
+    }
+
+    protected final ClassLoader getApplicationClassLoader() {
+        return this.service.getClassLoader();
+    }
+
+    protected final TransactionManager getTransactionManager() {
+        return service.getTransactionManager();
+    }
+
+    @Override
+    public void release() {
+        if (released.getAndSet(true))
+            throw new IllegalStateException("Message endpoint " + this + " has already been released");
+
+        // TODO: tidy up outstanding delivery
+
+        service.release(delegate);
     }
 }

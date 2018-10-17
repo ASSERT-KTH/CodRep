@@ -1,4 +1,4 @@
-entries.close();
+logger.debug("Can not run threaded action, execution rejected [{}] running on current thread", listener);
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -19,116 +19,111 @@ entries.close();
  * under the License.
  */
 
-package org.elasticsearch.search.facet.histogram;
+package org.elasticsearch.action.support;
 
-import com.carrotsearch.hppc.LongObjectOpenHashMap;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.elasticsearch.common.recycler.Recycler;
-import org.elasticsearch.index.fielddata.DoubleValues;
-import org.elasticsearch.index.fielddata.IndexNumericFieldData;
-import org.elasticsearch.search.facet.DoubleFacetAggregatorBase;
-import org.elasticsearch.search.facet.FacetExecutor;
-import org.elasticsearch.search.facet.InternalFacet;
-import org.elasticsearch.search.internal.SearchContext;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.action.*;
+import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.common.logging.ESLogger;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
+import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import static org.elasticsearch.action.support.PlainActionFuture.newFuture;
 
 /**
- * A histogram facet collector that uses the same field as the key as well as the
- * value.
+ *
  */
-public class FullHistogramFacetExecutor extends FacetExecutor {
+public abstract class TransportAction<Request extends ActionRequest, Response extends ActionResponse> extends AbstractComponent {
 
-    private final IndexNumericFieldData indexFieldData;
-    private final HistogramFacet.ComparatorType comparatorType;
-    final long interval;
+    protected final ThreadPool threadPool;
 
-    final Recycler.V<LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry>> entries;
-
-    public FullHistogramFacetExecutor(IndexNumericFieldData indexFieldData, long interval, HistogramFacet.ComparatorType comparatorType, SearchContext context) {
-        this.comparatorType = comparatorType;
-        this.indexFieldData = indexFieldData;
-        this.interval = interval;
-
-        this.entries = context.cacheRecycler().longObjectMap(-1);
+    protected TransportAction(Settings settings, ThreadPool threadPool) {
+        super(settings);
+        this.threadPool = threadPool;
     }
 
-    @Override
-    public Collector collector() {
-        return new Collector();
+    public ActionFuture<Response> execute(Request request) throws ElasticsearchException {
+        PlainActionFuture<Response> future = newFuture();
+        // since we don't have a listener, and we release a possible lock with the future
+        // there is no need to execute it under a listener thread
+        request.listenerThreaded(false);
+        execute(request, future);
+        return future;
     }
 
-    @Override
-    public InternalFacet buildFacet(String facetName) {
-        List<InternalFullHistogramFacet.FullEntry> fullEntries = new ArrayList<>(entries.v().size());
-        boolean[] states = entries.v().allocated;
-        Object[] values = entries.v().values;
-        for (int i = 0; i < states.length; i++) {
-            if (states[i]) {
-                fullEntries.add((InternalFullHistogramFacet.FullEntry) values[i]);
+    public void execute(Request request, ActionListener<Response> listener) {
+        if (request.listenerThreaded()) {
+            listener = new ThreadedActionListener<>(threadPool, listener, logger);
+        }
+        ActionRequestValidationException validationException = request.validate();
+        if (validationException != null) {
+            listener.onFailure(validationException);
+            return;
+        }
+        try {
+            doExecute(request, listener);
+        } catch (Throwable e) {
+            logger.trace("Error during transport action execution.", e);
+            listener.onFailure(e);
+        }
+    }
+
+    protected abstract void doExecute(Request request, ActionListener<Response> listener);
+
+    static final class ThreadedActionListener<Response> implements ActionListener<Response> {
+
+        private final ThreadPool threadPool;
+
+        private final ActionListener<Response> listener;
+
+        private final ESLogger logger;
+
+        ThreadedActionListener(ThreadPool threadPool, ActionListener<Response> listener, ESLogger logger) {
+            this.threadPool = threadPool;
+            this.listener = listener;
+            this.logger = logger;
+        }
+
+        @Override
+        public void onResponse(final Response response) {
+            try {
+                threadPool.generic().execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            listener.onResponse(response);
+                        } catch (Throwable e) {
+                            listener.onFailure(e);
+                        }
+                    }
+                });
+            } catch (EsRejectedExecutionException ex) {
+                logger.debug("Can not run threaded action, exectuion rejected [{}] running on current thread", listener);
+                /* we don't care if that takes long since we are shutting down. But if we not respond somebody could wait
+                 * for the response on the listener side which could be a remote machine so make sure we push it out there.*/
+                try {
+                    listener.onResponse(response);
+                } catch (Throwable e) {
+                    listener.onFailure(e);
+                }
             }
         }
-        entries.release();
-        return new InternalFullHistogramFacet(facetName, comparatorType, fullEntries);
-    }
-
-    public static long bucket(double value, long interval) {
-        return (((long) (value / interval)) * interval);
-    }
-
-    class Collector extends FacetExecutor.Collector {
-
-        private final HistogramProc histoProc;
-        private DoubleValues values;
-
-        Collector() {
-            this.histoProc = new HistogramProc(interval, entries.v());
-        }
-
+        
         @Override
-        public void setNextReader(AtomicReaderContext context) throws IOException {
-            values = indexFieldData.load(context).getDoubleValues();
-        }
-
-        @Override
-        public void collect(int doc) throws IOException {
-            histoProc.onDoc(doc, values);
-        }
-
-        @Override
-        public void postCollection() {
-        }
-    }
-
-    public final static class HistogramProc extends DoubleFacetAggregatorBase {
-
-        final long interval;
-        final LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry> entries;
-
-        public HistogramProc(long interval, LongObjectOpenHashMap<InternalFullHistogramFacet.FullEntry> entries) {
-            this.interval = interval;
-            this.entries = entries;
-        }
-
-        @Override
-        public void onValue(int docId, double value) {
-            long bucket = bucket(value, interval);
-            InternalFullHistogramFacet.FullEntry entry = entries.get(bucket);
-            if (entry == null) {
-                entry = new InternalFullHistogramFacet.FullEntry(bucket, 1, value, value, 1, value);
-                entries.put(bucket, entry);
-            } else {
-                entry.count++;
-                entry.totalCount++;
-                entry.total += value;
-                if (value < entry.min) {
-                    entry.min = value;
-                }
-                if (value > entry.max) {
-                    entry.max = value;
-                }
+        public void onFailure(final Throwable e) {
+            try {
+                threadPool.generic().execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        listener.onFailure(e);
+                    }
+                });
+            } catch (EsRejectedExecutionException ex) {
+                logger.debug("Can not run threaded action, exectuion rejected for listener [{}] running on current thread", listener);
+                /* we don't care if that takes long since we are shutting down. But if we not respond somebody could wait
+                 * for the response on the listener side which could be a remote machine so make sure we push it out there.*/
+                listener.onFailure(e);
             }
         }
     }

@@ -1,4 +1,4 @@
-return TransportActions.Admin.Indices.Validate.QUERY;
+this.concurrentStreams = componentSettings.getAsInt("concurrent_streams", settings.getAsInt("index.shard.recovery.concurrent_streams", 3));
 
 /*
  * Licensed to ElasticSearch and Shay Banon under one
@@ -19,137 +19,156 @@ return TransportActions.Admin.Indices.Validate.QUERY;
  * under the License.
  */
 
-package org.elasticsearch.action.admin.indices.validate.query;
+package org.elasticsearch.indices.recovery;
 
-import jsr166y.ThreadLocalRandom;
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.action.ShardOperationFailedException;
-import org.elasticsearch.action.TransportActions;
-import org.elasticsearch.action.support.DefaultShardOperationFailedException;
-import org.elasticsearch.action.support.broadcast.BroadcastShardOperationFailedException;
-import org.elasticsearch.action.support.broadcast.TransportBroadcastOperationAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockException;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
-import org.elasticsearch.cluster.routing.GroupShardsIterator;
-import org.elasticsearch.cluster.routing.ShardRouting;
+import com.google.common.base.Objects;
+import org.elasticsearch.cluster.metadata.MetaData;
+import org.elasticsearch.common.RateLimiter;
+import org.elasticsearch.common.component.AbstractComponent;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.query.IndexQueryParserService;
-import org.elasticsearch.index.query.QueryParsingException;
-import org.elasticsearch.indices.IndicesService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.node.settings.NodeSettingsService;
 
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicReferenceArray;
-
-import static com.google.common.collect.Lists.newArrayList;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
- *
  */
-public class TransportValidateQueryAction extends TransportBroadcastOperationAction<ValidateQueryRequest, ValidateQueryResponse, ShardValidateQueryRequest, ShardValidateQueryResponse> {
+public class RecoverySettings extends AbstractComponent {
 
-    private final IndicesService indicesService;
+    static {
+        MetaData.addDynamicSettings("indices.recovery.file_chunk_size");
+        MetaData.addDynamicSettings("indices.recovery.translog_ops");
+        MetaData.addDynamicSettings("indices.recovery.translog_size");
+        MetaData.addDynamicSettings("indices.recovery.compress");
+        MetaData.addDynamicSettings("indices.recovery.concurrent_streams");
+        MetaData.addDynamicSettings("indices.recovery.max_size_per_sec");
+    }
+
+    private volatile ByteSizeValue fileChunkSize;
+
+    private volatile boolean compress;
+    private volatile int translogOps;
+    private volatile ByteSizeValue translogSize;
+
+    private volatile int concurrentStreams;
+    private final ThreadPoolExecutor concurrentStreamPool;
+
+    private volatile ByteSizeValue maxSizePerSec;
+    private volatile RateLimiter rateLimiter;
 
     @Inject
-    public TransportValidateQueryAction(Settings settings, ThreadPool threadPool, ClusterService clusterService, TransportService transportService, IndicesService indicesService) {
-        super(settings, threadPool, clusterService, transportService);
-        this.indicesService = indicesService;
-    }
+    public RecoverySettings(Settings settings, NodeSettingsService nodeSettingsService) {
+        super(settings);
 
-    @Override
-    protected String executor() {
-        return ThreadPool.Names.SEARCH;
-    }
+        this.fileChunkSize = componentSettings.getAsBytesSize("file_chunk_size", settings.getAsBytesSize("index.shard.recovery.file_chunk_size", new ByteSizeValue(512, ByteSizeUnit.KB)));
+        this.translogOps = componentSettings.getAsInt("translog_ops", settings.getAsInt("index.shard.recovery.translog_ops", 1000));
+        this.translogSize = componentSettings.getAsBytesSize("translog_size", settings.getAsBytesSize("index.shard.recovery.translog_size", new ByteSizeValue(512, ByteSizeUnit.KB)));
+        this.compress = componentSettings.getAsBoolean("compress", true);
 
-    @Override
-    protected String transportAction() {
-        return TransportActions.Admin.Indices.VALIDATE_QUERY;
-    }
+        this.concurrentStreams = componentSettings.getAsInt("concurrent_streams", settings.getAsInt("index.shard.recovery.concurrent_streams", 5));
+        this.concurrentStreamPool = EsExecutors.newScalingExecutorService(0, concurrentStreams, 60, TimeUnit.SECONDS, EsExecutors.daemonThreadFactory(settings, "[recovery_stream]"));
 
-    @Override
-    protected ValidateQueryRequest newRequest() {
-        return new ValidateQueryRequest();
-    }
-
-    @Override
-    protected ShardValidateQueryRequest newShardRequest() {
-        return new ShardValidateQueryRequest();
-    }
-
-    @Override
-    protected ShardValidateQueryRequest newShardRequest(ShardRouting shard, ValidateQueryRequest request) {
-        String[] filteringAliases = clusterService.state().metaData().filteringAliases(shard.index(), request.indices());
-        return new ShardValidateQueryRequest(shard.index(), shard.id(), filteringAliases, request);
-    }
-
-    @Override
-    protected ShardValidateQueryResponse newShardResponse() {
-        return new ShardValidateQueryResponse();
-    }
-
-    @Override
-    protected GroupShardsIterator shards(ClusterState clusterState, ValidateQueryRequest request, String[] concreteIndices) {
-        // Hard-code routing to limit request to a single shard, but still, randomize it...
-        Map<String, Set<String>> routingMap = clusterState.metaData().resolveSearchRouting(Integer.toString(ThreadLocalRandom.current().nextInt(1000)), request.indices());
-        return clusterService.operationRouting().searchShards(clusterState, request.indices(), concreteIndices, null, routingMap, "_local");
-    }
-
-    @Override
-    protected ClusterBlockException checkGlobalBlock(ClusterState state, ValidateQueryRequest request) {
-        return state.blocks().globalBlockedException(ClusterBlockLevel.READ);
-    }
-
-    @Override
-    protected ClusterBlockException checkRequestBlock(ClusterState state, ValidateQueryRequest countRequest, String[] concreteIndices) {
-        return state.blocks().indicesBlockedException(ClusterBlockLevel.READ, concreteIndices);
-    }
-
-    @Override
-    protected ValidateQueryResponse newResponse(ValidateQueryRequest request, AtomicReferenceArray shardsResponses, ClusterState clusterState) {
-        int successfulShards = 0;
-        int failedShards = 0;
-        boolean valid = true;
-        List<ShardOperationFailedException> shardFailures = null;
-        for (int i = 0; i < shardsResponses.length(); i++) {
-            Object shardResponse = shardsResponses.get(i);
-            if (shardResponse == null) {
-                failedShards++;
-            } else if (shardResponse instanceof BroadcastShardOperationFailedException) {
-                failedShards++;
-                if (shardFailures == null) {
-                    shardFailures = newArrayList();
-                }
-                shardFailures.add(new DefaultShardOperationFailedException((BroadcastShardOperationFailedException) shardResponse));
-            } else {
-                valid = valid && ((ShardValidateQueryResponse) shardResponse).valid();
-                successfulShards++;
-            }
-        }
-        return new ValidateQueryResponse(valid, shardsResponses.length(), successfulShards, failedShards, shardFailures);
-    }
-
-    @Override
-    protected ShardValidateQueryResponse shardOperation(ShardValidateQueryRequest request) throws ElasticSearchException {
-        IndexQueryParserService queryParserService = indicesService.indexServiceSafe(request.index()).queryParserService();
-        boolean valid;
-        if (request.querySource().length() == 0) {
-            valid = true;
+        this.maxSizePerSec = componentSettings.getAsBytesSize("max_size_per_sec", new ByteSizeValue(0));
+        if (maxSizePerSec.bytes() <= 0) {
+            rateLimiter = null;
         } else {
-            try {
-                queryParserService.parse(request.querySource().bytes(), request.querySource().offset(), request.querySource().length());
-                valid = true;
-            } catch (QueryParsingException e) {
-                valid = false;
-            } catch (AssertionError e) {
-                valid = false;
+            rateLimiter = new RateLimiter(maxSizePerSec.mbFrac());
+        }
+
+        logger.debug("using max_size_per_sec[{}], concurrent_streams [{}], file_chunk_size [{}], translog_size [{}], translog_ops [{}], and compress [{}]",
+                maxSizePerSec, concurrentStreams, fileChunkSize, translogSize, translogOps, compress);
+
+        nodeSettingsService.addListener(new ApplySettings());
+    }
+
+    public void close() {
+        concurrentStreamPool.shutdown();
+        try {
+            concurrentStreamPool.awaitTermination(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // that's fine...
+        }
+        concurrentStreamPool.shutdownNow();
+    }
+
+    public ByteSizeValue fileChunkSize() {
+        return fileChunkSize;
+    }
+
+    public boolean compress() {
+        return compress;
+    }
+
+    public int translogOps() {
+        return translogOps;
+    }
+
+    public ByteSizeValue translogSize() {
+        return translogSize;
+    }
+
+    public int concurrentStreams() {
+        return concurrentStreams;
+    }
+
+    public ThreadPoolExecutor concurrentStreamPool() {
+        return concurrentStreamPool;
+    }
+
+    public RateLimiter rateLimiter() {
+        return rateLimiter;
+    }
+
+    class ApplySettings implements NodeSettingsService.Listener {
+        @Override
+        public void onRefreshSettings(Settings settings) {
+            ByteSizeValue maxSizePerSec = settings.getAsBytesSize("indices.recovery.max_size_per_sec", RecoverySettings.this.maxSizePerSec);
+            if (!Objects.equal(maxSizePerSec, RecoverySettings.this.maxSizePerSec)) {
+                logger.info("updating [indices.recovery.max_size_per_sec] from [{}] to [{}]", RecoverySettings.this.maxSizePerSec, maxSizePerSec);
+                RecoverySettings.this.maxSizePerSec = maxSizePerSec;
+                if (maxSizePerSec.bytes() <= 0) {
+                    rateLimiter = null;
+                } else if (rateLimiter != null) {
+                    rateLimiter.setMaxRate(maxSizePerSec.mbFrac());
+                } else {
+                    rateLimiter = new RateLimiter(maxSizePerSec.mbFrac());
+                }
+            }
+
+            ByteSizeValue fileChunkSize = settings.getAsBytesSize("indices.recovery.file_chunk_size", RecoverySettings.this.fileChunkSize);
+            if (!fileChunkSize.equals(RecoverySettings.this.fileChunkSize)) {
+                logger.info("updating [indices.recovery.file_chunk_size] from [{}] to [{}]", RecoverySettings.this.fileChunkSize, fileChunkSize);
+                RecoverySettings.this.fileChunkSize = fileChunkSize;
+            }
+
+            int translogOps = settings.getAsInt("indices.recovery.translog_ops", RecoverySettings.this.translogOps);
+            if (translogOps != RecoverySettings.this.translogOps) {
+                logger.info("updating [indices.recovery.translog_ops] from [{}] to [{}]", RecoverySettings.this.translogOps, translogOps);
+                RecoverySettings.this.translogOps = translogOps;
+            }
+
+            ByteSizeValue translogSize = settings.getAsBytesSize("indices.recovery.translog_size", RecoverySettings.this.translogSize);
+            if (!translogSize.equals(RecoverySettings.this.translogSize)) {
+                logger.info("updating [indices.recovery.translog_size] from [{}] to [{}]", RecoverySettings.this.translogSize, translogSize);
+                RecoverySettings.this.translogSize = translogSize;
+            }
+
+            boolean compress = settings.getAsBoolean("indices.recovery.compress", RecoverySettings.this.compress);
+            if (compress != RecoverySettings.this.compress) {
+                logger.info("updating [indices.recovery.compress] from [{}] to [{}]", RecoverySettings.this.compress, compress);
+                RecoverySettings.this.compress = compress;
+            }
+
+            int concurrentStreams = settings.getAsInt("indices.recovery.concurrent_streams", RecoverySettings.this.concurrentStreams);
+            if (concurrentStreams != RecoverySettings.this.concurrentStreams) {
+                logger.info("updating [indices.recovery.concurrent_streams] from [{}] to [{}]", RecoverySettings.this.concurrentStreams, concurrentStreams);
+                RecoverySettings.this.concurrentStreams = concurrentStreams;
+                RecoverySettings.this.concurrentStreamPool.setMaximumPoolSize(concurrentStreams);
             }
         }
-        return new ShardValidateQueryResponse(request.index(), request.shardId(), valid);
     }
 }

@@ -1,4 +1,4 @@
-metaDataService.createIndex("gateway", indexMetaData.index(), indexMetaData.settings(), indexMetaData.mappings(), timeValueMillis(10));
+sendExecuteFirstPhase(node, internalSearchRequest(shard, shardsIts.size(), request, filteringAliases, startTime), new SearchServiceListener<FirstResult>() {
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,140 +19,328 @@ metaDataService.createIndex("gateway", indexMetaData.index(), indexMetaData.sett
  * under the License.
  */
 
-package org.elasticsearch.gateway;
+package org.elasticsearch.action.search.type;
 
-import com.google.inject.Inject;
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.cluster.*;
-import org.elasticsearch.cluster.metadata.IndexMetaData;
-import org.elasticsearch.cluster.metadata.MetaData;
-import org.elasticsearch.cluster.metadata.MetaDataService;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.search.ReduceSearchPhaseException;
+import org.elasticsearch.action.search.SearchOperationThreading;
+import org.elasticsearch.action.search.SearchPhaseExecutionException;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.action.search.ShardSearchFailure;
+import org.elasticsearch.action.support.BaseAction;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.GroupShardsIterator;
+import org.elasticsearch.cluster.routing.ShardIterator;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.trove.ExtTIntArrayList;
+import org.elasticsearch.search.SearchPhaseResult;
+import org.elasticsearch.search.SearchShardTarget;
+import org.elasticsearch.search.action.SearchServiceListener;
+import org.elasticsearch.search.action.SearchServiceTransportAction;
+import org.elasticsearch.search.controller.SearchPhaseController;
+import org.elasticsearch.search.controller.ShardDoc;
+import org.elasticsearch.search.internal.InternalSearchRequest;
+import org.elasticsearch.search.query.QuerySearchResultProvider;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.util.component.AbstractLifecycleComponent;
-import org.elasticsearch.util.concurrent.DynamicExecutors;
-import org.elasticsearch.util.settings.Settings;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.elasticsearch.cluster.ClusterState.*;
-import static org.elasticsearch.cluster.metadata.MetaData.*;
-import static org.elasticsearch.util.TimeValue.*;
+import static org.elasticsearch.action.search.type.TransportSearchHelper.*;
 
 /**
- * @author kimchy (Shay Banon)
+ * @author kimchy (shay.banon)
  */
-public class GatewayService extends AbstractLifecycleComponent<GatewayService> implements ClusterStateListener {
+public abstract class TransportSearchTypeAction extends BaseAction<SearchRequest, SearchResponse> {
 
-    private final Gateway gateway;
+    protected final ClusterService clusterService;
 
-    private final ThreadPool threadPool;
+    protected final SearchServiceTransportAction searchService;
 
-    private volatile ExecutorService executor;
+    protected final SearchPhaseController searchPhaseController;
 
-    private final ClusterService clusterService;
+    protected final TransportSearchCache searchCache;
 
-    private final MetaDataService metaDataService;
-
-    private final AtomicBoolean firstMasterRead = new AtomicBoolean();
-
-    @Inject public GatewayService(Settings settings, Gateway gateway, ClusterService clusterService,
-                                  ThreadPool threadPool, MetaDataService metaDataService) {
-        super(settings);
-        this.gateway = gateway;
+    public TransportSearchTypeAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
+                                     TransportSearchCache searchCache, SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
+        super(settings, threadPool);
         this.clusterService = clusterService;
-        this.threadPool = threadPool;
-        this.metaDataService = metaDataService;
+        this.searchCache = searchCache;
+        this.searchService = searchService;
+        this.searchPhaseController = searchPhaseController;
     }
 
-    @Override protected void doStart() throws ElasticSearchException {
-        gateway.start();
-        this.executor = Executors.newSingleThreadExecutor(DynamicExecutors.daemonThreadFactory(settings, "gateway"));
-        clusterService.add(this);
-    }
+    protected abstract class BaseAsyncAction<FirstResult extends SearchPhaseResult> {
 
-    @Override protected void doStop() throws ElasticSearchException {
-        clusterService.remove(this);
-        executor.shutdown();
-        try {
-            executor.awaitTermination(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            // ignore
-        }
-        gateway.stop();
-    }
+        protected final ActionListener<SearchResponse> listener;
 
-    @Override protected void doClose() throws ElasticSearchException {
-        gateway.close();
-    }
+        private final GroupShardsIterator shardsIts;
 
-    @Override public void clusterChanged(final ClusterChangedEvent event) {
-        if (lifecycle.started() && event.localNodeMaster()) {
-            if (event.firstMaster() && firstMasterRead.compareAndSet(false, true)) {
-                readFromGateway();
-            } else {
-                writeToGateway(event);
+        protected final SearchRequest request;
+
+        protected final ClusterState clusterState;
+        protected final DiscoveryNodes nodes;
+
+        protected final int expectedSuccessfulOps;
+
+        private final int expectedTotalOps;
+
+        protected final AtomicInteger successulOps = new AtomicInteger();
+
+        private final AtomicInteger totalOps = new AtomicInteger();
+
+        protected final Collection<ShardSearchFailure> shardFailures = searchCache.obtainShardFailures();
+
+        protected volatile ShardDoc[] sortedShardList;
+
+        protected final long startTime = System.currentTimeMillis();
+
+        protected BaseAsyncAction(SearchRequest request, ActionListener<SearchResponse> listener) {
+            this.request = request;
+            this.listener = listener;
+
+            this.clusterState = clusterService.state();
+            nodes = clusterState.nodes();
+
+            String[] concreteIndices = clusterState.metaData().concreteIndices(request.indices(), false, true);
+
+            for (String index : concreteIndices) {
+                clusterState.blocks().indexBlockedRaiseException(ClusterBlockLevel.READ, index);
+            }
+
+            Map<String, Set<String>> routingMap = clusterState.metaData().resolveSearchRouting(request.routing(), request.indices());
+
+            shardsIts = clusterService.operationRouting().searchShards(clusterState, request.indices(), concreteIndices, request.queryHint(), routingMap, request.preference());
+            expectedSuccessfulOps = shardsIts.size();
+            // we need to add 1 for non active partition, since we count it in the total!
+            expectedTotalOps = shardsIts.totalSizeWith1ForEmpty();
+
+            if (expectedSuccessfulOps == 0) {
+                // not search shards to search on...
+                throw new SearchPhaseExecutionException("initial", "No indices / shards to search on, requested indices are " + Arrays.toString(request.indices()), buildShardFailures());
             }
         }
-    }
 
-    private void writeToGateway(final ClusterChangedEvent event) {
-        if (!event.metaDataChanged()) {
-            return;
-        }
-        executor.execute(new Runnable() {
-            @Override public void run() {
-                logger.debug("Writing to gateway");
-                try {
-                    gateway.write(event.state().metaData());
-                    // TODO, we need to remember that we failed, maybe add a retry scheduler?
-                } catch (Exception e) {
-                    logger.error("Failed to write to gateway", e);
+        public void start() {
+            // count the local operations, and perform the non local ones
+            int localOperations = 0;
+            for (final ShardIterator shardIt : shardsIts) {
+                final ShardRouting shard = shardIt.firstOrNull();
+                if (shard != null) {
+                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                        localOperations++;
+                    } else {
+                        // do the remote operation here, the localAsync flag is not relevant
+                        performFirstPhase(shardIt);
+                    }
+                } else {
+                    // really, no shards active in this group
+                    onFirstPhaseResult(null, shardIt, null);
                 }
             }
-        });
-    }
-
-    private void readFromGateway() {
-        // we are the first master, go ahead and read and create indices
-        logger.debug("First master in the cluster, reading state from gateway");
-        executor.execute(new Runnable() {
-            @Override public void run() {
-                MetaData metaData;
-                try {
-                    metaData = gateway.read();
-                } catch (Exception e) {
-                    logger.error("Failed to read from gateway", e);
-                    return;
-                }
-                if (metaData == null) {
-                    logger.debug("No state read from gateway");
-                    return;
-                }
-                final MetaData fMetaData = metaData;
-                clusterService.submitStateUpdateTask("gateway (recovered meta-data)", new ClusterStateUpdateTask() {
-                    @Override public ClusterState execute(ClusterState currentState) {
-                        MetaData.Builder metaDataBuilder = newMetaDataBuilder()
-                                .metaData(currentState.metaData()).maxNumberOfShardsPerNode(fMetaData.maxNumberOfShardsPerNode());
-                        // go over the meta data and create indices, we don't really need to copy over
-                        // the meta data per index, since we create the index and it will be added automatically
-                        for (final IndexMetaData indexMetaData : fMetaData) {
-                            threadPool.execute(new Runnable() {
-                                @Override public void run() {
-                                    try {
-                                        metaDataService.createIndex(indexMetaData.index(), indexMetaData.settings(), indexMetaData.mappings(), timeValueMillis(10));
-                                    } catch (Exception e) {
-                                        logger.error("Failed to create index [" + indexMetaData.index() + "]", e);
+            // we have local operations, perform them now
+            if (localOperations > 0) {
+                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
+                    request.beforeLocalFork();
+                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
+                        @Override public void run() {
+                            for (final ShardIterator shardIt : shardsIts) {
+                                final ShardRouting shard = shardIt.firstOrNull();
+                                if (shard != null) {
+                                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                                        performFirstPhase(shardIt);
                                     }
                                 }
-                            });
+                            }
                         }
-                        return newClusterStateBuilder().state(currentState).metaData(metaDataBuilder).build();
+                    });
+                } else {
+                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
+                    if (localAsync) {
+                        request.beforeLocalFork();
                     }
-                });
+                    for (final ShardIterator shardIt : shardsIts) {
+                        final ShardRouting shard = shardIt.firstOrNull();
+                        if (shard != null) {
+                            if (shard.currentNodeId().equals(nodes.localNodeId())) {
+                                if (localAsync) {
+                                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
+                                        @Override public void run() {
+                                            performFirstPhase(shardIt);
+                                        }
+                                    });
+                                } else {
+                                    performFirstPhase(shardIt);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        });
+        }
+
+        void performFirstPhase(final ShardIterator shardIt) {
+            performFirstPhase(shardIt, shardIt.nextOrNull());
+        }
+
+        void performFirstPhase(final ShardIterator shardIt, final ShardRouting shard) {
+            if (shard == null) {
+                // no more active shards... (we should not really get here, but just for safety)
+                onFirstPhaseResult(null, shardIt, null);
+            } else {
+                DiscoveryNode node = nodes.get(shard.currentNodeId());
+                if (node == null) {
+                    onFirstPhaseResult(shard, shardIt, null);
+                } else {
+                    String[] filteringAliases = clusterState.metaData().filteringAliases(shard.index(), request.indices());
+                    sendExecuteFirstPhase(node, internalSearchRequest(shard, shardsIts.size(), request, filteringAliases), new SearchServiceListener<FirstResult>() {
+                        @Override public void onResult(FirstResult result) {
+                            onFirstPhaseResult(shard, result, shardIt);
+                        }
+
+                        @Override public void onFailure(Throwable t) {
+                            onFirstPhaseResult(shard, shardIt, t);
+                        }
+                    });
+                }
+            }
+        }
+
+        void onFirstPhaseResult(ShardRouting shard, FirstResult result, ShardIterator shardIt) {
+            result.shardTarget(new SearchShardTarget(shard.currentNodeId(), shard.index(), shard.id()));
+            processFirstPhaseResult(shard, result);
+            // increment all the "future" shards to update the total ops since we some may work and some may not...
+            // and when that happens, we break on total ops, so we must maintain them
+            int xTotalOps = totalOps.addAndGet(shardIt.remaining() + 1);
+            successulOps.incrementAndGet();
+            if (xTotalOps == expectedTotalOps) {
+                try {
+                    moveToSecondPhase();
+                } catch (Exception e) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "] while moving to second phase", e);
+                    }
+                    listener.onFailure(new ReduceSearchPhaseException(firstPhaseName(), "", e, buildShardFailures()));
+                }
+            }
+        }
+
+        void onFirstPhaseResult(@Nullable ShardRouting shard, final ShardIterator shardIt, Throwable t) {
+            if (totalOps.incrementAndGet() == expectedTotalOps) {
+                // e is null when there is no next active....
+                if (logger.isDebugEnabled()) {
+                    if (t != null) {
+                        if (shard != null) {
+                            logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
+                        } else {
+                            logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+                        }
+                    }
+                }
+                // no more shards, add a failure
+                if (t == null) {
+                    // no active shards
+                    shardFailures.add(new ShardSearchFailure("No active shards", new SearchShardTarget(null, shardIt.shardId().index().name(), shardIt.shardId().id())));
+                } else {
+                    shardFailures.add(new ShardSearchFailure(t));
+                }
+                if (successulOps.get() == 0) {
+                    // no successful ops, raise an exception
+                    listener.onFailure(new SearchPhaseExecutionException(firstPhaseName(), "total failure", buildShardFailures()));
+                } else {
+                    try {
+                        moveToSecondPhase();
+                    } catch (Exception e) {
+                        listener.onFailure(new ReduceSearchPhaseException(firstPhaseName(), "", e, buildShardFailures()));
+                    }
+                }
+            } else {
+                ShardRouting nextShard = shardIt.nextOrNull();
+                if (nextShard != null) {
+                    // trace log this exception
+                    if (logger.isTraceEnabled()) {
+                        if (t != null) {
+                            if (shard != null) {
+                                logger.trace(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
+                            } else {
+                                logger.trace(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+                            }
+                        }
+                    }
+                    performFirstPhase(shardIt, nextShard);
+                } else {
+                    // no more shards active, add a failure
+                    // e is null when there is no next active....
+                    if (logger.isDebugEnabled()) {
+                        if (t != null) {
+                            if (shard != null) {
+                                logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
+                            } else {
+                                logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+                            }
+                        }
+                    }
+                    if (t == null) {
+                        // no active shards
+                        shardFailures.add(new ShardSearchFailure("No active shards", new SearchShardTarget(null, shardIt.shardId().index().name(), shardIt.shardId().id())));
+                    } else {
+                        shardFailures.add(new ShardSearchFailure(t));
+                    }
+                }
+            }
+        }
+
+        /**
+         * Builds how long it took to execute the search.
+         */
+        protected final long buildTookInMillis() {
+            return System.currentTimeMillis() - startTime;
+        }
+
+        /**
+         * Builds the shard failures, and releases the cache (meaning this should only be called once!).
+         */
+        protected final ShardSearchFailure[] buildShardFailures() {
+            return TransportSearchHelper.buildShardFailures(shardFailures, searchCache);
+        }
+
+        /**
+         * Releases shard targets that are not used in the docsIdsToLoad.
+         */
+        protected void releaseIrrelevantSearchContexts(Map<SearchShardTarget, QuerySearchResultProvider> queryResults,
+                                                       Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad) {
+            if (docIdsToLoad == null) {
+                return;
+            }
+            // we only release search context that we did not fetch from if we are not scrolling
+            if (request.scroll() == null) {
+                for (Map.Entry<SearchShardTarget, QuerySearchResultProvider> entry : queryResults.entrySet()) {
+                    if (!docIdsToLoad.containsKey(entry.getKey())) {
+                        DiscoveryNode node = nodes.get(entry.getKey().nodeId());
+                        if (node != null) { // should not happen (==null) but safeguard anyhow
+                            searchService.sendFreeContext(node, entry.getValue().id());
+                        }
+                    }
+                }
+            }
+        }
+
+        protected abstract void sendExecuteFirstPhase(DiscoveryNode node, InternalSearchRequest request, SearchServiceListener<FirstResult> listener);
+
+        protected abstract void processFirstPhaseResult(ShardRouting shard, FirstResult result);
+
+        protected abstract void moveToSecondPhase() throws Exception;
+
+        protected abstract String firstPhaseName();
     }
 }

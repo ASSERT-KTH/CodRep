@@ -1,327 +1,530 @@
-import org.apache.derby.iapi.services.sanity.SanityManager;
+with a call to one of the static <code>DirectoryReader.open()</code> methods,
 
-/*
-
-   Derby - Class org.apache.derby.impl.io.vfmem.BlockedByteArray
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to You under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
-*/
-
-package org.apache.derby.impl.io.vfmem;
-
-import org.apache.derby.shared.common.sanity.SanityManager;
+package org.apache.lucene.index;
 
 /**
- * Stores data in blocks, and supports reading/writing data from/into these
- * blocks.
- * <p>
- * The blocked array is expanded and shrunk as required.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-public class BlockedByteArray {
 
-    /** Constant for 4 KB. */
-    private static final int _4K = 4*1024;
-    /** Constant for 8 KB. */
-    private static final int _8K = 8*1024;
-    /** Constant for 16 KB. */
-    private static final int _16K = 16*1024;
-    /** Constant for 32 KB. */
-    private static final int _32K = 32*1024;
-    /** The default block size. */
-    private static final int DEFAULT_BLOCKSIZE = _4K;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.WeakHashMap;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
-    /** The default number of slots for holding a block of data. */
-    private static final int INITIAL_BLOCK_HOLDER_SIZE = 1024;
-    /**
-     * Minimum number of holder slots to grow with when the block holder array
-     * has to grow to be able to reference all the data arrays.
-     */
-    private static final int MIN_HOLDER_GROWTH = 1024;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.DocumentStoredFieldVisitor;
+import org.apache.lucene.search.SearcherManager; // javadocs
+import org.apache.lucene.store.*;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.ReaderUtil;         // for javadocs
 
-    /** References to blocks of data. */
-    private byte[][] blocks;
-    /** The size of a block of data (the allocation unit). */
-    private int blockSize;
-    /** The number of allocated blocks. */
-    private int allocatedBlocks;
-    /** The number of bytes stored in the blocked byte array. */
-    private long length;
+/** IndexReader is an abstract class, providing an interface for accessing an
+ index.  Search of an index is done entirely through this abstract interface,
+ so that any subclass which implements it is searchable.
 
-    /**
-     * Creates a new blocked byte array with the default number of slots to
-     * hold byte arrays (blocks).
-     * <p>
-     * No blocks are pre-allocated.
-     *
-     * @see #INITIAL_BLOCK_HOLDER_SIZE
-     */
-    public BlockedByteArray() {
-        blocks = new byte[INITIAL_BLOCK_HOLDER_SIZE][];
+ <p>There are two different types of IndexReaders:
+ <ul>
+  <li>{@link AtomicReader}: These indexes do not consist of several sub-readers,
+  they are atomic. They support retrieval of stored fields, doc values, terms,
+  and postings.
+  <li>{@link CompositeReader}: Instances (like {@link DirectoryReader})
+  of this reader can only
+  be used to get stored fields from the underlying AtomicReaders,
+  but it is not possible to directly retrieve postings. To do that, get
+  the sub-readers via {@link CompositeReader#getSequentialSubReaders}.
+  Alternatively, you can mimic an {@link AtomicReader} (with a serious slowdown),
+  by wrapping composite readers with {@link SlowCompositeReaderWrapper}.
+ </ul>
+ 
+ <p>IndexReader instances for indexes on disk are usually constructed
+ with a call to one of the static <code>DirectoryReader,open()</code> methods,
+ e.g. {@link DirectoryReader#open(Directory)}. {@link DirectoryReader} implements
+ the {@link CompositeReader} interface, it is not possible to directly get postings.
+
+ <p> For efficiency, in this API documents are often referred to via
+ <i>document numbers</i>, non-negative integers which each name a unique
+ document in the index.  These document numbers are ephemeral -- they may change
+ as documents are added to and deleted from an index.  Clients should thus not
+ rely on a given document having the same number between sessions.
+
+ <p>
+ <a name="thread-safety"></a><p><b>NOTE</b>: {@link
+ IndexReader} instances are completely thread
+ safe, meaning multiple threads can call any of its methods,
+ concurrently.  If your application requires external
+ synchronization, you should <b>not</b> synchronize on the
+ <code>IndexReader</code> instance; use your own
+ (non-Lucene) objects instead.
+*/
+public abstract class IndexReader implements Closeable {
+  
+  private boolean closed = false;
+  private boolean closedByChild = false;
+  private final AtomicInteger refCount = new AtomicInteger(1);
+
+  IndexReader() {
+    if (!(this instanceof CompositeReader || this instanceof AtomicReader))
+      throw new Error("IndexReader should never be directly extended, subclass AtomicReader or CompositeReader instead.");
+  }
+  
+  /**
+   * A custom listener that's invoked when the IndexReader
+   * is closed.
+   *
+   * @lucene.experimental
+   */
+  public static interface ReaderClosedListener {
+    public void onClose(IndexReader reader);
+  }
+
+  private final Set<ReaderClosedListener> readerClosedListeners = 
+      Collections.synchronizedSet(new LinkedHashSet<ReaderClosedListener>());
+
+  private final Set<IndexReader> parentReaders = 
+      Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<IndexReader,Boolean>()));
+
+  /** Expert: adds a {@link ReaderClosedListener}.  The
+   * provided listener will be invoked when this reader is closed.
+   *
+   * @lucene.experimental */
+  public final void addReaderClosedListener(ReaderClosedListener listener) {
+    ensureOpen();
+    readerClosedListeners.add(listener);
+  }
+
+  /** Expert: remove a previously added {@link ReaderClosedListener}.
+   *
+   * @lucene.experimental */
+  public final void removeReaderClosedListener(ReaderClosedListener listener) {
+    ensureOpen();
+    readerClosedListeners.remove(listener);
+  }
+  
+  /** Expert: This method is called by {@code IndexReader}s which wrap other readers
+   * (e.g. {@link CompositeReader} or {@link FilterAtomicReader}) to register the parent
+   * at the child (this reader) on construction of the parent. When this reader is closed,
+   * it will mark all registered parents as closed, too. The references to parent readers
+   * are weak only, so they can be GCed once they are no longer in use.
+   * @lucene.experimental */
+  public final void registerParentReader(IndexReader reader) {
+    ensureOpen();
+    parentReaders.add(reader);
+  }
+
+  private void notifyReaderClosedListeners() {
+    synchronized(readerClosedListeners) {
+      for(ReaderClosedListener listener : readerClosedListeners) {
+        listener.onClose(this);
+      }
     }
+  }
 
-    /**
-     * Returns the byte at the given position.
-     *
-     * @param pos position to read from
-     * @return A single byte.
-     */
-    public synchronized int read(long pos) {
-        if (pos < length) {
-            int block = (int)(pos / blockSize);
-            int index = (int)(pos % blockSize);
-            return (blocks[block][index] & 0xFF);
-        }
-        return -1;
+  private void reportCloseToParentReaders() {
+    synchronized(parentReaders) {
+      for(IndexReader parent : parentReaders) {
+        parent.closedByChild = true;
+        // cross memory barrier by a fake write:
+        parent.refCount.addAndGet(0);
+        // recurse:
+        parent.reportCloseToParentReaders();
+      }
     }
+  }
 
-    /**
-     * Reads up to {@code len} bytes.
-     *
-     * @param pos the position to start reading at
-     * @param buf the destination buffer
-     * @param offset offset into the destination buffer
-     * @param len the number of bytes to read
-     * @return The number of bytes read.
-     */
-     public synchronized int read(long pos, byte[] buf, int offset, int len) {
-        // Due to the loop condition below, we have to check the length here.
-        // The check is only required because calling code expects an exception.
-        if (len < 0) {
-            throw new ArrayIndexOutOfBoundsException(len);
-        }
-        // Check for EOF.
-        if (pos >= length) {
-            return -1;
-        }
-        // Adjust the length if required.
-        len = (int)Math.min(len, length - pos);
-        int block = (int)(pos / blockSize);
-        int index = (int)(pos % blockSize);
-        int read = 0;
-        while (read < len) {
-            int toRead = Math.min(len - read, blockSize - index);
-            System.arraycopy(blocks[block], index, buf, offset + read, toRead);
-            read += toRead;
-            block++;
-            index = 0;
-        }
-        return read;
-     }
-
-    /**
-     * Returns the number of bytes allocated.
-     *
-     * @return Bytes allocated.
-     */
-    public synchronized long length() {
-        return length;
+  /** Expert: returns the current refCount for this reader */
+  public final int getRefCount() {
+    // NOTE: don't ensureOpen, so that callers can see
+    // refCount is 0 (reader is closed)
+    return refCount.get();
+  }
+  
+  /**
+   * Expert: increments the refCount of this IndexReader
+   * instance.  RefCounts are used to determine when a
+   * reader can be closed safely, i.e. as soon as there are
+   * no more references.  Be sure to always call a
+   * corresponding {@link #decRef}, in a finally clause;
+   * otherwise the reader may never be closed.  Note that
+   * {@link #close} simply calls decRef(), which means that
+   * the IndexReader will not really be closed until {@link
+   * #decRef} has been called for all outstanding
+   * references.
+   *
+   * @see #decRef
+   * @see #tryIncRef
+   */
+  public final void incRef() {
+    ensureOpen();
+    refCount.incrementAndGet();
+  }
+  
+  /**
+   * Expert: increments the refCount of this IndexReader
+   * instance only if the IndexReader has not been closed yet
+   * and returns <code>true</code> iff the refCount was
+   * successfully incremented, otherwise <code>false</code>.
+   * If this method returns <code>false</code> the reader is either
+   * already closed or is currently been closed. Either way this
+   * reader instance shouldn't be used by an application unless
+   * <code>true</code> is returned.
+   * <p>
+   * RefCounts are used to determine when a
+   * reader can be closed safely, i.e. as soon as there are
+   * no more references.  Be sure to always call a
+   * corresponding {@link #decRef}, in a finally clause;
+   * otherwise the reader may never be closed.  Note that
+   * {@link #close} simply calls decRef(), which means that
+   * the IndexReader will not really be closed until {@link
+   * #decRef} has been called for all outstanding
+   * references.
+   *
+   * @see #decRef
+   * @see #incRef
+   */
+  public final boolean tryIncRef() {
+    int count;
+    while ((count = refCount.get()) > 0) {
+      if (refCount.compareAndSet(count, count+1)) {
+        return true;
+      }
     }
+    return false;
+  }
 
-    /**
-     * Changes the allocated length of the data.
-     * <p>
-     * If the new length is larger than the current length, the blocked byte
-     * array will be extended with new blocks. If the new length is smaller,
-     * existing (allocated) blocks will be removed if possible.
-     *
-     * @param newLength the new length of the allocated data in bytes
-     */
-    public synchronized void setLength(final long newLength) {
-        // If capacity is requested before any writes has taken place.
-        if (blockSize == 0) {
-            checkBlockSize((int)Math.min(Integer.MAX_VALUE, newLength));
-        }
-        final long currentCapacity = (long)allocatedBlocks * blockSize;
-        if (newLength > currentCapacity) {
-            // Allocate more blocks.
-            increaseCapacity(newLength);
-        } else if (newLength < currentCapacity) {
-            if (newLength <= 0L) {
-                // Just clear everything.
-                allocatedBlocks = 0;
-                blocks = new byte[INITIAL_BLOCK_HOLDER_SIZE][];
-            } else {
-                // Nullify the surplus data.
-                int blocksToKeep = (int)(newLength / blockSize) +1;
-                for (int i=blocksToKeep; i <= allocatedBlocks; i++) {
-                    blocks[i] = null;
-                }
-                allocatedBlocks = Math.min(allocatedBlocks, blocksToKeep);
-                // We keep the holder slots around, since the overhead for
-                // doing so is pretty small.
-            }
-        }
-        length = Math.max(0L, newLength);
+  /**
+   * Expert: decreases the refCount of this IndexReader
+   * instance.  If the refCount drops to 0, then this
+   * reader is closed.  If an exception is hit, the refCount
+   * is unchanged.
+   *
+   * @throws IOException in case an IOException occurs in  doClose()
+   *
+   * @see #incRef
+   */
+  public final void decRef() throws IOException {
+    // only check refcount here (don't call ensureOpen()), so we can
+    // still close the reader if it was made invalid by a child:
+    if (refCount.get() <= 0) {
+      throw new AlreadyClosedException("this IndexReader is closed");
     }
-
-    /**
-     * Writes the given bytes into the blocked byte array.
-     *
-     * @param pos the position to start writing at
-     * @param buf the source buffer
-     * @param offset the offset into the source buffer
-     * @param len the number of bytes to write
-     * @return The number of bytes written.
-     */
-    public synchronized int writeBytes(final long pos, final byte[] buf,
-                                       int offset, final int len) {
-        // Optimize block size if possible on first write.
-        if (blockSize == 0) {
-            checkBlockSize(len);
+    
+    final int rc = refCount.decrementAndGet();
+    if (rc == 0) {
+      boolean success = false;
+      try {
+        doClose();
+        success = true;
+      } finally {
+        if (!success) {
+          // Put reference back on failure
+          refCount.incrementAndGet();
         }
-        // Due to the loop condition below, we have to check the length here.
-        // The check is only required because calling code expects an exception.
-        if (len < 0) {
-            throw new ArrayIndexOutOfBoundsException(len);
-        }
-        // Increase the capacity if required.
-        increaseCapacity(pos + len);
-        // Calculate the block number and the index within this block.
-        int block = (int)(pos / blockSize);
-        int index = (int)(pos % blockSize);
-
-        int written = 0;
-        while (written < len) {
-            int toWrite = Math.min(len - written, blockSize - index);
-            System.arraycopy(buf, offset, blocks[block], index, toWrite);
-            written += toWrite;
-            offset += toWrite;
-            if (written < len) {
-                block++;
-                index = 0;
-            } else {
-                index += toWrite;
-            }
-        }
-
-        // Update the length if we wrote past the previous length.
-        length = Math.max(length, pos + len);
-        return written;
+      }
+      reportCloseToParentReaders();
+      notifyReaderClosedListeners();
+    } else if (rc < 0) {
+      throw new IllegalStateException("too many decRef calls: refCount is " + rc + " after decrement");
     }
-
-    /**
-     * Writes the given byte into the blocked byte array.
-     *
-     * @param pos the position to write the byte at
-     * @param b the byte to write
-     * @return {@code 1}, which is the number of bytes written.
-     */
-    public synchronized int writeByte(long pos, byte b) {
-        // Optimize block size if possible on first write.
-        if (blockSize == 0) {
-            checkBlockSize(0);
-        }
-        // Increase the capacity if required.
-        increaseCapacity(pos);
-        // Calculate the block number and the index within this block.
-        int block = (int)(pos / blockSize);
-        int index = (int)(pos % blockSize);
-        blocks[block][index] = b;
-        // Update the length if we wrote past the previous length.
-        length = Math.max(length, pos +1);
-        return 1; // The number of bytes written, always one.
+  }
+  
+  /**
+   * @throws AlreadyClosedException if this IndexReader is closed
+   */
+  protected final void ensureOpen() throws AlreadyClosedException {
+    if (refCount.get() <= 0) {
+      throw new AlreadyClosedException("this IndexReader is closed");
     }
-
-    /**
-     * Returns an input stream serving the data in the blocked byte array.
-     *
-     * @return An {@code InputStream}-object.
-     */
-    synchronized BlockedByteArrayInputStream getInputStream() {
-        return new BlockedByteArrayInputStream(this, 0L);
+    // the happens before rule on reading the refCount, which must be after the fake write,
+    // ensures that we see the value:
+    if (closedByChild) {
+      throw new AlreadyClosedException("this IndexReader cannot be used anymore as one of its child readers was closed");
     }
+  }
+  
+  /** {@inheritDoc}
+   * <p>For caching purposes, {@code IndexReader} subclasses are not allowed
+   * to implement equals/hashCode, so methods are declared final.
+   * To lookup instances from caches use {@link #getCoreCacheKey} and 
+   * {@link #getCombinedCoreAndDeletesKey}.
+   */
+  @Override
+  public final boolean equals(Object obj) {
+    return (this == obj);
+  }
+  
+  /** {@inheritDoc}
+   * <p>For caching purposes, {@code IndexReader} subclasses are not allowed
+   * to implement equals/hashCode, so methods are declared final.
+   * To lookup instances from caches use {@link #getCoreCacheKey} and 
+   * {@link #getCombinedCoreAndDeletesKey}.
+   */
+  @Override
+  public final int hashCode() {
+    return System.identityHashCode(this);
+  }
+  
+  /** Returns a IndexReader reading the index in the given
+   *  Directory
+   * @param directory the index directory
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   * @deprecated Use {@link DirectoryReader#open(Directory)}
+   */
+  @Deprecated
+  public static DirectoryReader open(final Directory directory) throws CorruptIndexException, IOException {
+    return DirectoryReader.open(directory);
+  }
+  
+  /** Expert: Returns a IndexReader reading the index in the given
+   *  Directory with the given termInfosIndexDivisor.
+   * @param directory the index directory
+   * @param termInfosIndexDivisor Subsamples which indexed
+   *  terms are loaded into RAM. This has the same effect as {@link
+   *  IndexWriterConfig#setTermIndexInterval} except that setting
+   *  must be done at indexing time while this setting can be
+   *  set per reader.  When set to N, then one in every
+   *  N*termIndexInterval terms in the index is loaded into
+   *  memory.  By setting this to a value > 1 you can reduce
+   *  memory usage, at the expense of higher latency when
+   *  loading a TermInfo.  The default value is 1.  Set this
+   *  to -1 to skip loading the terms index entirely.
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   * @deprecated Use {@link DirectoryReader#open(Directory,int)}
+   */
+  @Deprecated
+  public static DirectoryReader open(final Directory directory, int termInfosIndexDivisor) throws CorruptIndexException, IOException {
+    return DirectoryReader.open(directory, termInfosIndexDivisor);
+  }
+  
+  /**
+   * Open a near real time IndexReader from the {@link org.apache.lucene.index.IndexWriter}.
+   *
+   * @param writer The IndexWriter to open from
+   * @param applyAllDeletes If true, all buffered deletes will
+   * be applied (made visible) in the returned reader.  If
+   * false, the deletes are not applied but remain buffered
+   * (in IndexWriter) so that they will be applied in the
+   * future.  Applying deletes can be costly, so if your app
+   * can tolerate deleted documents being returned you might
+   * gain some performance by passing false.
+   * @return The new IndexReader
+   * @throws CorruptIndexException
+   * @throws IOException if there is a low-level IO error
+   *
+   * @see DirectoryReader#openIfChanged(DirectoryReader,IndexWriter,boolean)
+   *
+   * @lucene.experimental
+   * @deprecated Use {@link DirectoryReader#open(IndexWriter,boolean)}
+   */
+  @Deprecated
+  public static DirectoryReader open(final IndexWriter writer, boolean applyAllDeletes) throws CorruptIndexException, IOException {
+    return DirectoryReader.open(writer, applyAllDeletes);
+  }
 
-    /**
-     * Returns an output stream writing data into the blocked byte array.
-     *
-     * @param pos initial position of the output stream
-     * @return An {@code OutputStream}-object.
-     */
-    synchronized BlockedByteArrayOutputStream getOutputStream(long pos) {
-        if (pos < 0) {
-            throw new IllegalArgumentException(
-                                        "Position cannot be negative: " + pos);
-        }
-        return new BlockedByteArrayOutputStream(this, pos);
-    }
+  /** Expert: returns an IndexReader reading the index in the given
+   *  {@link IndexCommit}.
+   * @param commit the commit point to open
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   * @deprecated Use {@link DirectoryReader#open(IndexCommit)}
+   */
+  @Deprecated
+  public static DirectoryReader open(final IndexCommit commit) throws CorruptIndexException, IOException {
+    return DirectoryReader.open(commit);
+  }
 
-    /**
-     * Releases this array.
-     */
-    synchronized void release() {
-        blocks = null;
-        length = allocatedBlocks = -1;
-    }
 
-    /**
-     * Tries to optimize the block size by setting it equal to the the page
-     * size used by the database.
-     * <p>
-     * Since we don't have a way of knowing which page size will be used, wait
-     * to set the block size until the first write request and see how many
-     * bytes are written then.
-     *
-     * @param len the requested number of bytes to be written
-     */
-    private void checkBlockSize(int len) {
-        // Optimize on the block size (if possible).
-        if (len == _4K || len == _8K || len == _16K || len == _32K) {
-            blockSize = len;
-        } else {
-            blockSize = DEFAULT_BLOCKSIZE;
-        }
-    }
+  /** Expert: returns an IndexReader reading the index in the given
+   *  {@link IndexCommit} and termInfosIndexDivisor.
+   * @param commit the commit point to open
+   * @param termInfosIndexDivisor Subsamples which indexed
+   *  terms are loaded into RAM. This has the same effect as {@link
+   *  IndexWriterConfig#setTermIndexInterval} except that setting
+   *  must be done at indexing time while this setting can be
+   *  set per reader.  When set to N, then one in every
+   *  N*termIndexInterval terms in the index is loaded into
+   *  memory.  By setting this to a value > 1 you can reduce
+   *  memory usage, at the expense of higher latency when
+   *  loading a TermInfo.  The default value is 1.  Set this
+   *  to -1 to skip loading the terms index entirely.
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   * @deprecated Use {@link DirectoryReader#open(IndexCommit,int)}
+   */
+  @Deprecated
+  public static DirectoryReader open(final IndexCommit commit, int termInfosIndexDivisor) throws CorruptIndexException, IOException {
+    return DirectoryReader.open(commit, termInfosIndexDivisor);
+  }
 
-    /**
-     * Increases the capacity of this blocked byte array by allocating more
-     * blocks.
-     *
-     * @param lastIndex the index that must fit into the array
-     */
-    //@GuardedBy("this")
-    private void increaseCapacity(long lastIndex) {
-        if (SanityManager.DEBUG) {
-            SanityManager.ASSERT(blockSize > 0, "Invalid/unset block size");
-        }
-        // Safe-guard to avoid overwriting existing data.
-        if (lastIndex < (long)allocatedBlocks * blockSize) {
-            return;
-        }
-        // Calculate required number of blocks, and create those lacking.
-        // We may allocate one more array than required.
-        final int blocksRequired = (int)((lastIndex) / blockSize) +1;
-        if (blocksRequired > blocks.length) {
-            // Grow the block holder array.
-            // Make sure we have enough slots. Note that we only grow the block
-            // holder array, we don't fill it with data blocks before needed.
-            int growTo = Math.max(
-                    // Grow at least ~33%.
-                    blocks.length + (blocks.length / 3),
-                    // For cases where we need to grow more than 33%.
-                    blocksRequired + MIN_HOLDER_GROWTH);
-            byte[][] tmpBlocks = blocks;
-            blocks = new byte[growTo][];
-            // Copy the data array references.
-            System.arraycopy(tmpBlocks, 0, blocks, 0, allocatedBlocks);
-        }
-        // Allocate new data arrays to accomodate lastIndex bytes.
-        for (int i=allocatedBlocks; i < blocksRequired; i++) {
-            blocks[i] = new byte[blockSize];
-        }
-        allocatedBlocks = blocksRequired;
+  /** Retrieve term vectors for this document, or null if
+   *  term vectors were not indexed.  The returned Fields
+   *  instance acts like a single-document inverted index
+   *  (the docID will be 0). */
+  public abstract Fields getTermVectors(int docID)
+          throws IOException;
+
+  /** Retrieve term vector for this document and field, or
+   *  null if term vectors were not indexed.  The returned
+   *  Fields instance acts like a single-document inverted
+   *  index (the docID will be 0). */
+  public final Terms getTermVector(int docID, String field)
+    throws IOException {
+    Fields vectors = getTermVectors(docID);
+    if (vectors == null) {
+      return null;
     }
+    return vectors.terms(field);
+  }
+
+  /** Returns the number of documents in this index. */
+  public abstract int numDocs();
+
+  /** Returns one greater than the largest possible document number.
+   * This may be used to, e.g., determine how big to allocate an array which
+   * will have an element for every document number in an index.
+   */
+  public abstract int maxDoc();
+
+  /** Returns the number of deleted documents. */
+  public final int numDeletedDocs() {
+    return maxDoc() - numDocs();
+  }
+
+  /** Expert: visits the fields of a stored document, for
+   *  custom processing/loading of each field.  If you
+   *  simply want to load all fields, use {@link
+   *  #document(int)}.  If you want to load a subset, use
+   *  {@link DocumentStoredFieldVisitor}.  */
+  public abstract void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException;
+  
+  /**
+   * Returns the stored fields of the <code>n</code><sup>th</sup>
+   * <code>Document</code> in this index.  This is just
+   * sugar for using {@link DocumentStoredFieldVisitor}.
+   * <p>
+   * <b>NOTE:</b> for performance reasons, this method does not check if the
+   * requested document is deleted, and therefore asking for a deleted document
+   * may yield unspecified results. Usually this is not required, however you
+   * can test if the doc is deleted by checking the {@link
+   * Bits} returned from {@link MultiFields#getLiveDocs}.
+   *
+   * <b>NOTE:</b> only the content of a field is returned,
+   * if that field was stored during indexing.  Metadata
+   * like boost, omitNorm, IndexOptions, tokenized, etc.,
+   * are not preserved.
+   * 
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  // TODO: we need a separate StoredField, so that the
+  // Document returned here contains that class not
+  // IndexableField
+  public final Document document(int docID) throws CorruptIndexException, IOException {
+    final DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+    document(docID, visitor);
+    return visitor.getDocument();
+  }
+
+  /**
+   * Like {@link #document(int)} but only loads the specified
+   * fields.  Note that this is simply sugar for {@link
+   * DocumentStoredFieldVisitor#DocumentStoredFieldVisitor(Set)}.
+   */
+  public final Document document(int docID, Set<String> fieldsToLoad) throws CorruptIndexException, IOException {
+    final DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor(fieldsToLoad);
+    document(docID, visitor);
+    return visitor.getDocument();
+  }
+
+  /** Returns true if any documents have been deleted */
+  public abstract boolean hasDeletions();
+
+  /**
+   * Closes files associated with this index.
+   * Also saves any new deletions to disk.
+   * No other methods should be called after this has been called.
+   * @throws IOException if there is a low-level IO error
+   */
+  public final synchronized void close() throws IOException {
+    if (!closed) {
+      decRef();
+      closed = true;
+    }
+  }
+  
+  /** Implements close. */
+  protected abstract void doClose() throws IOException;
+
+  /**
+   * Expert: Returns a the root {@link IndexReaderContext} for this
+   * {@link IndexReader}'s sub-reader tree. Iff this reader is composed of sub
+   * readers ,ie. this reader being a composite reader, this method returns a
+   * {@link CompositeReaderContext} holding the reader's direct children as well as a
+   * view of the reader tree's atomic leaf contexts. All sub-
+   * {@link IndexReaderContext} instances referenced from this readers top-level
+   * context are private to this reader and are not shared with another context
+   * tree. For example, IndexSearcher uses this API to drive searching by one
+   * atomic leaf reader at a time. If this reader is not composed of child
+   * readers, this method returns an {@link AtomicReaderContext}.
+   * <p>
+   * Note: Any of the sub-{@link CompositeReaderContext} instances reference from this
+   * top-level context holds a <code>null</code> {@link CompositeReaderContext#leaves()}
+   * reference. Only the top-level context maintains the convenience leaf-view
+   * for performance reasons.
+   * 
+   * @lucene.experimental
+   */
+  public abstract IndexReaderContext getTopReaderContext();
+
+  /** Expert: Returns a key for this IndexReader, so FieldCache/CachingWrapperFilter can find
+   * it again.
+   * This key must not have equals()/hashCode() methods, so &quot;equals&quot; means &quot;identical&quot;. */
+  public Object getCoreCacheKey() {
+    // Don't can ensureOpen since FC calls this (to evict)
+    // on close
+    return this;
+  }
+
+  /** Expert: Returns a key for this IndexReader that also includes deletions,
+   * so FieldCache/CachingWrapperFilter can find it again.
+   * This key must not have equals()/hashCode() methods, so &quot;equals&quot; means &quot;identical&quot;. */
+  public Object getCombinedCoreAndDeletesKey() {
+    // Don't can ensureOpen since FC calls this (to evict)
+    // on close
+    return this;
+  }
+  
+  /** Returns the number of documents containing the 
+   * <code>term</code>.  This method returns 0 if the term or
+   * field does not exists.  This method does not take into
+   * account deleted documents that have not yet been merged
+   * away. */
+  public final int docFreq(Term term) throws IOException {
+    return docFreq(term.field(), term.bytes());
+  }
+
+  /** Returns the number of documents containing the
+   * <code>term</code>.  This method returns 0 if the term or
+   * field does not exists.  This method does not take into
+   * account deleted documents that have not yet been merged
+   * away. */
+  public abstract int docFreq(String field, BytesRef term) throws IOException;
 }

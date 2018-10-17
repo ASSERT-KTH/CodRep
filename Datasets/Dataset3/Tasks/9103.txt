@@ -1,4 +1,4 @@
-import org.wildfly.clustering.web.infinispan.logging.InfinispanWebLogger;
+import org.jboss.as.messaging.MessagingLogger;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -21,104 +21,270 @@ import org.wildfly.clustering.web.infinispan.logging.InfinispanWebLogger;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.wildfly.clustering.web.infinispan.session;
 
-import java.security.AccessController;
+package org.jboss.as.messaging.deployment;
+
+import static org.jboss.as.messaging.CommonAttributes.CONNECTOR;
+import static org.jboss.as.messaging.CommonAttributes.DEFAULT;
+import static org.jboss.as.messaging.CommonAttributes.HORNETQ_SERVER;
+import static org.jboss.as.messaging.CommonAttributes.JGROUPS_CHANNEL;
+import static org.jboss.as.messaging.CommonAttributes.NO_TX;
+import static org.jboss.as.messaging.CommonAttributes.POOLED_CONNECTION_FACTORY;
+import static org.jboss.as.messaging.CommonAttributes.XA_TX;
+import static org.jboss.as.messaging.jms.ConnectionFactoryAttributes.Common.DISCOVERY_GROUP_NAME;
+import static org.jboss.as.messaging.jms.ConnectionFactoryAttributes.Pooled.MAX_POOL_SIZE;
+import static org.jboss.as.messaging.jms.ConnectionFactoryAttributes.Pooled.MIN_POOL_SIZE;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 
-import org.jboss.as.clustering.concurrent.Scheduler;
-import org.jboss.as.clustering.infinispan.invoker.Remover;
-import org.jboss.threads.JBossThreadFactory;
-import org.wildfly.clustering.web.Batch;
-import org.wildfly.clustering.web.Batcher;
-import org.wildfly.clustering.web.infinispan.InfinispanWebLogger;
-import org.wildfly.clustering.web.session.ImmutableSession;
-import org.wildfly.security.manager.action.GetAccessControlContextAction;
+import org.jboss.as.connector.services.resourceadapters.ConnectionFactoryReferenceFactoryService;
+import org.jboss.as.controller.OperationFailedException;
+import org.jboss.as.controller.PathAddress;
+import org.jboss.as.controller.PathElement;
+import org.jboss.as.ee.component.InjectionSource;
+import org.jboss.as.messaging.CommonAttributes;
+import org.jboss.as.messaging.MessagingExtension;
+import org.jboss.as.messaging.logging.MessagingLogger;
+import org.jboss.as.messaging.jms.ConnectionFactoryAttribute;
+import org.jboss.as.messaging.jms.ConnectionFactoryAttributes;
+import org.jboss.as.messaging.jms.PooledConnectionFactoryConfigProperties;
+import org.jboss.as.messaging.jms.PooledConnectionFactoryConfigurationRuntimeHandler;
+import org.jboss.as.messaging.jms.PooledConnectionFactoryDefinition;
+import org.jboss.as.messaging.jms.PooledConnectionFactoryService;
+import org.jboss.as.naming.ManagedReferenceFactory;
+import org.jboss.as.naming.deployment.ContextNames;
+import org.jboss.as.server.deployment.DeploymentPhaseContext;
+import org.jboss.as.server.deployment.DeploymentUnit;
+import org.jboss.as.server.deployment.DeploymentUnitProcessingException;
+import org.jboss.dmr.ModelNode;
+import org.jboss.dmr.Property;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.ServiceBuilder;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.ServiceTarget;
 
 /**
- * Session expiration scheduler that eagerly expires sessions as soon as they are eligible.
- * If/When Infinispan implements expiration notifications (ISPN-694), this will be obsolete.
- * @author Paul Ferraro
+ * @author <a href="http://jmesnil.net/">Jeff Mesnil</a> (c) 2013 Red Hat inc.
  */
-public class SessionExpirationScheduler implements Scheduler<ImmutableSession> {
+public class DirectJMSConnectionFactoryInjectionSource extends InjectionSource {
 
-    final Map<String, Future<?>> expirationFutures = new ConcurrentHashMap<>();
-    final Batcher batcher;
-    final Remover<String> remover;
-    private final ScheduledExecutorService executor;
+    /*
+    String description() default "";
+    String name();
+    String interfaceName() default "javax.jms.ConnectionFactory";
+    String className() default "";
+    String resourceAdapter() default "";
+    String user() default "";
+    String password() default "";
+    String clientId() default "";
+    String[] properties() default {};
+    boolean transactional() default true;
+    int maxPoolSize() default -1;
+    int minPoolSize() default -1;
+    */
 
-    public SessionExpirationScheduler(Batcher batcher, Remover<String> remover) {
-        this(batcher, remover, createScheduledExecutor(createThreadFactory()));
+    private final String name;
+    // not used: HornetQ CF implements all JMS CF interfaces
+    private String interfaceName;
+    // not used
+    private String className;
+    private String resourceAdapter;
+    private String user;
+    private String password;
+    private String clientId;
+    private Map<String, String> properties = new HashMap<String, String>();
+    private boolean transactional;
+    private int maxPoolSize;
+    private int minPoolSize;
+
+    public DirectJMSConnectionFactoryInjectionSource(String name) {
+        this.name = name;
     }
 
-    private static ThreadFactory createThreadFactory() {
-        return new JBossThreadFactory(new ThreadGroup(SessionExpirationScheduler.class.getSimpleName()), Boolean.FALSE, null, "%G - %t", null, null, AccessController.doPrivileged(GetAccessControlContextAction.getInstance()));
+    void setInterfaceName(String interfaceName) {
+        this.interfaceName = interfaceName;
     }
 
-    private static ScheduledExecutorService createScheduledExecutor(ThreadFactory factory) {
-        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, factory);
-        executor.setRemoveOnCancelPolicy(true);
-        return executor;
+    void setClassName(String className) {
+        this.className = className;
     }
 
-    public SessionExpirationScheduler(Batcher batcher, Remover<String> remover, ScheduledExecutorService executor) {
-        this.batcher = batcher;
-        this.remover = remover;
-        this.executor = executor;
+    void setResourceAdapter(String resourceAdapter) {
+        this.resourceAdapter = resourceAdapter;
     }
+
+    void setUser(String user) {
+        this.user = user;
+    }
+
+    void setPassword(String password) {
+        this.password = password;
+    }
+
+    void setClientId(String clientId) {
+        this.clientId = clientId;
+    }
+
+    void addProperty(String key, String value) {
+        properties.put(key, value);
+    }
+
+    void setTransactional(boolean transactional) {
+        this.transactional = transactional;
+    }
+
+    void setMaxPoolSize(int maxPoolSize) {
+        this.maxPoolSize = maxPoolSize;
+    }
+
+    void setMinPoolSize(int minPoolSize) {
+        this.minPoolSize = minPoolSize;
+    }
+
 
     @Override
-    public void cancel(ImmutableSession session) {
-        Future<?> future = this.expirationFutures.remove(session.getId());
-        if (future != null) {
-            future.cancel(false);
+    public void getResourceValue(ResolutionContext context, ServiceBuilder<?> serviceBuilder, DeploymentPhaseContext phaseContext, Injector<ManagedReferenceFactory> injector) throws DeploymentUnitProcessingException {
+        final DeploymentUnit deploymentUnit = phaseContext.getDeploymentUnit();
+
+        try {
+            startedPooledConnectionFactory(context, name, serviceBuilder, phaseContext.getServiceTarget(), deploymentUnit, injector);
+        } catch (OperationFailedException e) {
+            throw new DeploymentUnitProcessingException(e);
         }
     }
 
-    @Override
-    public void schedule(ImmutableSession session) {
-        long timeout = session.getMetaData().getMaxInactiveInterval(TimeUnit.MILLISECONDS);
-        if (timeout > 0) {
-            String id = session.getId();
-            InfinispanWebLogger.ROOT_LOGGER.tracef("Session %s will expire in %d ms", id, timeout);
-            this.expirationFutures.put(id, this.executor.schedule(new ExpirationTask(id), timeout, TimeUnit.MILLISECONDS));
+    private void startedPooledConnectionFactory(ResolutionContext context, String name, ServiceBuilder<?> serviceBuilder, ServiceTarget serviceTarget, DeploymentUnit deploymentUnit, Injector<ManagedReferenceFactory> injector) throws DeploymentUnitProcessingException, OperationFailedException {
+        Map<String, String> props = new HashMap<>(properties);
+        List<String> connectors = getConnectors(props);
+        clearUnknownProperties(properties);
+
+        ModelNode model = new ModelNode();
+        for (String connector : connectors) {
+            model.get(CONNECTOR).add(connector);
         }
+        for (Map.Entry<String, String> entry : properties.entrySet()) {
+            model.get(entry.getKey()).set(entry.getValue());
+        }
+        model.get(MIN_POOL_SIZE.getName()).set(minPoolSize);
+        model.get(MAX_POOL_SIZE.getName()).set(maxPoolSize);
+        if (user != null && !user.isEmpty()) {
+            model.get(ConnectionFactoryAttributes.Pooled.USER.getName()).set(user);
+        }
+        if (password != null && !password.isEmpty()) {
+            model.get(ConnectionFactoryAttributes.Pooled.PASSWORD.getName()).set(password);
+        }
+        if (clientId != null && !clientId.isEmpty()) {
+            model.get(CommonAttributes.CLIENT_ID.getName()).set(clientId);
+        }
+
+        final String discoveryGroupName = properties.containsKey(DISCOVERY_GROUP_NAME.getName()) ? properties.get(DISCOVERY_GROUP_NAME.getName()) : null;
+        if (discoveryGroupName != null) {
+            model.get(DISCOVERY_GROUP_NAME.getName()).set(discoveryGroupName);
+        }
+        final String jgroupsChannelName = properties.containsKey(JGROUPS_CHANNEL.getName()) ? properties.get(JGROUPS_CHANNEL.getName()) : null;
+        if (jgroupsChannelName != null) {
+            model.get(JGROUPS_CHANNEL.getName()).set(jgroupsChannelName);
+        }
+
+        List<PooledConnectionFactoryConfigProperties> adapterParams = getAdapterParams(model);
+        String txSupport = transactional ? XA_TX : NO_TX;
+
+        final String pcfName = uniqueName(context, name);
+        final ContextNames.BindInfo bindInfo = ContextNames.bindInfoForEnvEntry(context.getApplicationName(), context.getModuleName(), context.getComponentName(), !context.isCompUsesModule(), name);
+        PooledConnectionFactoryService.installService(null, null, serviceTarget, pcfName, getHornetQServerName(), connectors,
+                discoveryGroupName, jgroupsChannelName, adapterParams,
+                bindInfo,
+                txSupport, minPoolSize, maxPoolSize, true);
+
+        final ServiceName referenceFactoryServiceName = ConnectionFactoryReferenceFactoryService.SERVICE_NAME_BASE
+                .append(bindInfo.getBinderServiceName());
+        serviceBuilder.addDependency(referenceFactoryServiceName, ManagedReferenceFactory.class, injector);
+
+        //create the management registration
+        String managementName = managementName(context, name);
+        final PathElement serverElement = PathElement.pathElement(HORNETQ_SERVER, getHornetQServerName());
+        deploymentUnit.createDeploymentSubModel(MessagingExtension.SUBSYSTEM_NAME, serverElement);
+        final PathElement pcfPath = PathElement.pathElement(POOLED_CONNECTION_FACTORY, managementName);
+        PathAddress registration = PathAddress.pathAddress(serverElement, pcfPath);
+        MessagingXmlInstallDeploymentUnitProcessor.createDeploymentSubModel(registration, deploymentUnit);
+        PooledConnectionFactoryConfigurationRuntimeHandler.INSTANCE.registerResource(getHornetQServerName(), managementName, model);
     }
 
-    @Override
-    public void close() {
-        this.executor.shutdown();
-    }
-
-    private class ExpirationTask implements Runnable {
-        private final String id;
-
-        public ExpirationTask(String id) {
-            this.id = id;
-        }
-
-        @Override
-        public void run() {
-            SessionExpirationScheduler.this.expirationFutures.remove(this.id);
-            InfinispanWebLogger.ROOT_LOGGER.tracef("Expiring session %s", this.id);
-            Batch batch = SessionExpirationScheduler.this.batcher.startBatch();
-            boolean success = false;
-            try {
-                SessionExpirationScheduler.this.remover.remove(this.id);
-                success = true;
-            } finally {
-                if (success) {
-                    batch.close();
-                } else {
-                    batch.discard();
+    private List<String> getConnectors(Map<String, String> props) {
+        List<String> connectors = new ArrayList<>();
+        if (props.containsKey(CONNECTOR)) {
+            String connectorsStr = properties.remove(CONNECTOR);
+            for (String s : connectorsStr.split(",")) {
+                String connector = s.trim();
+                if (!connector.isEmpty()) {
+                    connectors.add(connector);
                 }
             }
         }
+        return connectors;
+    }
+
+    void clearUnknownProperties(final Map<String, String> props) {
+        Set<String> attributeNames = PooledConnectionFactoryDefinition.getAttributes().keySet();
+
+        final Iterator<Map.Entry<String, String>> it = props.entrySet().iterator();
+        while (it.hasNext()) {
+            final Map.Entry<String, String> entry = it.next();
+            String value = entry.getKey();
+            if (value == null || "".equals(value)) {
+                it.remove();
+            } else if (!attributeNames.contains(entry.getKey())) {
+                MessagingLogger.MESSAGING_LOGGER.unknownPooledConnectionFactoryAttribute(entry.getKey());
+                it.remove();
+            }
+        }
+    }
+
+    private static String uniqueName(InjectionSource.ResolutionContext context, final String jndiName) {
+        StringBuilder uniqueName = new StringBuilder();
+        return uniqueName.append(context.getApplicationName() + "_")
+                .append(managementName(context, jndiName))
+                .toString();
+    }
+
+    private static String managementName(InjectionSource.ResolutionContext context, final String jndiName) {
+        StringBuilder uniqueName = new StringBuilder();
+        uniqueName.append(context.getModuleName() + "_");
+        if (context.getComponentName() != null) {
+            uniqueName.append(context.getComponentName() + "_");
+        }
+        return uniqueName
+                .append(jndiName.replace(':', '_'))
+                .toString();
+    }
+
+    private List<PooledConnectionFactoryConfigProperties> getAdapterParams(ModelNode model) {
+        Map<String, ConnectionFactoryAttribute> attributes = PooledConnectionFactoryDefinition.getAttributes();
+        List<PooledConnectionFactoryConfigProperties> props = new ArrayList<>();
+
+        for (Property property : model.asPropertyList()) {
+            ConnectionFactoryAttribute attribute = attributes.get(property.getName());
+
+            if (attribute.getPropertyName() == null) {
+                // not a RA property
+                continue;
+            }
+
+            props.add(new PooledConnectionFactoryConfigProperties(attribute.getPropertyName(), property.getValue().asString(), attribute.getClassType()));
+        }
+        return props;
+    }
+
+    /**
+     * The JMS connection factory can specify another hornetq-server to deploy its destinations
+     * by passing a property hornetq-server=&lt;name of the server>. Otherwise, "default" is used by default.
+     */
+    private String getHornetQServerName() {
+        return properties.containsKey(HORNETQ_SERVER) ? properties.get(HORNETQ_SERVER) : DEFAULT;
     }
 }

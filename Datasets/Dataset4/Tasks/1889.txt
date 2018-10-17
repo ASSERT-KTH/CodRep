@@ -1,13 +1,13 @@
-canExit = runState >= STOP || (queueSize.get() == 0 && poolSize.get() > corePoolSize);
+public static final String ACTION_NAME = "internal:cluster/nodes/indices/shard/store";
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,609 +19,396 @@ canExit = runState >= STOP || (queueSize.get() == 0 && poolSize.get() > corePool
  * under the License.
  */
 
-package org.elasticsearch.common.util.concurrent;
+package org.elasticsearch.indices.store;
 
-import org.elasticsearch.common.util.concurrent.jsr166y.LinkedTransferQueue;
-import org.elasticsearch.common.util.concurrent.jsr166y.TransferQueue;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.action.ActionFuture;
+import org.elasticsearch.action.FailedNodeException;
+import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.nodes.*;
+import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Streamable;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.env.NodeEnvironment;
+import org.elasticsearch.index.service.IndexService;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.shard.service.InternalIndexShard;
+import org.elasticsearch.index.store.Store;
+import org.elasticsearch.index.store.StoreFileMetaData;
+import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
 
-import java.util.*;
-import java.util.concurrent.AbstractExecutorService;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
+import java.io.File;
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
- * @author kimchy (shay.banon)
+ *
  */
-public class TransferThreadPoolExecutor extends AbstractExecutorService {
+public class TransportNodesListShardStoreMetaData extends TransportNodesOperationAction<TransportNodesListShardStoreMetaData.Request, TransportNodesListShardStoreMetaData.NodesStoreFilesMetaData, TransportNodesListShardStoreMetaData.NodeRequest, TransportNodesListShardStoreMetaData.NodeStoreFilesMetaData> {
 
-    private final TransferQueue<Runnable> workQueue = new LinkedTransferQueue<Runnable>();
+    private static final String ACTION_NAME = "/cluster/nodes/indices/shard/store";
 
-    private final AtomicInteger queueSize = new AtomicInteger();
+    private final IndicesService indicesService;
 
-    /**
-     * Lock held on updates to poolSize, corePoolSize,
-     * maximumPoolSize, runState, and workers set.
-     */
-    private final ReentrantLock mainLock = new ReentrantLock();
+    private final NodeEnvironment nodeEnv;
 
-    /**
-     * Wait condition to support awaitTermination
-     */
-    private final Condition termination = mainLock.newCondition();
-
-    /**
-     * Set containing all worker threads in pool. Accessed only when
-     * holding mainLock.
-     */
-    private final HashSet<Worker> workers = new HashSet<Worker>();
-
-
-    /**
-     * Factory for new threads. All threads are created using this
-     * factory (via method addThread).  All callers must be prepared
-     * for addThread to fail by returning null, which may reflect a
-     * system or user's policy limiting the number of threads.  Even
-     * though it is not treated as an error, failure to create threads
-     * may result in new tasks being rejected or existing ones
-     * remaining stuck in the queue. On the other hand, no special
-     * precautions exist to handle OutOfMemoryErrors that might be
-     * thrown while trying to create threads, since there is generally
-     * no recourse from within this class.
-     */
-    private final ThreadFactory threadFactory;
-
-    /**
-     * runState provides the main lifecyle control, taking on values:
-     *
-     * RUNNING:  Accept new tasks and process queued tasks
-     * SHUTDOWN: Don't accept new tasks, but process queued tasks
-     * STOP:     Don't accept new tasks, don't process queued tasks,
-     * and interrupt in-progress tasks
-     * TERMINATED: Same as STOP, plus all threads have terminated
-     *
-     * The numerical order among these values matters, to allow
-     * ordered comparisons. The runState monotonically increases over
-     * time, but need not hit each state. The transitions are:
-     *
-     * RUNNING -> SHUTDOWN
-     * On invocation of shutdown(), perhaps implicitly in finalize()
-     * (RUNNING or SHUTDOWN) -> STOP
-     * On invocation of shutdownNow()
-     * SHUTDOWN -> TERMINATED
-     * When both queue and pool are empty
-     * STOP -> TERMINATED
-     * When pool is empty
-     */
-    volatile int runState;
-    static final int RUNNING = 0;
-    static final int SHUTDOWN = 1;
-    static final int STOP = 2;
-    static final int TERMINATED = 3;
-
-
-    private final boolean blocking;
-
-    private final int blockingCapacity;
-
-    private final long blockingTime;
-
-    /**
-     * Core pool size, updated only while holding mainLock, but
-     * volatile to allow concurrent readability even during updates.
-     */
-    private final int corePoolSize;
-
-    /**
-     * Maximum pool size, updated only while holding mainLock but
-     * volatile to allow concurrent readability even during updates.
-     */
-    private final int maximumPoolSize;
-
-    /**
-     * Timeout in nanoseconds for idle threads waiting for work.
-     * Threads use this timeout when there are more than corePoolSize
-     * present or if allowCoreThreadTimeOut. Otherwise they wait
-     * forever for new work.
-     */
-    private final long keepAliveTime;
-
-    /**
-     * Current pool size, updated only while holding mainLock but
-     * volatile to allow concurrent readability even during updates.
-     */
-    private final AtomicInteger poolSize = new AtomicInteger();
-
-    public static TransferThreadPoolExecutor newScalingExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, ThreadFactory threadFactory) {
-        return new TransferThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, unit, false, 0, TimeUnit.NANOSECONDS, 0, threadFactory);
+    @Inject
+    public TransportNodesListShardStoreMetaData(Settings settings, ClusterName clusterName, ThreadPool threadPool, ClusterService clusterService, TransportService transportService,
+                                                IndicesService indicesService, NodeEnvironment nodeEnv, ActionFilters actionFilters) {
+        super(settings, ACTION_NAME, clusterName, threadPool, clusterService, transportService, actionFilters);
+        this.indicesService = indicesService;
+        this.nodeEnv = nodeEnv;
     }
 
-    public static TransferThreadPoolExecutor newBlockingExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit,
-                                                                 long blockingTime, TimeUnit blockingUnit, int blockingCapacity,
-                                                                 ThreadFactory threadFactory) {
-        return new TransferThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, unit, true, blockingTime, blockingUnit, blockingCapacity, threadFactory);
+    public ActionFuture<NodesStoreFilesMetaData> list(ShardId shardId, boolean onlyUnallocated, String[] nodesIds, @Nullable TimeValue timeout) {
+        return execute(new Request(shardId, onlyUnallocated, nodesIds).timeout(timeout));
     }
 
-    private TransferThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit,
-                                       boolean blocking, long blockingTime, TimeUnit blockingUnit, int blockingCapacity,
-                                       ThreadFactory threadFactory) {
-        this.blocking = blocking;
-        this.blockingTime = blockingUnit.toNanos(blockingTime);
-        this.blockingCapacity = blockingCapacity;
-        this.corePoolSize = corePoolSize;
-        this.maximumPoolSize = maximumPoolSize;
-        this.keepAliveTime = unit.toNanos(keepAliveTime);
-        this.threadFactory = threadFactory;
-
-        for (int i = 0; i < corePoolSize; i++) {
-            Thread t = addWorker();
-            if (t != null) {
-                poolSize.incrementAndGet();
-                t.start();
-            }
-        }
+    @Override
+    protected String executor() {
+        return ThreadPool.Names.GENERIC;
     }
 
-
-    @Override public void execute(Runnable command) {
-        if (blocking) {
-            executeBlocking(command);
-        } else {
-            executeNonBlocking(command);
-        }
+    @Override
+    protected Request newRequest() {
+        return new Request();
     }
 
-    private void executeNonBlocking(Runnable command) {
-        // note, there might be starvation of some commands that were added to the queue,
-        // while others are being transferred directly
-        queueSize.getAndIncrement();
-        boolean succeeded = workQueue.tryTransfer(command);
-        if (succeeded) {
-            return;
-        }
-        int currentPoolSize = poolSize.get();
-        if (currentPoolSize < maximumPoolSize) {
-            // if we manage to add a worker, add it, and tryTransfer again
-            if (poolSize.compareAndSet(currentPoolSize, currentPoolSize + 1)) {
-                Thread t = addWorker();
-                if (t == null) {
-                    poolSize.decrementAndGet();
-                    workQueue.add(command);
-                } else {
-                    t.start();
-                    succeeded = workQueue.tryTransfer(command);
-                    if (!succeeded) {
-                        workQueue.add(command);
-                    }
-                }
+    @Override
+    protected NodeRequest newNodeRequest() {
+        return new NodeRequest();
+    }
+
+    @Override
+    protected NodeRequest newNodeRequest(String nodeId, Request request) {
+        return new NodeRequest(nodeId, request);
+    }
+
+    @Override
+    protected NodeStoreFilesMetaData newNodeResponse() {
+        return new NodeStoreFilesMetaData();
+    }
+
+    @Override
+    protected NodesStoreFilesMetaData newResponse(Request request, AtomicReferenceArray responses) {
+        final List<NodeStoreFilesMetaData> nodeStoreFilesMetaDatas = Lists.newArrayList();
+        final List<FailedNodeException> failures = Lists.newArrayList();
+        for (int i = 0; i < responses.length(); i++) {
+            Object resp = responses.get(i);
+            if (resp instanceof NodeStoreFilesMetaData) { // will also filter out null response for unallocated ones
+                nodeStoreFilesMetaDatas.add((NodeStoreFilesMetaData) resp);
+            } else if (resp instanceof FailedNodeException) {
+                failures.add((FailedNodeException) resp);
             } else {
-                succeeded = workQueue.tryTransfer(command);
-                if (!succeeded) {
-                    workQueue.add(command);
-                }
-            }
-        } else {
-            workQueue.add(command);
-        }
-    }
-
-    private void executeBlocking(Runnable command) {
-        int currentCapacity = queueSize.getAndIncrement();
-        boolean succeeded = workQueue.tryTransfer(command);
-        if (succeeded) {
-            return;
-        }
-        int currentPoolSize = poolSize.get();
-        if (currentPoolSize < maximumPoolSize) {
-            // if we manage to add a worker, add it, and tryTransfer again
-            if (poolSize.compareAndSet(currentPoolSize, currentPoolSize + 1)) {
-                Thread t = addWorker();
-                if (t == null) {
-                    poolSize.decrementAndGet();
-                    workQueue.add(command);
-                } else {
-                    t.start();
-                    succeeded = workQueue.tryTransfer(command);
-                    if (!succeeded) {
-                        transferOrAddBlocking(command, currentCapacity);
-                    }
-                }
-            } else {
-                succeeded = workQueue.tryTransfer(command);
-                if (!succeeded) {
-                    transferOrAddBlocking(command, currentCapacity);
-                }
-            }
-        } else {
-            transferOrAddBlocking(command, currentCapacity);
-        }
-    }
-
-    private void transferOrAddBlocking(Runnable command, int currentCapacity) {
-        if (currentCapacity < blockingCapacity) {
-            workQueue.add(command);
-        } else {
-            boolean succeeded;
-            try {
-                succeeded = workQueue.tryTransfer(command, blockingTime, TimeUnit.NANOSECONDS);
-                if (!succeeded) {
-                    throw new RejectedExecutionException("Rejected execution after waiting "
-                            + TimeUnit.NANOSECONDS.toSeconds(blockingTime) + "ms for task [" + command.getClass() + "] to be executed.");
-                }
-            } catch (InterruptedException e) {
-                throw new RejectedExecutionException(e);
+                logger.warn("unknown response type [{}], expected NodeStoreFilesMetaData or FailedNodeException", resp);
             }
         }
+        return new NodesStoreFilesMetaData(clusterName, nodeStoreFilesMetaDatas.toArray(new NodeStoreFilesMetaData[nodeStoreFilesMetaDatas.size()]),
+                failures.toArray(new FailedNodeException[failures.size()]));
     }
 
-    @Override public void shutdown() {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
+    @Override
+    protected NodeStoreFilesMetaData nodeOperation(NodeRequest request) throws ElasticsearchException {
+        if (request.unallocated) {
+            IndexService indexService = indicesService.indexService(request.shardId.index().name());
+            if (indexService == null) {
+                return new NodeStoreFilesMetaData(clusterService.localNode(), null);
+            }
+            if (!indexService.hasShard(request.shardId.id())) {
+                return new NodeStoreFilesMetaData(clusterService.localNode(), null);
+            }
+        }
+        IndexMetaData metaData = clusterService.state().metaData().index(request.shardId.index().name());
+        if (metaData == null) {
+            return new NodeStoreFilesMetaData(clusterService.localNode(), null);
+        }
         try {
-            int state = runState;
-            if (state < SHUTDOWN)
-                runState = SHUTDOWN;
-
-            try {
-                for (Worker w : workers) {
-                    w.interruptIfIdle();
-                }
-            } catch (SecurityException se) { // Try to back out
-                runState = state;
-                // tryTerminate() here would be a no-op
-                throw se;
-            }
-
-            tryTerminate(); // Terminate now if pool and queue empty
-        } finally {
-            mainLock.unlock();
+            return new NodeStoreFilesMetaData(clusterService.localNode(), listStoreMetaData(request.shardId));
+        } catch (IOException e) {
+            throw new ElasticsearchException("Failed to list store metadata for shard [" + request.shardId + "]", e);
         }
     }
 
-    @Override public List<Runnable> shutdownNow() {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            int state = runState;
-            if (state < STOP)
-                runState = STOP;
-
-            try {
-                for (Worker w : workers) {
-                    w.interruptNow();
-                }
-            } catch (SecurityException se) { // Try to back out
-                runState = state;
-                // tryTerminate() here would be a no-op
-                throw se;
-            }
-
-            List<Runnable> tasks = drainQueue();
-            tryTerminate(); // Terminate now if pool and queue empty
-            return tasks;
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    @Override public boolean isShutdown() {
-        return runState != RUNNING;
-    }
-
-    @Override public boolean isTerminated() {
-        return runState == TERMINATED;
-    }
-
-    @Override public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-        long nanos = unit.toNanos(timeout);
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            for (; ;) {
-                if (runState == TERMINATED)
-                    return true;
-                if (nanos <= 0)
-                    return false;
-                nanos = termination.awaitNanos(nanos);
-            }
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    /**
-     * Returns the current number of threads in the pool.
-     *
-     * @return the number of threads
-     */
-    public int getPoolSize() {
-        return poolSize.get();
-    }
-
-    /**
-     * Returns the approximate number of threads that are actively
-     * executing tasks.
-     *
-     * @return the number of threads
-     */
-    public int getActiveCount() {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            int n = 0;
-            for (Worker w : workers) {
-                if (w.isActive())
-                    ++n;
-            }
-            return n;
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    public int getCorePoolSize() {
-        return corePoolSize;
-    }
-
-    public int getMaximumPoolSize() {
-        return maximumPoolSize;
-    }
-
-    public int getQueueSize() {
-        return queueSize.get();
-    }
-
-    private final class Worker implements Runnable {
-        /**
-         * The runLock is acquired and released surrounding each task
-         * execution. It mainly protects against interrupts that are
-         * intended to cancel the worker thread from instead
-         * interrupting the task being run.
-         */
-        private final ReentrantLock runLock = new ReentrantLock();
-
-        /**
-         * Thread this worker is running in.  Acts as a final field,
-         * but cannot be set until thread is created.
-         */
-        Thread thread;
-
-        Worker() {
-        }
-
-        boolean isActive() {
-            return runLock.isLocked();
-        }
-
-        /**
-         * Interrupts thread if not running a task.
-         */
-        void interruptIfIdle() {
-            final ReentrantLock runLock = this.runLock;
-            if (runLock.tryLock()) {
+    private StoreFilesMetaData listStoreMetaData(ShardId shardId) throws IOException {
+        IndexService indexService = indicesService.indexService(shardId.index().name());
+        if (indexService != null) {
+            InternalIndexShard indexShard = (InternalIndexShard) indexService.shard(shardId.id());
+            if (indexShard != null) {
+                Store store = indexShard.store();
+                store.incRef();
                 try {
-                    if (thread != Thread.currentThread())
-                        thread.interrupt();
-                } finally {
-                    runLock.unlock();
-                }
-            }
-        }
-
-        /**
-         * Interrupts thread even if running a task.
-         */
-        void interruptNow() {
-            thread.interrupt();
-        }
-
-        /**
-         * Runs a single task between before/after methods.
-         */
-        private void runTask(Runnable task) {
-            final ReentrantLock runLock = this.runLock;
-            runLock.lock();
-            try {
-                /*
-                 * Ensure that unless pool is stopping, this thread
-                 * does not have its interrupt set. This requires a
-                 * double-check of state in case the interrupt was
-                 * cleared concurrently with a shutdownNow -- if so,
-                 * the interrupt is re-enabled.
-                 */
-                if (runState < STOP && Thread.interrupted() && runState >= STOP)
-                    thread.interrupt();
-
-                task.run();
-            } finally {
-                runLock.unlock();
-            }
-        }
-
-        /**
-         * Main run loop
-         */
-        public void run() {
-            try {
-                Runnable task;
-                while ((task = getTask()) != null) {
-                    runTask(task);
-                }
-            } finally {
-                workerDone(this);
-            }
-        }
-    }
-
-
-    Runnable getTask() {
-        for (; ;) {
-            try {
-                int state = runState;
-                if (state > SHUTDOWN)
-                    return null;
-                Runnable r;
-                if (state == SHUTDOWN)  // Help drain queue
-                    r = workQueue.poll();
-                else if (poolSize.get() > corePoolSize)
-                    r = workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS);
-                else
-                    r = workQueue.take();
-                if (r != null) {
-                    queueSize.decrementAndGet();
-                    return r;
-                }
-                if (workerCanExit()) {
-                    if (runState >= SHUTDOWN) // Wake up others
-                        interruptIdleWorkers();
-                    return null;
-                }
-                // Else retry
-            } catch (InterruptedException ie) {
-                // On interruption, re-check runState
-            }
-        }
-    }
-
-    /**
-     * Check whether a worker thread that fails to get a task can
-     * exit.  We allow a worker thread to die if the pool is stopping,
-     * or the queue is empty, or there is at least one thread to
-     * handle possibly non-empty queue, even if core timeouts are
-     * allowed.
-     */
-    private boolean workerCanExit() {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        boolean canExit;
-        try {
-            canExit = runState >= STOP || queueSize.get() == 0;
-        } finally {
-            mainLock.unlock();
-        }
-        return canExit;
-    }
-
-    /**
-     * Wakes up all threads that might be waiting for tasks so they
-     * can check for termination. Note: this method is also called by
-     * ScheduledThreadPoolExecutor.
-     */
-    void interruptIdleWorkers() {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            for (Worker w : workers)
-                w.interruptIfIdle();
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    /**
-     * Performs bookkeeping for an exiting worker thread.
-     *
-     * @param w the worker
-     */
-    void workerDone(Worker w) {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            workers.remove(w);
-            if (poolSize.decrementAndGet() == 0)
-                tryTerminate();
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    /**
-     * Transitions to TERMINATED state if either (SHUTDOWN and pool
-     * and queue empty) or (STOP and pool empty), otherwise unless
-     * stopped, ensuring that there is at least one live thread to
-     * handle queued tasks.
-     *
-     * This method is called from the three places in which
-     * termination can occur: in workerDone on exit of the last thread
-     * after pool has been shut down, or directly within calls to
-     * shutdown or shutdownNow, if there are no live threads.
-     */
-    private void tryTerminate() {
-        if (poolSize.get() == 0) {
-            int state = runState;
-            if (state < STOP && queueSize.get() > 0) {
-                state = RUNNING; // disable termination check below
-                Thread t = addThread();
-                poolSize.incrementAndGet();
-                if (t != null)
-                    t.start();
-            }
-            if (state == STOP || state == SHUTDOWN) {
-                runState = TERMINATED;
-                termination.signalAll();
-            }
-        }
-    }
-
-    /**
-     * Creates and returns a new thread running firstTask as its first
-     * task. Executed under mainLock.
-     */
-    private Thread addWorker() {
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            return addThread();
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    /**
-     * Creates and returns a new thread running firstTask as its first
-     * task. Call only while holding mainLock.
-     */
-    private Thread addThread() {
-        Worker w = new Worker();
-        Thread t = threadFactory.newThread(w);
-        if (t != null) {
-            w.thread = t;
-            workers.add(w);
-        }
-        return t;
-    }
-
-    /**
-     * Drains the task queue into a new list. Used by shutdownNow.
-     * Call only while holding main lock.
-     */
-    private List<Runnable> drainQueue() {
-        List<Runnable> taskList = new ArrayList<Runnable>();
-        workQueue.drainTo(taskList);
-        queueSize.getAndAdd(taskList.size() * -1);
-        /*
-         * If the queue is a DelayQueue or any other kind of queue
-         * for which poll or drainTo may fail to remove some elements,
-         * we need to manually traverse and remove remaining tasks.
-         * To guarantee atomicity wrt other threads using this queue,
-         * we need to create a new iterator for each element removed.
-         */
-        while (!workQueue.isEmpty()) {
-            Iterator<Runnable> it = workQueue.iterator();
-            try {
-                if (it.hasNext()) {
-                    Runnable r = it.next();
-                    if (workQueue.remove(r)) {
-                        taskList.add(r);
-                        queueSize.decrementAndGet();
+                    if (indexShard != null) {
+                        return new StoreFilesMetaData(true, shardId, indexShard.store().getMetadata().asMap());
                     }
+                } finally {
+                    store.decRef();
                 }
-            } catch (ConcurrentModificationException ignore) {
             }
         }
-        return taskList;
+        // try and see if we an list unallocated
+        IndexMetaData metaData = clusterService.state().metaData().index(shardId.index().name());
+        if (metaData == null) {
+            return new StoreFilesMetaData(false, shardId, ImmutableMap.<String, StoreFileMetaData>of());
+        }
+        String storeType = metaData.settings().get("index.store.type", "fs");
+        if (!storeType.contains("fs")) {
+            return new StoreFilesMetaData(false, shardId, ImmutableMap.<String, StoreFileMetaData>of());
+        }
+        File[] shardLocations = nodeEnv.shardLocations(shardId);
+        File[] shardIndexLocations = new File[shardLocations.length];
+        for (int i = 0; i < shardLocations.length; i++) {
+            shardIndexLocations[i] = new File(shardLocations[i], "index");
+        }
+        boolean exists = false;
+        for (File shardIndexLocation : shardIndexLocations) {
+            if (shardIndexLocation.exists()) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            return new StoreFilesMetaData(false, shardId, ImmutableMap.<String, StoreFileMetaData>of());
+        }
+        final Store.MetadataSnapshot storeFileMetaDatas = Store.readMetadataSnapshot(shardIndexLocations, logger);
+        return new StoreFilesMetaData(false, shardId, storeFileMetaDatas.asMap());
+    }
+
+    @Override
+    protected boolean accumulateExceptions() {
+        return true;
+    }
+
+    public static class StoreFilesMetaData implements Iterable<StoreFileMetaData>, Streamable {
+        private boolean allocated;
+        private ShardId shardId;
+        private Map<String, StoreFileMetaData> files;
+
+        StoreFilesMetaData() {
+        }
+
+        public StoreFilesMetaData(boolean allocated, ShardId shardId, Map<String, StoreFileMetaData> files) {
+            this.allocated = allocated;
+            this.shardId = shardId;
+            this.files = files;
+        }
+
+        public boolean allocated() {
+            return allocated;
+        }
+
+        public ShardId shardId() {
+            return this.shardId;
+        }
+
+        public long totalSizeInBytes() {
+            long totalSizeInBytes = 0;
+            for (StoreFileMetaData file : this) {
+                totalSizeInBytes += file.length();
+            }
+            return totalSizeInBytes;
+        }
+
+        @Override
+        public Iterator<StoreFileMetaData> iterator() {
+            return files.values().iterator();
+        }
+
+        public boolean fileExists(String name) {
+            return files.containsKey(name);
+        }
+
+        public StoreFileMetaData file(String name) {
+            return files.get(name);
+        }
+
+        public static StoreFilesMetaData readStoreFilesMetaData(StreamInput in) throws IOException {
+            StoreFilesMetaData md = new StoreFilesMetaData();
+            md.readFrom(in);
+            return md;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            allocated = in.readBoolean();
+            shardId = ShardId.readShardId(in);
+            int size = in.readVInt();
+            files = Maps.newHashMapWithExpectedSize(size);
+            for (int i = 0; i < size; i++) {
+                StoreFileMetaData md = StoreFileMetaData.readStoreFileMetaData(in);
+                files.put(md.name(), md);
+            }
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeBoolean(allocated);
+            shardId.writeTo(out);
+            out.writeVInt(files.size());
+            for (StoreFileMetaData md : files.values()) {
+                md.writeTo(out);
+            }
+        }
+    }
+
+
+    static class Request extends NodesOperationRequest<Request> {
+
+        private ShardId shardId;
+
+        private boolean unallocated;
+
+        public Request() {
+        }
+
+        public Request(ShardId shardId, boolean unallocated, Set<String> nodesIds) {
+            super(nodesIds.toArray(new String[nodesIds.size()]));
+            this.shardId = shardId;
+            this.unallocated = unallocated;
+        }
+
+        public Request(ShardId shardId, boolean unallocated, String... nodesIds) {
+            super(nodesIds);
+            this.shardId = shardId;
+            this.unallocated = unallocated;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            shardId = ShardId.readShardId(in);
+            unallocated = in.readBoolean();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            shardId.writeTo(out);
+            out.writeBoolean(unallocated);
+        }
+    }
+
+    public static class NodesStoreFilesMetaData extends NodesOperationResponse<NodeStoreFilesMetaData> {
+
+        private FailedNodeException[] failures;
+
+        NodesStoreFilesMetaData() {
+        }
+
+        public NodesStoreFilesMetaData(ClusterName clusterName, NodeStoreFilesMetaData[] nodes, FailedNodeException[] failures) {
+            super(clusterName, nodes);
+            this.failures = failures;
+        }
+
+        public FailedNodeException[] failures() {
+            return failures;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            nodes = new NodeStoreFilesMetaData[in.readVInt()];
+            for (int i = 0; i < nodes.length; i++) {
+                nodes[i] = NodeStoreFilesMetaData.readListShardStoreNodeOperationResponse(in);
+            }
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            out.writeVInt(nodes.length);
+            for (NodeStoreFilesMetaData response : nodes) {
+                response.writeTo(out);
+            }
+        }
+    }
+
+
+    static class NodeRequest extends NodeOperationRequest {
+
+        private ShardId shardId;
+
+        private boolean unallocated;
+
+        NodeRequest() {
+        }
+
+        NodeRequest(String nodeId, TransportNodesListShardStoreMetaData.Request request) {
+            super(request, nodeId);
+            this.shardId = request.shardId;
+            this.unallocated = request.unallocated;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            shardId = ShardId.readShardId(in);
+            unallocated = in.readBoolean();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            shardId.writeTo(out);
+            out.writeBoolean(unallocated);
+        }
+    }
+
+    public static class NodeStoreFilesMetaData extends NodeOperationResponse {
+
+        private StoreFilesMetaData storeFilesMetaData;
+
+        NodeStoreFilesMetaData() {
+        }
+
+        public NodeStoreFilesMetaData(DiscoveryNode node, StoreFilesMetaData storeFilesMetaData) {
+            super(node);
+            this.storeFilesMetaData = storeFilesMetaData;
+        }
+
+        public StoreFilesMetaData storeFilesMetaData() {
+            return storeFilesMetaData;
+        }
+
+        public static NodeStoreFilesMetaData readListShardStoreNodeOperationResponse(StreamInput in) throws IOException {
+            NodeStoreFilesMetaData resp = new NodeStoreFilesMetaData();
+            resp.readFrom(in);
+            return resp;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            if (in.readBoolean()) {
+                storeFilesMetaData = StoreFilesMetaData.readStoreFilesMetaData(in);
+            }
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            if (storeFilesMetaData == null) {
+                out.writeBoolean(false);
+            } else {
+                out.writeBoolean(true);
+                storeFilesMetaData.writeTo(out);
+            }
+        }
     }
 }

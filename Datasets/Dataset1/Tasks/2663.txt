@@ -1,8 +1,8 @@
-final int docID = docStoreOffset + startDocID + count + 1;
+NumericDocValues getNormValues(String field) throws IOException {
 
 package org.apache.lucene.index;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,551 +19,292 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.document.*;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.AlreadyClosedException;
-import org.apache.lucene.store.BufferedIndexInput;
-
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.Reader;
-import java.util.zip.DataFormatException;
-import java.util.zip.Inflater;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Class responsible for access to stored document fields.
- * <p/>
- * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
- *
- * @version $Id$
- */
-final class FieldsReader {
-  private final FieldInfos fieldInfos;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.DocValuesProducer;
+import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.codecs.TermVectorsReader;
+import org.apache.lucene.index.FieldInfo.DocValuesType;
+import org.apache.lucene.index.SegmentReader.CoreClosedListener;
+import org.apache.lucene.store.CompoundFileDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.CloseableThreadLocal;
+import org.apache.lucene.util.IOUtils;
 
-  // The main fieldStream, used only for cloning.
-  private final IndexInput cloneableFieldsStream;
+/** Holds core readers that are shared (unchanged) when
+ * SegmentReader is cloned or reopened */
+final class SegmentCoreReaders {
+  
+  // Counts how many other reader share the core objects
+  // (freqStream, proxStream, tis, etc.) of this reader;
+  // when coreRef drops to 0, these core objects may be
+  // closed.  A given instance of SegmentReader may be
+  // closed, even those it shares core objects with other
+  // SegmentReaders:
+  private final AtomicInteger ref = new AtomicInteger(1);
+  
+  final FieldInfos fieldInfos;
+  
+  final FieldsProducer fields;
+  final DocValuesProducer dvProducer;
+  final DocValuesProducer normsProducer;
 
-  // This is a clone of cloneableFieldsStream used for reading documents.
-  // It should not be cloned outside of a synchronized context.
-  private final IndexInput fieldsStream;
+  final int termsIndexDivisor;
+  
+  private final SegmentReader owner;
+  
+  final StoredFieldsReader fieldsReaderOrig;
+  final TermVectorsReader termVectorsReaderOrig;
+  final CompoundFileDirectory cfsReader;
 
-  private final IndexInput indexStream;
-  private int numTotalDocs;
-  private int size;
-  private boolean closed;
+  // TODO: make a single thread local w/ a
+  // Thingy class holding fieldsReader, termVectorsReader,
+  // normsProducer, dvProducer
 
-  // The docID offset where our docs begin in the index
-  // file.  This will be 0 if we have our own private file.
-  private int docStoreOffset;
+  final CloseableThreadLocal<StoredFieldsReader> fieldsReaderLocal = new CloseableThreadLocal<StoredFieldsReader>() {
+    @Override
+    protected StoredFieldsReader initialValue() {
+      return fieldsReaderOrig.clone();
+    }
+  };
+  
+  final CloseableThreadLocal<TermVectorsReader> termVectorsLocal = new CloseableThreadLocal<TermVectorsReader>() {
+    @Override
+    protected TermVectorsReader initialValue() {
+      return (termVectorsReaderOrig == null) ? null : termVectorsReaderOrig.clone();
+    }
+  };
 
-  private ThreadLocal fieldsStreamTL = new ThreadLocal();
+  final CloseableThreadLocal<Map<String,Object>> docValuesLocal = new CloseableThreadLocal<Map<String,Object>>() {
+    @Override
+    protected Map<String,Object> initialValue() {
+      return new HashMap<String,Object>();
+    }
+  };
 
-  FieldsReader(Directory d, String segment, FieldInfos fn) throws IOException {
-    this(d, segment, fn, BufferedIndexInput.BUFFER_SIZE, -1, 0);
-  }
+  final CloseableThreadLocal<Map<String,Object>> normsLocal = new CloseableThreadLocal<Map<String,Object>>() {
+    @Override
+    protected Map<String,Object> initialValue() {
+      return new HashMap<String,Object>();
+    }
+  };
 
-  FieldsReader(Directory d, String segment, FieldInfos fn, int readBufferSize) throws IOException {
-    this(d, segment, fn, readBufferSize, -1, 0);
-  }
+  private final Set<CoreClosedListener> coreClosedListeners = 
+      Collections.synchronizedSet(new LinkedHashSet<CoreClosedListener>());
+  
+  SegmentCoreReaders(SegmentReader owner, Directory dir, SegmentInfoPerCommit si, IOContext context, int termsIndexDivisor) throws IOException {
+    
+    if (termsIndexDivisor == 0) {
+      throw new IllegalArgumentException("indexDivisor must be < 0 (don't load terms index) or greater than 0 (got 0)");
+    }
+    
+    final Codec codec = si.info.getCodec();
+    final Directory cfsDir; // confusing name: if (cfs) its the cfsdir, otherwise its the segment's directory.
 
-  FieldsReader(Directory d, String segment, FieldInfos fn, int readBufferSize, int docStoreOffset, int size) throws IOException {
     boolean success = false;
-
+    
     try {
-      fieldInfos = fn;
-
-      cloneableFieldsStream = d.openInput(segment + ".fdt", readBufferSize);
-      fieldsStream = (IndexInput) cloneableFieldsStream.clone();
-      indexStream = d.openInput(segment + ".fdx", readBufferSize);
-
-      if (docStoreOffset != -1) {
-        // We read only a slice out of this shared fields file
-        this.docStoreOffset = docStoreOffset;
-        this.size = size;
-
-        // Verify the file is long enough to hold all of our
-        // docs
-        assert ((int) (indexStream.length() / 8)) >= size + this.docStoreOffset;
+      if (si.info.getUseCompoundFile()) {
+        cfsDir = cfsReader = new CompoundFileDirectory(dir, IndexFileNames.segmentFileName(si.info.name, "", IndexFileNames.COMPOUND_FILE_EXTENSION), context, false);
       } else {
-        this.docStoreOffset = 0;
-        this.size = (int) (indexStream.length() >> 3);
+        cfsReader = null;
+        cfsDir = dir;
+      }
+      fieldInfos = codec.fieldInfosFormat().getFieldInfosReader().read(cfsDir, si.info.name, IOContext.READONCE);
+
+      this.termsIndexDivisor = termsIndexDivisor;
+      final PostingsFormat format = codec.postingsFormat();
+      final SegmentReadState segmentReadState = new SegmentReadState(cfsDir, si.info, fieldInfos, context, termsIndexDivisor);
+      // Ask codec for its Fields
+      fields = format.fieldsProducer(segmentReadState);
+      assert fields != null;
+      // ask codec for its Norms: 
+      // TODO: since we don't write any norms file if there are no norms,
+      // kinda jaky to assume the codec handles the case of no norms file at all gracefully?!
+
+      if (fieldInfos.hasDocValues()) {
+        dvProducer = codec.docValuesFormat().fieldsProducer(segmentReadState);
+        assert dvProducer != null;
+      } else {
+        dvProducer = null;
       }
 
-      numTotalDocs = (int) (indexStream.length() >> 3);
+      if (fieldInfos.hasNorms()) {
+        normsProducer = codec.normsFormat().normsProducer(segmentReadState);
+        assert normsProducer != null;
+      } else {
+        normsProducer = null;
+      }
+  
+      fieldsReaderOrig = si.info.getCodec().storedFieldsFormat().fieldsReader(cfsDir, si.info, fieldInfos, context);
+
+      if (fieldInfos.hasVectors()) { // open term vector files only as needed
+        termVectorsReaderOrig = si.info.getCodec().termVectorsFormat().vectorsReader(cfsDir, si.info, fieldInfos, context);
+      } else {
+        termVectorsReaderOrig = null;
+      }
+
       success = true;
     } finally {
-      // With lock-less commits, it's entirely possible (and
-      // fine) to hit a FileNotFound exception above. In
-      // this case, we want to explicitly close any subset
-      // of things that were opened so that we don't have to
-      // wait for a GC to do so.
       if (!success) {
-        close();
+        decRef();
       }
     }
-  }
-
-  /**
-   * @throws AlreadyClosedException if this FieldsReader is closed
-   */
-  protected final void ensureOpen() throws AlreadyClosedException {
-    if (closed) {
-      throw new AlreadyClosedException("this FieldsReader is closed");
-    }
-  }
-
-  /**
-   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams, including any ones associated with a
-   * lazy implementation of a Field.  This means that the Fields values will not be accessible.
-   *
-   * @throws IOException
-   */
-  final void close() throws IOException {
-    if (!closed) {
-      if (fieldsStream != null) {
-        fieldsStream.close();
-      }
-      if (cloneableFieldsStream != null) {
-        cloneableFieldsStream.close();
-      }
-      if (indexStream != null) {
-        indexStream.close();
-      }
-      IndexInput localFieldsStream = (IndexInput) fieldsStreamTL.get();
-      if (localFieldsStream != null) {
-        localFieldsStream.close();
-        fieldsStreamTL.set(null);
-      }
-      closed = true;
-    }
-  }
-
-  final int size() {
-    return size;
-  }
-
-  final Document doc(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
-    indexStream.seek((n + docStoreOffset) * 8L);
-    long position = indexStream.readLong();
-    fieldsStream.seek(position);
-
-    Document doc = new Document();
-    int numFields = fieldsStream.readVInt();
-    for (int i = 0; i < numFields; i++) {
-      int fieldNumber = fieldsStream.readVInt();
-      FieldInfo fi = fieldInfos.fieldInfo(fieldNumber);
-      FieldSelectorResult acceptField = fieldSelector == null ? FieldSelectorResult.LOAD : fieldSelector.accept(fi.name);
-      
-      byte bits = fieldsStream.readByte();
-      assert bits <= FieldsWriter.FIELD_IS_COMPRESSED + FieldsWriter.FIELD_IS_TOKENIZED + FieldsWriter.FIELD_IS_BINARY;
-
-      boolean compressed = (bits & FieldsWriter.FIELD_IS_COMPRESSED) != 0;
-      boolean tokenize = (bits & FieldsWriter.FIELD_IS_TOKENIZED) != 0;
-      boolean binary = (bits & FieldsWriter.FIELD_IS_BINARY) != 0;
-      //TODO: Find an alternative approach here if this list continues to grow beyond the
-      //list of 5 or 6 currently here.  See Lucene 762 for discussion
-      if (acceptField.equals(FieldSelectorResult.LOAD)) {
-        addField(doc, fi, binary, compressed, tokenize);
-      }
-      else if (acceptField.equals(FieldSelectorResult.LOAD_FOR_MERGE)) {
-        addFieldForMerge(doc, fi, binary, compressed, tokenize);
-      }
-      else if (acceptField.equals(FieldSelectorResult.LOAD_AND_BREAK)){
-        addField(doc, fi, binary, compressed, tokenize);
-        break;//Get out of this loop
-      }
-      else if (acceptField.equals(FieldSelectorResult.LAZY_LOAD)) {
-        addFieldLazy(doc, fi, binary, compressed, tokenize);
-      }
-      else if (acceptField.equals(FieldSelectorResult.SIZE)){
-        skipField(binary, compressed, addFieldSize(doc, fi, binary, compressed));
-      }
-      else if (acceptField.equals(FieldSelectorResult.SIZE_AND_BREAK)){
-        addFieldSize(doc, fi, binary, compressed);
-        break;
-      }
-      else {
-        skipField(binary, compressed);
-      }
-    }
-
-    return doc;
-  }
-
-  /** Returns the length in bytes of each raw document in a
-   *  contiguous range of length numDocs starting with
-   *  startDocID.  Returns the IndexInput (the fieldStream),
-   *  already seeked to the starting point for startDocID.*/
-  final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
-    indexStream.seek(startDocID * 8L);
-    long startOffset = indexStream.readLong();
-    long lastOffset = startOffset;
-    int count = 0;
-    while (count < numDocs) {
-      final long offset;
-      final int docID = startDocID + count + 1;
-      assert docID <= numTotalDocs;
-      if (docID < numTotalDocs) 
-        offset = indexStream.readLong();
-      else
-        offset = fieldsStream.length();
-      lengths[count++] = (int) (offset-lastOffset);
-      lastOffset = offset;
-    }
-
-    fieldsStream.seek(startOffset);
-
-    return fieldsStream;
-  }
-
-  /**
-   * Skip the field.  We still have to read some of the information about the field, but can skip past the actual content.
-   * This will have the most payoff on large fields.
-   */
-  private void skipField(boolean binary, boolean compressed) throws IOException {
-    skipField(binary, compressed, fieldsStream.readVInt());
-  }
-  
-  private void skipField(boolean binary, boolean compressed, int toRead) throws IOException {
-    if (binary || compressed) {
-      long pointer = fieldsStream.getFilePointer();
-      fieldsStream.seek(pointer + toRead);
-    } else {
-      //We need to skip chars.  This will slow us down, but still better
-      fieldsStream.skipChars(toRead);
-    }
-  }
-
-  private void addFieldLazy(Document doc, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) throws IOException {
-    if (binary == true) {
-      int toRead = fieldsStream.readVInt();
-      long pointer = fieldsStream.getFilePointer();
-      if (compressed) {
-        //was: doc.add(new Fieldable(fi.name, uncompress(b), Fieldable.Store.COMPRESS));
-        doc.add(new LazyField(fi.name, Field.Store.COMPRESS, toRead, pointer));
-      } else {
-        //was: doc.add(new Fieldable(fi.name, b, Fieldable.Store.YES));
-        doc.add(new LazyField(fi.name, Field.Store.YES, toRead, pointer));
-      }
-      //Need to move the pointer ahead by toRead positions
-      fieldsStream.seek(pointer + toRead);
-    } else {
-      Field.Store store = Field.Store.YES;
-      Field.Index index = getIndexType(fi, tokenize);
-      Field.TermVector termVector = getTermVectorType(fi);
-
-      Fieldable f;
-      if (compressed) {
-        store = Field.Store.COMPRESS;
-        int toRead = fieldsStream.readVInt();
-        long pointer = fieldsStream.getFilePointer();
-        f = new LazyField(fi.name, store, toRead, pointer);
-        //skip over the part that we aren't loading
-        fieldsStream.seek(pointer + toRead);
-        f.setOmitNorms(fi.omitNorms);
-      } else {
-        int length = fieldsStream.readVInt();
-        long pointer = fieldsStream.getFilePointer();
-        //Skip ahead of where we are by the length of what is stored
-        fieldsStream.skipChars(length);
-        f = new LazyField(fi.name, store, index, termVector, length, pointer);
-        f.setOmitNorms(fi.omitNorms);
-      }
-      doc.add(f);
-    }
-
-  }
-
-  // in merge mode we don't uncompress the data of a compressed field
-  private void addFieldForMerge(Document doc, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) throws IOException {
-    Object data;
-      
-    if (binary || compressed) {
-      int toRead = fieldsStream.readVInt();
-      final byte[] b = new byte[toRead];
-      fieldsStream.readBytes(b, 0, b.length);
-      data = b;
-    } else {
-      data = fieldsStream.readString();
-    }
-      
-    doc.add(new FieldForMerge(data, fi, binary, compressed, tokenize));
-  }
-  
-  private void addField(Document doc, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) throws CorruptIndexException, IOException {
-
-    //we have a binary stored field, and it may be compressed
-    if (binary) {
-      int toRead = fieldsStream.readVInt();
-      final byte[] b = new byte[toRead];
-      fieldsStream.readBytes(b, 0, b.length);
-      if (compressed)
-        doc.add(new Field(fi.name, uncompress(b), Field.Store.COMPRESS));
-      else
-        doc.add(new Field(fi.name, b, Field.Store.YES));
-
-    } else {
-      Field.Store store = Field.Store.YES;
-      Field.Index index = getIndexType(fi, tokenize);
-      Field.TermVector termVector = getTermVectorType(fi);
-
-      Fieldable f;
-      if (compressed) {
-        store = Field.Store.COMPRESS;
-        int toRead = fieldsStream.readVInt();
-
-        final byte[] b = new byte[toRead];
-        fieldsStream.readBytes(b, 0, b.length);
-        f = new Field(fi.name,      // field name
-                new String(uncompress(b), "UTF-8"), // uncompress the value and add as string
-                store,
-                index,
-                termVector);
-        f.setOmitNorms(fi.omitNorms);
-      } else {
-        f = new Field(fi.name,     // name
-                fieldsStream.readString(), // read value
-                store,
-                index,
-                termVector);
-        f.setOmitNorms(fi.omitNorms);
-      }
-      doc.add(f);
-    }
-  }
-  
-  // Add the size of field as a byte[] containing the 4 bytes of the integer byte size (high order byte first; char = 2 bytes)
-  // Read just the size -- caller must skip the field content to continue reading fields
-  // Return the size in bytes or chars, depending on field type
-  private int addFieldSize(Document doc, FieldInfo fi, boolean binary, boolean compressed) throws IOException {
-    int size = fieldsStream.readVInt(), bytesize = binary || compressed ? size : 2*size;
-    byte[] sizebytes = new byte[4];
-    sizebytes[0] = (byte) (bytesize>>>24);
-    sizebytes[1] = (byte) (bytesize>>>16);
-    sizebytes[2] = (byte) (bytesize>>> 8);
-    sizebytes[3] = (byte)  bytesize      ;
-    doc.add(new Field(fi.name, sizebytes, Field.Store.YES));
-    return size;
-  }
-
-  private Field.TermVector getTermVectorType(FieldInfo fi) {
-    Field.TermVector termVector = null;
-    if (fi.storeTermVector) {
-      if (fi.storeOffsetWithTermVector) {
-        if (fi.storePositionWithTermVector) {
-          termVector = Field.TermVector.WITH_POSITIONS_OFFSETS;
-        } else {
-          termVector = Field.TermVector.WITH_OFFSETS;
-        }
-      } else if (fi.storePositionWithTermVector) {
-        termVector = Field.TermVector.WITH_POSITIONS;
-      } else {
-        termVector = Field.TermVector.YES;
-      }
-    } else {
-      termVector = Field.TermVector.NO;
-    }
-    return termVector;
-  }
-
-  private Field.Index getIndexType(FieldInfo fi, boolean tokenize) {
-    Field.Index index;
-    if (fi.isIndexed && tokenize)
-      index = Field.Index.TOKENIZED;
-    else if (fi.isIndexed && !tokenize)
-      index = Field.Index.UN_TOKENIZED;
-    else
-      index = Field.Index.NO;
-    return index;
-  }
-
-  /**
-   * A Lazy implementation of Fieldable that differs loading of fields until asked for, instead of when the Document is
-   * loaded.
-   */
-  private class LazyField extends AbstractField implements Fieldable {
-    private int toRead;
-    private long pointer;
-
-    public LazyField(String name, Field.Store store, int toRead, long pointer) {
-      super(name, store, Field.Index.NO, Field.TermVector.NO);
-      this.toRead = toRead;
-      this.pointer = pointer;
-      lazy = true;
-    }
-
-    public LazyField(String name, Field.Store store, Field.Index index, Field.TermVector termVector, int toRead, long pointer) {
-      super(name, store, index, termVector);
-      this.toRead = toRead;
-      this.pointer = pointer;
-      lazy = true;
-    }
-
-    private IndexInput getFieldStream() {
-      IndexInput localFieldsStream = (IndexInput) fieldsStreamTL.get();
-      if (localFieldsStream == null) {
-        localFieldsStream = (IndexInput) cloneableFieldsStream.clone();
-        fieldsStreamTL.set(localFieldsStream);
-      }
-      return localFieldsStream;
-    }
-
-    /** The value of the field in Binary, or null.  If null, the Reader value,
-     * String value, or TokenStream value is used. Exactly one of stringValue(), 
-     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
-    public byte[] binaryValue() {
-      ensureOpen();
-      if (fieldsData == null) {
-        final byte[] b = new byte[toRead];
-        IndexInput localFieldsStream = getFieldStream();
-        //Throw this IO Exception since IndexREader.document does so anyway, so probably not that big of a change for people
-        //since they are already handling this exception when getting the document
-        try {
-          localFieldsStream.seek(pointer);
-          localFieldsStream.readBytes(b, 0, b.length);
-          if (isCompressed == true) {
-            fieldsData = uncompress(b);
-          } else {
-            fieldsData = b;
-          }
-        } catch (IOException e) {
-          throw new FieldReaderException(e);
-        }
-      }
-      return fieldsData instanceof byte[] ? (byte[]) fieldsData : null;
-    }
-
-    /** The value of the field as a Reader, or null.  If null, the String value,
-     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
-     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
-    public Reader readerValue() {
-      ensureOpen();
-      return fieldsData instanceof Reader ? (Reader) fieldsData : null;
-    }
-
-    /** The value of the field as a TokesStream, or null.  If null, the Reader value,
-     * String value, or binary value is used. Exactly one of stringValue(), 
-     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
-    public TokenStream tokenStreamValue() {
-      ensureOpen();
-      return fieldsData instanceof TokenStream ? (TokenStream) fieldsData : null;
-    }
-
     
-    /** The value of the field as a String, or null.  If null, the Reader value,
-     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
-     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
-    public String stringValue() {
-      ensureOpen();
-      if (fieldsData == null) {
-        IndexInput localFieldsStream = getFieldStream();
-        try {
-          localFieldsStream.seek(pointer);
-          if (isCompressed) {
-            final byte[] b = new byte[toRead];
-            localFieldsStream.readBytes(b, 0, b.length);
-            fieldsData = new String(uncompress(b), "UTF-8");
-          } else {
-            //read in chars b/c we already know the length we need to read
-            char[] chars = new char[toRead];
-            localFieldsStream.readChars(chars, 0, toRead);
-            fieldsData = new String(chars);
-          }
-        } catch (IOException e) {
-          throw new FieldReaderException(e);
-        }
-      }
-      return fieldsData instanceof String ? (String) fieldsData : null;
-    }
-
-    public long getPointer() {
-      ensureOpen();
-      return pointer;
-    }
-
-    public void setPointer(long pointer) {
-      ensureOpen();
-      this.pointer = pointer;
-    }
-
-    public int getToRead() {
-      ensureOpen();
-      return toRead;
-    }
-
-    public void setToRead(int toRead) {
-      ensureOpen();
-      this.toRead = toRead;
-    }
-  }
-
-  private final byte[] uncompress(final byte[] input)
-          throws CorruptIndexException, IOException {
-
-    Inflater decompressor = new Inflater();
-    decompressor.setInput(input);
-
-    // Create an expandable byte array to hold the decompressed data
-    ByteArrayOutputStream bos = new ByteArrayOutputStream(input.length);
-
-    // Decompress the data
-    byte[] buf = new byte[1024];
-    while (!decompressor.finished()) {
-      try {
-        int count = decompressor.inflate(buf);
-        bos.write(buf, 0, count);
-      }
-      catch (DataFormatException e) {
-        // this will happen if the field is not compressed
-        CorruptIndexException newException = new CorruptIndexException("field data are in wrong format: " + e.toString());
-        newException.initCause(e);
-        throw newException;
-      }
-    }
-  
-    decompressor.end();
-    
-    // Get the decompressed data
-    return bos.toByteArray();
+    // Must assign this at the end -- if we hit an
+    // exception above core, we don't want to attempt to
+    // purge the FieldCache (will hit NPE because core is
+    // not assigned yet).
+    this.owner = owner;
   }
   
-  // Instances of this class hold field properties and data
-  // for merge
-  final static class FieldForMerge extends AbstractField {
-    public String stringValue() {
-      return (String) this.fieldsData;
-    }
+  void incRef() {
+    ref.incrementAndGet();
+  }
 
-    public Reader readerValue() {
-      // not needed for merge
+  NumericDocValues getNumericDocValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
+    }
+    if (fi.getDocValuesType() == null) {
+      // Field was not indexed with doc values
+      return null;
+    }
+    if (fi.getDocValuesType() != DocValuesType.NUMERIC) {
+      // DocValues were not numeric
       return null;
     }
 
-    public byte[] binaryValue() {
-      return (byte[]) this.fieldsData;
+    assert dvProducer != null;
+
+    Map<String,Object> dvFields = docValuesLocal.get();
+
+    NumericDocValues dvs = (NumericDocValues) dvFields.get(field);
+    if (dvs == null) {
+      dvs = dvProducer.getNumeric(fi);
+      dvFields.put(field, dvs);
     }
 
-    public TokenStream tokenStreamValue() {
-      // not needed for merge
+    return dvs;
+  }
+
+  BinaryDocValues getBinaryDocValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
       return null;
     }
-    
-    public FieldForMerge(Object value, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) {
-      this.isStored = true;  
-      this.fieldsData = value;
-      this.isCompressed = compressed;
-      this.isBinary = binary;
-      this.isTokenized = tokenize;
-
-      this.name = fi.name.intern();
-      this.isIndexed = fi.isIndexed;
-      this.omitNorms = fi.omitNorms;          
-      this.storeOffsetWithTermVector = fi.storeOffsetWithTermVector;
-      this.storePositionWithTermVector = fi.storePositionWithTermVector;
-      this.storeTermVector = fi.storeTermVector;            
+    if (fi.getDocValuesType() == null) {
+      // Field was not indexed with doc values
+      return null;
     }
-     
+    if (fi.getDocValuesType() != DocValuesType.BINARY) {
+      // DocValues were not binary
+      return null;
+    }
+
+    assert dvProducer != null;
+
+    Map<String,Object> dvFields = docValuesLocal.get();
+
+    BinaryDocValues dvs = (BinaryDocValues) dvFields.get(field);
+    if (dvs == null) {
+      dvs = dvProducer.getBinary(fi);
+      dvFields.put(field, dvs);
+    }
+
+    return dvs;
+  }
+
+  SortedDocValues getSortedDocValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
+    }
+    if (fi.getDocValuesType() == null) {
+      // Field was not indexed with doc values
+      return null;
+    }
+    if (fi.getDocValuesType() != DocValuesType.SORTED) {
+      // DocValues were not sorted
+      return null;
+    }
+
+    assert dvProducer != null;
+
+    Map<String,Object> dvFields = docValuesLocal.get();
+
+    SortedDocValues dvs = (SortedDocValues) dvFields.get(field);
+    if (dvs == null) {
+      dvs = dvProducer.getSorted(fi);
+      dvFields.put(field, dvs);
+    }
+
+    return dvs;
+  }
+
+  NumericDocValues getSimpleNormValues(String field) throws IOException {
+    FieldInfo fi = fieldInfos.fieldInfo(field);
+    if (fi == null) {
+      // Field does not exist
+      return null;
+    }
+    if (!fi.hasNorms()) {
+      return null;
+    }
+   
+    assert normsProducer != null;
+
+    Map<String,Object> normFields = normsLocal.get();
+
+    NumericDocValues norms = (NumericDocValues) normFields.get(field);
+    if (norms == null) {
+      norms = normsProducer.getNumeric(fi);
+      normFields.put(field, norms);
+    }
+
+    return norms;
+  }
+
+  void decRef() throws IOException {
+    if (ref.decrementAndGet() == 0) {
+      IOUtils.close(termVectorsLocal, fieldsReaderLocal, docValuesLocal, normsLocal, fields, dvProducer,
+                    termVectorsReaderOrig, fieldsReaderOrig, cfsReader, normsProducer);
+      notifyCoreClosedListeners();
+    }
+  }
+  
+  private void notifyCoreClosedListeners() {
+    synchronized(coreClosedListeners) {
+      for (CoreClosedListener listener : coreClosedListeners) {
+        listener.onClose(owner);
+      }
+    }
+  }
+
+  void addCoreClosedListener(CoreClosedListener listener) {
+    coreClosedListeners.add(listener);
+  }
+  
+  void removeCoreClosedListener(CoreClosedListener listener) {
+    coreClosedListeners.remove(listener);
+  }
+
+  @Override
+  public String toString() {
+    return "SegmentCoreReader(owner=" + owner + ")";
   }
 }

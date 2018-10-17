@@ -1,8 +1,8 @@
-PerDocWriteState perDocWriteState = docState.docWriter.newPerDocWriteState("");
+import org.apache.lucene.search.suggest.Sort.ByteSequencesWriter;
 
-package org.apache.lucene.index;
+package org.apache.lucene.search.suggest.fst;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -20,331 +20,269 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.Collection;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
+import java.util.List;
 
-import org.apache.lucene.index.DocumentsWriterPerThread.DocState;
-import org.apache.lucene.index.codecs.DocValuesFormat;
-import org.apache.lucene.index.codecs.DocValuesConsumer;
-import org.apache.lucene.index.codecs.PerDocConsumer;
-import org.apache.lucene.index.values.PerDocFieldValues;
+import org.apache.lucene.search.spell.TermFreqIterator;
+import org.apache.lucene.search.suggest.Lookup;
+import org.apache.lucene.search.suggest.SortedTermFreqIteratorWrapper;
+import org.apache.lucene.search.suggest.fst.Sort.ByteSequencesWriter;
+import org.apache.lucene.store.ByteArrayDataInput;
+import org.apache.lucene.store.ByteArrayDataOutput;
+import org.apache.lucene.store.InputStreamDataInput;
+import org.apache.lucene.store.OutputStreamDataOutput;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
 import org.apache.lucene.util.IOUtils;
-
+import org.apache.lucene.util.IntsRef;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.util.fst.Builder;
+import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.fst.FST.Arc;
+import org.apache.lucene.util.fst.FST.BytesReader;
+import org.apache.lucene.util.fst.PositiveIntOutputs;
+import org.apache.lucene.util.fst.Util;
+import org.apache.lucene.util.fst.Util.MinResult;
 
 /**
- * This is a DocConsumer that gathers all fields under the
- * same name, and calls per-field consumers to process field
- * by field.  This class doesn't doesn't do any "real" work
- * of its own: it just forwards the fields to a
- * DocFieldConsumer.
+ * Suggester based on a weighted FST: it first traverses the prefix, 
+ * then walks the <i>n</i> shortest paths to retrieve top-ranked
+ * suggestions.
+ * <p>
+ * <b>NOTE</b>:
+ * Input weights must be between 0 and {@link Integer#MAX_VALUE}, any
+ * other values will be rejected.
+ * 
+ * @lucene.experimental
  */
-
-final class DocFieldProcessor extends DocConsumer {
-
-  final DocFieldConsumer consumer;
-  final StoredFieldsWriter fieldsWriter;
-
-  // Holds all fields seen in current doc
-  DocFieldProcessorPerField[] fields = new DocFieldProcessorPerField[1];
-  int fieldCount;
-
-  // Hash table for all fields ever seen
-  DocFieldProcessorPerField[] fieldHash = new DocFieldProcessorPerField[2];
-  int hashMask = 1;
-  int totalFieldCount;
-
-  float docBoost;
-  int fieldGen;
-  final DocumentsWriterPerThread.DocState docState;
-
-  public DocFieldProcessor(DocumentsWriterPerThread docWriter, DocFieldConsumer consumer) {
-    this.docState = docWriter.docState;
-    this.consumer = consumer;
-    fieldsWriter = new StoredFieldsWriter(docWriter);
+public class WFSTCompletionLookup extends Lookup {
+  
+  /**
+   * FST<Long>, weights are encoded as costs: (Integer.MAX_VALUE-weight)
+   */
+  // NOTE: like FSTSuggester, this is really a WFSA, if you want to
+  // customize the code to add some output you should use PairOutputs.
+  private FST<Long> fst = null;
+  
+  /** 
+   * True if exact match suggestions should always be returned first.
+   */
+  private final boolean exactFirst;
+  
+  /**
+   * Calls {@link #WFSTCompletionLookup(boolean) WFSTCompletionLookup(true)}
+   */
+  public WFSTCompletionLookup() {
+    this(true);
   }
-
-  @Override
-  public void flush(SegmentWriteState state) throws IOException {
-
-    Map<FieldInfo, DocFieldConsumerPerField> childFields = new HashMap<FieldInfo, DocFieldConsumerPerField>();
-    Collection<DocFieldConsumerPerField> fields = fields();
-    for (DocFieldConsumerPerField f : fields) {
-      childFields.put(f.getFieldInfo(), f);
-    }
-
-    fieldsWriter.flush(state);
-    consumer.flush(childFields, state);
-
-    // Important to save after asking consumer to flush so
-    // consumer can alter the FieldInfo* if necessary.  EG,
-    // FreqProxTermsWriter does this with
-    // FieldInfo.storePayload.
-    final String fileName = IndexFileNames.segmentFileName(state.segmentName, "", IndexFileNames.FIELD_INFOS_EXTENSION);
-    state.fieldInfos.write(state.directory, fileName);
-    for (DocValuesConsumerAndDocID consumers : docValues.values()) {
-      consumers.docValuesConsumer.finish(state.numDocs);
-    }
-    // close perDocConsumer during flush to ensure all files are flushed due to PerCodec CFS
-    IOUtils.close(perDocConsumers.values());
+  
+  /**
+   * Creates a new suggester.
+   * 
+   * @param exactFirst <code>true</code> if suggestions that match the 
+   *        prefix exactly should always be returned first, regardless
+   *        of score. This has no performance impact, but could result
+   *        in low-quality suggestions.
+   */
+  public WFSTCompletionLookup(boolean exactFirst) {
+    this.exactFirst = exactFirst;
   }
-
-  @Override
-  public void abort() {
-    Throwable th = null;
-    
-    for (DocFieldProcessorPerField field : fieldHash) {
-      while (field != null) {
-        final DocFieldProcessorPerField next = field.next;
-        try {
-          field.abort();
-        } catch (Throwable t) {
-          if (th == null) {
-            th = t;
-          }
-        }
-        field = next;
-      }
-    }
-    try {
-      IOUtils.closeWhileHandlingException(perDocConsumers.values());
-      // TODO add abort to PerDocConsumer!
-    } catch (IOException e) {
-      // ignore on abort!
-    }
-    
-    try {
-      fieldsWriter.abort();
-    } catch (Throwable t) {
-      if (th == null) {
-        th = t;
-      }
-    }
-    
-    try {
-      consumer.abort();
-    } catch (Throwable t) {
-      if (th == null) {
-        th = t;
-      }
-    }
-    
-    // If any errors occured, throw it.
-    if (th != null) {
-      if (th instanceof RuntimeException) throw (RuntimeException) th;
-      if (th instanceof Error) throw (Error) th;
-      // defensive code - we should not hit unchecked exceptions
-      throw new RuntimeException(th);
-    }
-  }
-
-  @Override
-  public boolean freeRAM() {
-    return consumer.freeRAM();
-  }
-
-  public Collection<DocFieldConsumerPerField> fields() {
-    Collection<DocFieldConsumerPerField> fields = new HashSet<DocFieldConsumerPerField>();
-    for(int i=0;i<fieldHash.length;i++) {
-      DocFieldProcessorPerField field = fieldHash[i];
-      while(field != null) {
-        fields.add(field.consumer);
-        field = field.next;
-      }
-    }
-    assert fields.size() == totalFieldCount;
-    return fields;
-  }
-
-  /** In flush we reset the fieldHash to not maintain per-field state
-   *  across segments */
-  @Override
-  void doAfterFlush() {
-    fieldHash = new DocFieldProcessorPerField[2];
-    hashMask = 1;
-    totalFieldCount = 0;
-    perDocConsumers.clear();
-    docValues.clear();
-  }
-
-  private void rehash() {
-    final int newHashSize = (fieldHash.length*2);
-    assert newHashSize > fieldHash.length;
-
-    final DocFieldProcessorPerField newHashArray[] = new DocFieldProcessorPerField[newHashSize];
-
-    // Rehash
-    int newHashMask = newHashSize-1;
-    for(int j=0;j<fieldHash.length;j++) {
-      DocFieldProcessorPerField fp0 = fieldHash[j];
-      while(fp0 != null) {
-        final int hashPos2 = fp0.fieldInfo.name.hashCode() & newHashMask;
-        DocFieldProcessorPerField nextFP0 = fp0.next;
-        fp0.next = newHashArray[hashPos2];
-        newHashArray[hashPos2] = fp0;
-        fp0 = nextFP0;
-      }
-    }
-
-    fieldHash = newHashArray;
-    hashMask = newHashMask;
-  }
-
-  @Override
-  public void processDocument(FieldInfos fieldInfos) throws IOException {
-
-    consumer.startDocument();
-    fieldsWriter.startDocument();
-
-    fieldCount = 0;
-
-    final int thisFieldGen = fieldGen++;
-
-    // Absorb any new fields first seen in this document.
-    // Also absorb any changes to fields we had already
-    // seen before (eg suddenly turning on norms or
-    // vectors, etc.):
-
-    for(IndexableField field : docState.doc) {
-      final String fieldName = field.name();
-
-      // Make sure we have a PerField allocated
-      final int hashPos = fieldName.hashCode() & hashMask;
-      DocFieldProcessorPerField fp = fieldHash[hashPos];
-      while(fp != null && !fp.fieldInfo.name.equals(fieldName)) {
-        fp = fp.next;
-      }
-
-      if (fp == null) {
-
-        // TODO FI: we need to genericize the "flags" that a
-        // field holds, and, how these flags are merged; it
-        // needs to be more "pluggable" such that if I want
-        // to have a new "thing" my Fields can do, I can
-        // easily add it
-        FieldInfo fi = fieldInfos.addOrUpdate(fieldName, field.fieldType(), false, field.docValuesType());
-
-        fp = new DocFieldProcessorPerField(this, fi);
-        fp.next = fieldHash[hashPos];
-        fieldHash[hashPos] = fp;
-        totalFieldCount++;
-
-        if (totalFieldCount >= fieldHash.length/2) {
-          rehash();
-        }
-      } else {
-        fieldInfos.addOrUpdate(fp.fieldInfo.name, field.fieldType(), false, field.docValuesType());
-      }
-
-      if (thisFieldGen != fp.lastGen) {
-
-        // First time we're seeing this field for this doc
-        fp.fieldCount = 0;
-
-        if (fieldCount == fields.length) {
-          final int newSize = fields.length*2;
-          DocFieldProcessorPerField newArray[] = new DocFieldProcessorPerField[newSize];
-          System.arraycopy(fields, 0, newArray, 0, fieldCount);
-          fields = newArray;
-        }
-
-        fields[fieldCount++] = fp;
-        fp.lastGen = thisFieldGen;
-      }
-
-      fp.addField(field);
-
-      if (field.fieldType().stored()) {
-        fieldsWriter.addField(field, fp.fieldInfo);
-      }
-      final PerDocFieldValues docValues = field.docValues();
-      if (docValues != null) {
-        docValuesConsumer(docState, fp.fieldInfo).add(docState.docID, docValues);
-      }
-    }
-
-    // If we are writing vectors then we must visit
-    // fields in sorted order so they are written in
-    // sorted order.  TODO: we actually only need to
-    // sort the subset of fields that have vectors
-    // enabled; we could save [small amount of] CPU
-    // here.
-    ArrayUtil.quickSort(fields, 0, fieldCount, fieldsComp);
-    for(int i=0;i<fieldCount;i++) {
-      final DocFieldProcessorPerField perField = fields[i];
-      perField.consumer.processFields(perField.fields, perField.fieldCount);
-    }
-
-    if (docState.maxTermPrefix != null && docState.infoStream != null) {
-      docState.infoStream.println("WARNING: document contains at least one immense term (whose UTF8 encoding is longer than the max length " + DocumentsWriterPerThread.MAX_TERM_LENGTH_UTF8 + "), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '" + docState.maxTermPrefix + "...'");
-      docState.maxTermPrefix = null;
-    }
-  }
-
-  private static final Comparator<DocFieldProcessorPerField> fieldsComp = new Comparator<DocFieldProcessorPerField>() {
-    public int compare(DocFieldProcessorPerField o1, DocFieldProcessorPerField o2) {
-      return o1.fieldInfo.name.compareTo(o2.fieldInfo.name);
-    }
-  };
   
   @Override
-  void finishDocument() throws IOException {
-    try {
-      fieldsWriter.finishDocument();
-    } finally {
-      consumer.finishDocument();
-    }
-  }
-
-  private static class DocValuesConsumerAndDocID {
-    public int docID;
-    final DocValuesConsumer docValuesConsumer;
-
-    public DocValuesConsumerAndDocID(DocValuesConsumer docValuesConsumer) {
-      this.docValuesConsumer = docValuesConsumer;
-    }
-  }
-
-  final private Map<String, DocValuesConsumerAndDocID> docValues = new HashMap<String, DocValuesConsumerAndDocID>();
-  final private Map<Integer, PerDocConsumer> perDocConsumers = new HashMap<Integer, PerDocConsumer>();
-
-  DocValuesConsumer docValuesConsumer(DocState docState, FieldInfo fieldInfo) 
-      throws IOException {
-    DocValuesConsumerAndDocID docValuesConsumerAndDocID = docValues.get(fieldInfo.name);
-    if (docValuesConsumerAndDocID != null) {
-      if (docState.docID == docValuesConsumerAndDocID.docID) {
-        throw new IllegalArgumentException("IndexDocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed, per field)");
+  public void build(TermFreqIterator iterator) throws IOException {
+    BytesRef scratch = new BytesRef();
+    TermFreqIterator iter = new WFSTTermFreqIteratorWrapper(iterator);
+    IntsRef scratchInts = new IntsRef();
+    BytesRef previous = null;
+    PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
+    Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, outputs);
+    while ((scratch = iter.next()) != null) {
+      long cost = iter.weight();
+      
+      if (previous == null) {
+        previous = new BytesRef();
+      } else if (scratch.equals(previous)) {
+        continue; // for duplicate suggestions, the best weight is actually
+                  // added
       }
-      assert docValuesConsumerAndDocID.docID < docState.docID;
-      docValuesConsumerAndDocID.docID = docState.docID;
-      return docValuesConsumerAndDocID.docValuesConsumer;
+      Util.toIntsRef(scratch, scratchInts);
+      builder.add(scratchInts, cost);
+      previous.copyBytes(scratch);
+    }
+    fst = builder.finish();
+  }
+
+  
+  @Override
+  public boolean store(OutputStream output) throws IOException {
+    try {
+      if (fst == null) {
+        return false;
+      }
+      fst.save(new OutputStreamDataOutput(output));
+    } finally {
+      IOUtils.close(output);
+    }
+    return true;
+  }
+
+  @Override
+  public boolean load(InputStream input) throws IOException {
+    try {
+      this.fst = new FST<Long>(new InputStreamDataInput(input), PositiveIntOutputs.getSingleton(true));
+    } finally {
+      IOUtils.close(input);
+    }
+    return true;
+  }
+
+  @Override
+  public List<LookupResult> lookup(CharSequence key, boolean onlyMorePopular, int num) {
+    assert num > 0;
+
+    if (onlyMorePopular) {
+      throw new IllegalArgumentException("this suggester only works with onlyMorePopular=false");
     }
 
-    PerDocConsumer perDocConsumer = perDocConsumers.get(0);
-    if (perDocConsumer == null) {
-      PerDocWriteState perDocWriteState = docState.docWriter.newPerDocWriteState(0);
-      DocValuesFormat dvFormat = docState.docWriter.codec.docValuesFormat();
-      perDocConsumer = dvFormat.docsConsumer(perDocWriteState);
-      perDocConsumers.put(0, perDocConsumer);
+    if (fst == null) {
+      return Collections.emptyList();
     }
-    boolean success = false;
-    DocValuesConsumer docValuesConsumer = null;
+
+    BytesRef scratch = new BytesRef(key);
+    int prefixLength = scratch.length;
+    Arc<Long> arc = new Arc<Long>();
+    
+    // match the prefix portion exactly
+    Long prefixOutput = null;
     try {
-      docValuesConsumer = perDocConsumer.addValuesField(fieldInfo);
-      fieldInfo.commitDocValues();
-      success = true;
-    } finally {
-      if (!success) {
-        fieldInfo.revertUncommitted();
+      prefixOutput = lookupPrefix(scratch, arc);
+    } catch (IOException bogus) { throw new RuntimeException(bogus); }
+    
+    if (prefixOutput == null) {
+      return Collections.<LookupResult>emptyList();
+    }
+    
+    List<LookupResult> results = new ArrayList<LookupResult>(num);
+    CharsRef spare = new CharsRef();
+    if (exactFirst && arc.isFinal()) {
+      spare.grow(scratch.length);
+      UnicodeUtil.UTF8toUTF16(scratch, spare);
+      results.add(new LookupResult(spare.toString(), decodeWeight(prefixOutput + arc.nextFinalOutput)));
+      if (--num == 0) {
+        return results; // that was quick
       }
     }
 
-    docValuesConsumerAndDocID = new DocValuesConsumerAndDocID(docValuesConsumer);
-    docValuesConsumerAndDocID.docID = docState.docID;
-    docValues.put(fieldInfo.name, docValuesConsumerAndDocID);
-    return docValuesConsumer;
+    // complete top-N
+    MinResult<Long> completions[] = null;
+    try {
+      completions = Util.shortestPaths(fst, arc, prefixOutput, weightComparator, num, !exactFirst);
+    } catch (IOException bogus) {
+      throw new RuntimeException(bogus);
+    }
+    
+    BytesRef suffix = new BytesRef(8);
+    for (MinResult<Long> completion : completions) {
+      scratch.length = prefixLength;
+      // append suffix
+      Util.toBytesRef(completion.input, suffix);
+      scratch.append(suffix);
+      spare.grow(scratch.length);
+      UnicodeUtil.UTF8toUTF16(scratch, spare);
+      results.add(new LookupResult(spare.toString(), decodeWeight(completion.output)));
+    }
+    return results;
   }
+  
+  private Long lookupPrefix(BytesRef scratch, Arc<Long> arc) throws /*Bogus*/IOException {
+    assert 0 == fst.outputs.getNoOutput().longValue();
+    long output = 0;
+    BytesReader bytesReader = fst.getBytesReader();
+    
+    fst.getFirstArc(arc);
+    
+    byte[] bytes = scratch.bytes;
+    int pos = scratch.offset;
+    int end = pos + scratch.length;
+    while (pos < end) {
+      if (fst.findTargetArc(bytes[pos++] & 0xff, arc, arc, bytesReader) == null) {
+        return null;
+      } else {
+        output += arc.output.longValue();
+      }
+    }
+    
+    return output;
+  }
+  
+  /**
+   * Returns the weight associated with an input string,
+   * or null if it does not exist.
+   */
+  public Object get(CharSequence key) {
+    if (fst == null) {
+      return null;
+    }
+    Arc<Long> arc = new Arc<Long>();
+    Long result = null;
+    try {
+      result = lookupPrefix(new BytesRef(key), arc);
+    } catch (IOException bogus) { throw new RuntimeException(bogus); }
+    if (result == null || !arc.isFinal()) {
+      return null;
+    } else {
+      return Integer.valueOf(decodeWeight(result + arc.nextFinalOutput));
+    }
+  }
+  
+  /** cost -> weight */
+  private static int decodeWeight(long encoded) {
+    return (int)(Integer.MAX_VALUE - encoded);
+  }
+  
+  /** weight -> cost */
+  private static int encodeWeight(long value) {
+    if (value < 0 || value > Integer.MAX_VALUE) {
+      throw new UnsupportedOperationException("cannot encode value: " + value);
+    }
+    return Integer.MAX_VALUE - (int)value;
+  }
+  
+  private final class WFSTTermFreqIteratorWrapper extends SortedTermFreqIteratorWrapper {
+
+    WFSTTermFreqIteratorWrapper(TermFreqIterator source) throws IOException {
+      super(source);
+    }
+
+    @Override
+    protected void encode(ByteSequencesWriter writer, ByteArrayDataOutput output, byte[] buffer, BytesRef spare, long weight) throws IOException {
+      if (spare.length + 4 >= buffer.length) {
+        buffer = ArrayUtil.grow(buffer, spare.length + 4);
+      }
+      output.reset(buffer);
+      output.writeBytes(spare.bytes, spare.offset, spare.length);
+      output.writeInt(encodeWeight(weight));
+      writer.write(buffer, 0, output.getPosition());
+    }
+    
+    @Override
+    protected long decode(BytesRef scratch, ByteArrayDataInput tmpInput) {
+      scratch.length -= 4; // int
+      // skip suggestion:
+      tmpInput.reset(scratch.bytes, scratch.offset+scratch.length, 4);
+      return tmpInput.readInt();
+    }
+  }
+  
+  static final Comparator<Long> weightComparator = new Comparator<Long> () {
+    @Override
+    public int compare(Long left, Long right) {
+      return left.compareTo(right);
+    }  
+  };
 }

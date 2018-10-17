@@ -1,4 +1,4 @@
-shardsIts = clusterService.operationRouting().searchShards(clusterState, request.indices(), request.queryHint(), request.routing(), request.preference());
+import static org.elasticsearch.util.concurrent.ConcurrentCollections.*;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,318 +19,340 @@ shardsIts = clusterService.operationRouting().searchShards(clusterState, request
  * under the License.
  */
 
-package org.elasticsearch.action.search.type;
+package org.elasticsearch.discovery.zen.ping.multicast;
 
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.search.*;
-import org.elasticsearch.action.support.BaseAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
-import org.elasticsearch.cluster.routing.GroupShardsIterator;
-import org.elasticsearch.cluster.routing.ShardIterator;
-import org.elasticsearch.cluster.routing.ShardRouting;
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.trove.ExtTIntArrayList;
-import org.elasticsearch.search.SearchPhaseResult;
-import org.elasticsearch.search.SearchShardTarget;
-import org.elasticsearch.search.action.SearchServiceListener;
-import org.elasticsearch.search.action.SearchServiceTransportAction;
-import org.elasticsearch.search.controller.SearchPhaseController;
-import org.elasticsearch.search.controller.ShardDoc;
-import org.elasticsearch.search.internal.InternalSearchRequest;
-import org.elasticsearch.search.query.QuerySearchResultProvider;
+import org.elasticsearch.discovery.DiscoveryException;
+import org.elasticsearch.discovery.zen.DiscoveryNodesProvider;
+import org.elasticsearch.discovery.zen.ping.ZenPing;
+import org.elasticsearch.discovery.zen.ping.ZenPingException;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
+import org.elasticsearch.util.TimeValue;
+import org.elasticsearch.util.component.AbstractLifecycleComponent;
+import org.elasticsearch.util.io.stream.*;
+import org.elasticsearch.util.network.NetworkService;
+import org.elasticsearch.util.settings.Settings;
 
-import java.util.Arrays;
-import java.util.Collection;
+import java.io.IOException;
+import java.net.*;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
-import static org.elasticsearch.action.search.type.TransportSearchHelper.*;
+import static org.elasticsearch.cluster.node.DiscoveryNode.*;
+import static org.elasticsearch.util.concurrent.ConcurrentMaps.*;
+import static org.elasticsearch.util.concurrent.DynamicExecutors.*;
+import static org.elasticsearch.util.settings.ImmutableSettings.Builder.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public abstract class TransportSearchTypeAction extends BaseAction<SearchRequest, SearchResponse> {
+public class MulticastZenPing extends AbstractLifecycleComponent<ZenPing> implements ZenPing {
 
-    protected final ClusterService clusterService;
+    private final String address;
 
-    protected final SearchServiceTransportAction searchService;
+    private final int port;
 
-    protected final SearchPhaseController searchPhaseController;
+    private final String group;
 
-    protected final TransportSearchCache searchCache;
+    private final int bufferSize;
 
-    public TransportSearchTypeAction(Settings settings, ThreadPool threadPool, ClusterService clusterService,
-                                     TransportSearchCache searchCache, SearchServiceTransportAction searchService, SearchPhaseController searchPhaseController) {
-        super(settings, threadPool);
-        this.clusterService = clusterService;
-        this.searchCache = searchCache;
-        this.searchService = searchService;
-        this.searchPhaseController = searchPhaseController;
+    private final int ttl;
+
+    private final ThreadPool threadPool;
+
+    private final TransportService transportService;
+
+    private final ClusterName clusterName;
+
+    private final NetworkService networkService;
+
+
+    private volatile DiscoveryNodesProvider nodesProvider;
+
+    private volatile Receiver receiver;
+
+    private volatile Thread receiverThread;
+
+    private MulticastSocket multicastSocket;
+
+    private DatagramPacket datagramPacketSend;
+
+    private DatagramPacket datagramPacketReceive;
+
+    private final AtomicInteger pingIdGenerator = new AtomicInteger();
+
+    private final Map<Integer, ConcurrentMap<DiscoveryNode, PingResponse>> receivedResponses = newConcurrentMap();
+
+    private final Object sendMutex = new Object();
+
+    private final Object receiveMutex = new Object();
+
+    public MulticastZenPing(ThreadPool threadPool, TransportService transportService, ClusterName clusterName) {
+        this(EMPTY_SETTINGS, threadPool, transportService, clusterName, new NetworkService(EMPTY_SETTINGS));
     }
 
-    protected abstract class BaseAsyncAction<FirstResult extends SearchPhaseResult> {
+    public MulticastZenPing(Settings settings, ThreadPool threadPool, TransportService transportService, ClusterName clusterName, NetworkService networkService) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.transportService = transportService;
+        this.clusterName = clusterName;
+        this.networkService = networkService;
 
-        protected final ActionListener<SearchResponse> listener;
+        this.address = componentSettings.get("address");
+        this.port = componentSettings.getAsInt("port", 54328);
+        this.group = componentSettings.get("group", "224.2.2.4");
+        this.bufferSize = componentSettings.getAsInt("buffer_size", 2048);
+        this.ttl = componentSettings.getAsInt("ttl", 3);
 
-        protected final GroupShardsIterator shardsIts;
+        this.transportService.registerHandler(MulticastPingResponseRequestHandler.ACTION, new MulticastPingResponseRequestHandler());
+    }
 
-        protected final SearchRequest request;
+    @Override public void setNodesProvider(DiscoveryNodesProvider nodesProvider) {
+        if (lifecycle.started()) {
+            throw new ElasticSearchIllegalStateException("Can't set nodes provider when started");
+        }
+        this.nodesProvider = nodesProvider;
+    }
 
-        protected final DiscoveryNodes nodes;
-
-        protected final int expectedSuccessfulOps;
-
-        protected final int expectedTotalOps;
-
-        protected final AtomicInteger successulOps = new AtomicInteger();
-
-        protected final AtomicInteger totalOps = new AtomicInteger();
-
-        protected final Collection<ShardSearchFailure> shardFailures = searchCache.obtainShardFailures();
-
-        protected volatile ShardDoc[] sortedShardList;
-
-        protected final long startTime = System.currentTimeMillis();
-
-        protected BaseAsyncAction(SearchRequest request, ActionListener<SearchResponse> listener) {
-            this.request = request;
-            this.listener = listener;
-
-            ClusterState clusterState = clusterService.state();
-
-            nodes = clusterState.nodes();
-
-            request.indices(clusterState.metaData().concreteIndices(request.indices()));
-
-            for (String index : request.indices()) {
-                clusterState.blocks().indexBlockedRaiseException(ClusterBlockLevel.READ, index);
-            }
-
-            shardsIts = clusterService.operationRouting().searchShards(clusterState, request.indices(), request.queryHint(), request.routing());
-            expectedSuccessfulOps = shardsIts.size();
-            // we need to add 1 for non active partition, since we count it in the total!
-            expectedTotalOps = shardsIts.totalSizeActiveWith1ForEmpty();
-
-            if (expectedSuccessfulOps == 0) {
-                // not search shards to search on...
-                throw new SearchPhaseExecutionException("initial", "No indices / shards to search on, requested indices are " + Arrays.toString(request.indices()), buildShardFailures());
-            }
+    @Override protected void doStart() throws ElasticSearchException {
+        try {
+            this.datagramPacketReceive = new DatagramPacket(new byte[bufferSize], bufferSize);
+            this.datagramPacketSend = new DatagramPacket(new byte[bufferSize], bufferSize, InetAddress.getByName(group), port);
+        } catch (Exception e) {
+            throw new DiscoveryException("Failed to set datagram packets", e);
         }
 
-        public void start() {
-            // count the local operations, and perform the non local ones
-            int localOperations = 0;
-            for (final ShardIterator shardIt : shardsIts) {
-                final ShardRouting shard = shardIt.nextActiveOrNull();
-                if (shard != null) {
-                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
-                        localOperations++;
-                    } else {
-                        // do the remote operation here, the localAsync flag is not relevant
-                        performFirstPhase(shardIt.reset());
-                    }
-                } else {
-                    // really, no shards active in this group
-                    onFirstPhaseResult(null, shardIt, null);
-                }
-            }
-            // we have local operations, perform them now
-            if (localOperations > 0) {
-                if (request.operationThreading() == SearchOperationThreading.SINGLE_THREAD) {
-                    request.beforeLocalFork();
-                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
-                        @Override public void run() {
-                            for (final ShardIterator shardIt : shardsIts) {
-                                final ShardRouting shard = shardIt.reset().nextActiveOrNull();
-                                if (shard != null) {
-                                    if (shard.currentNodeId().equals(nodes.localNodeId())) {
-                                        performFirstPhase(shardIt.reset());
-                                    }
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    boolean localAsync = request.operationThreading() == SearchOperationThreading.THREAD_PER_SHARD;
-                    if (localAsync) {
-                        request.beforeLocalFork();
-                    }
-                    for (final ShardIterator shardIt : shardsIts) {
-                        final ShardRouting shard = shardIt.reset().nextActiveOrNull();
-                        if (shard != null) {
-                            if (shard.currentNodeId().equals(nodes.localNodeId())) {
-                                if (localAsync) {
-                                    threadPool.executor(ThreadPool.Names.SEARCH).execute(new Runnable() {
-                                        @Override public void run() {
-                                            performFirstPhase(shardIt.reset());
-                                        }
-                                    });
-                                } else {
-                                    performFirstPhase(shardIt.reset());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        try {
+            MulticastSocket multicastSocket = new MulticastSocket(null);
+            multicastSocket.setReuseAddress(true);
+            // bind to receive interface
+            multicastSocket.bind(new InetSocketAddress(port));
+            multicastSocket.setTimeToLive(ttl);
+            // set the send interface
+            InetAddress multicastInterface = networkService.resolvePublishHostAddress(address);
+            multicastSocket.setInterface(multicastInterface);
+            multicastSocket.setReceiveBufferSize(bufferSize);
+            multicastSocket.setSendBufferSize(bufferSize);
+            multicastSocket.joinGroup(InetAddress.getByName(group));
+            multicastSocket.setSoTimeout(60000);
+
+            this.multicastSocket = multicastSocket;
+        } catch (Exception e) {
+            throw new DiscoveryException("Failed to setup multicast socket", e);
         }
 
-        private void performFirstPhase(final ShardIterator shardIt) {
-            final ShardRouting shard = shardIt.nextActiveOrNull();
-            if (shard == null) {
-                // no more active shards... (we should not really get here, but just for safety)
-                onFirstPhaseResult(null, shardIt, null);
-            } else {
-                DiscoveryNode node = nodes.get(shard.currentNodeId());
-                if (node == null) {
-                    onFirstPhaseResult(shard, shardIt, null);
-                } else {
-                    sendExecuteFirstPhase(node, internalSearchRequest(shard, shardsIts.size(), request), new SearchServiceListener<FirstResult>() {
-                        @Override public void onResult(FirstResult result) {
-                            onFirstPhaseResult(shard, result, shardIt);
-                        }
+        this.receiver = new Receiver();
+        this.receiverThread = daemonThreadFactory(settings, "discovery#multicast#received").newThread(receiver);
+        this.receiverThread.start();
+    }
 
-                        @Override public void onFailure(Throwable t) {
-                            onFirstPhaseResult(shard, shardIt, t);
-                        }
-                    });
-                }
+    @Override protected void doStop() throws ElasticSearchException {
+        receiver.stop();
+        receiverThread.interrupt();
+        multicastSocket.close();
+    }
+
+    @Override protected void doClose() throws ElasticSearchException {
+    }
+
+    public PingResponse[] pingAndWait(TimeValue timeout) {
+        final AtomicReference<PingResponse[]> response = new AtomicReference<PingResponse[]>();
+        final CountDownLatch latch = new CountDownLatch(1);
+        ping(new PingListener() {
+            @Override public void onPing(PingResponse[] pings) {
+                response.set(pings);
+                latch.countDown();
             }
+        }, timeout);
+        try {
+            latch.await();
+            return response.get();
+        } catch (InterruptedException e) {
+            return null;
         }
+    }
 
-        private void onFirstPhaseResult(ShardRouting shard, FirstResult result, ShardIterator shardIt) {
-            result.shardTarget(new SearchShardTarget(shard.currentNodeId(), shard.index(), shard.id()));
-            processFirstPhaseResult(shard, result);
-            // increment all the "future" shards to update the total ops since we some may work and some may not...
-            // and when that happens, we break on total ops, so we must maintain them
-            while (shardIt.hasNextActive()) {
-                totalOps.incrementAndGet();
-                shardIt.nextActive();
-            }
-            if (successulOps.incrementAndGet() == expectedSuccessfulOps ||
-                    totalOps.incrementAndGet() == expectedTotalOps) {
+    @Override public void ping(final PingListener listener, final TimeValue timeout) {
+        final int id = pingIdGenerator.incrementAndGet();
+        receivedResponses.put(id, new ConcurrentHashMap<DiscoveryNode, PingResponse>());
+        sendPingRequest(id);
+        // try and send another ping request halfway through (just in case someone woke up during it...)
+        // this can be a good trade-off to nailing the initial lookup or un-delivered messages
+        threadPool.schedule(new Runnable() {
+            @Override public void run() {
                 try {
-                    moveToSecondPhase();
+                    sendPingRequest(id);
                 } catch (Exception e) {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "] while moving to second phase", e);
-                    }
-                    listener.onFailure(new ReduceSearchPhaseException(firstPhaseName(), "", e, buildShardFailures()));
+                    logger.debug("[{}] Failed to send second ping request", e, id);
                 }
             }
+        }, timeout.millis() / 2, TimeUnit.MILLISECONDS);
+        threadPool.schedule(new Runnable() {
+            @Override public void run() {
+                ConcurrentMap<DiscoveryNode, PingResponse> responses = receivedResponses.remove(id);
+                listener.onPing(responses.values().toArray(new PingResponse[responses.size()]));
+            }
+        }, timeout);
+    }
+
+    private void sendPingRequest(int id) {
+        synchronized (sendMutex) {
+            try {
+                HandlesStreamOutput out = BytesStreamOutput.Cached.cachedHandles();
+                out.writeInt(id);
+                clusterName.writeTo(out);
+                nodesProvider.nodes().localNode().writeTo(out);
+                datagramPacketSend.setData(((BytesStreamOutput) out.wrappedOut()).copiedByteArray());
+            } catch (IOException e) {
+                receivedResponses.remove(id);
+                throw new ZenPingException("Failed to serialize ping request", e);
+            }
+            try {
+                multicastSocket.send(datagramPacketSend);
+                if (logger.isTraceEnabled()) {
+                    logger.trace("[{}] Sending ping request", id);
+                }
+            } catch (IOException e) {
+                receivedResponses.remove(id);
+                throw new ZenPingException("Failed to send ping request over multicast", e);
+            }
+        }
+    }
+
+    class MulticastPingResponseRequestHandler extends BaseTransportRequestHandler<MulticastPingResponse> {
+
+        static final String ACTION = "discovery/zen/multicast";
+
+        @Override public MulticastPingResponse newInstance() {
+            return new MulticastPingResponse();
         }
 
-        private void onFirstPhaseResult(@Nullable ShardRouting shard, final ShardIterator shardIt, Throwable t) {
-            if (totalOps.incrementAndGet() == expectedTotalOps) {
-                // e is null when there is no next active....
-                if (logger.isDebugEnabled()) {
-                    if (t != null) {
-                        if (shard != null) {
-                            logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
-                        } else {
-                            logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
-                        }
-                    }
-                }
-                // no more shards, add a failure
-                if (t == null) {
-                    // no active shards
-                    shardFailures.add(new ShardSearchFailure("No active shards", new SearchShardTarget(null, shardIt.shardId().index().name(), shardIt.shardId().id())));
-                } else {
-                    shardFailures.add(new ShardSearchFailure(t));
-                }
-                if (successulOps.get() == 0) {
-                    // no successful ops, raise an exception
-                    listener.onFailure(new SearchPhaseExecutionException(firstPhaseName(), "total failure", buildShardFailures()));
-                } else {
-                    try {
-                        moveToSecondPhase();
-                    } catch (Exception e) {
-                        listener.onFailure(new ReduceSearchPhaseException(firstPhaseName(), "", e, buildShardFailures()));
-                    }
-                }
+        @Override public void messageReceived(MulticastPingResponse request, TransportChannel channel) throws Exception {
+            if (logger.isTraceEnabled()) {
+                logger.trace("[{}] Received {}", request.id, request.pingResponse);
+            }
+            ConcurrentMap<DiscoveryNode, PingResponse> responses = receivedResponses.get(request.id);
+            if (responses == null) {
+                logger.warn("Received ping response with no matching id [{}]", request.id);
             } else {
-                if (shardIt.hasNextActive()) {
-                    // trace log this exception
+                responses.put(request.pingResponse.target(), request.pingResponse);
+            }
+            channel.sendResponse(VoidStreamable.INSTANCE);
+        }
+    }
+
+    static class MulticastPingResponse implements Streamable {
+
+        int id;
+
+        PingResponse pingResponse;
+
+        MulticastPingResponse() {
+        }
+
+        @Override public void readFrom(StreamInput in) throws IOException {
+            id = in.readInt();
+            pingResponse = PingResponse.readPingResponse(in);
+        }
+
+        @Override public void writeTo(StreamOutput out) throws IOException {
+            out.writeInt(id);
+            pingResponse.writeTo(out);
+        }
+    }
+
+
+    private class Receiver implements Runnable {
+
+        private volatile boolean running = true;
+
+        public void stop() {
+            running = false;
+        }
+
+        @Override public void run() {
+            while (running) {
+                try {
+                    int id;
+                    DiscoveryNode requestingNodeX;
+                    ClusterName clusterName;
+                    synchronized (receiveMutex) {
+                        try {
+                            multicastSocket.receive(datagramPacketReceive);
+                        } catch (SocketTimeoutException ignore) {
+                            continue;
+                        } catch (Exception e) {
+                            if (running) {
+                                logger.warn("Failed to receive packet", e);
+                            }
+                            continue;
+                        }
+                        try {
+                            StreamInput input = HandlesStreamInput.Cached.cached(new BytesStreamInput(datagramPacketReceive.getData(), datagramPacketReceive.getOffset(), datagramPacketReceive.getLength()));
+                            id = input.readInt();
+                            clusterName = ClusterName.readClusterName(input);
+                            requestingNodeX = readNode(input);
+                        } catch (Exception e) {
+                            logger.warn("Failed to read requesting node from {}", e, datagramPacketReceive.getSocketAddress());
+                            continue;
+                        }
+                    }
+                    DiscoveryNodes discoveryNodes = nodesProvider.nodes();
+                    final DiscoveryNode requestingNode = requestingNodeX;
+                    if (requestingNode.id().equals(discoveryNodes.localNodeId())) {
+                        // that's me, ignore
+                        continue;
+                    }
+                    if (!clusterName.equals(MulticastZenPing.this.clusterName)) {
+                        // not our cluster, ignore it...
+                        continue;
+                    }
+                    final MulticastPingResponse multicastPingResponse = new MulticastPingResponse();
+                    multicastPingResponse.id = id;
+                    multicastPingResponse.pingResponse = new PingResponse(discoveryNodes.localNode(), discoveryNodes.masterNode(), clusterName);
+
                     if (logger.isTraceEnabled()) {
-                        if (t != null) {
-                            if (shard != null) {
-                                logger.trace(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
-                            } else {
-                                logger.trace(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
-                            }
-                        }
+                        logger.trace("[{}] Received ping_request from [{}], sending {}", id, requestingNode, multicastPingResponse.pingResponse);
                     }
-                    performFirstPhase(shardIt);
-                } else {
-                    // no more shards active, add a failure
-                    // e is null when there is no next active....
-                    if (logger.isDebugEnabled()) {
-                        if (t != null) {
-                            if (shard != null) {
-                                logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", t);
-                            } else {
-                                logger.debug(shardIt.shardId() + ": Failed to execute [" + request + "]", t);
+
+                    if (!transportService.nodeConnected(requestingNode)) {
+                        // do the connect and send on a thread pool
+                        threadPool.execute(new Runnable() {
+                            @Override public void run() {
+                                // connect to the node if possible
+                                try {
+                                    transportService.connectToNode(requestingNode);
+                                } catch (Exception e) {
+                                    logger.warn("Failed to connect to requesting node {}", e, requestingNode);
+                                }
+                                transportService.sendRequest(requestingNode, MulticastPingResponseRequestHandler.ACTION, multicastPingResponse, new VoidTransportResponseHandler(false) {
+                                    @Override public void handleException(RemoteTransportException exp) {
+                                        logger.warn("Failed to receive confirmation on sent ping response to [{}]", exp, requestingNode);
+                                    }
+                                });
                             }
-                        }
-                    }
-                    if (t == null) {
-                        // no active shards
-                        shardFailures.add(new ShardSearchFailure("No active shards", new SearchShardTarget(null, shardIt.shardId().index().name(), shardIt.shardId().id())));
+                        });
                     } else {
-                        shardFailures.add(new ShardSearchFailure(t));
+                        transportService.sendRequest(requestingNode, MulticastPingResponseRequestHandler.ACTION, multicastPingResponse, new VoidTransportResponseHandler(false) {
+                            @Override public void handleException(RemoteTransportException exp) {
+                                logger.warn("Failed to receive confirmation on sent ping response to [{}]", exp, requestingNode);
+                            }
+                        });
                     }
+                } catch (Exception e) {
+                    logger.warn("Unexpected exception in multicast receiver", e);
                 }
             }
         }
-
-        /**
-         * Builds how long it took to execute the search.
-         */
-        protected final long buildTookInMillis() {
-            return System.currentTimeMillis() - startTime;
-        }
-
-        /**
-         * Builds the shard failures, and releases the cache (meaning this should only be called once!).
-         */
-        protected final ShardSearchFailure[] buildShardFailures() {
-            return TransportSearchHelper.buildShardFailures(shardFailures, searchCache);
-        }
-
-        /**
-         * Releases shard targets that are not used in the docsIdsToLoad.
-         */
-        protected void releaseIrrelevantSearchContexts(Map<SearchShardTarget, QuerySearchResultProvider> queryResults,
-                                                       Map<SearchShardTarget, ExtTIntArrayList> docIdsToLoad) {
-            if (docIdsToLoad == null) {
-                return;
-            }
-            // we only release search context that we did not fetch from if we are not scrolling
-            if (request.scroll() == null) {
-                for (Map.Entry<SearchShardTarget, QuerySearchResultProvider> entry : queryResults.entrySet()) {
-                    if (!docIdsToLoad.containsKey(entry.getKey())) {
-                        DiscoveryNode node = nodes.get(entry.getKey().nodeId());
-                        if (node != null) { // should not happen (==null) but safeguard anyhow
-                            searchService.sendFreeContext(node, entry.getValue().id());
-                        }
-                    }
-                }
-            }
-        }
-
-        protected abstract void sendExecuteFirstPhase(DiscoveryNode node, InternalSearchRequest request, SearchServiceListener<FirstResult> listener);
-
-        protected abstract void processFirstPhaseResult(ShardRouting shard, FirstResult result);
-
-        protected abstract void moveToSecondPhase() throws Exception;
-
-        protected abstract String firstPhaseName();
     }
 }

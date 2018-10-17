@@ -1,149 +1,141 @@
-public void add(MessageResolver messageResolver, String element) {
+Long collectionTimeP = _gcBean.getCollectionTime();
 
-/*
- * Copyright 2004-2009 the original author or authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-package org.springframework.ui.message.support;
+package backtype.storm.metric;
 
-import java.text.MessageFormat;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import backtype.storm.Config;
+import backtype.storm.metric.api.AssignableMetric;
+import backtype.storm.metric.api.IMetric;
+import backtype.storm.task.IBolt;
+import backtype.storm.task.OutputCollector;
+import backtype.storm.task.TopologyContext;
+import backtype.storm.tuple.Tuple;
+import clojure.lang.AFn;
+import clojure.lang.IFn;
+import clojure.lang.RT;
+import com.google.common.collect.ImmutableMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.management.*;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
-import org.springframework.context.MessageSource;
-import org.springframework.context.i18n.LocaleContextHolder;
-import org.springframework.context.support.AbstractMessageSource;
-import org.springframework.core.style.ToStringCreator;
-import org.springframework.ui.message.Message;
-import org.springframework.ui.message.MessageContext;
-import org.springframework.ui.message.MessageResolver;
-import org.springframework.ui.message.Severity;
-import org.springframework.util.CachingMapDecorator;
 
-import edu.emory.mathcs.backport.java.util.Collections;
+// There is one task inside one executor for each worker of the topology.
+// TaskID is always -1, therefore you can only send-unanchored tuples to co-located SystemBolt.
+// This bolt was conceived to export worker stats via metrics api.
+public class SystemBolt implements IBolt {
+    private static Logger LOG = LoggerFactory.getLogger(SystemBolt.class);
+    private static boolean _prepareWasCalled = false;
 
-/**
- * The default message context implementation.
- * Uses a {@link MessageSource} to resolve messages that are added by callers.
- * 
- * @author Keith Donald
- */
-public class DefaultMessageContext implements MessageContext {
+    private static class MemoryUsageMetric implements IMetric {
+        IFn _getUsage;
+        public MemoryUsageMetric(IFn getUsage) {
+            _getUsage = getUsage;
+        }
+        @Override
+        public Object getValueAndReset() {
+            MemoryUsage memUsage = (MemoryUsage)_getUsage.invoke();
+            return ImmutableMap.builder()
+                    .put("maxBytes", memUsage.getMax())
+                    .put("committedBytes", memUsage.getCommitted())
+                    .put("initBytes", memUsage.getInit())
+                    .put("usedBytes", memUsage.getUsed())
+                    .put("virtualFreeBytes", memUsage.getMax() - memUsage.getUsed())
+                    .put("unusedBytes", memUsage.getCommitted() - memUsage.getUsed())
+                    .build();
+        }
+    }
 
-	private MessageSource messageSource;
+    // canonically the metrics data exported is time bucketed when doing counts.
+    // convert the absolute values here into time buckets.
+    private static class GarbageCollectorMetric implements IMetric {
+        GarbageCollectorMXBean _gcBean;
+        Long _collectionCount;
+        Long _collectionTime;
+        public GarbageCollectorMetric(GarbageCollectorMXBean gcBean) {
+            _gcBean = gcBean;
+        }
+        @Override
+        public Object getValueAndReset() {
+            Long collectionCountP = _gcBean.getCollectionCount();
+            Long collectionTimeP = _gcBean.getCollectionCount();
 
-	@SuppressWarnings("serial")
-	private Map<String, ArrayList<Message>> messagesByElement = new CachingMapDecorator<String, ArrayList<Message>>(new LinkedHashMap<String, ArrayList<Message>>()) {
-		protected ArrayList<Message> create(String element) {
-			return new ArrayList<Message>();
-		}
-	};
+            Map ret = null;
+            if(_collectionCount!=null && _collectionTime!=null) {
+                ret = ImmutableMap.builder()
+                        .put("count", collectionCountP - _collectionCount)
+                        .put("timeMs", collectionTimeP - _collectionTime)
+                        .build();
+            }
 
-	/**
-	 * Creates a new default message context.
-	 * Defaults to a message source that simply resolves default text and cannot resolve localized message codes.
-	 */
-	public DefaultMessageContext() {
-		init(null);
-	}
+            _collectionCount = collectionCountP;
+            _collectionTime = collectionTimeP;
+            return ret;
+        }
+    }
 
-	/**
-	 * Creates a new default message context.
-	 * @param messageSource the message source to resolve messages added to this context
-	 */
-	public DefaultMessageContext(MessageSource messageSource) {
-		init(messageSource);
-	}
+    @Override
+    public void prepare(final Map stormConf, TopologyContext context, OutputCollector collector) {
+        if(_prepareWasCalled && stormConf.get(Config.STORM_CLUSTER_MODE) != "local") {
+            throw new RuntimeException("A single worker should have 1 SystemBolt instance.");
+        }
+        _prepareWasCalled = true;
 
-	/**
-	 * The message source configured to resolve message text.
-	 * @return the message source
-	 */
-	public MessageSource getMessageSource() {
-		return messageSource;
-	}
+        int bucketSize = RT.intCast(stormConf.get(Config.TOPOLOGY_BUILTIN_METRICS_BUCKET_SIZE_SECS));
 
-	// implementing message context
+        final RuntimeMXBean jvmRT = ManagementFactory.getRuntimeMXBean();
 
-	@SuppressWarnings("unchecked")
-	public Map<String, List<Message>> getMessages() {
-		return Collections.unmodifiableMap(messagesByElement);
-	}
-	
-	@SuppressWarnings("unchecked")
-	public List<Message> getMessages(String element) {
-		List<Message> messages = messagesByElement.get(element);
-		if (messages.isEmpty()) {
-			return Collections.emptyList();
-		}
-		return Collections.unmodifiableList(messages);
-	}
+        context.registerMetric("uptimeSecs", new IMetric() {
+            @Override
+            public Object getValueAndReset() {
+                return jvmRT.getUptime()/1000.0;
+            }
+        }, bucketSize);
 
-	public void addMessage(String element, MessageResolver messageResolver) {
-		List<Message> messages = messagesByElement.get(element);
-		messages.add(new ResolvableMessage(messageResolver));
-	}
+        context.registerMetric("startTimeSecs", new IMetric() {
+            @Override
+            public Object getValueAndReset() {
+                return jvmRT.getStartTime()/1000.0;
+            }
+        }, bucketSize);
 
-	public String toString() {
-		return new ToStringCreator(this).append("messagesByElement", messagesByElement).toString();
-	}
+        context.registerMetric("newWorkerEvent", new IMetric() {
+            boolean doEvent = true;
 
-	// internal helpers
+            @Override
+            public Object getValueAndReset() {
+                if (doEvent) {
+                    doEvent = false;
+                    return 1;
+                } else return 0;
+            }
+        }, bucketSize);
 
-	private void init(MessageSource messageSource) {
-		setMessageSource(messageSource);
-	}
+        final MemoryMXBean jvmMemRT = ManagementFactory.getMemoryMXBean();
 
-	private void setMessageSource(MessageSource messageSource) {
-		if (messageSource == null) {
-			messageSource = new DefaultTextFallbackMessageSource();
-		}
-		this.messageSource = messageSource;
-	}
+        context.registerMetric("memory/heap", new MemoryUsageMetric(new AFn() {
+            public Object invoke() {
+                return jvmMemRT.getHeapMemoryUsage();
+            }
+        }), bucketSize);
+        context.registerMetric("memory/nonHeap", new MemoryUsageMetric(new AFn() {
+            public Object invoke() {
+                return jvmMemRT.getNonHeapMemoryUsage();
+            }
+        }), bucketSize);
 
-	private static class DefaultTextFallbackMessageSource extends AbstractMessageSource {
-		protected MessageFormat resolveCode(String code, Locale locale) {
-			return null;
-		}
-	}
-	
-	class ResolvableMessage implements Message {
+        for(GarbageCollectorMXBean b : ManagementFactory.getGarbageCollectorMXBeans()) {
+            context.registerMetric("GC/" + b.getName().replaceAll("\\W", ""), new GarbageCollectorMetric(b), bucketSize);
+        }
+    }
 
-		private MessageResolver resolver;
-		
-		private Message resolvedMessage;
-		
-		public ResolvableMessage(MessageResolver resolver) {
-			this.resolver = resolver;
-		}
-		
-		public Severity getSeverity() {
-			return getMessage().getSeverity();
-		}
+    @Override
+    public void execute(Tuple input) {
+        throw new RuntimeException("Non-system tuples should never be sent to __system bolt.");
+    }
 
-		public String getText() {
-			return getMessage().getText();
-		}
-
-		public Message getMessage() {
-			if (resolvedMessage == null) {
-				resolvedMessage = resolver.resolveMessage(messageSource, LocaleContextHolder.getLocale());
-			}
-			return resolvedMessage;
-		}
-	}
+    @Override
+    public void cleanup() {
+    }
 }

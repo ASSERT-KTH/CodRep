@@ -1,19 +1,17 @@
-throws IOException {
+void add(int ordinal, int parentOrdinal) {
 
-package org.apache.lucene.facet.search;
+package org.apache.lucene.facet.taxonomy.directory;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
 
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsAndPositionsEnum;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.MatchAllDocsQuery;
-import org.apache.lucene.search.Query;
-import org.junit.Test;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
 
-import org.apache.lucene.facet.search.params.FacetSearchParams;
-import org.apache.lucene.facet.search.results.FacetResult;
-import org.apache.lucene.facet.search.results.FacetResultNode;
 import org.apache.lucene.facet.taxonomy.TaxonomyReader;
 
 /*
@@ -33,110 +31,134 @@ import org.apache.lucene.facet.taxonomy.TaxonomyReader;
  * limitations under the License.
  */
 
-public class TestTopKResultsHandlerRandom extends BaseTestTopK {
-  
-  private List<FacetResult> countFacets(int partitionSize, int numResults, final boolean doComplement)
-      throws IOException, IllegalAccessException, InstantiationException {
-    Query q = new MatchAllDocsQuery();
-    FacetSearchParams facetSearchParams = searchParamsWithRequests(numResults, partitionSize);
-    FacetsCollector fc = new FacetsCollector(facetSearchParams, indexReader, taxoReader) {
-      @Override
-      protected FacetsAccumulator initFacetsAccumulator(
-          FacetSearchParams facetSearchParams, IndexReader indexReader,
-          TaxonomyReader taxonomyReader) {
-        FacetsAccumulator accumulator = new StandardFacetsAccumulator(facetSearchParams, indexReader, taxonomyReader);
-        double complement = doComplement ? FacetsAccumulator.FORCE_COMPLEMENT : FacetsAccumulator.DISABLE_COMPLEMENT;
-        accumulator.setComplementThreshold(complement);
-        return accumulator;
-      }
-    };
-    searcher.search(q, fc);
-    List<FacetResult> facetResults = fc.getFacetResults();
-    return facetResults;
+// getParent() needs to be extremely efficient, to the point that we need
+// to fetch all the data in advance into memory, and answer these calls
+// from memory. Currently we use a large integer array, which is
+// initialized when the taxonomy is opened, and potentially enlarged
+// when it is refresh()ed.
+/**
+ * @lucene.experimental
+ */
+class ParentArray {
+
+  // These arrays are not syncrhonized. Rather, the reference to the array
+  // is volatile, and the only writing operation (refreshPrefetchArrays)
+  // simply creates a new array and replaces the reference. The volatility
+  // of the reference ensures the correct atomic replacement and its
+  // visibility properties (the content of the array is visible when the
+  // new reference is visible).
+  private volatile int prefetchParentOrdinal[] = null;
+
+  public int[] getArray() {
+    return prefetchParentOrdinal;
   }
 
   /**
-   * Test that indeed top results are returned, ordered same as all results 
-   * also when some facets have the same counts.
+   * refreshPrefetch() refreshes the parent array. Initially, it fills the
+   * array from the positions of an appropriate posting list. If called during
+   * a refresh(), when the arrays already exist, only values for new documents
+   * (those beyond the last one in the array) are read from the positions and
+   * added to the arrays (that are appropriately enlarged). We assume (and
+   * this is indeed a correct assumption in our case) that existing categories
+   * are never modified or deleted.
    */
-  @Test
-  public void testTopCountsOrder() throws Exception {
-    for (int partitionSize : partitionSizes) {
-      initIndex(partitionSize);
-      
-      /*
-       * Try out faceted search in it's most basic form (no sampling nor complement
-       * that is). In this test lots (and lots..) of randomly generated data is
-       * being indexed, and later on an "over-all" faceted search is performed. The
-       * results are checked against the DF of each facet by itself
-       */
-      List<FacetResult> facetResults = countFacets(partitionSize, 100000, false);
-      assertCountsAndCardinality(facetCountsTruth(), facetResults);
-      
-      /*
-       * Try out faceted search with complements. In this test lots (and lots..) of
-       * randomly generated data is being indexed, and later on, a "beta" faceted
-       * search is performed - retrieving ~90% of the documents so complements takes
-       * place in here. The results are checked against the a regular (a.k.a
-       * no-complement, no-sampling) faceted search with the same parameters.
-       */
-      facetResults = countFacets(partitionSize, 100000, true);
-      assertCountsAndCardinality(facetCountsTruth(), facetResults);
-      
-      List<FacetResult> allFacetResults = countFacets(partitionSize, 100000, false);
-      
-      HashMap<String,Integer> all = new HashMap<String,Integer>();
-      int maxNumNodes = 0;
-      int k = 0;
-      for (FacetResult fr : allFacetResults) {
-        FacetResultNode topResNode = fr.getFacetResultNode();
-        maxNumNodes = Math.max(maxNumNodes, topResNode.getNumSubResults());
-        int prevCount = Integer.MAX_VALUE;
-        int pos = 0;
-        for (FacetResultNode frn: topResNode.getSubResults()) {
-          assertTrue("wrong counts order: prev="+prevCount+" curr="+frn.getValue(), prevCount>=frn.getValue());
-          prevCount = (int) frn.getValue();
-          String key = k+"--"+frn.getLabel()+"=="+frn.getValue();
-          if (VERBOSE) {
-            System.out.println(frn.getLabel() + " - " + frn.getValue() + "  "+key+"  "+pos);
-          }
-          all.put(key, pos++); // will use this later to verify order of sub-results
-        }
-        k++;
+  void refresh(IndexReader indexReader) throws IOException {
+    // Note that it is not necessary for us to obtain the read lock.
+    // The reason is that we are only called from refresh() (precluding
+    // another concurrent writer) or from the constructor (when no method
+    // could be running).
+    // The write lock is also not held during the following code, meaning
+    // that reads *can* happen while this code is running. The "volatile"
+    // property of the prefetchParentOrdinal and prefetchDepth array
+    // references ensure the correct visibility property of the assignment
+    // but other than that, we do *not* guarantee that a reader will not
+    // use an old version of one of these arrays (or both) while a refresh
+    // is going on. But we find this acceptable - until a refresh has
+    // finished, the reader should not expect to see new information
+    // (and the old information is the same in the old and new versions).
+    int first;
+    int num = indexReader.maxDoc();
+    if (prefetchParentOrdinal==null) {
+      prefetchParentOrdinal = new int[num];
+      // Starting Lucene 2.9, following the change LUCENE-1542, we can
+      // no longer reliably read the parent "-1" (see comment in
+      // LuceneTaxonomyWriter.SinglePositionTokenStream). We have no way
+      // to fix this in indexing without breaking backward-compatibility
+      // with existing indexes, so what we'll do instead is just
+      // hard-code the parent of ordinal 0 to be -1, and assume (as is
+      // indeed the case) that no other parent can be -1.
+      if (num>0) {
+        prefetchParentOrdinal[0] = TaxonomyReader.INVALID_ORDINAL;
       }
-      
-      // verify that when asking for less results, they are always of highest counts
-      // also verify that the order is stable
-      for (int n=1; n<maxNumNodes; n++) {
-        if (VERBOSE) {
-          System.out.println("-------  verify for "+n+" top results");
-        }
-        List<FacetResult> someResults = countFacets(partitionSize, n, false);
-        k = 0;
-        for (FacetResult fr : someResults) {
-          FacetResultNode topResNode = fr.getFacetResultNode();
-          assertTrue("too many results: n="+n+" but got "+topResNode.getNumSubResults(), n>=topResNode.getNumSubResults());
-          int pos = 0;
-          for (FacetResultNode frn: topResNode.getSubResults()) {
-            String key = k+"--"+frn.getLabel()+"=="+frn.getValue();
-            if (VERBOSE) {
-              System.out.println(frn.getLabel() + " - " + frn.getValue() + "  "+key+"  "+pos);
+      first = 1;
+    } else {
+      first = prefetchParentOrdinal.length;
+      if (first==num) {
+        return; // nothing to do - no category was added
+      }
+      // In Java 6, we could just do Arrays.copyOf()...
+      int[] newarray = new int[num];
+      System.arraycopy(prefetchParentOrdinal, 0, newarray, 0,
+          prefetchParentOrdinal.length);
+      prefetchParentOrdinal = newarray;
+    }
+
+    // Read the new part of the parents array from the positions:
+    // TODO (Facet): avoid Multi*?
+    Bits liveDocs = MultiFields.getLiveDocs(indexReader);
+    DocsAndPositionsEnum positions = MultiFields.getTermPositionsEnum(indexReader, liveDocs,
+                                                                      Consts.FIELD_PAYLOADS, new BytesRef(Consts.PAYLOAD_PARENT),
+                                                                      false);
+      if ((positions == null || positions.advance(first) == DocIdSetIterator.NO_MORE_DOCS) && first < num) {
+        throw new CorruptIndexException("Missing parent data for category " + first);
+      }
+      for (int i=first; i<num; i++) {
+        // Note that we know positions.doc() >= i (this is an
+        // invariant kept throughout this loop)
+        if (positions.docID()==i) {
+          if (positions.freq() == 0) { // shouldn't happen
+            throw new CorruptIndexException(
+                "Missing parent data for category "+i);
+          }
+
+          // TODO (Facet): keep a local (non-volatile) copy of the prefetchParentOrdinal
+          // reference, because access to volatile reference is slower (?).
+          // Note: The positions we get here are one less than the position
+          // increment we added originally, so we get here the right numbers:
+          prefetchParentOrdinal[i] = positions.nextPosition();
+
+          if (positions.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+            if ( i+1 < num ) {
+              throw new CorruptIndexException(
+                  "Missing parent data for category "+(i+1));
             }
-            Integer origPos = all.get(key);
-            assertNotNull("missing in all results: "+frn,origPos);
-            assertEquals("wrong order of sub-results!",pos++, origPos.intValue()); // verify order of sub-results
+            break;
           }
-          k++;
-        }
+        } else { // this shouldn't happen
+        throw new CorruptIndexException(
+            "Missing parent data for category "+i);
       }
-      
-      closeAll(); // done with this partition
     }
   }
 
-  @Override
-  protected int numDocsToIndex() {
-    return TEST_NIGHTLY ? 20000 : 1000;
+  /**
+   * add() is used in LuceneTaxonomyWriter, not in LuceneTaxonomyReader.
+   * It is only called from a synchronized method, so it is not reentrant,
+   * and also doesn't need to worry about reads happening at the same time.
+   * 
+   * NOTE: add() and refresh() CANNOT be used together. If you call add(),
+   * this changes the arrays and refresh() can no longer be used.
+   */
+  void add(int ordinal, int parentOrdinal) throws IOException {
+    if (ordinal >= prefetchParentOrdinal.length) {
+      // grow the array, if necessary.
+      // In Java 6, we could just do Arrays.copyOf()...
+      int[] newarray = new int[ordinal*2+1];
+      System.arraycopy(prefetchParentOrdinal, 0, newarray, 0,
+          prefetchParentOrdinal.length);
+      prefetchParentOrdinal = newarray;
+    }
+    prefetchParentOrdinal[ordinal] = parentOrdinal;
   }
 
 }

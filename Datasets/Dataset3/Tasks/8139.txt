@@ -1,8 +1,8 @@
-throw MESSAGES.couldNotCreateURI(uri,e.toString());
+import org.jboss.as.controller.logging.ControllerLogger;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2011, Red Hat, Inc., and individual contributors
+ * Copyright 2013, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,104 +22,215 @@ throw MESSAGES.couldNotCreateURI(uri,e.toString());
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.remoting;
+package org.jboss.as.controller.access.constraint;
 
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.PathAddress;
-import org.jboss.as.controller.ServiceVerificationHandler;
-import org.jboss.as.controller.descriptions.ModelDescriptionConstants;
-import org.jboss.as.controller.registry.Resource;
-import org.jboss.dmr.ModelNode;
-import org.jboss.msc.service.ServiceBuilder;
-import org.jboss.msc.service.ServiceController;
-import org.jboss.msc.service.ServiceName;
-import org.jboss.remoting3.Endpoint;
-import org.xnio.OptionMap;
-
-import java.net.URI;
-import java.net.URISyntaxException;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
-import static org.jboss.as.remoting.RemotingMessages.MESSAGES;
+import org.jboss.as.controller.ControllerLogger;
+import org.jboss.as.controller.access.Action;
+import org.jboss.as.controller.access.HostEffect;
+import org.jboss.as.controller.access.TargetAttribute;
+import org.jboss.as.controller.access.TargetResource;
+import org.jboss.as.controller.access.rbac.StandardRole;
 
 /**
- * @author Jaikiran Pai
+ * Constraint related to whether the target resource is associated with one or more managed domain hosts.
+ *
+ * @author Brian Stansberry (c) 2013 Red Hat Inc.
  */
-class GenericOutboundConnectionAdd extends AbstractOutboundConnectionAddHandler {
+public class HostEffectConstraint extends AbstractConstraint implements Constraint, ScopingConstraint {
 
-    static final GenericOutboundConnectionAdd INSTANCE = new GenericOutboundConnectionAdd();
 
-    static ModelNode getAddOperation(final String connectionName, final String uri, PathAddress address) {
-        if (connectionName == null || connectionName.trim().isEmpty()) {
-            throw MESSAGES.connectionNameEmpty();
-        }
-        if (uri == null || uri.trim().isEmpty()) {
-            throw MESSAGES.connectionUriEmpty(connectionName);
-        }
-        final ModelNode addOperation = new ModelNode();
-        addOperation.get(ModelDescriptionConstants.OP).set(ModelDescriptionConstants.ADD);
-        addOperation.get(ModelDescriptionConstants.OP_ADDR).set(address.toModelNode());
+    public static final ScopingConstraintFactory FACTORY = new Factory();
 
-        // set the other params
-        addOperation.get(CommonAttributes.URI).set(uri);
+    private static final HostEffectConstraint GLOBAL_USER = new HostEffectConstraint(true);
+    private static final HostEffectConstraint GLOBAL_REQUIRED = new HostEffectConstraint(false);
 
-        return addOperation;
+    private final boolean user;
+    private final boolean global;
+    private final HostsHolder hostsHolder;
+    private final boolean readOnly;
+    private final HostEffectConstraint readOnlyConstraint;
+
+    private HostEffectConstraint(final boolean user) {
+        super();
+        this.user = user;
+        this.global = true;
+        this.readOnly = false;
+        this.readOnlyConstraint = null;
+        this.hostsHolder = new HostsHolder();
     }
 
-    private GenericOutboundConnectionAdd() {
+    private HostEffectConstraint(Set<String> allowed) {
+        super();
+        this.user = false;
+        this.global = false;
+        this.hostsHolder = new HostsHolder(allowed);
+        this.readOnly = false;
+        this.readOnlyConstraint = null;
+    }
 
+    public HostEffectConstraint(List<String> allowed) {
+        super();
+        this.user = true;
+        this.global = false;
+        this.hostsHolder = new HostsHolder(allowed);
+        this.readOnly = false;
+        this.readOnlyConstraint = new HostEffectConstraint(this.hostsHolder, true);
+    }
+
+    /**
+     * Creates the constraint the standard constraint will return from {@link #getOutofScopeReadConstraint()}
+     * Only call from {@link HostEffectConstraint#HostEffectConstraint(java.util.List)}
+     */
+    private HostEffectConstraint(HostsHolder hostsHolder, boolean readOnly) {
+        super();
+        this.user = true;
+        this.global = false;
+        this.hostsHolder = hostsHolder;
+        this.readOnly = readOnly;
+        this.readOnlyConstraint = null;
+    }
+
+    public void setAllowedHosts(List<String> allowed) {
+        assert !global : "constraint is global";
+        assert readOnlyConstraint != null : "invalid cast";
+        this.hostsHolder.specific = new LinkedHashSet<String>(allowed);
     }
 
     @Override
-    protected void populateModel(ModelNode operation, ModelNode model) throws OperationFailedException {
-        super.populateModel(operation, model);
-        GenericOutboundConnectionResourceDefinition.URI.validateAndSet(operation, model);
+    public boolean violates(Constraint other, Action.ActionEffect actionEffect) {
+        if (other instanceof HostEffectConstraint) {
+            HostEffectConstraint hec = (HostEffectConstraint) other;
+            Set<String> ourSpecific = hostsHolder.specific;
+            Set<String> hecSpecific = hec.hostsHolder.specific;
+            if (user) {
+                assert !hec.user : "illegal comparison";
+                if (readOnly) {
+                    // Allow global or any matching server group
+                    if (!hec.global) {
+                        boolean anyMatch = anyMatch(ourSpecific, hecSpecific);
+                        if (!anyMatch) ControllerLogger.ACCESS_LOGGER.tracef("read-only host constraint violated " +
+                                "for action %s due to no match between hosts %s and allowed hosts %s",
+                                actionEffect, hecSpecific, ourSpecific);
+                        return !anyMatch;
+                    }
+                } else if (!global) {
+                    if (hec.global) {
+                        // Only the readOnlyConstraint gets global
+                        ControllerLogger.ACCESS_LOGGER.tracef("host constraint violated for action %s due to " +
+                                "requirement for access to global resources", actionEffect);
+                        return true;
+                    } else {
+                        if (actionEffect == Action.ActionEffect.WRITE_RUNTIME || actionEffect == Action.ActionEffect.WRITE_CONFIG) {
+                            //  Writes must not effect other groups
+                            boolean containsAll = ourSpecific.containsAll(hecSpecific);
+                            if (!containsAll) {
+                                ControllerLogger.ACCESS_LOGGER.tracef("host constraint violated for action %s due to " +
+                                        "mismatch of hosts %s vs hosts %s", actionEffect, hecSpecific, ourSpecific);
+                            }
+                            return !containsAll;
+                        } else {
+                            // Reads ok as long as one of our groups match
+                            boolean anyMatch = anyMatch(ourSpecific, hecSpecific);
+                            if (!anyMatch) ControllerLogger.ACCESS_LOGGER.tracef("host constraint violated " +
+                                    "for action %s due to no match between hosts %s and allowed hosts %s",
+                                    actionEffect, hecSpecific, ourSpecific);
+                            return !anyMatch;
+                        }
+                    } // else fall through
+                }
+            } else {
+                assert hec.user : "illegal comparison";
+                return other.violates(this, actionEffect);
+            }
+        }
+        return false;
+    }
 
+    private boolean anyMatch(Set<String> ourSpecific, Set<String> hecSpecific) {
+
+        boolean matched = false;
+        for (String ourGroup : ourSpecific) {
+            if (hecSpecific.contains(ourGroup)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            // WFLY-2089
+            matched = hecSpecific.size() == 1 && hecSpecific.contains("*");
+        }
+        return matched;
+    }
+
+
+    @Override
+    public boolean replaces(Constraint other) {
+        return other instanceof HostEffectConstraint && (readOnly || readOnlyConstraint != null);
+    }
+
+    // Scoping Constraint
+
+    @Override
+    public ScopingConstraintFactory getFactory() {
+        assert readOnlyConstraint != null : "invalid cast";
+        return FACTORY;
     }
 
     @Override
-    protected void performRuntime(OperationContext context, ModelNode operation, ModelNode model,
-                                  ServiceVerificationHandler verificationHandler, List<ServiceController<?>> newControllers)
-            throws OperationFailedException {
-        final ModelNode fullModel = Resource.Tools.readModel(context.readResource(PathAddress.EMPTY_ADDRESS));
-        final ServiceController serviceController = installRuntimeService(context, operation, fullModel, verificationHandler);
-        newControllers.add(serviceController);
+    public Constraint getStandardConstraint() {
+        assert readOnlyConstraint != null : "invalid cast";
+        return this;
     }
 
-    ServiceController installRuntimeService(final OperationContext context, final ModelNode operation, final ModelNode fullModel,
-                                            ServiceVerificationHandler verificationHandler) throws OperationFailedException {
+    @Override
+    public Constraint getOutofScopeReadConstraint() {
+        assert readOnlyConstraint != null : "invalid cast";
+        return readOnlyConstraint;
+    }
 
-        final PathAddress pathAddress = PathAddress.pathAddress(operation.require(OP_ADDR));
-        final String connectionName = pathAddress.getLastElement().getValue();
-        final OptionMap connectionCreationOptions = ConnectorResource.getOptions(fullModel.get(CommonAttributes.PROPERTY));
-
-
-        //final OptionMap connectionCreationOptions = getConnectionCreationOptions(outboundConnection);
-        // Get the destination URI
-        final URI uri = getDestinationURI(context, operation);
-        // create the service
-        final GenericOutboundConnectionService outboundRemotingConnectionService = new GenericOutboundConnectionService(connectionName, uri, connectionCreationOptions);
-        final ServiceName serviceName = AbstractOutboundConnectionService.OUTBOUND_CONNECTION_BASE_SERVICE_NAME.append(connectionName);
-        // also add a alias service name to easily distinguish between a generic, remote and local type of connection services
-        final ServiceName aliasServiceName = GenericOutboundConnectionService.GENERIC_OUTBOUND_CONNECTION_BASE_SERVICE_NAME.append(connectionName);
-        final ServiceBuilder<GenericOutboundConnectionService> svcBuilder = context.getServiceTarget().addService(serviceName, outboundRemotingConnectionService)
-                .addAliases(aliasServiceName)
-                .addDependency(RemotingServices.SUBSYSTEM_ENDPOINT, Endpoint.class, outboundRemotingConnectionService.getEnpointInjector());
-
-        if (verificationHandler != null) {
-            svcBuilder.addListener(verificationHandler);
+    private static class HostsHolder {
+        private volatile Set<String> specific = new LinkedHashSet<String>();
+        private HostsHolder() {
+            // no-op
         }
-        return svcBuilder.install();
+        private HostsHolder(Collection<String> hosts) {
+            this.specific.addAll(hosts);
+        }
     }
 
-    URI getDestinationURI(final OperationContext context, final ModelNode outboundConnection) throws OperationFailedException {
-        final String uri = GenericOutboundConnectionResourceDefinition.URI.resolveModelAttribute(context, outboundConnection).asString();
-        try {
-            return new URI(uri);
-        } catch (URISyntaxException e) {
-            throw MESSAGES.couldNotCreateURI(new ModelNode().set("Cannot create a valid URI from " + uri + " -- " + e.toString()));
+    private static class Factory extends AbstractConstraintFactory implements ScopingConstraintFactory {
+
+        @Override
+        public Constraint getStandardUserConstraint(StandardRole role, Action.ActionEffect actionEffect) {
+            return GLOBAL_USER;
+        }
+
+        @Override
+        public Constraint getRequiredConstraint(Action.ActionEffect actionEffect, Action action, TargetAttribute target) {
+            return getRequiredConstraint(target.getHostEffect());
+        }
+
+        @Override
+        public Constraint getRequiredConstraint(Action.ActionEffect actionEffect, Action action, TargetResource target) {
+            return getRequiredConstraint(target.getHostEffect());
+        }
+
+        private Constraint getRequiredConstraint(HostEffect hostEffect) {
+            if (hostEffect == null || hostEffect.isHostEffectGlobal()) {
+                return GLOBAL_REQUIRED;
+            }
+            return new HostEffectConstraint(hostEffect.getAffectedHosts());
+        }
+
+        @Override
+        protected int internalCompare(AbstractConstraintFactory other) {
+            // We prefer going first
+            return this.equals(other) ? 0 : -1;
         }
     }
 }

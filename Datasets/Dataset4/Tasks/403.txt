@@ -1,13 +1,13 @@
-pendingClusterTasks.add(new PendingClusterTask(pending.insertionOrder, pending.priority, new StringText(source), timeInQueue, pending.executing));
+IndexService indexService = indicesService.createIndex(indexMetaData.index(), indexMetaData.settings(), clusterService.localNode().id());
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,689 +19,619 @@ pendingClusterTasks.add(new PendingClusterTask(pending.insertionOrder, pending.p
  * under the License.
  */
 
-package org.elasticsearch.cluster.service;
+package org.elasticsearch.cluster.metadata;
 
-import org.elasticsearch.ElasticsearchException;
-import org.elasticsearch.ElasticsearchIllegalStateException;
-import org.elasticsearch.cluster.*;
-import org.elasticsearch.cluster.ClusterState.Builder;
-import org.elasticsearch.cluster.block.ClusterBlock;
-import org.elasticsearch.cluster.block.ClusterBlocks;
-import org.elasticsearch.cluster.metadata.MetaData;
-import org.elasticsearch.cluster.metadata.ProcessClusterEventTimeoutException;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.node.DiscoveryNodes;
-import org.elasticsearch.cluster.routing.RoutingTable;
-import org.elasticsearch.cluster.routing.operation.OperationRouting;
-import org.elasticsearch.common.Nullable;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import org.elasticsearch.action.support.master.MasterNodeOperationRequest;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateUpdateTask;
+import org.elasticsearch.cluster.TimeoutClusterStateUpdateTask;
+import org.elasticsearch.cluster.action.index.NodeMappingCreatedAction;
+import org.elasticsearch.cluster.routing.IndexRoutingTable;
 import org.elasticsearch.common.Priority;
-import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.common.compress.CompressedString;
 import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.logging.ESLogger;
-import org.elasticsearch.common.logging.Loggers;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.text.StringText;
 import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.util.concurrent.*;
-import org.elasticsearch.discovery.Discovery;
-import org.elasticsearch.discovery.DiscoveryService;
-import org.elasticsearch.node.settings.NodeSettingsService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.mapper.DocumentMapper;
+import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.index.mapper.MergeMappingException;
+import org.elasticsearch.index.service.IndexService;
+import org.elasticsearch.indices.IndexMissingException;
+import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.indices.InvalidTypeNameException;
+import org.elasticsearch.indices.TypeMissingException;
+import org.elasticsearch.percolator.PercolatorService;
 
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Queue;
-import java.util.concurrent.*;
+import java.util.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadFactory;
+import static com.google.common.collect.Maps.newHashMap;
+import static org.elasticsearch.cluster.ClusterState.newClusterStateBuilder;
+import static org.elasticsearch.cluster.metadata.IndexMetaData.newIndexMetaDataBuilder;
+import static org.elasticsearch.cluster.metadata.MetaData.newMetaDataBuilder;
+import static org.elasticsearch.index.mapper.DocumentMapper.MergeFlags.mergeFlags;
 
 /**
  *
  */
-public class InternalClusterService extends AbstractLifecycleComponent<ClusterService> implements ClusterService {
+public class MetaDataMappingService extends AbstractComponent {
 
-    private final ThreadPool threadPool;
+    private final ClusterService clusterService;
 
-    private final DiscoveryService discoveryService;
+    private final IndicesService indicesService;
 
-    private final OperationRouting operationRouting;
+    private final NodeMappingCreatedAction mappingCreatedAction;
 
-    private final TransportService transportService;
-
-    private final NodeSettingsService nodeSettingsService;
-
-    private final TimeValue reconnectInterval;
-
-    private volatile PrioritizedEsThreadPoolExecutor updateTasksExecutor;
-
-    private final List<ClusterStateListener> priorityClusterStateListeners = new CopyOnWriteArrayList<>();
-    private final List<ClusterStateListener> clusterStateListeners = new CopyOnWriteArrayList<>();
-    private final List<ClusterStateListener> lastClusterStateListeners = new CopyOnWriteArrayList<>();
-    private final LocalNodeMasterListeners localNodeMasterListeners;
-
-    private final Queue<NotifyTimeout> onGoingTimeouts = ConcurrentCollections.newQueue();
-
-    private volatile ClusterState clusterState;
-
-    private final ClusterBlocks.Builder initialBlocks = ClusterBlocks.builder().addGlobalBlock(Discovery.NO_MASTER_BLOCK);
-
-    private volatile ScheduledFuture reconnectToNodes;
+    private final BlockingQueue<Object> refreshOrUpdateQueue = ConcurrentCollections.newBlockingQueue();
 
     @Inject
-    public InternalClusterService(Settings settings, DiscoveryService discoveryService, OperationRouting operationRouting, TransportService transportService,
-                                  NodeSettingsService nodeSettingsService, ThreadPool threadPool, ClusterName clusterName) {
+    public MetaDataMappingService(Settings settings, ClusterService clusterService, IndicesService indicesService, NodeMappingCreatedAction mappingCreatedAction) {
         super(settings);
-        this.operationRouting = operationRouting;
-        this.transportService = transportService;
-        this.discoveryService = discoveryService;
-        this.threadPool = threadPool;
-        this.nodeSettingsService = nodeSettingsService;
-        this.clusterState = ClusterState.builder(clusterName).build();
-
-        this.nodeSettingsService.setClusterService(this);
-
-        this.reconnectInterval = componentSettings.getAsTime("reconnect_interval", TimeValue.timeValueSeconds(10));
-
-        localNodeMasterListeners = new LocalNodeMasterListeners(threadPool);
+        this.clusterService = clusterService;
+        this.indicesService = indicesService;
+        this.mappingCreatedAction = mappingCreatedAction;
     }
 
-    public NodeSettingsService settingsService() {
-        return this.nodeSettingsService;
-    }
+    static class RefreshTask {
+        final String index;
+        final String[] types;
 
-    public void addInitialStateBlock(ClusterBlock block) throws ElasticsearchIllegalStateException {
-        if (lifecycle.started()) {
-            throw new ElasticsearchIllegalStateException("can't set initial block when started");
-        }
-        initialBlocks.addGlobalBlock(block);
-    }
-
-    @Override
-    public void removeInitialStateBlock(ClusterBlock block) throws ElasticsearchIllegalStateException {
-        if (lifecycle.started()) {
-            throw new ElasticsearchIllegalStateException("can't set initial block when started");
-        }
-        initialBlocks.removeGlobalBlock(block);
-    }
-
-    @Override
-    protected void doStart() throws ElasticsearchException {
-        add(localNodeMasterListeners);
-        this.clusterState = ClusterState.builder(clusterState).blocks(initialBlocks).build();
-        this.updateTasksExecutor = EsExecutors.newSinglePrioritizing(daemonThreadFactory(settings, "clusterService#updateTask"));
-        this.reconnectToNodes = threadPool.schedule(reconnectInterval, ThreadPool.Names.GENERIC, new ReconnectToNodes());
-    }
-
-    @Override
-    protected void doStop() throws ElasticsearchException {
-        this.reconnectToNodes.cancel(true);
-        for (NotifyTimeout onGoingTimeout : onGoingTimeouts) {
-            onGoingTimeout.cancel();
-            onGoingTimeout.listener.onClose();
-        }
-        updateTasksExecutor.shutdown();
-        try {
-            updateTasksExecutor.awaitTermination(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            // ignore
-        }
-        remove(localNodeMasterListeners);
-    }
-
-    @Override
-    protected void doClose() throws ElasticsearchException {
-    }
-
-    @Override
-    public DiscoveryNode localNode() {
-        return discoveryService.localNode();
-    }
-
-    @Override
-    public OperationRouting operationRouting() {
-        return operationRouting;
-    }
-
-    public ClusterState state() {
-        return this.clusterState;
-    }
-
-    public void addFirst(ClusterStateListener listener) {
-        priorityClusterStateListeners.add(listener);
-    }
-
-    public void addLast(ClusterStateListener listener) {
-        lastClusterStateListeners.add(listener);
-    }
-
-    public void add(ClusterStateListener listener) {
-        clusterStateListeners.add(listener);
-    }
-
-    public void remove(ClusterStateListener listener) {
-        clusterStateListeners.remove(listener);
-        priorityClusterStateListeners.remove(listener);
-        lastClusterStateListeners.remove(listener);
-        for (Iterator<NotifyTimeout> it = onGoingTimeouts.iterator(); it.hasNext(); ) {
-            NotifyTimeout timeout = it.next();
-            if (timeout.listener.equals(listener)) {
-                timeout.cancel();
-                it.remove();
-            }
+        RefreshTask(String index, String[] types) {
+            this.index = index;
+            this.types = types;
         }
     }
 
-    @Override
-    public void add(LocalNodeMasterListener listener) {
-        localNodeMasterListeners.add(listener);
-    }
+    static class UpdateTask {
+        final String index;
+        final String type;
+        final CompressedString mappingSource;
+        final Listener listener;
 
-    @Override
-    public void remove(LocalNodeMasterListener listener) {
-        localNodeMasterListeners.remove(listener);
-    }
-
-    public void add(final TimeValue timeout, final TimeoutClusterStateListener listener) {
-        if (lifecycle.stoppedOrClosed()) {
-            listener.onClose();
-            return;
+        UpdateTask(String index, String type, CompressedString mappingSource, Listener listener) {
+            this.index = index;
+            this.type = type;
+            this.mappingSource = mappingSource;
+            this.listener = listener;
         }
-        // call the post added notification on the same event thread
-        try {
-            updateTasksExecutor.execute(new PrioritizedRunnable(Priority.HIGH) {
-                @Override
-                public void run() {
-                    NotifyTimeout notifyTimeout = new NotifyTimeout(listener, timeout);
-                    notifyTimeout.future = threadPool.schedule(timeout, ThreadPool.Names.GENERIC, notifyTimeout);
-                    onGoingTimeouts.add(notifyTimeout);
-                    clusterStateListeners.add(listener);
-                    listener.postAdded();
-                }
-            });
-        } catch (EsRejectedExecutionException e) {
-            if (lifecycle.stoppedOrClosed()) {
-                listener.onClose();
+    }
+
+    /**
+     * Batch method to apply all the queued refresh or update operations. The idea is to try and batch as much
+     * as possible so we won't create the same index all the time for example for the updates on the same mapping
+     * and generate a single cluster change event out of all of those.
+     */
+    ClusterState executeRefreshOrUpdate(final ClusterState currentState) throws Exception {
+        List<Object> allTasks = new ArrayList<Object>();
+        refreshOrUpdateQueue.drainTo(allTasks);
+
+        if (allTasks.isEmpty()) {
+            return currentState;
+        }
+
+        // break down to tasks per index, so we can optimize the on demand index service creation
+        // to only happen for the duration of a single index processing of its respective events
+        Map<String, List<Object>> tasksPerIndex = Maps.newHashMap();
+        for (Object task : allTasks) {
+            String index = null;
+            if (task instanceof UpdateTask) {
+                index = ((UpdateTask) task).index;
+            } else if (task instanceof RefreshTask) {
+                index = ((RefreshTask) task).index;
             } else {
-                throw e;
+                logger.warn("illegal state, got wrong mapping task type [{}]", task);
+            }
+            if (index != null) {
+                List<Object> indexTasks = tasksPerIndex.get(index);
+                if (indexTasks == null) {
+                    indexTasks = new ArrayList<Object>();
+                    tasksPerIndex.put(index, indexTasks);
+                }
+                indexTasks.add(task);
             }
         }
-    }
 
-    public void submitStateUpdateTask(final String source, final ClusterStateUpdateTask updateTask) {
-        submitStateUpdateTask(source, Priority.NORMAL, updateTask);
-    }
-
-    public void submitStateUpdateTask(final String source, Priority priority, final ClusterStateUpdateTask updateTask) {
-        if (!lifecycle.started()) {
-            return;
-        }
-        try {
-            final UpdateTask task = new UpdateTask(source, priority, updateTask);
-            if (updateTask instanceof TimeoutClusterStateUpdateTask) {
-                final TimeoutClusterStateUpdateTask timeoutUpdateTask = (TimeoutClusterStateUpdateTask) updateTask;
-                updateTasksExecutor.execute(task, threadPool.scheduler(), timeoutUpdateTask.timeout(), new Runnable() {
-                    @Override
-                    public void run() {
-                        threadPool.generic().execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                timeoutUpdateTask.onFailure(task.source, new ProcessClusterEventTimeoutException(timeoutUpdateTask.timeout(), task.source));
+        boolean dirty = false;
+        MetaData.Builder mdBuilder = newMetaDataBuilder().metaData(currentState.metaData());
+        for (Map.Entry<String, List<Object>> entry : tasksPerIndex.entrySet()) {
+            String index = entry.getKey();
+            List<Object> tasks = entry.getValue();
+            boolean removeIndex = false;
+            // keep track of what we already refreshed, no need to refresh it again...
+            Set<String> processedRefreshes = Sets.newHashSet();
+            try {
+                for (Object task : tasks) {
+                    if (task instanceof RefreshTask) {
+                        RefreshTask refreshTask = (RefreshTask) task;
+                        final IndexMetaData indexMetaData = mdBuilder.get(index);
+                        if (indexMetaData == null) {
+                            // index got delete on us, ignore...
+                            continue;
+                        }
+                        IndexService indexService = indicesService.indexService(index);
+                        if (indexService == null) {
+                            // we need to create the index here, and add the current mapping to it, so we can merge
+                            indexService = indicesService.createIndex(indexMetaData.index(), indexMetaData.settings(), currentState.nodes().localNode().id());
+                            removeIndex = true;
+                            for (String type : refreshTask.types) {
+                                // only add the current relevant mapping (if exists)
+                                if (indexMetaData.mappings().containsKey(type)) {
+                                    // don't apply the default mapping, it has been applied when the mapping was created
+                                    indexService.mapperService().merge(type, indexMetaData.mappings().get(type).source().string(), false);
+                                }
                             }
-                        });
-                    }
-                });
-            } else {
-                updateTasksExecutor.execute(task);
-            }
-        } catch (EsRejectedExecutionException e) {
-            // ignore cases where we are shutting down..., there is really nothing interesting
-            // to be done here...
-            if (!lifecycle.stoppedOrClosed()) {
-                throw e;
-            }
-        }
-    }
+                        }
+                        IndexMetaData.Builder indexMetaDataBuilder = newIndexMetaDataBuilder(indexMetaData);
+                        List<String> updatedTypes = Lists.newArrayList();
+                        for (String type : refreshTask.types) {
+                            if (processedRefreshes.contains(type)) {
+                                continue;
+                            }
+                            DocumentMapper mapper = indexService.mapperService().documentMapper(type);
+                            if (!mapper.mappingSource().equals(indexMetaData.mappings().get(type).source())) {
+                                updatedTypes.add(type);
+                                indexMetaDataBuilder.putMapping(new MappingMetaData(mapper));
+                            }
+                            processedRefreshes.add(type);
+                        }
 
-    @Override
-    public List<PendingClusterTask> pendingTasks() {
-        long now = System.currentTimeMillis();
-        PrioritizedEsThreadPoolExecutor.Pending[] pendings = updateTasksExecutor.getPending();
-        List<PendingClusterTask> pendingClusterTasks = new ArrayList<>(pendings.length);
-        for (PrioritizedEsThreadPoolExecutor.Pending pending : pendings) {
-            final String source;
-            final long timeInQueue;
-            if (pending.task instanceof UpdateTask) {
-                UpdateTask updateTask = (UpdateTask) pending.task;
-                source = updateTask.source;
-                timeInQueue = now - updateTask.addedAt;
-            } else {
-                source = "unknown";
-                timeInQueue = -1;
-            }
+                        if (updatedTypes.isEmpty()) {
+                            continue;
+                        }
 
-            pendingClusterTasks.add(new PendingClusterTask(pending.insertionOrder, pending.priority, new StringText(source), timeInQueue));
-        }
-        return pendingClusterTasks;
-    }
+                        logger.warn("[{}] re-syncing mappings with cluster state for types [{}]", index, updatedTypes);
+                        mdBuilder.put(indexMetaDataBuilder);
+                        dirty = true;
 
-    class UpdateTask extends PrioritizedRunnable {
+                    } else if (task instanceof UpdateTask) {
+                        UpdateTask updateTask = (UpdateTask) task;
+                        String type = updateTask.type;
+                        CompressedString mappingSource = updateTask.mappingSource;
 
-        public final String source;
-        public final ClusterStateUpdateTask updateTask;
-        public final long addedAt = System.currentTimeMillis();
+                        // first, check if it really needs to be updated
+                        final IndexMetaData indexMetaData = mdBuilder.get(index);
+                        if (indexMetaData == null) {
+                            // index got delete on us, ignore...
+                            continue;
+                        }
+                        if (indexMetaData.mappings().containsKey(type) && indexMetaData.mapping(type).source().equals(mappingSource)) {
+                            continue;
+                        }
 
-        UpdateTask(String source, Priority priority, ClusterStateUpdateTask updateTask) {
-            super(priority);
-            this.source = source;
-            this.updateTask = updateTask;
-        }
+                        IndexService indexService = indicesService.indexService(index);
+                        if (indexService == null) {
+                            // we need to create the index here, and add the current mapping to it, so we can merge
+                            indexService = indicesService.createIndex(indexMetaData.index(), indexMetaData.settings(), currentState.nodes().localNode().id());
+                            removeIndex = true;
+                            // only add the current relevant mapping (if exists)
+                            if (indexMetaData.mappings().containsKey(type)) {
+                                indexService.mapperService().merge(type, indexMetaData.mappings().get(type).source().string(), false);
+                            }
+                        }
 
-        @Override
-        public void run() {
-            if (!lifecycle.started()) {
-                logger.debug("processing [{}]: ignoring, cluster_service not started", source);
-                return;
-            }
-            logger.debug("processing [{}]: execute", source);
-            ClusterState previousClusterState = clusterState;
-            ClusterState newClusterState;
-            try {
-                newClusterState = updateTask.execute(previousClusterState);
-            } catch (Throwable e) {
-                if (logger.isTraceEnabled()) {
-                    StringBuilder sb = new StringBuilder("failed to execute cluster state update, state:\nversion [").append(previousClusterState.version()).append("], source [").append(source).append("]\n");
-                    sb.append(previousClusterState.nodes().prettyPrint());
-                    sb.append(previousClusterState.routingTable().prettyPrint());
-                    sb.append(previousClusterState.readOnlyRoutingNodes().prettyPrint());
-                    logger.trace(sb.toString(), e);
-                }
-                updateTask.onFailure(source, e);
-                return;
-            }
+                        DocumentMapper updatedMapper = indexService.mapperService().merge(type, mappingSource.string(), false);
+                        processedRefreshes.add(type);
 
-            if (previousClusterState == newClusterState) {
-                logger.debug("processing [{}]: no change in cluster_state", source);
-                if (updateTask instanceof AckedClusterStateUpdateTask) {
-                    //no need to wait for ack if nothing changed, the update can be counted as acknowledged
-                    ((AckedClusterStateUpdateTask) updateTask).onAllNodesAcked(null);
-                }
-                if (updateTask instanceof ProcessedClusterStateUpdateTask) {
-                    ((ProcessedClusterStateUpdateTask) updateTask).clusterStateProcessed(source, previousClusterState, newClusterState);
-                }
-                return;
-            }
+                        // if we end up with the same mapping as the original once, ignore
+                        if (indexMetaData.mappings().containsKey(type) && indexMetaData.mapping(type).source().equals(updatedMapper.mappingSource())) {
+                            continue;
+                        }
 
-            try {
-                Discovery.AckListener ackListener = new NoOpAckListener();
-                if (newClusterState.nodes().localNodeMaster()) {
-                    // only the master controls the version numbers
-                    Builder builder = ClusterState.builder(newClusterState).version(newClusterState.version() + 1);
-                    if (previousClusterState.routingTable() != newClusterState.routingTable()) {
-                        builder.routingTable(RoutingTable.builder(newClusterState.routingTable()).version(newClusterState.routingTable().version() + 1));
-                    }
-                    if (previousClusterState.metaData() != newClusterState.metaData()) {
-                        builder.metaData(MetaData.builder(newClusterState.metaData()).version(newClusterState.metaData().version() + 1));
-                    }
-                    newClusterState = builder.build();
-
-                    if (updateTask instanceof AckedClusterStateUpdateTask) {
-                        final AckedClusterStateUpdateTask ackedUpdateTask = (AckedClusterStateUpdateTask) updateTask;
-                        if (ackedUpdateTask.ackTimeout() == null || ackedUpdateTask.ackTimeout().millis() == 0) {
-                            ackedUpdateTask.onAckTimeout();
-                        } else {
+                        // build the updated mapping source
+                        if (logger.isDebugEnabled()) {
                             try {
-                                ackListener = new AckCountDownListener(ackedUpdateTask, newClusterState.version(), newClusterState.nodes(), threadPool);
-                            } catch (EsRejectedExecutionException ex) {
+                                logger.debug("[{}] update_mapping [{}] (dynamic) with source [{}]", index, type, updatedMapper.mappingSource().string());
+                            } catch (Exception e) {
+                                // ignore
+                            }
+                        } else if (logger.isInfoEnabled()) {
+                            logger.info("[{}] update_mapping [{}] (dynamic)", index, type);
+                        }
+
+                        mdBuilder.put(newIndexMetaDataBuilder(indexMetaData).putMapping(new MappingMetaData(updatedMapper)));
+                        dirty = true;
+                    } else {
+                        logger.warn("illegal state, got wrong mapping task type [{}]", task);
+                    }
+                }
+            } finally {
+                if (removeIndex) {
+                    indicesService.removeIndex(index, "created for mapping processing");
+                }
+                for (Object task : tasks) {
+                    if (task instanceof UpdateTask) {
+                        ((UpdateTask) task).listener.onResponse(new Response(true));
+                    }
+                }
+            }
+        }
+
+        if (!dirty) {
+            return currentState;
+        }
+        return newClusterStateBuilder().state(currentState).metaData(mdBuilder).build();
+    }
+
+    /**
+     * Refreshes mappings if they are not the same between original and parsed version
+     */
+    public void refreshMapping(final String index, final String... types) {
+        refreshOrUpdateQueue.add(new RefreshTask(index, types));
+        clusterService.submitStateUpdateTask("refresh-mapping [" + index + "][" + Arrays.toString(types) + "]", Priority.HIGH, new ClusterStateUpdateTask() {
+            @Override
+            public void onFailure(String source, Throwable t) {
+                logger.warn("failure during [{}]", t, source);
+            }
+
+            @Override
+            public ClusterState execute(ClusterState currentState) throws Exception {
+                return executeRefreshOrUpdate(currentState);
+            }
+        });
+    }
+
+    public void updateMapping(final String index, final String type, final CompressedString mappingSource, final Listener listener) {
+        refreshOrUpdateQueue.add(new UpdateTask(index, type, mappingSource, listener));
+        clusterService.submitStateUpdateTask("update-mapping [" + index + "][" + type + "]", Priority.HIGH, new ClusterStateUpdateTask() {
+            @Override
+            public void onFailure(String source, Throwable t) {
+                listener.onFailure(t);
+            }
+
+            @Override
+            public ClusterState execute(final ClusterState currentState) throws Exception {
+                return executeRefreshOrUpdate(currentState);
+            }
+        });
+    }
+
+    public void removeMapping(final RemoveRequest request, final Listener listener) {
+        clusterService.submitStateUpdateTask("remove-mapping [" + request.mappingType + "]", Priority.HIGH, new TimeoutClusterStateUpdateTask() {
+
+            @Override
+            public TimeValue timeout() {
+                return request.masterTimeout;
+            }
+
+            @Override
+            public void onFailure(String source, Throwable t) {
+                listener.onFailure(t);
+            }
+
+            @Override
+            public ClusterState execute(ClusterState currentState) {
+                if (request.indices.length == 0) {
+                    throw new IndexMissingException(new Index("_all"));
+                }
+
+                MetaData.Builder builder = newMetaDataBuilder().metaData(currentState.metaData());
+                boolean changed = false;
+                String latestIndexWithout = null;
+                for (String indexName : request.indices) {
+                    IndexMetaData indexMetaData = currentState.metaData().index(indexName);
+                    if (indexMetaData != null) {
+                        if (indexMetaData.mappings().containsKey(request.mappingType)) {
+                            builder.put(newIndexMetaDataBuilder(indexMetaData).removeMapping(request.mappingType));
+                            changed = true;
+                        } else {
+                            latestIndexWithout = indexMetaData.index();
+                        }
+                    }
+                }
+
+                if (!changed) {
+                    throw new TypeMissingException(new Index(latestIndexWithout), request.mappingType);
+                }
+
+                logger.info("[{}] remove_mapping [{}]", request.indices, request.mappingType);
+
+                return ClusterState.builder().state(currentState).metaData(builder).build();
+            }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                listener.onResponse(new Response(true));
+            }
+        });
+    }
+
+    public void putMapping(final PutRequest request, final Listener listener) {
+
+        clusterService.submitStateUpdateTask("put-mapping [" + request.mappingType + "]", Priority.HIGH, new TimeoutClusterStateUpdateTask() {
+
+            CountDownListener countDownListener; // used to count ack responses before confirming operation is complete
+
+            @Override
+            public TimeValue timeout() {
+                return request.masterTimeout;
+            }
+
+            @Override
+            public void onFailure(String source, Throwable t) {
+                listener.onFailure(t);
+            }
+
+            @Override
+            public ClusterState execute(final ClusterState currentState) throws Exception {
+                List<String> indicesToClose = Lists.newArrayList();
+                try {
+                    if (request.indices.length == 0) {
+                        throw new IndexMissingException(new Index("_all"));
+                    }
+                    for (String index : request.indices) {
+                        if (!currentState.metaData().hasIndex(index)) {
+                            throw new IndexMissingException(new Index(index));
+                        }
+                    }
+
+                    // pre create indices here and add mappings to them so we can merge the mappings here if needed
+                    for (String index : request.indices) {
+                        if (indicesService.hasIndex(index)) {
+                            continue;
+                        }
+                        final IndexMetaData indexMetaData = currentState.metaData().index(index);
+                        IndexService indexService = indicesService.createIndex(indexMetaData.index(), indexMetaData.settings(), currentState.nodes().localNode().id());
+                        indicesToClose.add(indexMetaData.index());
+                        // only add the current relevant mapping (if exists)
+                        if (indexMetaData.mappings().containsKey(request.mappingType)) {
+                            indexService.mapperService().merge(request.mappingType, indexMetaData.mappings().get(request.mappingType).source().string(), false);
+                        }
+                    }
+
+                    Map<String, DocumentMapper> newMappers = newHashMap();
+                    Map<String, DocumentMapper> existingMappers = newHashMap();
+                    for (String index : request.indices) {
+                        IndexService indexService = indicesService.indexService(index);
+                        if (indexService != null) {
+                            // try and parse it (no need to add it here) so we can bail early in case of parsing exception
+                            DocumentMapper newMapper;
+                            DocumentMapper existingMapper = indexService.mapperService().documentMapper(request.mappingType);
+                            if (MapperService.DEFAULT_MAPPING.equals(request.mappingType)) {
+                                // _default_ types do not go through merging, but we do test the new settings. Also don't apply the old default
+                                newMapper = indexService.mapperService().parse(request.mappingType, request.mappingSource, false);
+                            } else {
+                                newMapper = indexService.mapperService().parse(request.mappingType, request.mappingSource);
+                                if (existingMapper != null) {
+                                    // first, simulate
+                                    DocumentMapper.MergeResult mergeResult = existingMapper.merge(newMapper, mergeFlags().simulate(true));
+                                    // if we have conflicts, and we are not supposed to ignore them, throw an exception
+                                    if (!request.ignoreConflicts && mergeResult.hasConflicts()) {
+                                        throw new MergeMappingException(mergeResult.conflicts());
+                                    }
+                                }
+                            }
+
+                            newMappers.put(index, newMapper);
+                            if (existingMapper != null) {
+                                existingMappers.put(index, existingMapper);
+                            }
+
+                        } else {
+                            throw new IndexMissingException(new Index(index));
+                        }
+                    }
+
+                    String mappingType = request.mappingType;
+                    if (mappingType == null) {
+                        mappingType = newMappers.values().iterator().next().type();
+                    } else if (!mappingType.equals(newMappers.values().iterator().next().type())) {
+                        throw new InvalidTypeNameException("Type name provided does not match type name within mapping definition");
+                    }
+                    if (!MapperService.DEFAULT_MAPPING.equals(mappingType) && !PercolatorService.Constants.TYPE_NAME.equals(mappingType) && mappingType.charAt(0) == '_') {
+                        throw new InvalidTypeNameException("Document mapping type name can't start with '_'");
+                    }
+
+                    final Map<String, MappingMetaData> mappings = newHashMap();
+                    for (Map.Entry<String, DocumentMapper> entry : newMappers.entrySet()) {
+                        String index = entry.getKey();
+                        // do the actual merge here on the master, and update the mapping source
+                        DocumentMapper newMapper = entry.getValue();
+                        IndexService indexService = indicesService.indexService(index);
+                        CompressedString existingSource = null;
+                        if (existingMappers.containsKey(entry.getKey())) {
+                            existingSource = existingMappers.get(entry.getKey()).mappingSource();
+                        }
+                        DocumentMapper mergedMapper = indexService.mapperService().merge(newMapper.type(), newMapper.mappingSource().string(), false);
+                        CompressedString updatedSource = mergedMapper.mappingSource();
+
+                        if (existingSource != null) {
+                            if (existingSource.equals(updatedSource)) {
+                                // same source, no changes, ignore it
+                            } else {
+                                // use the merged mapping source
+                                mappings.put(index, new MappingMetaData(mergedMapper));
                                 if (logger.isDebugEnabled()) {
-                                    logger.debug("Couldn't schedule timeout thread - node might be shutting down", ex);
+                                    logger.debug("[{}] update_mapping [{}] with source [{}]", index, mergedMapper.type(), updatedSource);
+                                } else if (logger.isInfoEnabled()) {
+                                    logger.info("[{}] update_mapping [{}]", index, mergedMapper.type());
                                 }
-                                //timeout straightaway, otherwise we could wait forever as the timeout thread has not started
-                                ackedUpdateTask.onAckTimeout();
+                            }
+                        } else {
+                            mappings.put(index, new MappingMetaData(mergedMapper));
+                            if (logger.isDebugEnabled()) {
+                                logger.debug("[{}] create_mapping [{}] with source [{}]", index, newMapper.type(), updatedSource);
+                            } else if (logger.isInfoEnabled()) {
+                                logger.info("[{}] create_mapping [{}]", index, newMapper.type());
                             }
                         }
                     }
-                } else {
-                    if (previousClusterState.blocks().hasGlobalBlock(Discovery.NO_MASTER_BLOCK) && !newClusterState.blocks().hasGlobalBlock(Discovery.NO_MASTER_BLOCK)) {
-                        // force an update, its a fresh update from the master as we transition from a start of not having a master to having one
-                        // have a fresh instances of routing and metadata to remove the chance that version might be the same
-                        Builder builder = ClusterState.builder(newClusterState);
-                        builder.routingTable(RoutingTable.builder(newClusterState.routingTable()));
-                        builder.metaData(MetaData.builder(newClusterState.metaData()));
-                        newClusterState = builder.build();
-                        logger.debug("got first state from fresh master [{}]", newClusterState.nodes().masterNodeId());
-                    } else if (newClusterState.version() < previousClusterState.version()) {
-                        // we got a cluster state with older version, when we are *not* the master, let it in since it might be valid
-                        // we check on version where applicable, like at ZenDiscovery#handleNewClusterStateFromMaster
-                        logger.debug("got smaller cluster state when not master [" + newClusterState.version() + "<" + previousClusterState.version() + "] from source [" + source + "]");
+
+                    if (mappings.isEmpty()) {
+                        // no changes, return
+                        listener.onResponse(new Response(true));
+                        return currentState;
                     }
-                }
 
-                newClusterState.status(ClusterState.ClusterStateStatus.BEING_APPLIED);
-
-                if (logger.isTraceEnabled()) {
-                    StringBuilder sb = new StringBuilder("cluster state updated, source [").append(source).append("]\n");
-                    sb.append(newClusterState.prettyPrint());
-                    logger.trace(sb.toString());
-                } else if (logger.isDebugEnabled()) {
-                    logger.debug("cluster state updated, version [{}], source [{}]", newClusterState.version(), source);
-                }
-
-                ClusterChangedEvent clusterChangedEvent = new ClusterChangedEvent(source, newClusterState, previousClusterState);
-                // new cluster state, notify all listeners
-                final DiscoveryNodes.Delta nodesDelta = clusterChangedEvent.nodesDelta();
-                if (nodesDelta.hasChanges() && logger.isInfoEnabled()) {
-                    String summary = nodesDelta.shortSummary();
-                    if (summary.length() > 0) {
-                        logger.info("{}, reason: {}", summary, source);
-                    }
-                }
-
-                // TODO, do this in parallel (and wait)
-                for (DiscoveryNode node : nodesDelta.addedNodes()) {
-                    if (!nodeRequiresConnection(node)) {
-                        continue;
-                    }
-                    try {
-                        transportService.connectToNode(node);
-                    } catch (Throwable e) {
-                        // the fault detection will detect it as failed as well
-                        logger.warn("failed to connect to node [" + node + "]", e);
-                    }
-                }
-
-                // if we are the master, publish the new state to all nodes
-                // we publish here before we send a notification to all the listeners, since if it fails
-                // we don't want to notify
-                if (newClusterState.nodes().localNodeMaster()) {
-                    logger.debug("publishing cluster state version {}", newClusterState.version());
-                    discoveryService.publish(newClusterState, ackListener);
-                }
-
-                // update the current cluster state
-                clusterState = newClusterState;
-                logger.debug("set local cluster state to version {}", newClusterState.version());
-
-                for (ClusterStateListener listener : priorityClusterStateListeners) {
-                    listener.clusterChanged(clusterChangedEvent);
-                }
-                for (ClusterStateListener listener : clusterStateListeners) {
-                    listener.clusterChanged(clusterChangedEvent);
-                }
-                for (ClusterStateListener listener : lastClusterStateListeners) {
-                    listener.clusterChanged(clusterChangedEvent);
-                }
-
-                if (!nodesDelta.removedNodes().isEmpty()) {
-                    threadPool.generic().execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            for (DiscoveryNode node : nodesDelta.removedNodes()) {
-                                transportService.disconnectFromNode(node);
-                            }
+                    MetaData.Builder builder = newMetaDataBuilder().metaData(currentState.metaData());
+                    for (String indexName : request.indices) {
+                        IndexMetaData indexMetaData = currentState.metaData().index(indexName);
+                        if (indexMetaData == null) {
+                            throw new IndexMissingException(new Index(indexName));
                         }
-                    });
-                }
+                        MappingMetaData mappingMd = mappings.get(indexName);
+                        if (mappingMd != null) {
+                            builder.put(newIndexMetaDataBuilder(indexMetaData).putMapping(mappingMd));
+                        }
+                    }
 
-                newClusterState.status(ClusterState.ClusterStateStatus.APPLIED);
+                    ClusterState updatedState = newClusterStateBuilder().state(currentState).metaData(builder).build();
 
-                //manual ack only from the master at the end of the publish
-                if (newClusterState.nodes().localNodeMaster()) {
-                    try {
-                        ackListener.onNodeAck(localNode(), null);
-                    } catch (Throwable t) {
-                        logger.debug("error while processing ack for master node [{}]", t, newClusterState.nodes().localNode());
+                    int counter = 1; // we want to wait on the master node to apply it on its cluster state
+                    // also wait for nodes that actually have the index created on them to apply the mappings internally
+                    for (String index : request.indices) {
+                        IndexRoutingTable indexRoutingTable = updatedState.routingTable().index(index);
+                        if (indexRoutingTable != null) {
+                            counter += indexRoutingTable.numberOfNodesShardsAreAllocatedOn(updatedState.nodes().masterNodeId());
+                        }
+                    }
+
+
+                    // TODO: adding one to the version is based on knowledge on how the parent class will increment the version
+                    //       move this to the base class or add another callback before publishing the new cluster state so we
+                    //       capture it's version.
+                    countDownListener = new CountDownListener(counter, currentState.version() + 1, listener);
+                    mappingCreatedAction.add(countDownListener, request.timeout);
+
+                    return updatedState;
+                } finally {
+                    for (String index : indicesToClose) {
+                        indicesService.removeIndex(index, "created for mapping processing");
                     }
                 }
-
-                if (updateTask instanceof ProcessedClusterStateUpdateTask) {
-                    ((ProcessedClusterStateUpdateTask) updateTask).clusterStateProcessed(source, previousClusterState, newClusterState);
-                }
-
-                logger.debug("processing [{}]: done applying updated cluster_state (version: {})", source, newClusterState.version());
-            } catch (Throwable t) {
-                StringBuilder sb = new StringBuilder("failed to apply updated cluster state:\nversion [").append(newClusterState.version()).append("], source [").append(source).append("]\n");
-                sb.append(newClusterState.nodes().prettyPrint());
-                sb.append(newClusterState.routingTable().prettyPrint());
-                sb.append(newClusterState.readOnlyRoutingNodes().prettyPrint());
-                logger.warn(sb.toString(), t);
-                // TODO: do we want to call updateTask.onFailure here?
             }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                if (countDownListener != null) {
+                    // the master has applied it on its cluster state
+                    countDownListener.decrementCounter();
+                }
+            }
+        });
+    }
+
+    public static interface Listener {
+
+        void onResponse(Response response);
+
+        void onFailure(Throwable t);
+    }
+
+    public static class RemoveRequest {
+
+        final String[] indices;
+        final String mappingType;
+        TimeValue masterTimeout = MasterNodeOperationRequest.DEFAULT_MASTER_NODE_TIMEOUT;
+
+        public RemoveRequest(String[] indices, String mappingType) {
+            this.indices = indices;
+            this.mappingType = mappingType;
+        }
+
+        public RemoveRequest masterTimeout(TimeValue masterTimeout) {
+            this.masterTimeout = masterTimeout;
+            return this;
         }
     }
 
-    class NotifyTimeout implements Runnable {
-        final TimeoutClusterStateListener listener;
-        final TimeValue timeout;
-        ScheduledFuture future;
+    public static class PutRequest {
 
-        NotifyTimeout(TimeoutClusterStateListener listener, TimeValue timeout) {
-            this.listener = listener;
+        final String[] indices;
+
+        final String mappingType;
+
+        final String mappingSource;
+
+        boolean ignoreConflicts = false;
+
+        TimeValue timeout = TimeValue.timeValueSeconds(10);
+        TimeValue masterTimeout = MasterNodeOperationRequest.DEFAULT_MASTER_NODE_TIMEOUT;
+
+        public PutRequest(String[] indices, String mappingType, String mappingSource) {
+            this.indices = indices;
+            this.mappingType = mappingType;
+            this.mappingSource = mappingSource;
+        }
+
+        public PutRequest ignoreConflicts(boolean ignoreConflicts) {
+            this.ignoreConflicts = ignoreConflicts;
+            return this;
+        }
+
+        public PutRequest timeout(TimeValue timeout) {
             this.timeout = timeout;
+            return this;
         }
 
-        public void cancel() {
-            future.cancel(false);
+        public PutRequest masterTimeout(TimeValue masterTimeout) {
+            this.masterTimeout = masterTimeout;
+            return this;
+        }
+    }
+
+    public static class Response {
+        private final boolean acknowledged;
+
+        public Response(boolean acknowledged) {
+            this.acknowledged = acknowledged;
+        }
+
+        public boolean acknowledged() {
+            return acknowledged;
+        }
+    }
+
+    private class CountDownListener implements NodeMappingCreatedAction.Listener {
+
+        private final AtomicBoolean notified = new AtomicBoolean();
+        private final AtomicInteger countDown;
+        private final Listener listener;
+        private final long minClusterStateVersion;
+
+        /**
+         * @param countDown              initial counter value
+         * @param minClusterStateVersion the minimum cluster state version for which accept responses
+         * @param listener               listener to call when counter reaches 0.
+         */
+        public CountDownListener(int countDown, long minClusterStateVersion, Listener listener) {
+            this.countDown = new AtomicInteger(countDown);
+            this.listener = listener;
+            this.minClusterStateVersion = minClusterStateVersion;
         }
 
         @Override
-        public void run() {
-            if (future.isCancelled()) {
+        public void onNodeMappingCreated(NodeMappingCreatedAction.NodeMappingCreatedResponse response) {
+            if (response.clusterStateVersion() < minClusterStateVersion) {
                 return;
             }
-            if (lifecycle.stoppedOrClosed()) {
-                listener.onClose();
-            } else {
-                listener.onTimeout(this.timeout);
-            }
-            // note, we rely on the listener to remove itself in case of timeout if needed
+            decrementCounter();
+
         }
-    }
 
-    private class ReconnectToNodes implements Runnable {
-
-        private ConcurrentMap<DiscoveryNode, Integer> failureCount = ConcurrentCollections.newConcurrentMap();
-
-        @Override
-        public void run() {
-            // master node will check against all nodes if its alive with certain discoveries implementations,
-            // but we can't rely on that, so we check on it as well
-            for (DiscoveryNode node : clusterState.nodes()) {
-                if (lifecycle.stoppedOrClosed()) {
-                    return;
+        public void decrementCounter() {
+            if (countDown.decrementAndGet() == 0) {
+                mappingCreatedAction.remove(this);
+                if (notified.compareAndSet(false, true)) {
+                    listener.onResponse(new Response(true));
                 }
-                if (!nodeRequiresConnection(node)) {
-                    continue;
-                }
-                if (clusterState.nodes().nodeExists(node.id())) { // we double check existence of node since connectToNode might take time...
-                    if (!transportService.nodeConnected(node)) {
-                        try {
-                            transportService.connectToNode(node);
-                        } catch (Exception e) {
-                            if (lifecycle.stoppedOrClosed()) {
-                                return;
-                            }
-                            if (clusterState.nodes().nodeExists(node.id())) { // double check here as well, maybe its gone?
-                                Integer nodeFailureCount = failureCount.get(node);
-                                if (nodeFailureCount == null) {
-                                    nodeFailureCount = 1;
-                                } else {
-                                    nodeFailureCount = nodeFailureCount + 1;
-                                }
-                                // log every 6th failure
-                                if ((nodeFailureCount % 6) == 0) {
-                                    // reset the failure count...
-                                    nodeFailureCount = 0;
-                                    logger.warn("failed to reconnect to node {}", e, node);
-                                }
-                                failureCount.put(node, nodeFailureCount);
-                            }
-                        }
-                    }
-                }
-            }
-            // go over and remove failed nodes that have been removed
-            DiscoveryNodes nodes = clusterState.nodes();
-            for (Iterator<DiscoveryNode> failedNodesIt = failureCount.keySet().iterator(); failedNodesIt.hasNext(); ) {
-                DiscoveryNode failedNode = failedNodesIt.next();
-                if (!nodes.nodeExists(failedNode.id())) {
-                    failedNodesIt.remove();
-                }
-            }
-            if (lifecycle.started()) {
-                reconnectToNodes = threadPool.schedule(reconnectInterval, ThreadPool.Names.GENERIC, this);
-            }
-        }
-    }
-
-    private boolean nodeRequiresConnection(DiscoveryNode node) {
-        return localNode().shouldConnectTo(node);
-    }
-
-    private static class LocalNodeMasterListeners implements ClusterStateListener {
-
-        private final List<LocalNodeMasterListener> listeners = new CopyOnWriteArrayList<>();
-        private final ThreadPool threadPool;
-        private volatile boolean master = false;
-
-        private LocalNodeMasterListeners(ThreadPool threadPool) {
-            this.threadPool = threadPool;
-        }
-
-        @Override
-        public void clusterChanged(ClusterChangedEvent event) {
-            if (!master && event.localNodeMaster()) {
-                master = true;
-                for (LocalNodeMasterListener listener : listeners) {
-                    Executor executor = threadPool.executor(listener.executorName());
-                    executor.execute(new OnMasterRunnable(listener));
-                }
-                return;
-            }
-
-            if (master && !event.localNodeMaster()) {
-                master = false;
-                for (LocalNodeMasterListener listener : listeners) {
-                    Executor executor = threadPool.executor(listener.executorName());
-                    executor.execute(new OffMasterRunnable(listener));
-                }
-            }
-        }
-
-        private void add(LocalNodeMasterListener listener) {
-            listeners.add(listener);
-        }
-
-        private void remove(LocalNodeMasterListener listener) {
-            listeners.remove(listener);
-        }
-
-        private void clear() {
-            listeners.clear();
-        }
-    }
-
-    private static class OnMasterRunnable implements Runnable {
-
-        private final LocalNodeMasterListener listener;
-
-        private OnMasterRunnable(LocalNodeMasterListener listener) {
-            this.listener = listener;
-        }
-
-        @Override
-        public void run() {
-            listener.onMaster();
-        }
-    }
-
-    private static class OffMasterRunnable implements Runnable {
-
-        private final LocalNodeMasterListener listener;
-
-        private OffMasterRunnable(LocalNodeMasterListener listener) {
-            this.listener = listener;
-        }
-
-        @Override
-        public void run() {
-            listener.offMaster();
-        }
-    }
-
-    private static class NoOpAckListener implements Discovery.AckListener {
-        @Override
-        public void onNodeAck(DiscoveryNode node, @Nullable Throwable t) {
-        }
-
-        @Override
-        public void onTimeout() {
-        }
-    }
-
-    private static class AckCountDownListener implements Discovery.AckListener {
-
-        private static final ESLogger logger = Loggers.getLogger(AckCountDownListener.class);
-
-        private final AckedClusterStateUpdateTask ackedUpdateTask;
-        private final CountDown countDown;
-        private final DiscoveryNodes nodes;
-        private final long clusterStateVersion;
-        private final Future<?> ackTimeoutCallback;
-        private Throwable lastFailure;
-
-        AckCountDownListener(AckedClusterStateUpdateTask ackedUpdateTask, long clusterStateVersion, DiscoveryNodes nodes, ThreadPool threadPool) {
-            this.ackedUpdateTask = ackedUpdateTask;
-            this.clusterStateVersion = clusterStateVersion;
-            this.nodes = nodes;
-            int countDown = 0;
-            for (DiscoveryNode node : nodes) {
-                if (ackedUpdateTask.mustAck(node)) {
-                    countDown++;
-                }
-            }
-            //we always wait for at least 1 node (the master)
-            countDown = Math.max(1, countDown);
-            logger.trace("expecting {} acknowledgements for cluster_state update (version: {})", countDown, clusterStateVersion);
-            this.countDown = new CountDown(countDown);
-            this.ackTimeoutCallback = threadPool.schedule(ackedUpdateTask.ackTimeout(), ThreadPool.Names.GENERIC, new Runnable() {
-                @Override
-                public void run() {
-                    onTimeout();
-                }
-            });
-        }
-
-        @Override
-        public void onNodeAck(DiscoveryNode node, @Nullable Throwable t) {
-            if (!ackedUpdateTask.mustAck(node)) {
-                //we always wait for the master ack anyway
-                if (!node.equals(nodes.masterNode())) {
-                    return;
-                }
-            }
-            if (t == null) {
-                logger.trace("ack received from node [{}], cluster_state update (version: {})", node, clusterStateVersion);
-            } else {
-                this.lastFailure = t;
-                logger.debug("ack received from node [{}], cluster_state update (version: {})", t, node, clusterStateVersion);
-            }
-
-            if (countDown.countDown()) {
-                logger.trace("all expected nodes acknowledged cluster_state update (version: {})", clusterStateVersion);
-                ackTimeoutCallback.cancel(true);
-                ackedUpdateTask.onAllNodesAcked(lastFailure);
             }
         }
 
         @Override
         public void onTimeout() {
-            if (countDown.fastForward()) {
-                logger.trace("timeout waiting for acknowledgement for cluster_state update (version: {})", clusterStateVersion);
-                ackedUpdateTask.onAckTimeout();
+            mappingCreatedAction.remove(this);
+            if (notified.compareAndSet(false, true)) {
+                listener.onResponse(new Response(false));
             }
         }
     }
-
 }

@@ -1,160 +1,198 @@
-private final DeploymentChain deploymentChain =  new DeploymentChainImpl("test.chain");
+if(status!=null && tx.equals(status.attempt)) {
 
-/*
- * JBoss, Home of Professional Open Source.
- * Copyright 2010, Red Hat Middleware LLC, and individual contributors
- * as indicated by the @author tags. See the copyright.txt file in the
- * distribution for a full listing of individual contributors.
- *
- * This is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Lesser General Public License as
- * published by the Free Software Foundation; either version 2.1 of
- * the License, or (at your option) any later version.
- *
- * This software is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this software; if not, write to the Free
- * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
- */
+package backtype.storm.transactional;
 
-package org.jboss.as.deployment;
+import backtype.storm.Config;
+import backtype.storm.spout.SpoutOutputCollector;
+import backtype.storm.task.TopologyContext;
+import backtype.storm.topology.FailedException;
+import backtype.storm.topology.IRichSpout;
+import backtype.storm.topology.OutputFieldsDeclarer;
+import backtype.storm.transactional.state.RotatingTransactionalState;
+import backtype.storm.transactional.state.TransactionalState;
+import backtype.storm.tuple.Fields;
+import backtype.storm.tuple.Values;
+import backtype.storm.utils.Utils;
+import java.math.BigInteger;
+import java.util.Map;
+import java.util.TreeMap;
+import org.apache.log4j.Logger;
 
-import org.jboss.as.deployment.module.DeploymentModuleLoader;
-import org.jboss.as.deployment.module.DeploymentModuleLoaderImpl;
-import org.jboss.as.deployment.unit.DeploymentChain;
-import org.jboss.as.deployment.unit.DeploymentChainImpl;
-import org.jboss.msc.service.BatchBuilder;
-import org.jboss.msc.service.Service;
-import org.jboss.msc.service.ServiceContainer;
-import org.jboss.msc.service.ServiceController;
-import org.jboss.msc.service.ServiceName;
-import org.jboss.msc.service.StartContext;
-import org.jboss.msc.service.StartException;
-import org.jboss.msc.service.StopContext;
-import org.jboss.vfs.VFS;
-import org.jboss.vfs.VirtualFile;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+// TODO: Need to change this to replay EVERYTHING after a failure and ignore acks/fails for unknown attempts
+public class TransactionalSpoutCoordinator implements IRichSpout { 
+    public static final Logger LOG = Logger.getLogger(TransactionalSpoutCoordinator.class);
+    
+    public static final BigInteger INIT_TXID = BigInteger.ONE;
+    
+    
+    public static final String TRANSACTION_BATCH_STREAM_ID = TransactionalSpoutCoordinator.class.getName() + "/batch";
+    public static final String TRANSACTION_COMMIT_STREAM_ID = TransactionalSpoutCoordinator.class.getName() + "/commit";
 
-import java.lang.reflect.Field;
-import java.net.URL;
+    private static final String CURRENT_TX = "currtx";
+    private static final String META_DIR = "meta";
+    
+    private ITransactionalSpout _spout;
+    private ITransactionalSpout.Coordinator _coordinator;
+    private TransactionalState _state;
+    private RotatingTransactionalState _coordinatorState;
+    
+    TreeMap<BigInteger, TransactionStatus> _activeTx = new TreeMap<BigInteger, TransactionStatus>();
+    
+    private SpoutOutputCollector _collector;
+    BigInteger _currTransaction;
+    int _maxTransactionActive;
+    StateInitializer _initializer;
+    
+    
+    public TransactionalSpoutCoordinator(ITransactionalSpout spout) {
+        _spout = spout;
+    }
+    
+    public ITransactionalSpout getSpout() {
+        return _spout;
+    }
+    
+    @Override
+    public void open(Map conf, TopologyContext context, SpoutOutputCollector collector) {
+        _state = TransactionalState.newCoordinatorState(conf, (String) conf.get(Config.TOPOLOGY_TRANSACTIONAL_ID), _spout.getComponentConfiguration());
+        _coordinatorState = new RotatingTransactionalState(_state, META_DIR, true);
+        _collector = collector;
+        _coordinator = _spout.getCoordinator(conf, context);
+        _currTransaction = getStoredCurrTransaction(_state);
+        Object active = conf.get(Config.TOPOLOGY_MAX_SPOUT_PENDING);
+        if(active==null) {
+            _maxTransactionActive = 1;
+        } else {
+            _maxTransactionActive = Utils.getInt(active);
+        }
+        _initializer = new StateInitializer();
+    }
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.fail;
+    @Override
+    public void close() {
+        _state.close();
+    }
 
-/**
- * Test to verify the DeploymentManager correctly installs the deployment service.
- *
- * @author John E. Bailey
- */
-public class DeploymentManagerTestCase {
+    @Override
+    public void nextTuple() {
+        sync();
+    }
 
-    private ServiceContainer serviceContainer;
-    private final DeploymentChain deploymentChain =  new DeploymentChainImpl();
-    private final DeploymentModuleLoader deploymentModuleLoader = new DeploymentModuleLoaderImpl(null);
-    private DeploymentManager deploymentManager;
-
-    @Before
-    public void setupDeploymentManager() throws Exception {
-        serviceContainer = ServiceContainer.Factory.create();
-        final ServiceName chainServiceName = ServiceName.JBOSS.append("deployment", "chain");
-        final ServiceName moduleLoaderServiceName = ServiceName.JBOSS.append("deployment", "module", "loader");
-
-        deploymentManager = new DeploymentManager(serviceContainer) {
-            @Override
-            protected ServiceName determineDeploymentChain() {
-                return chainServiceName;
+    @Override
+    public void ack(Object msgId) {
+        TransactionAttempt tx = (TransactionAttempt) msgId;
+        TransactionStatus status = _activeTx.get(tx.getTransactionId());
+        if(tx.equals(status.attempt)) {
+            if(status.status==AttemptStatus.PROCESSING) {
+                status.status = AttemptStatus.PROCESSED;
+            } else if(status.status==AttemptStatus.COMMITTING) {
+                _activeTx.remove(tx.getTransactionId());
+                _coordinatorState.cleanupBefore(tx.getTransactionId());
+                _currTransaction = nextTransactionId(tx.getTransactionId());
+                _state.setData(CURRENT_TX, _currTransaction);
             }
-
-            @Override
-            protected ServiceName determineDeploymentModuleLoader() {
-                return moduleLoaderServiceName;
-            }
-        };
-
-        final BatchBuilder batchBuilder = serviceContainer.batchBuilder();
-        batchBuilder.addService(chainServiceName, new PassThroughService(deploymentChain));
-        batchBuilder.addService(moduleLoaderServiceName, new PassThroughService(deploymentModuleLoader));
-        batchBuilder.install();
+            sync();
+        }
     }
 
-    @After
-    public void shutdown() {
-        serviceContainer.shutdown();
+    @Override
+    public void fail(Object msgId) {
+        TransactionAttempt tx = (TransactionAttempt) msgId;
+        TransactionStatus stored = _activeTx.remove(tx.getTransactionId());
+        if(stored!=null && tx.equals(stored.attempt)) {
+            _activeTx.tailMap(tx.getTransactionId()).clear();
+            sync();
+        }
     }
-
-    @Test
-    public void testDeployVirtualFile() throws Exception {
-        final VirtualFile virtualFile = VFS.getChild(getResource("/test/deploymentOne"));
-
-        deploymentManager.deploy(virtualFile);
-
-        // Verify the DeploymentService is correctly setup
-        final ServiceController<?> serviceController = serviceContainer.getService(DeploymentService.SERVICE_NAME.append(virtualFile.getPathName()));
-        assertNotNull(serviceController);
-        assertEquals(ServiceController.State.UP, serviceController.getState());
-        final DeploymentService deploymentService = (DeploymentService)serviceController.getValue();
-        assertNotNull(deploymentService);
-
-        assertEquals(virtualFile.getPathName(), deploymentService.getDeploymentName());
-        assertEquals(deploymentChain, getPrivateFieldValue(deploymentService, "deploymentChain", DeploymentChain.class));
-        assertEquals(deploymentModuleLoader, getPrivateFieldValue(deploymentService, "deploymentModuleLoader", DeploymentModuleLoader.class));
-
-        // Verify the mount service is setup
-        ServiceController<?> mountServiceController = serviceContainer.getService(ServiceName.JBOSS.append("mounts").append(virtualFile.getPathName()));
-        assertNotNull(mountServiceController);
-        assertEquals(ServiceController.State.UP, mountServiceController.getState());
-        assertNull(mountServiceController.getValue());
+    
+    @Override
+    public void declareOutputFields(OutputFieldsDeclarer declarer) {
+        // in partitioned example, in case an emitter task receives a later transaction than it's emitted so far,
+        // when it sees the earlier txid it should know to emit nothing
+        declarer.declareStream(TRANSACTION_BATCH_STREAM_ID, new Fields("tx", "tx-meta", "curr-txid"));
+        declarer.declareStream(TRANSACTION_COMMIT_STREAM_ID, new Fields("tx"));
     }
-
-    @Test
-    public void testDeploymentException() throws Exception {
-        final VirtualFile virtualFile = VFS.getChild("/test/bogus");
-
+    
+    private void sync() {
+        // note that sometimes the tuples active may be less than max_spout_pending, e.g.
+        // max_spout_pending = 3
+        // tx 1, 2, 3 active, tx 2 is acked. there won't be a commit for tx 2 (because tx 1 isn't committed yet),
+        // and there won't be a batch for tx 4 because there's max_spout_pending tx active
+        TransactionStatus maybeCommit = _activeTx.get(_currTransaction);
+        if(maybeCommit!=null && maybeCommit.status == AttemptStatus.PROCESSED) {
+            maybeCommit.status = AttemptStatus.COMMITTING;
+            _collector.emit(TRANSACTION_COMMIT_STREAM_ID, new Values(maybeCommit.attempt), maybeCommit.attempt);
+        }
+        
         try {
-            deploymentManager.deploy(virtualFile);
-            fail("Should have thrown a DeploymentException");
-        } catch(DeploymentException expected){
+            if(_activeTx.size() < _maxTransactionActive) {
+                BigInteger curr = _currTransaction;
+                for(int i=0; i<_maxTransactionActive; i++) {
+                    if(!_activeTx.containsKey(curr)) {
+                        TransactionAttempt attempt = new TransactionAttempt(curr, Utils.randomLong());
+                        Object state = _coordinatorState.getState(curr, _initializer);
+                        _activeTx.put(curr, new TransactionStatus(attempt));
+                        _collector.emit(TRANSACTION_BATCH_STREAM_ID, new Values(attempt, state, previousTransactionId(_currTransaction)), attempt);
+                    }
+                    curr = nextTransactionId(curr);
+                }
+            }     
+        } catch(FailedException e) {
+            LOG.warn("Failed to get metadata for a transaction", e);
         }
     }
 
-    private URL getResource(final String path) {
-        return DeploymentManagerTestCase.class.getResource(path);
+    @Override
+    public Map<String, Object> getComponentConfiguration() {
+        Config ret = new Config();
+        ret.setMaxTaskParallelism(1);
+        return ret;
     }
-
-    private <T> T getPrivateFieldValue(final Object target, final String fieldName, final Class<T> fieldType) throws Exception {
-        final Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return (T)field.get(target);
+    
+    private static enum AttemptStatus {
+        PROCESSING,
+        PROCESSED,
+        COMMITTING
     }
-
-    private static class PassThroughService<T> implements Service<T> {
-        private final T value;
-
-        private PassThroughService(T value) {
-            this.value = value;
+    
+    private static class TransactionStatus {
+        TransactionAttempt attempt;
+        AttemptStatus status;
+        
+        public TransactionStatus(TransactionAttempt attempt) {
+            this.attempt = attempt;
+            this.status = AttemptStatus.PROCESSING;
         }
 
         @Override
-        public void start(StartContext context) throws StartException {
+        public String toString() {
+            return attempt.toString() + " <" + status.toString() + ">";
+        }        
+    }
+    
+    
+    private BigInteger nextTransactionId(BigInteger id) {
+        return id.add(BigInteger.ONE);
+    }
+    
+    private BigInteger previousTransactionId(BigInteger id) {
+        if(id.equals(INIT_TXID)) {
+            return null;
+        } else {
+            return id.subtract(BigInteger.ONE);
         }
-
+    }    
+    
+    private BigInteger getStoredCurrTransaction(TransactionalState state) {
+        BigInteger ret = (BigInteger) state.getData(CURRENT_TX);
+        if(ret==null) return INIT_TXID;
+        else return ret;
+    }
+    
+    private class StateInitializer implements RotatingTransactionalState.StateInitializer {
         @Override
-        public void stop(StopContext context) {
-        }
-
-        @Override
-        public T getValue() throws IllegalStateException {
-            return value;
+        public Object init(BigInteger txid, Object lastState) {
+            return _coordinator.initializeTransaction(txid, lastState);
         }
     }
-
 }

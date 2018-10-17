@@ -1,8 +1,8 @@
-import org.wildfly.security.manager.GetAccessControlContextAction;
+JdrRunner runner = new JdrRunner();
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2013, Red Hat, Inc., and individual contributors
+ * Copyright 2011, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -21,104 +21,112 @@ import org.wildfly.security.manager.GetAccessControlContextAction;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.wildfly.clustering.web.infinispan.session;
 
-import java.security.AccessController;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+package org.jboss.as.jdr;
 
-import org.jboss.as.clustering.concurrent.Scheduler;
-import org.jboss.as.clustering.infinispan.invoker.Remover;
-import org.jboss.threads.JBossThreadFactory;
-import org.wildfly.clustering.web.Batch;
-import org.wildfly.clustering.web.Batcher;
-import org.wildfly.clustering.web.infinispan.InfinispanWebLogger;
-import org.wildfly.clustering.web.session.ImmutableSession;
+import org.jboss.as.controller.ModelController;
+import org.jboss.as.controller.OperationFailedException;
+import org.jboss.as.controller.ServiceVerificationHandler;
+import org.jboss.as.controller.client.ModelControllerClient;
+import org.jboss.as.server.ServerEnvironment;
+import org.jboss.as.server.ServerEnvironmentService;
+import org.jboss.as.server.Services;
 import org.wildfly.security.manager.action.GetAccessControlContextAction;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceController;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.ServiceTarget;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
+import org.jboss.threads.JBossThreadFactory;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+
+import static java.security.AccessController.doPrivileged;
 
 /**
- * Session expiration scheduler that eagerly expires sessions as soon as they are eligible.
- * If/When Infinispan implements expiration notifications (ISPN-694), this will be obsolete.
- * @author Paul Ferraro
+ * Service that provides a {@link JdrReportCollector}.
+ *
+ * @author Brian Stansberry
+ * @author Mike M. Clark
+ * @author Jesse Jaggars
  */
-public class SessionExpirationScheduler implements Scheduler<ImmutableSession> {
+public class JdrReportService implements JdrReportCollector, Service<JdrReportCollector> {
 
-    final Map<String, Future<?>> expirationFutures = new ConcurrentHashMap<>();
-    final Batcher batcher;
-    final Remover<String> remover;
-    private final ScheduledExecutorService executor;
+    public static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("jdr", "collector");
 
-    public SessionExpirationScheduler(Batcher batcher, Remover<String> remover) {
-        this(batcher, remover, createScheduledExecutor(createThreadFactory()));
+    public static ServiceController<JdrReportCollector> addService(final ServiceTarget target, final ServiceVerificationHandler verificationHandler) {
+
+        JdrReportService service = new JdrReportService();
+        return target.addService(SERVICE_NAME, service)
+                .addDependency(ServerEnvironmentService.SERVICE_NAME, ServerEnvironment.class, service.serverEnvironmentValue)
+                .addDependency(Services.JBOSS_SERVER_CONTROLLER, ModelController.class, service.modelControllerValue)
+                .addListener(verificationHandler)
+                .setInitialMode(ServiceController.Mode.ACTIVE)
+                .install();
     }
 
-    private static ThreadFactory createThreadFactory() {
-        return new JBossThreadFactory(new ThreadGroup(SessionExpirationScheduler.class.getSimpleName()), Boolean.FALSE, null, "%G - %t", null, null, AccessController.doPrivileged(GetAccessControlContextAction.getInstance()));
+    private final InjectedValue<ServerEnvironment> serverEnvironmentValue = new InjectedValue<ServerEnvironment>();
+    private final InjectedValue<ModelController> modelControllerValue = new InjectedValue<ModelController>();
+    private ExecutorService executorService;
+    private ServerEnvironment serverEnvironment;
+    private ModelControllerClient controllerClient;
+
+    /**
+     * Collect a JDR report when run outside the Application Server.
+     */
+    public JdrReport standaloneCollect(String protocol, String host, String port) throws OperationFailedException {
+        String username = null;
+        String password = null;
+
+        if (host == null) {
+            host = "localhost";
+        }
+        if (port == null) {
+            port = "9990";
+        }
+        if(protocol == null) {
+            protocol = "http-remoting";
+        }
+
+        return new JdrRunner(protocol, username, password, host, port).collect();
     }
 
-    private static ScheduledExecutorService createScheduledExecutor(ThreadFactory factory) {
-        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, factory);
-        executor.setRemoveOnCancelPolicy(true);
-        return executor;
+    /**
+     * Collect a JDR report.
+     */
+    public JdrReport collect() throws OperationFailedException {
+        JdrRunner runner = new JdrRunner(true);
+        serverEnvironment = serverEnvironmentValue.getValue();
+        runner.setJbossHomeDir(serverEnvironment.getHomeDir().getAbsolutePath());
+        runner.setReportLocationDir(serverEnvironment.getServerTempDir().getAbsolutePath());
+        runner.setControllerClient(controllerClient);
+        runner.setHostControllerName(serverEnvironment.getHostControllerName());
+        runner.setServerName(serverEnvironment.getServerName());
+        return runner.collect();
     }
 
-    public SessionExpirationScheduler(Batcher batcher, Remover<String> remover, ScheduledExecutorService executor) {
-        this.batcher = batcher;
-        this.remover = remover;
-        this.executor = executor;
+    public synchronized void start(StartContext context) throws StartException {
+        final ThreadFactory threadFactory = new JBossThreadFactory(
+                new ThreadGroup("JdrReportCollector-threads"),
+                Boolean.FALSE, null, "%G - %t", null, null,
+                doPrivileged(GetAccessControlContextAction.getInstance()));
+        executorService = Executors.newCachedThreadPool(threadFactory);
+        serverEnvironment = serverEnvironmentValue.getValue();
+        controllerClient = modelControllerValue.getValue().createClient(executorService);
     }
 
-    @Override
-    public void cancel(ImmutableSession session) {
-        Future<?> future = this.expirationFutures.remove(session.getId());
-        if (future != null) {
-            future.cancel(false);
+    public synchronized void stop(StopContext context) {
+        if (executorService != null) {
+            executorService.shutdownNow();
         }
     }
 
-    @Override
-    public void schedule(ImmutableSession session) {
-        long timeout = session.getMetaData().getMaxInactiveInterval(TimeUnit.MILLISECONDS);
-        if (timeout > 0) {
-            String id = session.getId();
-            InfinispanWebLogger.ROOT_LOGGER.tracef("Session %s will expire in %d ms", id, timeout);
-            this.expirationFutures.put(id, this.executor.schedule(new ExpirationTask(id), timeout, TimeUnit.MILLISECONDS));
-        }
-    }
-
-    @Override
-    public void close() {
-        this.executor.shutdown();
-    }
-
-    private class ExpirationTask implements Runnable {
-        private final String id;
-
-        public ExpirationTask(String id) {
-            this.id = id;
-        }
-
-        @Override
-        public void run() {
-            SessionExpirationScheduler.this.expirationFutures.remove(this.id);
-            InfinispanWebLogger.ROOT_LOGGER.tracef("Expiring session %s", this.id);
-            Batch batch = SessionExpirationScheduler.this.batcher.startBatch();
-            boolean success = false;
-            try {
-                SessionExpirationScheduler.this.remover.remove(this.id);
-                success = true;
-            } finally {
-                if (success) {
-                    batch.close();
-                } else {
-                    batch.discard();
-                }
-            }
-        }
+    public JdrReportService getValue() throws IllegalStateException, IllegalArgumentException {
+        return this;
     }
 }

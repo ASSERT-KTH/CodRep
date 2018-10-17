@@ -1,271 +1,244 @@
-return combine(ImmutableSet.copyOf(modules));
+clusterState = new ClusterState(clusterState.version() + 1, clusterState);
 
-/**
- * Copyright (C) 2008 Google Inc.
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
-package org.elasticsearch.common.inject.util;
+package org.elasticsearch.cluster.service;
 
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import org.elasticsearch.common.inject.*;
-import org.elasticsearch.common.inject.spi.*;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.discovery.DiscoveryService;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
 
-import java.lang.annotation.Annotation;
-import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import static java.util.concurrent.Executors.*;
+import static org.elasticsearch.cluster.ClusterState.*;
+import static org.elasticsearch.common.unit.TimeValue.*;
+import static org.elasticsearch.common.util.concurrent.DynamicExecutors.*;
 
 /**
- * Static utility methods for creating and working with instances of {@link Module}.
- *
- * @author jessewilson@google.com (Jesse Wilson)
- * @since 2.0
+ * @author kimchy (shay.banon)
  */
-public final class Modules {
-    private Modules() {
+public class InternalClusterService extends AbstractLifecycleComponent<ClusterService> implements ClusterService {
+
+    private final TimeValue timeoutInterval;
+
+    private final ThreadPool threadPool;
+
+    private final DiscoveryService discoveryService;
+
+    private final TransportService transportService;
+
+    private volatile ExecutorService updateTasksExecutor;
+
+    private final List<ClusterStateListener> clusterStateListeners = new CopyOnWriteArrayList<ClusterStateListener>();
+
+    private final List<TimeoutHolder> clusterStateTimeoutListeners = new CopyOnWriteArrayList<TimeoutHolder>();
+
+    private volatile ScheduledFuture scheduledFuture;
+
+    private volatile ClusterState clusterState = newClusterStateBuilder().build();
+
+    @Inject public InternalClusterService(Settings settings, DiscoveryService discoveryService, TransportService transportService, ThreadPool threadPool) {
+        super(settings);
+        this.transportService = transportService;
+        this.discoveryService = discoveryService;
+        this.threadPool = threadPool;
+
+        this.timeoutInterval = componentSettings.getAsTime("timeout_interval", timeValueMillis(500));
     }
 
-    public static final Module EMPTY_MODULE = new Module() {
-        public void configure(Binder binder) {
-        }
-    };
-
-    /**
-     * Returns a builder that creates a module that overlays override modules over the given
-     * modules. If a key is bound in both sets of modules, only the binding from the override modules
-     * is kept. This can be used to replace the bindings of a production module with test bindings:
-     * <pre>
-     * Module functionalTestModule
-     *     = Modules.override(new ProductionModule()).with(new TestModule());
-     * </pre>
-     * <p/>
-     * <p>Prefer to write smaller modules that can be reused and tested without overrides.
-     *
-     * @param modules the modules whose bindings are open to be overridden
-     */
-    public static OverriddenModuleBuilder override(Module... modules) {
-        return new RealOverriddenModuleBuilder(Arrays.asList(modules));
-    }
-
-    /**
-     * Returns a builder that creates a module that overlays override modules over the given
-     * modules. If a key is bound in both sets of modules, only the binding from the override modules
-     * is kept. This can be used to replace the bindings of a production module with test bindings:
-     * <pre>
-     * Module functionalTestModule
-     *     = Modules.override(getProductionModules()).with(getTestModules());
-     * </pre>
-     * <p/>
-     * <p>Prefer to write smaller modules that can be reused and tested without overrides.
-     *
-     * @param modules the modules whose bindings are open to be overridden
-     */
-    public static OverriddenModuleBuilder override(Iterable<? extends Module> modules) {
-        return new RealOverriddenModuleBuilder(modules);
-    }
-
-    /**
-     * Returns a new module that installs all of {@code modules}.
-     */
-    public static Module combine(Module... modules) {
-        return combine(ImmutableSet.of(modules));
-    }
-
-    /**
-     * Returns a new module that installs all of {@code modules}.
-     */
-    public static Module combine(Iterable<? extends Module> modules) {
-        final Set<Module> modulesSet = ImmutableSet.copyOf(modules);
-        return new Module() {
-            public void configure(Binder binder) {
-                binder = binder.skipSources(getClass());
-                for (Module module : modulesSet) {
-                    binder.install(module);
+    @Override protected void doStart() throws ElasticSearchException {
+        this.clusterState = newClusterStateBuilder().build();
+        this.updateTasksExecutor = newSingleThreadExecutor(daemonThreadFactory(settings, "clusterService#updateTask"));
+        scheduledFuture = threadPool.scheduleWithFixedDelay(new Runnable() {
+            @Override public void run() {
+                long timestamp = System.currentTimeMillis();
+                for (final TimeoutHolder holder : clusterStateTimeoutListeners) {
+                    if ((timestamp - holder.timestamp) > holder.timeout.millis()) {
+                        clusterStateTimeoutListeners.remove(holder);
+                        InternalClusterService.this.threadPool.execute(new Runnable() {
+                            @Override public void run() {
+                                holder.listener.onTimeout(holder.timeout);
+                            }
+                        });
+                    }
                 }
             }
-        };
+        }, timeoutInterval);
     }
 
-    /**
-     * See the EDSL example at {@link Modules#override(Module[]) override()}.
-     */
-    public interface OverriddenModuleBuilder {
-
-        /**
-         * See the EDSL example at {@link Modules#override(Module[]) override()}.
-         */
-        Module with(Module... overrides);
-
-        /**
-         * See the EDSL example at {@link Modules#override(Module[]) override()}.
-         */
-        Module with(Iterable<? extends Module> overrides);
+    @Override protected void doStop() throws ElasticSearchException {
+        scheduledFuture.cancel(false);
+        for (TimeoutHolder holder : clusterStateTimeoutListeners) {
+            holder.listener.onTimeout(holder.timeout);
+        }
+        updateTasksExecutor.shutdown();
+        try {
+            updateTasksExecutor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // ignore
+        }
     }
 
-    private static final class RealOverriddenModuleBuilder implements OverriddenModuleBuilder {
-        private final ImmutableSet<Module> baseModules;
+    @Override protected void doClose() throws ElasticSearchException {
+    }
 
-        private RealOverriddenModuleBuilder(Iterable<? extends Module> baseModules) {
-            this.baseModules = ImmutableSet.copyOf(baseModules);
+    public ClusterState state() {
+        return this.clusterState;
+    }
+
+    public void add(ClusterStateListener listener) {
+        clusterStateListeners.add(listener);
+    }
+
+    public void remove(ClusterStateListener listener) {
+        clusterStateListeners.remove(listener);
+    }
+
+    public void add(TimeValue timeout, TimeoutClusterStateListener listener) {
+        clusterStateTimeoutListeners.add(new TimeoutHolder(listener, System.currentTimeMillis(), timeout));
+    }
+
+    public void remove(TimeoutClusterStateListener listener) {
+        clusterStateTimeoutListeners.remove(new TimeoutHolder(listener, -1, null));
+    }
+
+    public void submitStateUpdateTask(final String source, final ClusterStateUpdateTask updateTask) {
+        if (!lifecycle.started()) {
+            return;
         }
-
-        public Module with(Module... overrides) {
-            return with(Arrays.asList(overrides));
-        }
-
-        public Module with(final Iterable<? extends Module> overrides) {
-            return new AbstractModule() {
-                @Override
-                public void configure() {
-                    final List<Element> elements = Elements.getElements(baseModules);
-                    final List<Element> overrideElements = Elements.getElements(overrides);
-
-                    final Set<Key> overriddenKeys = Sets.newHashSet();
-                    final Set<Class<? extends Annotation>> overridesScopeAnnotations = Sets.newHashSet();
-
-                    // execute the overrides module, keeping track of which keys and scopes are bound
-                    new ModuleWriter(binder()) {
-                        @Override
-                        public <T> Void visit(Binding<T> binding) {
-                            overriddenKeys.add(binding.getKey());
-                            return super.visit(binding);
-                        }
-
-                        @Override
-                        public Void visit(ScopeBinding scopeBinding) {
-                            overridesScopeAnnotations.add(scopeBinding.getAnnotationType());
-                            return super.visit(scopeBinding);
-                        }
-
-                        @Override
-                        public Void visit(PrivateElements privateElements) {
-                            overriddenKeys.addAll(privateElements.getExposedKeys());
-                            return super.visit(privateElements);
-                        }
-                    }.writeAll(overrideElements);
-
-                    // execute the original module, skipping all scopes and overridden keys. We only skip each
-                    // overridden binding once so things still blow up if the module binds the same thing
-                    // multiple times.
-                    final Map<Scope, Object> scopeInstancesInUse = Maps.newHashMap();
-                    final List<ScopeBinding> scopeBindings = Lists.newArrayList();
-                    new ModuleWriter(binder()) {
-                        @Override
-                        public <T> Void visit(Binding<T> binding) {
-                            if (!overriddenKeys.remove(binding.getKey())) {
-                                super.visit(binding);
-
-                                // Record when a scope instance is used in a binding
-                                Scope scope = getScopeInstanceOrNull(binding);
-                                if (scope != null) {
-                                    scopeInstancesInUse.put(scope, binding.getSource());
-                                }
-                            }
-
-                            return null;
-                        }
-
-                        @Override
-                        public Void visit(PrivateElements privateElements) {
-                            PrivateBinder privateBinder = binder.withSource(privateElements.getSource())
-                                    .newPrivateBinder();
-
-                            Set<Key<?>> skippedExposes = Sets.newHashSet();
-
-                            for (Key<?> key : privateElements.getExposedKeys()) {
-                                if (overriddenKeys.remove(key)) {
-                                    skippedExposes.add(key);
-                                } else {
-                                    privateBinder.withSource(privateElements.getExposedSource(key)).expose(key);
-                                }
-                            }
-
-                            // we're not skipping deep exposes, but that should be okay. If we ever need to, we
-                            // have to search through this set of elements for PrivateElements, recursively
-                            for (Element element : privateElements.getElements()) {
-                                if (element instanceof Binding
-                                        && skippedExposes.contains(((Binding) element).getKey())) {
-                                    continue;
-                                }
-                                element.applyTo(privateBinder);
-                            }
-
-                            return null;
-                        }
-
-                        @Override
-                        public Void visit(ScopeBinding scopeBinding) {
-                            scopeBindings.add(scopeBinding);
-                            return null;
-                        }
-                    }.writeAll(elements);
-
-                    // execute the scope bindings, skipping scopes that have been overridden. Any scope that
-                    // is overridden and in active use will prompt an error
-                    new ModuleWriter(binder()) {
-                        @Override
-                        public Void visit(ScopeBinding scopeBinding) {
-                            if (!overridesScopeAnnotations.remove(scopeBinding.getAnnotationType())) {
-                                super.visit(scopeBinding);
-                            } else {
-                                Object source = scopeInstancesInUse.get(scopeBinding.getScope());
-                                if (source != null) {
-                                    binder().withSource(source).addError(
-                                            "The scope for @%s is bound directly and cannot be overridden.",
-                                            scopeBinding.getAnnotationType().getSimpleName());
-                                }
-                            }
-                            return null;
-                        }
-                    }.writeAll(scopeBindings);
-
-                    // TODO: bind the overridden keys using multibinder
+        updateTasksExecutor.execute(new Runnable() {
+            @Override public void run() {
+                if (!lifecycle.started()) {
+                    return;
                 }
+                ClusterState previousClusterState = clusterState;
+                try {
+                    clusterState = updateTask.execute(previousClusterState);
+                } catch (Exception e) {
+                    StringBuilder sb = new StringBuilder("failed to execute cluster state update, state:\nversion [").append(clusterState.version()).append("], source [").append(source).append("]\n");
+                    sb.append(clusterState.nodes().prettyPrint());
+                    sb.append(clusterState.routingTable().prettyPrint());
+                    sb.append(clusterState.readOnlyRoutingNodes().prettyPrint());
+                    logger.warn(sb.toString(), e);
+                    return;
+                }
+                if (previousClusterState != clusterState) {
+                    if (clusterState.nodes().localNodeMaster()) {
+                        // only the master controls the version numbers
+                        clusterState = new ClusterState(clusterState.version() + 1, clusterState.metaData(), clusterState.routingTable(), clusterState.nodes());
+                    } else {
+                        // we got this cluster state from the master, filter out based on versions (don't call listeners)
+                        if (clusterState.version() < previousClusterState.version()) {
+                            logger.debug("got old cluster state [" + clusterState.version() + "<" + previousClusterState.version() + "] from source [" + source + "], ignoring");
+                            return;
+                        }
+                    }
 
-                private Scope getScopeInstanceOrNull(Binding<?> binding) {
-                    return binding.acceptScopingVisitor(new DefaultBindingScopingVisitor<Scope>() {
-                        public Scope visitScope(Scope scope) {
-                            return scope;
+                    if (logger.isTraceEnabled()) {
+                        StringBuilder sb = new StringBuilder("cluster state updated:\nversion [").append(clusterState.version()).append("], source [").append(source).append("]\n");
+                        sb.append(clusterState.nodes().prettyPrint());
+                        sb.append(clusterState.routingTable().prettyPrint());
+                        sb.append(clusterState.readOnlyRoutingNodes().prettyPrint());
+                        logger.trace(sb.toString());
+                    } else if (logger.isDebugEnabled()) {
+                        logger.debug("cluster state updated, version [{}], source [{}]", clusterState.version(), source);
+                    }
+
+                    ClusterChangedEvent clusterChangedEvent = new ClusterChangedEvent(source, clusterState, previousClusterState);
+                    // new cluster state, notify all listeners
+                    final DiscoveryNodes.Delta nodesDelta = clusterChangedEvent.nodesDelta();
+                    if (nodesDelta.hasChanges() && logger.isInfoEnabled()) {
+                        String summary = nodesDelta.shortSummary();
+                        if (summary.length() > 0) {
+                            logger.info("{}, reason: {}", summary, source);
+                        }
+                    }
+
+                    // TODO, do this in parallel (and wait)
+                    for (DiscoveryNode node : nodesDelta.addedNodes()) {
+                        try {
+                            transportService.connectToNode(node);
+                        } catch (Exception e) {
+                            // the fault detection will detect it as failed as well
+                            logger.warn("failed to connect to node [" + node + "]", e);
+                        }
+                    }
+
+                    for (TimeoutHolder timeoutHolder : clusterStateTimeoutListeners) {
+                        timeoutHolder.listener.clusterChanged(clusterChangedEvent);
+                    }
+                    for (ClusterStateListener listener : clusterStateListeners) {
+                        listener.clusterChanged(clusterChangedEvent);
+                    }
+
+                    threadPool.execute(new Runnable() {
+                        @Override public void run() {
+                            for (DiscoveryNode node : nodesDelta.removedNodes()) {
+                                transportService.disconnectFromNode(node);
+                            }
                         }
                     });
+
+                    // if we are the master, publish the new state to all nodes
+                    if (clusterState.nodes().localNodeMaster()) {
+                        discoveryService.publish(clusterState);
+                    }
+
+                    if (updateTask instanceof ProcessedClusterStateUpdateTask) {
+                        ((ProcessedClusterStateUpdateTask) updateTask).clusterStateProcessed(clusterState);
+                    }
                 }
-            };
-        }
+            }
+        });
     }
 
-    private static class ModuleWriter extends DefaultElementVisitor<Void> {
-        protected final Binder binder;
+    private static class TimeoutHolder {
+        final TimeoutClusterStateListener listener;
+        final long timestamp;
+        final TimeValue timeout;
 
-        ModuleWriter(Binder binder) {
-            this.binder = binder;
+        private TimeoutHolder(TimeoutClusterStateListener listener, long timestamp, TimeValue timeout) {
+            this.listener = listener;
+            this.timestamp = timestamp;
+            this.timeout = timeout;
         }
 
-        @Override
-        protected Void visitOther(Element element) {
-            element.applyTo(binder);
-            return null;
+        @Override public int hashCode() {
+            return listener.hashCode();
         }
 
-        void writeAll(Iterable<? extends Element> elements) {
-            for (Element element : elements) {
-                element.acceptVisitor(this);
-            }
+        @Override public boolean equals(Object obj) {
+            return ((TimeoutHolder) obj).listener == listener;
         }
     }
 }

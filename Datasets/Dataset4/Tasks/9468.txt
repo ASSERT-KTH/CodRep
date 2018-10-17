@@ -1,66 +1,212 @@
-Settings settings = settingsBuilder().put("index.number_of_shards", 3).put("index.number_of_replicas", 0).build();
+return acceptDocs.get(doc) && parents.contains(typeCache.idByDoc(doc));
 
-package org.elasticsearch.test.integration.search.msearch;
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-import org.elasticsearch.action.search.MultiSearchResponse;
-import org.elasticsearch.client.Client;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.index.query.QueryBuilders;
-import org.elasticsearch.test.integration.AbstractNodesTests;
-import org.testng.annotations.AfterClass;
-import org.testng.annotations.BeforeClass;
-import org.testng.annotations.Test;
+package org.elasticsearch.index.search.child;
 
-import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.equalTo;
+import gnu.trove.set.hash.THashSet;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
+import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.common.CacheRecycler;
+import org.elasticsearch.common.bytes.HashedBytesArray;
+import org.elasticsearch.common.lucene.docset.GetDocSet;
+import org.elasticsearch.common.lucene.search.NoopCollector;
+import org.elasticsearch.index.cache.id.IdReaderTypeCache;
+import org.elasticsearch.search.internal.ScopePhase;
+import org.elasticsearch.search.internal.SearchContext;
+
+import java.io.IOException;
+import java.util.Map;
 
 /**
+ *
  */
-@Test
-public class SimpleMultiSearchTests extends AbstractNodesTests {
+public abstract class HasChildFilter extends Filter implements ScopePhase.CollectorPhase {
 
-    private Client client;
+    final Query childQuery;
+    final String scope;
+    final String parentType;
+    final String childType;
+    final SearchContext searchContext;
 
-    @BeforeClass
-    public void createNodes() throws Exception {
-        Settings settings = settingsBuilder().put("number_of_shards", 3).put("number_of_replicas", 0).build();
-        startNode("node1", settings);
-        startNode("node2", settings);
-        client = getClient();
+    protected HasChildFilter(Query childQuery, String scope, String parentType, String childType, SearchContext searchContext) {
+        this.searchContext = searchContext;
+        this.parentType = parentType;
+        this.childType = childType;
+        this.scope = scope;
+        this.childQuery = childQuery;
     }
 
-    @AfterClass
-    public void closeNodes() {
-        client.close();
-        closeAllNodes();
+    public Query query() {
+        return childQuery;
     }
 
-    protected Client getClient() {
-        return client("node1");
+    public String scope() {
+        return scope;
     }
 
-    @Test
-    public void simpleMultiSearch() {
-        client.admin().indices().prepareDelete().execute().actionGet();
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("child_filter[").append(childType).append("/").append(parentType).append("](").append(childQuery).append(')');
+        return sb.toString();
+    }
 
-        client.prepareIndex("test", "type", "1").setSource("field", "xxx").execute().actionGet();
-        client.prepareIndex("test", "type", "2").setSource("field", "yyy").execute().actionGet();
+    public static HasChildFilter create(Query childQuery, String scope, String parentType, String childType, SearchContext searchContext, String executionType) {
+        // This mechanism is experimental and will most likely be removed.
+        if ("bitset".equals(executionType)) {
+            return new Bitset(childQuery, scope, parentType, childType, searchContext);
+        } else if ("uid".endsWith(executionType)) {
+            return new Uid(childQuery, scope, parentType, childType, searchContext);
+        }
+        throw new ElasticSearchIllegalStateException("Illegal has_child execution type: " + executionType);
+    }
 
-        client.admin().indices().prepareRefresh().execute().actionGet();
+    static class Bitset extends HasChildFilter {
 
-        MultiSearchResponse response = client.prepareMultiSearch()
-                .add(client.prepareSearch("test").setQuery(QueryBuilders.termQuery("field", "xxx")))
-                .add(client.prepareSearch("test").setQuery(QueryBuilders.termQuery("field", "yyy")))
-                .add(client.prepareSearch("test").setQuery(QueryBuilders.matchAllQuery()))
-                .execute().actionGet();
+        private Map<Object, FixedBitSet> parentDocs;
 
-        assertThat(response.responses().length, equalTo(3));
-        assertThat(response.responses()[0].response().hits().totalHits(), equalTo(1l));
-        assertThat(response.responses()[1].response().hits().totalHits(), equalTo(1l));
-        assertThat(response.responses()[2].response().hits().totalHits(), equalTo(2l));
+        public Bitset(Query childQuery, String scope, String parentType, String childType, SearchContext searchContext) {
+            super(childQuery, scope, parentType, childType, searchContext);
+        }
 
-        assertThat(response.responses()[0].response().hits().getAt(0).id(), equalTo("1"));
-        assertThat(response.responses()[1].response().hits().getAt(0).id(), equalTo("2"));
+        public boolean requiresProcessing() {
+            return parentDocs == null;
+        }
+
+        public Collector collector() {
+            return new ChildCollector(parentType, searchContext);
+        }
+
+        public void processCollector(Collector collector) {
+            this.parentDocs = ((ChildCollector) collector).parentDocs();
+        }
+
+        public void clear() {
+            parentDocs = null;
+        }
+
+        public DocIdSet getDocIdSet(AtomicReaderContext context, Bits acceptDocs) throws IOException {
+            if (parentDocs == null) {
+                throw new ElasticSearchIllegalStateException("has_child filter/query hasn't executed properly");
+            }
+
+            // np need to use acceptDocs, since the parentDocs were collected with a collector, which means those
+            // collected docs are not deleted
+            // ok to return null
+            return parentDocs.get(context.reader().getCoreCacheKey());
+        }
+
+    }
+
+    static class Uid extends HasChildFilter {
+
+        THashSet<HashedBytesArray> collectedUids;
+
+        Uid(Query childQuery, String scope, String parentType, String childType, SearchContext searchContext) {
+            super(childQuery, scope, parentType, childType, searchContext);
+        }
+
+        public boolean requiresProcessing() {
+            return collectedUids == null;
+        }
+
+        public Collector collector() {
+            collectedUids = CacheRecycler.popHashSet();
+            return new UidCollector(parentType, searchContext, collectedUids);
+        }
+
+        public void processCollector(Collector collector) {
+            collectedUids = ((UidCollector) collector).collectedUids;
+        }
+
+        public DocIdSet getDocIdSet(AtomicReaderContext context, Bits acceptDocs) throws IOException {
+            if (collectedUids == null) {
+                throw new ElasticSearchIllegalStateException("has_child filter/query hasn't executed properly");
+            }
+
+            IdReaderTypeCache idReaderTypeCache = searchContext.idCache().reader(context.reader()).type(parentType);
+            if (idReaderTypeCache != null) {
+                return new ParentDocSet(context.reader(), collectedUids, idReaderTypeCache, acceptDocs);
+            } else {
+                return null;
+            }
+        }
+
+        public void clear() {
+            if (collectedUids != null) {
+                CacheRecycler.pushHashSet(collectedUids);
+            }
+            collectedUids = null;
+        }
+
+        static class ParentDocSet extends GetDocSet {
+
+            final IndexReader reader;
+            final THashSet<HashedBytesArray> parents;
+            final IdReaderTypeCache typeCache;
+            final Bits acceptDocs;
+
+            ParentDocSet(IndexReader reader, THashSet<HashedBytesArray> parents, IdReaderTypeCache typeCache, Bits acceptDocs) {
+                super(reader.maxDoc());
+                this.reader = reader;
+                this.parents = parents;
+                this.typeCache = typeCache;
+                this.acceptDocs = acceptDocs;
+            }
+
+            public boolean get(int doc) {
+                return !acceptDocs.get(doc) && parents.contains(typeCache.idByDoc(doc));
+            }
+        }
+
+        static class UidCollector extends NoopCollector {
+
+            final String parentType;
+            final SearchContext context;
+            final THashSet<HashedBytesArray> collectedUids;
+
+            private IdReaderTypeCache typeCache;
+
+            UidCollector(String parentType, SearchContext context, THashSet<HashedBytesArray> collectedUids) {
+                this.parentType = parentType;
+                this.context = context;
+                this.collectedUids = collectedUids;
+            }
+
+            @Override
+            public void collect(int doc) throws IOException {
+                collectedUids.add(typeCache.parentIdByDoc(doc));
+            }
+
+            @Override
+            public void setNextReader(AtomicReaderContext readerContext) throws IOException {
+                typeCache = context.idCache().reader(readerContext.reader()).type(parentType);
+            }
+        }
     }
 }

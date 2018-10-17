@@ -1,4 +1,4 @@
-protected Messaging20SubsystemParser() {
+sessionID = statefulSessionComponent.createSession();
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,235 +22,143 @@ protected Messaging20SubsystemParser() {
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.messaging;
+package org.jboss.as.ejb3.remote.protocol.versionone;
 
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.ADD;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
-import static org.jboss.as.controller.parsing.ParseUtils.missingRequired;
-import static org.jboss.as.messaging.Attribute.HTTP_LISTENER;
-import static org.jboss.as.messaging.Attribute.SOCKET_BINDING;
-import static org.jboss.as.messaging.CommonAttributes.ACCEPTOR;
-import static org.jboss.as.messaging.CommonAttributes.CONNECTOR;
-import static org.jboss.as.messaging.CommonAttributes.HTTP_ACCEPTOR;
-import static org.jboss.as.messaging.CommonAttributes.HTTP_CONNECTOR;
-import static org.jboss.as.messaging.CommonAttributes.IN_VM_ACCEPTOR;
-import static org.jboss.as.messaging.CommonAttributes.IN_VM_CONNECTOR;
-import static org.jboss.as.messaging.CommonAttributes.REMOTE_ACCEPTOR;
-import static org.jboss.as.messaging.CommonAttributes.REMOTE_CONNECTOR;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.concurrent.ExecutorService;
 
-import java.util.Collections;
-import java.util.List;
-
-import javax.xml.stream.XMLStreamException;
-
-import org.jboss.as.controller.parsing.ParseUtils;
-import org.jboss.dmr.ModelNode;
-import org.jboss.staxmapper.XMLExtendedStreamReader;
+import org.jboss.as.ee.component.Component;
+import org.jboss.as.ejb3.logging.EjbLogger;
+import org.jboss.as.ejb3.component.stateful.StatefulSessionComponent;
+import org.jboss.as.ejb3.deployment.DeploymentRepository;
+import org.jboss.as.ejb3.deployment.EjbDeploymentInformation;
+import org.jboss.ejb.client.Affinity;
+import org.jboss.ejb.client.SessionID;
+import org.jboss.ejb.client.remoting.PackedInteger;
+import org.jboss.marshalling.Marshaller;
+import org.jboss.marshalling.MarshallerFactory;
+import org.jboss.remoting3.MessageOutputStream;
+import org.xnio.IoUtils;
 
 /**
- * Messaging subsystem 2.0 XML parser.
- *
- * @author <a href="http://jmesnil.net/">Jeff Mesnil</a>
- *
+ * @author Jaikiran Pai
  */
-public class Messaging20SubsystemParser extends Messaging14SubsystemParser {
+class SessionOpenRequestHandler extends EJBIdentifierBasedMessageHandler {
 
-    private static final Messaging20SubsystemParser INSTANCE = new Messaging20SubsystemParser();
+    private static final byte HEADER_SESSION_OPEN_RESPONSE = 0x02;
+    private static final byte HEADER_EJB_NOT_STATEFUL = 0x0D;
 
-    public static MessagingSubsystemParser getInstance() {
-        return INSTANCE;
-    }
+    private final ExecutorService executorService;
+    private final MarshallerFactory marshallerFactory;
 
-    private Messaging20SubsystemParser() {
+    SessionOpenRequestHandler(final DeploymentRepository deploymentRepository, final MarshallerFactory marshallerFactory,
+                              final ExecutorService executorService) {
+        super(deploymentRepository);
+        this.marshallerFactory = marshallerFactory;
+        this.executorService = executorService;
     }
 
     @Override
-    void processConnectors(final XMLExtendedStreamReader reader, final ModelNode address, final List<ModelNode> updates) throws XMLStreamException {
-        while(reader.hasNext() && reader.nextTag() != END_ELEMENT) {
-            String name = null;
-            String socketBinding = null;
-            String serverId = null;
+    public void processMessage(ChannelAssociation channelAssociation, InputStream inputStream) throws IOException {
+        if (inputStream == null) {
+            throw EjbLogger.ROOT_LOGGER.messageInputStreamCannotBeNull();
+        }
+        final DataInputStream dataInputStream = new DataInputStream(inputStream);
+        // read invocation id
+        final short invocationId = dataInputStream.readShort();
+        final String appName = dataInputStream.readUTF();
+        final String moduleName = dataInputStream.readUTF();
+        final String distinctName = dataInputStream.readUTF();
+        final String beanName = dataInputStream.readUTF();
 
-            int count = reader.getAttributeCount();
-            for (int i = 0; i < count; i++) {
-                final String attrValue = reader.getAttributeValue(i);
-                final Attribute attribute = Attribute.forName(reader.getAttributeLocalName(i));
-                switch (attribute) {
-                    case NAME: {
-                        name = attrValue;
-                        break;
-                    } case SOCKET_BINDING: {
-                        socketBinding = attrValue;
-                        break;
-                    } case SERVER_ID: {
-                        serverId = attrValue;
-                        break;
-                    } default: {
-                        throw ParseUtils.unexpectedAttribute(reader, i);
-                    }
-                }
-            }
-            if(name == null) {
-                throw missingRequired(reader, Collections.singleton(Attribute.NAME));
-            }
+        final EjbDeploymentInformation ejbDeploymentInformation = this.findEJB(appName, moduleName, distinctName, beanName);
+        if (ejbDeploymentInformation == null) {
+            this.writeNoSuchEJBFailureMessage(channelAssociation, invocationId, appName, moduleName, distinctName, beanName, null);
+            return;
+        }
+        final Component component = ejbDeploymentInformation.getEjbComponent();
+        if (!(component instanceof StatefulSessionComponent)) {
+            final String failureMessage = EjbLogger.ROOT_LOGGER.notStatefulSessionBean(beanName, appName, moduleName, distinctName).getLocalizedMessage();
+            this.writeInvocationFailure(channelAssociation, HEADER_EJB_NOT_STATEFUL, invocationId, failureMessage);
+            return;
+        }
+        final StatefulSessionComponent statefulSessionComponent = (StatefulSessionComponent) component;
+        // generate the session id and write out the response on a separate thread
+        executorService.submit(new SessionIDGeneratorTask(statefulSessionComponent, channelAssociation, invocationId));
 
-            final ModelNode connectorAddress = address.clone();
-            final ModelNode operation = new ModelNode();
-            operation.get(OP).set(ADD);
+    }
 
-            boolean generic = false;
-            final Element element = Element.forName(reader.getLocalName());
-            switch (element) {
-                case CONNECTOR: {
-                    operation.get(OP_ADDR).set(connectorAddress.add(CONNECTOR, name));
-                    if (socketBinding != null) {
-                        operation.get(RemoteTransportDefinition.SOCKET_BINDING.getName()).set(socketBinding);
-                    }
-                    generic = true;
-                    break;
-                } case NETTY_CONNECTOR: {
-                    operation.get(OP_ADDR).set(connectorAddress.add(REMOTE_CONNECTOR, name));
-                    if (socketBinding == null) {
-                        throw missingRequired(reader, Collections.singleton(Attribute.SOCKET_BINDING));
-                    }
-                    operation.get(RemoteTransportDefinition.SOCKET_BINDING.getName()).set(socketBinding);
-                    break;
-                } case IN_VM_CONNECTOR: {
-                    operation.get(OP_ADDR).set(connectorAddress.add(IN_VM_CONNECTOR, name));
-                    if (serverId != null) {
-                        InVMTransportDefinition.SERVER_ID.parseAndSetParameter(serverId, operation, reader);
-                    }
-                    break;
-                } case HTTP_CONNECTOR: {
-                    if (socketBinding == null) {
-                        throw missingRequired(reader, Collections.singleton(SOCKET_BINDING));
-                    }
-                    operation.get(OP_ADDR).set(connectorAddress.add(HTTP_CONNECTOR, name));
-                    HTTPConnectorDefinition.SOCKET_BINDING.parseAndSetParameter(socketBinding, operation, reader);
-                    break;
-                } default: {
-                    throw ParseUtils.unexpectedElement(reader);
-                }
-            }
+    private void writeSessionId(final ChannelAssociation channelAssociation, final short invocationId, final SessionID sessionID, final Affinity hardAffinity) throws IOException {
+        final byte[] sessionIdBytes = sessionID.getEncodedForm();
+        final DataOutputStream dataOutputStream;
+        final MessageOutputStream messageOutputStream;
+        try {
+            messageOutputStream = channelAssociation.acquireChannelMessageOutputStream();
+        } catch (Exception e) {
+            throw EjbLogger.ROOT_LOGGER.failedToOpenMessageOutputStream(e);
+        }
+        dataOutputStream = new DataOutputStream(messageOutputStream);
+        try {
+            // write out header
+            dataOutputStream.writeByte(HEADER_SESSION_OPEN_RESPONSE);
+            // write out invocation id
+            dataOutputStream.writeShort(invocationId);
+            // session id byte length
+            PackedInteger.writePackedInteger(dataOutputStream, sessionIdBytes.length);
+            // write out the session id bytes
+            dataOutputStream.write(sessionIdBytes);
+            // now marshal the hard affinity associated with this session
+            final Marshaller marshaller = this.prepareForMarshalling(this.marshallerFactory, dataOutputStream);
+            marshaller.writeObject(hardAffinity);
 
-            updates.add(operation);
-            parseTransportConfiguration(reader, operation, generic, updates);
+            // finish marshalling
+            marshaller.finish();
+
+        } finally {
+            channelAssociation.releaseChannelMessageOutputStream(messageOutputStream);
+            dataOutputStream.close();
         }
     }
 
-    @Override
-    void processAcceptors(XMLExtendedStreamReader reader, ModelNode address, List<ModelNode> updates) throws XMLStreamException {
-        while(reader.hasNext() && reader.nextTag() != END_ELEMENT) {
-            String name = null;
-            String socketBinding = null;
-            String serverId = null;
-            String httpListener = null;
+    /**
+     * Task for generation a session id when a session open request is received
+     */
+    private class SessionIDGeneratorTask implements Runnable {
 
-            int count = reader.getAttributeCount();
-            for (int i = 0; i < count; i++) {
-                final String attrValue = reader.getAttributeValue(i);
-                final Attribute attribute = Attribute.forName(reader.getAttributeLocalName(i));
-                switch (attribute) {
-                    case NAME: {
-                        name = attrValue;
-                        break;
-                    } case SOCKET_BINDING: {
-                        socketBinding = attrValue;
-                        break;
-                    } case SERVER_ID: {
-                        serverId = attrValue;
-                        break;
-                    } case HTTP_LISTENER: {
-                        httpListener = attrValue;
-                        break;
-                    } default: {
-                        throw ParseUtils.unexpectedAttribute(reader, i);
-                    }
+        private final StatefulSessionComponent statefulSessionComponent;
+        private final ChannelAssociation channelAssociation;
+        private final short invocationId;
+
+
+        SessionIDGeneratorTask(final StatefulSessionComponent statefulSessionComponent, final ChannelAssociation channelAssociation, final short invocationId) {
+            this.statefulSessionComponent = statefulSessionComponent;
+            this.invocationId = invocationId;
+            this.channelAssociation = channelAssociation;
+        }
+
+        @Override
+        public void run() {
+            final SessionID sessionID;
+            try {
+                try {
+                    sessionID = statefulSessionComponent.createSessionRemote();
+                } catch (Throwable t) {
+                    EjbLogger.ROOT_LOGGER.exceptionGeneratingSessionId(t, statefulSessionComponent.getComponentName(), invocationId, channelAssociation.getChannel());
+                    SessionOpenRequestHandler.this.writeException(channelAssociation, SessionOpenRequestHandler.this.marshallerFactory, invocationId, t, null);
+                    return;
                 }
+                // get the affinity of the component
+                final Affinity hardAffinity = statefulSessionComponent.getCache().getStrictAffinity();
+                SessionOpenRequestHandler.this.writeSessionId(channelAssociation, invocationId, sessionID, hardAffinity);
+            } catch (IOException ioe) {
+                EjbLogger.ROOT_LOGGER.exceptionGeneratingSessionId(ioe, statefulSessionComponent.getComponentName(), invocationId, channelAssociation.getChannel());
+                // close the channel
+                IoUtils.safeClose(this.channelAssociation.getChannel());
+                return;
             }
-            if(name == null) {
-                throw ParseUtils.missingRequired(reader, Collections.singleton(Attribute.NAME));
-            }
-
-            final ModelNode acceptorAddress = address.clone();
-            final ModelNode operation = new ModelNode();
-            operation.get(OP).set(ADD);
-
-            final Element element = Element.forName(reader.getLocalName());
-            boolean generic = false;
-            switch (element) {
-                case ACCEPTOR: {
-                    operation.get(OP_ADDR).set(acceptorAddress.add(ACCEPTOR, name));
-                    if(socketBinding != null) {
-                        operation.get(RemoteTransportDefinition.SOCKET_BINDING.getName()).set(socketBinding);
-                    }
-                    generic = true;
-                    break;
-                } case NETTY_ACCEPTOR: {
-                    operation.get(OP_ADDR).set(acceptorAddress.add(REMOTE_ACCEPTOR, name));
-                    if(socketBinding == null) {
-                        throw ParseUtils.missingRequired(reader, Collections.singleton(Attribute.SOCKET_BINDING));
-                    }
-                    operation.get(RemoteTransportDefinition.SOCKET_BINDING.getName()).set(socketBinding);
-                    break;
-                } case IN_VM_ACCEPTOR: {
-                    operation.get(OP_ADDR).set(acceptorAddress.add(IN_VM_ACCEPTOR, name));
-                    if (serverId != null) {
-                        InVMTransportDefinition.SERVER_ID.parseAndSetParameter(serverId, operation, reader);
-                    }
-                    break;
-                } case HTTP_ACCEPTOR: {
-                    if (httpListener == null) {
-                        throw missingRequired(reader, Collections.singleton(HTTP_LISTENER));
-                    }
-                    operation.get(OP_ADDR).set(acceptorAddress.add(HTTP_ACCEPTOR, name));
-                    HTTPAcceptorDefinition.HTTP_LISTENER.parseAndSetParameter(httpListener, operation, reader);
-                    break;
-                } default: {
-                    throw ParseUtils.unexpectedElement(reader);
-                }
-            }
-
-            updates.add(operation);
-            parseTransportConfiguration(reader, operation, generic, updates);
-        }
-    }
-
-    @Override
-    protected void handleUnknownBridgeAttribute(XMLExtendedStreamReader reader, Element element, ModelNode bridgeAdd) throws XMLStreamException {
-        switch (element) {
-            case RECONNECT_ATTEMPTS_ON_SAME_NODE:
-                handleElementText(reader, element, bridgeAdd);
-                break;
-            case INITIAL_CONNECT_ATTEMPTS:
-                handleElementText(reader, element, "bridge", bridgeAdd);
-                break;
-            default:
-                super.handleUnknownBridgeAttribute(reader, element, bridgeAdd);
-        }
-    }
-
-    @Override
-    protected void handleUnknownAddressSetting(XMLExtendedStreamReader reader, Element element, ModelNode addressSettingsAdd) throws XMLStreamException {
-        switch (element) {
-            case EXPIRY_DELAY:
-                handleElementText(reader, element, addressSettingsAdd);
-                break;
-            default:
-                super.handleUnknownAddressSetting(reader, element, addressSettingsAdd);
-        }
-    }
-
-
-    @Override
-    protected void handleUnknownClusterConnectionAttribute(XMLExtendedStreamReader reader, Element element, ModelNode clusterConnectionAdd) throws XMLStreamException {
-        switch (element) {
-            case INITIAL_CONNECT_ATTEMPTS:
-                handleElementText(reader, element, "cluster", clusterConnectionAdd);
-                break;
-            default:
-                super.handleUnknownClusterConnectionAttribute(reader, element, clusterConnectionAdd);
         }
     }
 }

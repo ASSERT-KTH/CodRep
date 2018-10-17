@@ -1,6 +1,6 @@
-builder.add(text, BytesRef.deepCopyOf(spare));
+previous = CharsRef.deepCopyOf(current);
 
-package org.apache.lucene.index.codecs.memory;
+package org.apache.lucene.util.automaton;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,790 +19,345 @@ package org.apache.lucene.index.codecs.memory;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.Set;
-import java.util.SortedMap;
-import java.util.TreeMap;
+import java.util.*;
 
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.index.FieldInfos;
-import org.apache.lucene.index.FieldsEnum;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.SegmentReadState;
-import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.index.codecs.PostingsFormat;
-import org.apache.lucene.index.codecs.FieldsConsumer;
-import org.apache.lucene.index.codecs.FieldsProducer;
-import org.apache.lucene.index.codecs.PostingsConsumer;
-import org.apache.lucene.index.codecs.TermStats;
-import org.apache.lucene.index.codecs.TermsConsumer;
-import org.apache.lucene.store.ByteArrayDataInput;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.RAMOutputStream;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.fst.Builder;
-import org.apache.lucene.util.fst.ByteSequenceOutputs;
-import org.apache.lucene.util.fst.BytesRefFSTEnum;
-import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.UnicodeUtil;
 
-// TODO: would be nice to somehow allow this to act like
-// InstantiatedIndex, by never writing to disk; ie you write
-// to this Codec in RAM only and then when you open a reader
-// it pulls the FST directly from what you wrote w/o going
-// to disk.
-
-/** Stores terms & postings (docs, positions, payloads) in
- *  RAM, using an FST.
- *
- * <p>Note that this codec implements advance as a linear
- * scan!  This means if you store large fields in here,
- * queries that rely on advance will (AND BooleanQuery,
- * PhraseQuery) will be relatively slow!
- *
- * <p><b>NOTE</b>: this codec cannot address more than ~2.1 GB
- * of postings, because the underlying FST uses an int
- * to address the underlying byte[].
- *
- * @lucene.experimental */
-
-// TODO: Maybe name this 'Cached' or something to reflect
-// the reality that it is actually written to disk, but
-// loads itself in ram?
-public class MemoryPostingsFormat extends PostingsFormat {
+/**
+ * Builds a minimal deterministic automaton that accepts a set of strings. The
+ * algorithm requires sorted input data, but is very fast (nearly linear with
+ * the input size).
+ */
+public final class DaciukMihovAutomatonBuilder {
+  /**
+   * DFSA state with <code>char</code> labels on transitions.
+   */
+  final static class State {
+    
+    /** An empty set of labels. */
+    private final static int[] NO_LABELS = new int[0];
+    
+    /** An empty set of states. */
+    private final static State[] NO_STATES = new State[0];
+    
+    /**
+     * Labels of outgoing transitions. Indexed identically to {@link #states}.
+     * Labels must be sorted lexicographically.
+     */
+    int[] labels = NO_LABELS;
+    
+    /**
+     * States reachable from outgoing transitions. Indexed identically to
+     * {@link #labels}.
+     */
+    State[] states = NO_STATES;
+    
+    /**
+     * <code>true</code> if this state corresponds to the end of at least one
+     * input sequence.
+     */
+    boolean is_final;
+    
+    /**
+     * Returns the target state of a transition leaving this state and labeled
+     * with <code>label</code>. If no such transition exists, returns
+     * <code>null</code>.
+     */
+    public State getState(int label) {
+      final int index = Arrays.binarySearch(labels, label);
+      return index >= 0 ? states[index] : null;
+    }
+    
+    /**
+     * Returns an array of outgoing transition labels. The array is sorted in
+     * lexicographic order and indexes correspond to states returned from
+     * {@link #getStates()}.
+     */
+    public int[] getTransitionLabels() {
+      return this.labels;
+    }
+    
+    /**
+     * Returns an array of outgoing transitions from this state. The returned
+     * array must not be changed.
+     */
+    public State[] getStates() {
+      return this.states;
+    }
+    
+    /**
+     * Two states are equal if:
+     * <ul>
+     * <li>they have an identical number of outgoing transitions, labeled with
+     * the same labels</li>
+     * <li>corresponding outgoing transitions lead to the same states (to states
+     * with an identical right-language).
+     * </ul>
+     */
+    @Override
+    public boolean equals(Object obj) {
+      final State other = (State) obj;
+      return is_final == other.is_final
+          && Arrays.equals(this.labels, other.labels)
+          && referenceEquals(this.states, other.states);
+    }
+    
+    /**
+     * Return <code>true</code> if this state has any children (outgoing
+     * transitions).
+     */
+    public boolean hasChildren() {
+      return labels.length > 0;
+    }
+    
+    /**
+     * Is this state a final state in the automaton?
+     */
+    public boolean isFinal() {
+      return is_final;
+    }
+    
+    /**
+     * Compute the hash code of the <i>current</i> status of this state.
+     */
+    @Override
+    public int hashCode() {
+      int hash = is_final ? 1 : 0;
+      
+      hash ^= hash * 31 + this.labels.length;
+      for (int c : this.labels)
+        hash ^= hash * 31 + c;
+      
+      /*
+       * Compare the right-language of this state using reference-identity of
+       * outgoing states. This is possible because states are interned (stored
+       * in registry) and traversed in post-order, so any outgoing transitions
+       * are already interned.
+       */
+      for (State s : this.states) {
+        hash ^= System.identityHashCode(s);
+      }
+      
+      return hash;
+    }
+    
+    /**
+     * Create a new outgoing transition labeled <code>label</code> and return
+     * the newly created target state for this transition.
+     */
+    State newState(int label) {
+      assert Arrays.binarySearch(labels, label) < 0 : "State already has transition labeled: "
+          + label;
+      
+      labels = copyOf(labels, labels.length + 1);
+      states = copyOf(states, states.length + 1);
+      
+      labels[labels.length - 1] = label;
+      return states[states.length - 1] = new State();
+    }
+    
+    /**
+     * Return the most recent transitions's target state.
+     */
+    State lastChild() {
+      assert hasChildren() : "No outgoing transitions.";
+      return states[states.length - 1];
+    }
+    
+    /**
+     * Return the associated state if the most recent transition is labeled with
+     * <code>label</code>.
+     */
+    State lastChild(int label) {
+      final int index = labels.length - 1;
+      State s = null;
+      if (index >= 0 && labels[index] == label) {
+        s = states[index];
+      }
+      assert s == getState(label);
+      return s;
+    }
+    
+    /**
+     * Replace the last added outgoing transition's target state with the given
+     * state.
+     */
+    void replaceLastChild(State state) {
+      assert hasChildren() : "No outgoing transitions.";
+      states[states.length - 1] = state;
+    }
+    
+    /**
+     * JDK1.5-replacement of {@link Arrays#copyOf(int[], int)}
+     */
+    private static int[] copyOf(int[] original, int newLength) {
+      int[] copy = new int[newLength];
+      System.arraycopy(original, 0, copy, 0,
+          Math.min(original.length, newLength));
+      return copy;
+    }
+    
+    /**
+     * JDK1.5-replacement of {@link Arrays#copyOf(char[], int)}
+     */
+    public static State[] copyOf(State[] original, int newLength) {
+      State[] copy = new State[newLength];
+      System.arraycopy(original, 0, copy, 0,
+          Math.min(original.length, newLength));
+      return copy;
+    }
+    
+    /**
+     * Compare two lists of objects for reference-equality.
+     */
+    private static boolean referenceEquals(Object[] a1, Object[] a2) {
+      if (a1.length != a2.length) return false;
+      
+      for (int i = 0; i < a1.length; i++)
+        if (a1[i] != a2[i]) return false;
+      
+      return true;
+    }
+  }
   
-  public MemoryPostingsFormat() {
-    super("Memory");
-  }
+  /**
+   * "register" for state interning.
+   */
+  private HashMap<State,State> register = new HashMap<State,State>();
+  
+  /**
+   * Root automaton state.
+   */
+  private State root = new State();
+  
+  /**
+   * Previous sequence added to the automaton in {@link #add(CharSequence)}.
+   */
+  private CharsRef previous;
+  
+  private static final Comparator<CharsRef> comparator = CharsRef.getUTF16SortedAsUTF8Comparator();
 
-  private static final boolean VERBOSE = false;
-
-  private final static class TermsWriter extends TermsConsumer {
-    private final IndexOutput out;
-    private final FieldInfo field;
-    private final Builder<BytesRef> builder;
-    private final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
-    private int termCount;
-
-    public TermsWriter(IndexOutput out, FieldInfo field) {
-      this.out = out;
-      this.field = field;
-      builder = new Builder<BytesRef>(FST.INPUT_TYPE.BYTE1, outputs);
-    }
-
-    private class PostingsWriter extends PostingsConsumer {
-      private int lastDocID;
-      private int lastPos;
-      private int lastPayloadLen;
-
-      // NOTE: not private so we don't pay access check at runtime:
-      int docCount;
-      RAMOutputStream buffer = new RAMOutputStream();
-
-      @Override
-      public void startDoc(int docID, int termDocFreq) throws IOException {
-        if (VERBOSE) System.out.println("    startDoc docID=" + docID + " freq=" + termDocFreq);
-        final int delta = docID - lastDocID;
-        assert docID == 0 || delta > 0;
-        lastDocID = docID;
-        docCount++;
-
-        if (field.indexOptions == IndexOptions.DOCS_ONLY) {
-          buffer.writeVInt(delta);
-        } else if (termDocFreq == 1) {
-          buffer.writeVInt((delta<<1) | 1);
-        } else {
-          buffer.writeVInt(delta<<1);
-          assert termDocFreq > 0;
-          buffer.writeVInt(termDocFreq);
-        }
-
-        lastPos = 0;
-      }
-
-      @Override
-      public void addPosition(int pos, BytesRef payload) throws IOException {
-        assert payload == null || field.storePayloads;
-
-        if (VERBOSE) System.out.println("      addPos pos=" + pos + " payload=" + payload);
-
-        final int delta = pos - lastPos;
-        assert delta >= 0;
-        lastPos = pos;
-        
-        if (field.storePayloads) {
-          final int payloadLen = payload == null ? 0 : payload.length;
-          if (payloadLen != lastPayloadLen) {
-            lastPayloadLen = payloadLen;
-            buffer.writeVInt((delta<<1)|1);
-            buffer.writeVInt(payloadLen);
-          } else {
-            buffer.writeVInt(delta<<1);
-          }
-
-          if (payloadLen > 0) {
-            buffer.writeBytes(payload.bytes, payload.offset, payloadLen);
-          }
-        } else {
-          buffer.writeVInt(delta);
-        }
-      }
-
-      @Override
-      public void finishDoc() {
-      }
-
-      public PostingsWriter reset() {
-        assert buffer.getFilePointer() == 0;
-        lastDocID = 0;
-        docCount = 0;
-        lastPayloadLen = 0;
-        return this;
-      }
-    }
-
-    private final PostingsWriter postingsWriter = new PostingsWriter();
-
-    @Override
-    public PostingsConsumer startTerm(BytesRef text) {
-      if (VERBOSE) System.out.println("  startTerm term=" + text.utf8ToString());
-      return postingsWriter.reset();
-    }
-
-    private final RAMOutputStream buffer2 = new RAMOutputStream();
-    private final BytesRef spare = new BytesRef();
-    private byte[] finalBuffer = new byte[128];
-
-    @Override
-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
-
-      assert postingsWriter.docCount == stats.docFreq;
-
-      assert buffer2.getFilePointer() == 0;
-
-      buffer2.writeVInt(stats.docFreq);
-      if (field.indexOptions != IndexOptions.DOCS_ONLY) {
-        buffer2.writeVLong(stats.totalTermFreq-stats.docFreq);
-      }
-      int pos = (int) buffer2.getFilePointer();
-      buffer2.writeTo(finalBuffer, 0);
-      buffer2.reset();
-
-      final int totalBytes = pos + (int) postingsWriter.buffer.getFilePointer();
-      if (totalBytes > finalBuffer.length) {
-        finalBuffer = ArrayUtil.grow(finalBuffer, totalBytes);
-      }
-      postingsWriter.buffer.writeTo(finalBuffer, pos);
-      postingsWriter.buffer.reset();
-
-      spare.bytes = finalBuffer;
-      spare.length = totalBytes;
-      if (VERBOSE) {
-        System.out.println("    finishTerm term=" + text.utf8ToString() + " " + totalBytes + " bytes totalTF=" + stats.totalTermFreq);
-        for(int i=0;i<totalBytes;i++) {
-          System.out.println("      " + Integer.toHexString(finalBuffer[i]&0xFF));
-        }
-      }
-      builder.add(text, new BytesRef(spare));
-      termCount++;
-    }
-
-    @Override
-    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
-      if (termCount > 0) {
-        out.writeVInt(termCount);
-        out.writeVInt(field.number);
-        if (field.indexOptions != IndexOptions.DOCS_ONLY) {
-          out.writeVLong(sumTotalTermFreq);
-        }
-        out.writeVLong(sumDocFreq);
-        out.writeVInt(docCount);
-        builder.finish().save(out);
-        if (VERBOSE) System.out.println("finish field=" + field.name + " fp=" + out.getFilePointer());
-      }
-    }
-
-    @Override
-    public Comparator<BytesRef> getComparator() {
-      return BytesRef.getUTF8SortedAsUnicodeComparator();
-    }
-  }
-
-  private static String EXTENSION = "ram";
-
-  @Override
-  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
-
-    final String fileName = IndexFileNames.segmentFileName(state.segmentName, state.segmentSuffix, EXTENSION);
-    final IndexOutput out = state.directory.createOutput(fileName, state.context);
+  /**
+   * Add another character sequence to this automaton. The sequence must be
+   * lexicographically larger or equal compared to any previous sequences added
+   * to this automaton (the input must be sorted).
+   */
+  public void add(CharsRef current) {
+    assert register != null : "Automaton already built.";
+    assert previous == null
+        || comparator.compare(previous, current) <= 0 : "Input must be sorted: "
+        + previous + " >= " + current;
+    assert setPrevious(current);
     
-    return new FieldsConsumer() {
-      @Override
-      public TermsConsumer addField(FieldInfo field) {
-        if (VERBOSE) System.out.println("\naddField field=" + field.name);
-        return new TermsWriter(out, field);
-      }
-
-      @Override
-      public void close() throws IOException {
-        // EOF marker:
-        try {
-          out.writeVInt(0);
-        } finally {
-          out.close();
-        }
-      }
-    };
-  }
-
-  private final static class FSTDocsEnum extends DocsEnum {
-    private final IndexOptions indexOptions;
-    private final boolean storePayloads;
-    private byte[] buffer = new byte[16];
-    private final ByteArrayDataInput in = new ByteArrayDataInput(buffer);
-
-    private Bits liveDocs;
-    private int docUpto;
-    private int docID = -1;
-    private int accum;
-    private int freq;
-    private int payloadLen;
-    private int numDocs;
-
-    public FSTDocsEnum(IndexOptions indexOptions, boolean storePayloads) {
-      this.indexOptions = indexOptions;
-      this.storePayloads = storePayloads;
-    }
-
-    public boolean canReuse(IndexOptions indexOptions, boolean storePayloads) {
-      return indexOptions == this.indexOptions && storePayloads == this.storePayloads;
+    // Descend in the automaton (find matching prefix).
+    int pos = 0, max = current.length();
+    State next, state = root;
+    while (pos < max && (next = state.lastChild(Character.codePointAt(current, pos))) != null) {
+      state = next;
+      // todo, optimize me
+      pos += Character.charCount(Character.codePointAt(current, pos));
     }
     
-    public FSTDocsEnum reset(BytesRef bufferIn, Bits liveDocs, int numDocs) {
-      assert numDocs > 0;
-      if (buffer.length < bufferIn.length - bufferIn.offset) {
-        buffer = ArrayUtil.grow(buffer, bufferIn.length - bufferIn.offset);
-      }
-      in.reset(buffer, 0, bufferIn.length - bufferIn.offset);
-      System.arraycopy(bufferIn.bytes, bufferIn.offset, buffer, 0, bufferIn.length - bufferIn.offset);
-      this.liveDocs = liveDocs;
-      docID = -1;
-      accum = 0;
-      docUpto = 0;
-      payloadLen = 0;
-      this.numDocs = numDocs;
-      return this;
-    }
-
-    @Override
-    public int nextDoc() {
-      while(true) {
-        if (VERBOSE) System.out.println("  nextDoc cycle docUpto=" + docUpto + " numDocs=" + numDocs + " fp=" + in.getPosition() + " this=" + this);
-        if (docUpto == numDocs) {
-          if (VERBOSE) {
-            System.out.println("    END");
-          }
-          return docID = NO_MORE_DOCS;
-        }
-        docUpto++;
-        if (indexOptions == IndexOptions.DOCS_ONLY) {
-          accum += in.readVInt();
-          freq = 1;
-        } else {
-          final int code = in.readVInt();
-          accum += code >>> 1;
-          if (VERBOSE) System.out.println("  docID=" + accum + " code=" + code);
-          if ((code & 1) != 0) {
-            freq = 1;
-          } else {
-            freq = in.readVInt();
-            assert freq > 0;
-          }
-
-          if (indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
-            // Skip positions
-            for(int posUpto=0;posUpto<freq;posUpto++) {
-              if (!storePayloads) {
-                in.readVInt();
-              } else {
-                final int posCode = in.readVInt();
-                if ((posCode & 1) != 0) {
-                  payloadLen = in.readVInt();
-                }
-                in.skipBytes(payloadLen);
-              }
-            }
-          }
-        }
-
-        if (liveDocs == null || liveDocs.get(accum)) {
-          if (VERBOSE) System.out.println("    return docID=" + accum + " freq=" + freq);
-          return (docID = accum);
-        }
-      }
-    }
-
-    @Override
-    public int docID() {
-      return docID;
-    }
-
-    @Override
-    public int advance(int target) {
-      // TODO: we could make more efficient version, but, it
-      // should be rare that this will matter in practice
-      // since usually apps will not store "big" fields in
-      // this codec!
-      //System.out.println("advance start docID=" + docID + " target=" + target);
-      while(nextDoc() < target) {
-      }
-      return docID;
-    }
-
-    @Override
-    public int freq() {
-      return freq;
-    }
+    if (state.hasChildren()) replaceOrRegister(state);
+    
+    addSuffix(state, current, pos);
   }
-
-  private final static class FSTDocsAndPositionsEnum extends DocsAndPositionsEnum {
-    private final boolean storePayloads;
-    private byte[] buffer = new byte[16];
-    private final ByteArrayDataInput in = new ByteArrayDataInput(buffer);
-
-    private Bits liveDocs;
-    private int docUpto;
-    private int docID = -1;
-    private int accum;
-    private int freq;
-    private int numDocs;
-    private int posPending;
-    private int payloadLength;
-    private boolean payloadRetrieved;
-
-    private int pos;
-    private final BytesRef payload = new BytesRef();
-
-    public FSTDocsAndPositionsEnum(boolean storePayloads) {
-      this.storePayloads = storePayloads;
-    }
-
-    public boolean canReuse(boolean storePayloads) {
-      return storePayloads == this.storePayloads;
+  
+  /**
+   * Finalize the automaton and return the root state. No more strings can be
+   * added to the builder after this call.
+   * 
+   * @return Root automaton state.
+   */
+  public State complete() {
+    if (this.register == null) throw new IllegalStateException();
+    
+    if (root.hasChildren()) replaceOrRegister(root);
+    
+    register = null;
+    return root;
+  }
+  
+  /**
+   * Internal recursive traversal for conversion.
+   */
+  private static org.apache.lucene.util.automaton.State convert(State s,
+      IdentityHashMap<State,org.apache.lucene.util.automaton.State> visited) {
+    org.apache.lucene.util.automaton.State converted = visited.get(s);
+    if (converted != null) return converted;
+    
+    converted = new org.apache.lucene.util.automaton.State();
+    converted.setAccept(s.is_final);
+    
+    visited.put(s, converted);
+    int i = 0;
+    int[] labels = s.labels;
+    for (DaciukMihovAutomatonBuilder.State target : s.states) {
+      converted.addTransition(new Transition(labels[i++], convert(target,
+          visited)));
     }
     
-    public FSTDocsAndPositionsEnum reset(BytesRef bufferIn, Bits liveDocs, int numDocs) {
-      assert numDocs > 0;
-      if (VERBOSE) {
-        System.out.println("D&P reset bytes this=" + this);
-        for(int i=bufferIn.offset;i<bufferIn.length;i++) {
-          System.out.println("  " + Integer.toHexString(bufferIn.bytes[i]&0xFF));
-        }
-      }
-      if (buffer.length < bufferIn.length - bufferIn.offset) {
-        buffer = ArrayUtil.grow(buffer, bufferIn.length - bufferIn.offset);
-      }
-      in.reset(buffer, 0, bufferIn.length - bufferIn.offset);
-      System.arraycopy(bufferIn.bytes, bufferIn.offset, buffer, 0, bufferIn.length - bufferIn.offset);
-      this.liveDocs = liveDocs;
-      docID = -1;
-      accum = 0;
-      docUpto = 0;
-      payload.bytes = buffer;
-      payloadLength = 0;
-      this.numDocs = numDocs;
-      posPending = 0;
-      payloadRetrieved = false;
-      return this;
-    }
-
-    @Override
-    public int nextDoc() {
-      while (posPending > 0) {
-        nextPosition();
-      }
-      while(true) {
-        if (VERBOSE) System.out.println("  nextDoc cycle docUpto=" + docUpto + " numDocs=" + numDocs + " fp=" + in.getPosition() + " this=" + this);
-        if (docUpto == numDocs) {
-          if (VERBOSE) System.out.println("    END");
-          return docID = NO_MORE_DOCS;
-        }
-        docUpto++;
-        
-        final int code = in.readVInt();
-        accum += code >>> 1;
-        if ((code & 1) != 0) {
-          freq = 1;
-        } else {
-          freq = in.readVInt();
-          assert freq > 0;
-        }
-
-        if (liveDocs == null || liveDocs.get(accum)) {
-          pos = 0;
-          posPending = freq;
-          if (VERBOSE) System.out.println("    return docID=" + accum + " freq=" + freq);
-          return (docID = accum);
-        }
-
-        // Skip positions
-        for(int posUpto=0;posUpto<freq;posUpto++) {
-          if (!storePayloads) {
-            in.readVInt();
-          } else {
-            final int skipCode = in.readVInt();
-            if ((skipCode & 1) != 0) {
-              payloadLength = in.readVInt();
-              if (VERBOSE) System.out.println("    new payloadLen=" + payloadLength);
-            }
-            in.skipBytes(payloadLength);
-          }
-        }
-      }
-    }
-
-    @Override
-    public int nextPosition() {
-      if (VERBOSE) System.out.println("    nextPos storePayloads=" + storePayloads + " this=" + this);
-      assert posPending > 0;
-      posPending--;
-      if (!storePayloads) {
-        pos += in.readVInt();
-      } else {
-        final int code = in.readVInt();
-        pos += code >>> 1;
-        if ((code & 1) != 0) {
-          payloadLength = in.readVInt();
-          //System.out.println("      new payloadLen=" + payloadLength);
-          //} else {
-          //System.out.println("      same payloadLen=" + payloadLength);
-        }
-        payload.offset = in.getPosition();
-        in.skipBytes(payloadLength);
-        payload.length = payloadLength;
-        // Necessary, in case caller changed the
-        // payload.bytes from prior call:
-        payload.bytes = buffer;
-        payloadRetrieved = false;
-      }
-
-      if (VERBOSE) System.out.println("      pos=" + pos + " payload=" + payload + " fp=" + in.getPosition());
-      return pos;
-    }
-
-    @Override
-    public BytesRef getPayload() {
-      payloadRetrieved = true;
-      return payload;
-    }
-
-    @Override
-    public boolean hasPayload() {
-      return !payloadRetrieved && payload.length > 0;
-    }
-
-    @Override
-    public int docID() {
-      return docID;
-    }
-
-    @Override
-    public int advance(int target) {
-      // TODO: we could make more efficient version, but, it
-      // should be rare that this will matter in practice
-      // since usually apps will not store "big" fields in
-      // this codec!
-      //System.out.println("advance target=" + target);
-      while(nextDoc() < target) {
-      }
-      //System.out.println("  return " + docID);
-      return docID;
-    }
-
-    @Override
-    public int freq() {
-      return freq;
-    }
+    return converted;
   }
-
-  private final static class FSTTermsEnum extends TermsEnum {
-    private final FieldInfo field;
-    private final BytesRefFSTEnum<BytesRef> fstEnum;
-    private final ByteArrayDataInput buffer = new ByteArrayDataInput();
-    private boolean didDecode;
-
-    private int docFreq;
-    private long totalTermFreq;
-    private BytesRefFSTEnum.InputOutput<BytesRef> current;
-
-    public FSTTermsEnum(FieldInfo field, FST<BytesRef> fst) {
-      this.field = field;
-      fstEnum = new BytesRefFSTEnum<BytesRef>(fst);
-    }
-
-    private void decodeMetaData() throws IOException {
-      if (!didDecode) {
-        buffer.reset(current.output.bytes, 0, current.output.length);
-        docFreq = buffer.readVInt();
-        if (field.indexOptions != IndexOptions.DOCS_ONLY) {
-          totalTermFreq = docFreq + buffer.readVLong();
-        } else {
-          totalTermFreq = -1;
-        }
-        current.output.offset = buffer.getPosition();
-        if (VERBOSE) System.out.println("  df=" + docFreq + " totTF=" + totalTermFreq + " offset=" + buffer.getPosition() + " len=" + current.output.length);
-        didDecode = true;
-      }
-    }
-
-    @Override
-    public boolean seekExact(BytesRef text, boolean useCache /* ignored */) throws IOException {
-      if (VERBOSE) System.out.println("te.seekExact text=" + field.name + ":" + text.utf8ToString() + " this=" + this);
-      current = fstEnum.seekExact(text);
-      didDecode = false;
-      return current != null;
-    }
-
-    @Override
-    public SeekStatus seekCeil(BytesRef text, boolean useCache /* ignored */) throws IOException {
-      if (VERBOSE) System.out.println("te.seek text=" + field.name + ":" + text.utf8ToString() + " this=" + this);
-      current = fstEnum.seekCeil(text);
-      if (current == null) {
-        return SeekStatus.END;
-      } else {
-        if (VERBOSE) {
-          System.out.println("  got term=" + current.input.utf8ToString());
-          for(int i=0;i<current.output.length;i++) {
-            System.out.println("    " + Integer.toHexString(current.output.bytes[i]&0xFF));
-          }
-        }
-
-        didDecode = false;
-
-        if (text.equals(current.input)) {
-          if (VERBOSE) System.out.println("  found!");
-          return SeekStatus.FOUND;
-        } else {
-          if (VERBOSE) System.out.println("  not found: " + current.input.utf8ToString());
-          return SeekStatus.NOT_FOUND;
-        }
-      }
+  
+  /**
+   * Build a minimal, deterministic automaton from a sorted list of strings.
+   */
+  public static Automaton build(Collection<BytesRef> input) {
+    final DaciukMihovAutomatonBuilder builder = new DaciukMihovAutomatonBuilder();
+    
+    CharsRef scratch = new CharsRef();
+    for (BytesRef b : input) {
+      UnicodeUtil.UTF8toUTF16(b, scratch);
+      builder.add(scratch);
     }
     
-    @Override
-    public DocsEnum docs(Bits liveDocs, DocsEnum reuse) throws IOException {
-      decodeMetaData();
-      FSTDocsEnum docsEnum;
-      if (reuse == null || !(reuse instanceof FSTDocsEnum)) {
-        docsEnum = new FSTDocsEnum(field.indexOptions, field.storePayloads);
-      } else {
-        docsEnum = (FSTDocsEnum) reuse;        
-        if (!docsEnum.canReuse(field.indexOptions, field.storePayloads)) {
-          docsEnum = new FSTDocsEnum(field.indexOptions, field.storePayloads);
-        }
-      }
-      return docsEnum.reset(current.output, liveDocs, docFreq);
-    }
-
-    @Override
-    public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse) throws IOException {
-      if (field.indexOptions != IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
-        return null;
-      }
-      decodeMetaData();
-      FSTDocsAndPositionsEnum docsAndPositionsEnum;
-      if (reuse == null || !(reuse instanceof FSTDocsAndPositionsEnum)) {
-        docsAndPositionsEnum = new FSTDocsAndPositionsEnum(field.storePayloads);
-      } else {
-        docsAndPositionsEnum = (FSTDocsAndPositionsEnum) reuse;        
-        if (!docsAndPositionsEnum.canReuse(field.storePayloads)) {
-          docsAndPositionsEnum = new FSTDocsAndPositionsEnum(field.storePayloads);
-        }
-      }
-      if (VERBOSE) System.out.println("D&P reset this=" + this);
-      return docsAndPositionsEnum.reset(current.output, liveDocs, docFreq);
-    }
-
-    @Override
-    public BytesRef term() {
-      return current.input;
-    }
-
-    @Override
-    public BytesRef next() throws IOException {
-      if (VERBOSE) System.out.println("te.next");
-      current = fstEnum.next();
-      if (current == null) {
-        if (VERBOSE) System.out.println("  END");
-        return null;
-      }
-      didDecode = false;
-      if (VERBOSE) System.out.println("  term=" + field.name + ":" + current.input.utf8ToString());
-      return current.input;
-    }
-
-    @Override
-    public int docFreq() throws IOException {
-      decodeMetaData();
-      return docFreq;
-    }
-
-    @Override
-    public long totalTermFreq() throws IOException {
-      decodeMetaData();
-      return totalTermFreq;
-    }
-
-    @Override
-    public Comparator<BytesRef> getComparator() {
-      return BytesRef.getUTF8SortedAsUnicodeComparator();
-    }
-
-    @Override
-    public void seekExact(long ord) {
-      // NOTE: we could add this...
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public long ord() {
-      // NOTE: we could add this...
-      throw new UnsupportedOperationException();
-    }
+    Automaton a = new Automaton();
+    a.initial = convert(builder.complete(), new IdentityHashMap<State,org.apache.lucene.util.automaton.State>());
+    a.deterministic = true;
+    return a;
   }
 
-  private final static class TermsReader extends Terms {
-
-    private final long sumTotalTermFreq;
-    private final long sumDocFreq;
-    private final int docCount;
-    private final int termCount;
-    private FST<BytesRef> fst;
-    private final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
-    private final FieldInfo field;
-
-    public TermsReader(FieldInfos fieldInfos, IndexInput in, int termCount) throws IOException {
-      this.termCount = termCount;
-      final int fieldNumber = in.readVInt();
-      field = fieldInfos.fieldInfo(fieldNumber);
-      if (field.indexOptions != IndexOptions.DOCS_ONLY) {
-        sumTotalTermFreq = in.readVLong();
-      } else {
-        sumTotalTermFreq = -1;
-      }
-      sumDocFreq = in.readVLong();
-      docCount = in.readVInt();
-      
-      fst = new FST<BytesRef>(in, outputs);
-    }
-
-    @Override
-    public long getSumTotalTermFreq() {
-      return sumTotalTermFreq;
-    }
-
-    @Override
-    public long getSumDocFreq() throws IOException {
-      return sumDocFreq;
-    }
-
-    @Override
-    public int getDocCount() throws IOException {
-      return docCount;
-    }
-
-    @Override
-    public long getUniqueTermCount() throws IOException {
-      return termCount;
-    }
-
-    @Override
-    public TermsEnum iterator(TermsEnum reuse) {
-      return new FSTTermsEnum(field, fst);
-    }
-
-    @Override
-    public Comparator<BytesRef> getComparator() {
-      return BytesRef.getUTF8SortedAsUnicodeComparator();
+  /**
+   * Copy <code>current</code> into an internal buffer.
+   */
+  private boolean setPrevious(CharsRef current) {
+    // don't need to copy, once we fix https://issues.apache.org/jira/browse/LUCENE-3277
+    // still, called only from assert
+    previous = new CharsRef(current);
+    return true;
+  }
+  
+  /**
+   * Replace last child of <code>state</code> with an already registered state
+   * or register the last child state.
+   */
+  private void replaceOrRegister(State state) {
+    final State child = state.lastChild();
+    
+    if (child.hasChildren()) replaceOrRegister(child);
+    
+    final State registered = register.get(child);
+    if (registered != null) {
+      state.replaceLastChild(registered);
+    } else {
+      register.put(child, child);
     }
   }
-
-  @Override
-  public FieldsProducer fieldsProducer(SegmentReadState state) throws IOException {
-    final String fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
-    final IndexInput in = state.dir.openInput(fileName, IOContext.READONCE);
-
-    final SortedMap<String,TermsReader> fields = new TreeMap<String,TermsReader>();
-
-    try {
-      while(true) {
-        final int termCount = in.readVInt();
-        if (termCount == 0) {
-          break;
-        }
-        final TermsReader termsReader = new TermsReader(state.fieldInfos, in, termCount);
-        fields.put(termsReader.field.name, termsReader);
-      }
-    } finally {
-      in.close();
+  
+  /**
+   * Add a suffix of <code>current</code> starting at <code>fromIndex</code>
+   * (inclusive) to state <code>state</code>.
+   */
+  private void addSuffix(State state, CharSequence current, int fromIndex) {
+    final int len = current.length();
+    while (fromIndex < len) {
+      int cp = Character.codePointAt(current, fromIndex);
+      state = state.newState(cp);
+      fromIndex += Character.charCount(cp);
     }
-
-    return new FieldsProducer() {
-      @Override
-      public FieldsEnum iterator() {
-        final Iterator<TermsReader> iter = fields.values().iterator();
-
-        return new FieldsEnum() {
-
-          private TermsReader current;
-
-          @Override
-          public String next() {
-            current = iter.next();
-            return current.field.name;
-          }
-
-          @Override
-          public Terms terms() {
-            return current;
-          }
-        };
-      }
-
-      @Override
-      public Terms terms(String field) {
-        return fields.get(field);
-      }
-      
-      @Override
-      public int getUniqueFieldCount() {
-        return fields.size();
-      }
-
-      @Override
-      public void close() {
-        // Drop ref to FST:
-        for(TermsReader termsReader : fields.values()) {
-          termsReader.fst = null;
-        }
-      }
-    };
-  }
-
-  @Override
-  public void files(Directory dir, SegmentInfo segmentInfo, String segmentSuffix, Set<String> files) throws IOException {
-    files.add(IndexFileNames.segmentFileName(segmentInfo.name, segmentSuffix, EXTENSION));
+    state.is_final = true;
   }
 }

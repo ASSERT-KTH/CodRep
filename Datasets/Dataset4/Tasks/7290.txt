@@ -1,230 +1,349 @@
-package com.badlogic.gdx.backends.openal;
+private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
 
-/*******************************************************************************
- * Copyright 2011 See AUTHORS file.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
+/*
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- ******************************************************************************/
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.backends.lwjgl.audio;
+package org.elasticsearch.discovery.zen.fd;
 
-import java.nio.ByteBuffer;
-import java.nio.IntBuffer;
+import org.elasticsearch.ElasticsearchIllegalStateException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.common.component.AbstractComponent;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
 
-import org.lwjgl.BufferUtils;
-import org.lwjgl.openal.AL11;
+import java.io.IOException;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
-import com.badlogic.gdx.audio.Music;
-import com.badlogic.gdx.files.FileHandle;
-import com.badlogic.gdx.math.MathUtils;
-import com.badlogic.gdx.utils.GdxRuntimeException;
+import static org.elasticsearch.cluster.node.DiscoveryNodes.EMPTY_NODES;
+import static org.elasticsearch.common.unit.TimeValue.timeValueSeconds;
+import static org.elasticsearch.common.util.concurrent.ConcurrentCollections.newConcurrentMap;
+import static org.elasticsearch.transport.TransportRequestOptions.options;
 
-import static org.lwjgl.openal.AL10.*;
+/**
+ * A fault detection of multiple nodes.
+ */
+public class NodesFaultDetection extends AbstractComponent {
 
-/** @author Nathan Sweet */
-public abstract class OpenALMusic implements Music {
-	static private final int bufferSize = 4096 * 10;
-	static private final int bufferCount = 3;
-	static private final int bytesPerSample = 2;
-	static private final byte[] tempBytes = new byte[bufferSize];
-	static private final ByteBuffer tempBuffer = BufferUtils.createByteBuffer(bufferSize);
+    public static interface Listener {
 
-	private final OpenALAudio audio;
-	private IntBuffer buffers;
-	private int sourceID = -1;
-	private int format, sampleRate;
-	private boolean isLooping, isPlaying;
-	private float volume = 1;
-	private float pan = 0;
-	private float renderedSeconds, secondsPerBuffer;
+        void onNodeFailure(DiscoveryNode node, String reason);
+    }
 
-	protected final FileHandle file;
+    private final ThreadPool threadPool;
 
-	private OnCompletionListener onCompletionListener;
+    private final TransportService transportService;
 
-	public OpenALMusic (OpenALAudio audio, FileHandle file) {
-		this.audio = audio;
-		this.file = file;
-		if (audio != null) {
-			if (!audio.noDevice) audio.music.add(this);
-		}
-		this.onCompletionListener = null;
-	}
 
-	protected void setup (int channels, int sampleRate) {
-		this.format = channels > 1 ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
-		this.sampleRate = sampleRate;
-		secondsPerBuffer = (float)bufferSize / bytesPerSample / channels / sampleRate;
-	}
+    private final boolean connectOnNetworkDisconnect;
 
-	public void play () {
-		if (audio.noDevice) return;
-		if (sourceID == -1) {
-			sourceID = audio.obtainSource(true);
-			if (sourceID == -1) return;
-			if (buffers == null) {
-				buffers = BufferUtils.createIntBuffer(bufferCount);
-				alGenBuffers(buffers);
-				if (alGetError() != AL_NO_ERROR) throw new GdxRuntimeException("Unabe to allocate audio buffers.");
-			}
-			alSourcei(sourceID, AL_LOOPING, AL_FALSE);
-			setPan(pan, volume);
-			for (int i = 0; i < bufferCount; i++) {
-				int bufferID = buffers.get(i);
-				if (!fill(bufferID)) break;
-				alSourceQueueBuffers(sourceID, bufferID);
-			}
-			if (alGetError() != AL_NO_ERROR) {
-				stop();
-				return;
-			}
-		}
-		alSourcePlay(sourceID);
-		isPlaying = true;
-	}
+    private final TimeValue pingInterval;
 
-	public void stop () {
-		if (audio.noDevice) return;
-		if (sourceID == -1) return;
-		reset();
-		audio.freeSource(sourceID);
-		sourceID = -1;
-		renderedSeconds = 0;
-		isPlaying = false;
-	}
+    private final TimeValue pingRetryTimeout;
 
-	public void pause () {
-		if (audio.noDevice) return;
-		if (sourceID != -1) alSourcePause(sourceID);
-		isPlaying = false;
-	}
+    private final int pingRetryCount;
 
-	public boolean isPlaying () {
-		if (audio.noDevice) return false;
-		if (sourceID == -1) return false;
-		return isPlaying;
-	}
+    // used mainly for testing, should always be true
+    private final boolean registerConnectionListener;
 
-	public void setLooping (boolean isLooping) {
-		this.isLooping = isLooping;
-	}
 
-	public boolean isLooping () {
-		return isLooping;
-	}
+    private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<Listener>();
 
-	public void setVolume (float volume) {
-		this.volume = volume;
-		if (audio.noDevice) return;
-		if (sourceID != -1) alSourcef(sourceID, AL_GAIN, volume);
-	}
+    private final ConcurrentMap<DiscoveryNode, NodeFD> nodesFD = newConcurrentMap();
 
-	public float getVolume () {
-		return this.volume;
-	}
+    private final FDConnectionListener connectionListener;
 
-	public void setPan (float pan, float volume) {
-		this.volume = volume;
-		this.pan = pan;
-		if (audio.noDevice) return;
-		if (sourceID == -1) return;
-		alSource3f(sourceID, AL_POSITION, MathUtils.cos((pan - 1) * MathUtils.PI / 2), 0,
-			MathUtils.sin((pan + 1) * MathUtils.PI / 2));
-		alSourcef(sourceID, AL_GAIN, volume);
-	}
+    private volatile DiscoveryNodes latestNodes = EMPTY_NODES;
 
-	public float getPosition () {
-		if (audio.noDevice) return 0;
-		if (sourceID == -1) return 0;
-		return renderedSeconds + alGetSourcef(sourceID, AL11.AL_SEC_OFFSET);
-	}
+    private volatile boolean running = false;
 
-	/** Fills as much of the buffer as possible and returns the number of bytes filled. Returns <= 0 to indicate the end of the
-	 * stream. */
-	abstract public int read (byte[] buffer);
+    public NodesFaultDetection(Settings settings, ThreadPool threadPool, TransportService transportService) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.transportService = transportService;
 
-	/** Resets the stream to the beginning. */
-	abstract public void reset ();
+        this.connectOnNetworkDisconnect = componentSettings.getAsBoolean("connect_on_network_disconnect", true);
+        this.pingInterval = componentSettings.getAsTime("ping_interval", timeValueSeconds(1));
+        this.pingRetryTimeout = componentSettings.getAsTime("ping_timeout", timeValueSeconds(30));
+        this.pingRetryCount = componentSettings.getAsInt("ping_retries", 3);
+        this.registerConnectionListener = componentSettings.getAsBoolean("register_connection_listener", true);
 
-	public int getChannels () {
-		return format == AL_FORMAT_STEREO16 ? 2 : 1;
-	}
+        logger.debug("[node  ] uses ping_interval [{}], ping_timeout [{}], ping_retries [{}]", pingInterval, pingRetryTimeout, pingRetryCount);
 
-	public int getRate () {
-		return sampleRate;
-	}
+        transportService.registerHandler(PingRequestHandler.ACTION, new PingRequestHandler());
 
-	public void update () {
-		if (audio.noDevice) return;
-		if (sourceID == -1) return;
+        this.connectionListener = new FDConnectionListener();
+        if (registerConnectionListener) {
+            transportService.addConnectionListener(connectionListener);
+        }
+    }
 
-		boolean end = false;
-		int buffers = alGetSourcei(sourceID, AL_BUFFERS_PROCESSED);
-		while (buffers-- > 0) {
-			int bufferID = alSourceUnqueueBuffers(sourceID);
-			if (bufferID == AL_INVALID_VALUE) break;
-			renderedSeconds += secondsPerBuffer;
-			if (end) continue;
-			if (fill(bufferID))
-				alSourceQueueBuffers(sourceID, bufferID);
-			else
-				end = true;
-		}
-		if (end && alGetSourcei(sourceID, AL_BUFFERS_QUEUED) == 0) {
-			if (onCompletionListener != null) onCompletionListener.onCompletion(this);
-			stop();
-		}
+    public void addListener(Listener listener) {
+        listeners.add(listener);
+    }
 
-		// A buffer underflow will cause the source to stop.
-		if (isPlaying && alGetSourcei(sourceID, AL_SOURCE_STATE) != AL_PLAYING) alSourcePlay(sourceID);
-	}
+    public void removeListener(Listener listener) {
+        listeners.remove(listener);
+    }
 
-	private boolean fill (int bufferID) {
-		tempBuffer.clear();
-		int length = read(tempBytes);
-		if (length <= 0) {
-			if (isLooping) {
-				reset();
-				renderedSeconds = 0;
-				length = read(tempBytes);
-				if (length <= 0) return false;
-			} else
-				return false;
-		}
-		tempBuffer.put(tempBytes, 0, length).flip();
-		alBufferData(bufferID, format, tempBuffer, sampleRate);
-		return true;
-	}
+    public void updateNodes(DiscoveryNodes nodes) {
+        DiscoveryNodes prevNodes = latestNodes;
+        this.latestNodes = nodes;
+        if (!running) {
+            return;
+        }
+        DiscoveryNodes.Delta delta = nodes.delta(prevNodes);
+        for (DiscoveryNode newNode : delta.addedNodes()) {
+            if (newNode.id().equals(nodes.localNodeId())) {
+                // no need to monitor the local node
+                continue;
+            }
+            if (!nodesFD.containsKey(newNode)) {
+                nodesFD.put(newNode, new NodeFD());
+                threadPool.schedule(pingInterval, ThreadPool.Names.SAME, new SendPingRequest(newNode));
+            }
+        }
+        for (DiscoveryNode removedNode : delta.removedNodes()) {
+            nodesFD.remove(removedNode);
+        }
+    }
 
-	public void dispose () {
-		if (audio.noDevice) return;
-		if (buffers == null) return;
-		if (sourceID != -1) {
-			reset();
-			audio.music.removeValue(this, true);
-			audio.freeSource(sourceID);
-			sourceID = -1;
-		}
-		alDeleteBuffers(buffers);
-		buffers = null;
-		onCompletionListener = null;
-	}
+    public NodesFaultDetection start() {
+        if (running) {
+            return this;
+        }
+        running = true;
+        return this;
+    }
 
-	public void setOnCompletionListener (OnCompletionListener listener) {
-		onCompletionListener = listener;
-	}
+    public NodesFaultDetection stop() {
+        if (!running) {
+            return this;
+        }
+        running = false;
+        return this;
+    }
 
-	public int getSourceId () {
-		return sourceID;
-	}
+    public void close() {
+        stop();
+        transportService.removeHandler(PingRequestHandler.ACTION);
+        transportService.removeConnectionListener(connectionListener);
+    }
+
+    private void handleTransportDisconnect(DiscoveryNode node) {
+        if (!latestNodes.nodeExists(node.id())) {
+            return;
+        }
+        NodeFD nodeFD = nodesFD.remove(node);
+        if (nodeFD == null) {
+            return;
+        }
+        if (!running) {
+            return;
+        }
+        nodeFD.running = false;
+        if (connectOnNetworkDisconnect) {
+            try {
+                transportService.connectToNode(node);
+                nodesFD.put(node, new NodeFD());
+                threadPool.schedule(pingInterval, ThreadPool.Names.SAME, new SendPingRequest(node));
+            } catch (Exception e) {
+                logger.trace("[node  ] [{}] transport disconnected (with verified connect)", node);
+                notifyNodeFailure(node, "transport disconnected (with verified connect)");
+            }
+        } else {
+            logger.trace("[node  ] [{}] transport disconnected", node);
+            notifyNodeFailure(node, "transport disconnected");
+        }
+    }
+
+    private void notifyNodeFailure(final DiscoveryNode node, final String reason) {
+        threadPool.generic().execute(new Runnable() {
+            @Override
+            public void run() {
+                for (Listener listener : listeners) {
+                    listener.onNodeFailure(node, reason);
+                }
+            }
+        });
+    }
+
+    private class SendPingRequest implements Runnable {
+
+        private final DiscoveryNode node;
+
+        private SendPingRequest(DiscoveryNode node) {
+            this.node = node;
+        }
+
+        @Override
+        public void run() {
+            if (!running) {
+                return;
+            }
+            transportService.sendRequest(node, PingRequestHandler.ACTION, new PingRequest(node.id()), options().withType(TransportRequestOptions.Type.PING).withTimeout(pingRetryTimeout),
+                    new BaseTransportResponseHandler<PingResponse>() {
+                        @Override
+                        public PingResponse newInstance() {
+                            return new PingResponse();
+                        }
+
+                        @Override
+                        public void handleResponse(PingResponse response) {
+                            if (!running) {
+                                return;
+                            }
+                            NodeFD nodeFD = nodesFD.get(node);
+                            if (nodeFD != null) {
+                                if (!nodeFD.running) {
+                                    return;
+                                }
+                                nodeFD.retryCount = 0;
+                                threadPool.schedule(pingInterval, ThreadPool.Names.SAME, SendPingRequest.this);
+                            }
+                        }
+
+                        @Override
+                        public void handleException(TransportException exp) {
+                            // check if the master node did not get switched on us...
+                            if (!running) {
+                                return;
+                            }
+                            if (exp instanceof ConnectTransportException) {
+                                // ignore this one, we already handle it by registering a connection listener
+                                return;
+                            }
+                            NodeFD nodeFD = nodesFD.get(node);
+                            if (nodeFD != null) {
+                                if (!nodeFD.running) {
+                                    return;
+                                }
+                                int retryCount = ++nodeFD.retryCount;
+                                logger.trace("[node  ] failed to ping [{}], retry [{}] out of [{}]", exp, node, retryCount, pingRetryCount);
+                                if (retryCount >= pingRetryCount) {
+                                    logger.debug("[node  ] failed to ping [{}], tried [{}] times, each with  maximum [{}] timeout", node, pingRetryCount, pingRetryTimeout);
+                                    // not good, failure
+                                    if (nodesFD.remove(node) != null) {
+                                        notifyNodeFailure(node, "failed to ping, tried [" + pingRetryCount + "] times, each with maximum [" + pingRetryTimeout + "] timeout");
+                                    }
+                                } else {
+                                    // resend the request, not reschedule, rely on send timeout
+                                    transportService.sendRequest(node, PingRequestHandler.ACTION, new PingRequest(node.id()),
+                                            options().withType(TransportRequestOptions.Type.PING).withTimeout(pingRetryTimeout), this);
+                                }
+                            }
+                        }
+
+                        @Override
+                        public String executor() {
+                            return ThreadPool.Names.SAME;
+                        }
+                    });
+        }
+    }
+
+    static class NodeFD {
+        volatile int retryCount;
+        volatile boolean running = true;
+    }
+
+    private class FDConnectionListener implements TransportConnectionListener {
+        @Override
+        public void onNodeConnected(DiscoveryNode node) {
+        }
+
+        @Override
+        public void onNodeDisconnected(DiscoveryNode node) {
+            handleTransportDisconnect(node);
+        }
+    }
+
+
+    class PingRequestHandler extends BaseTransportRequestHandler<PingRequest> {
+
+        public static final String ACTION = "discovery/zen/fd/ping";
+
+        @Override
+        public PingRequest newInstance() {
+            return new PingRequest();
+        }
+
+        @Override
+        public void messageReceived(PingRequest request, TransportChannel channel) throws Exception {
+            // if we are not the node we are supposed to be pinged, send an exception
+            // this can happen when a kill -9 is sent, and another node is started using the same port
+            if (!latestNodes.localNodeId().equals(request.nodeId)) {
+                throw new ElasticsearchIllegalStateException("Got pinged as node [" + request.nodeId + "], but I am node [" + latestNodes.localNodeId() + "]");
+            }
+            channel.sendResponse(new PingResponse());
+        }
+
+        @Override
+        public String executor() {
+            return ThreadPool.Names.SAME;
+        }
+    }
+
+
+    static class PingRequest extends TransportRequest {
+
+        // the (assumed) node id we are pinging
+        private String nodeId;
+
+        PingRequest() {
+        }
+
+        PingRequest(String nodeId) {
+            this.nodeId = nodeId;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            nodeId = in.readString();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            out.writeString(nodeId);
+        }
+    }
+
+    private static class PingResponse extends TransportResponse {
+
+        private PingResponse() {
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+        }
+    }
 }

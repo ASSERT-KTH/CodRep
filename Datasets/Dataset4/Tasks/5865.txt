@@ -1,13 +1,13 @@
-request.opType(IndexRequest.OpType.fromString(opType));
+import org.elasticsearch.util.inject.Inject;
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,299 +19,180 @@ request.opType(IndexRequest.OpType.fromString(opType));
  * under the License.
  */
 
-package org.elasticsearch.action.index;
+package org.elasticsearch.action.admin.cluster.health;
 
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.WriteConsistencyLevel;
-import org.elasticsearch.action.support.replication.ReplicationType;
-import org.elasticsearch.action.support.replication.ShardReplicationOperationRequestBuilder;
-import org.elasticsearch.client.Client;
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.index.VersionType;
-
-import java.util.Map;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.action.TransportActions;
+import org.elasticsearch.action.support.master.TransportMasterNodeOperationAction;
+import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.routing.IndexRoutingTable;
+import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
+import org.elasticsearch.cluster.routing.RoutingTableValidation;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.timer.TimerService;
+import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.util.guice.inject.Inject;
+import org.elasticsearch.util.settings.Settings;
 
 /**
- * An index document action request builder.
+ * @author kimchy (shay.banon)
  */
-public class IndexRequestBuilder extends ShardReplicationOperationRequestBuilder<IndexRequest, IndexResponse, IndexRequestBuilder> {
+public class TransportClusterHealthAction extends TransportMasterNodeOperationAction<ClusterHealthRequest, ClusterHealthResponse> {
 
-    public IndexRequestBuilder(Client client) {
-        super(client, new IndexRequest());
+    private final ClusterName clusterName;
+
+    private final TimerService timerService;
+
+    @Inject public TransportClusterHealthAction(Settings settings, TransportService transportService, ClusterService clusterService, ThreadPool threadPool,
+                                                TimerService timerService, ClusterName clusterName) {
+        super(settings, transportService, clusterService, threadPool);
+        this.clusterName = clusterName;
+        this.timerService = timerService;
     }
 
-    public IndexRequestBuilder(Client client, @Nullable String index) {
-        super(client, new IndexRequest(index));
+    @Override protected String transportAction() {
+        return TransportActions.Admin.Cluster.HEALTH;
     }
 
-    /**
-     * Sets the type to index the document to.
-     */
-    public IndexRequestBuilder setType(String type) {
-        request.type(type);
-        return this;
+    @Override protected ClusterHealthRequest newRequest() {
+        return new ClusterHealthRequest();
     }
 
-    /**
-     * Sets the id to index the document under. Optional, and if not set, one will be automatically
-     * generated.
-     */
-    public IndexRequestBuilder setId(String id) {
-        request.id(id);
-        return this;
+    @Override protected ClusterHealthResponse newResponse() {
+        return new ClusterHealthResponse();
     }
 
-    /**
-     * Controls the shard routing of the request. Using this value to hash the shard
-     * and not the id.
-     */
-    public IndexRequestBuilder setRouting(String routing) {
-        request.routing(routing);
-        return this;
+    @Override protected ClusterHealthResponse masterOperation(ClusterHealthRequest request) throws ElasticSearchException {
+        int waitFor = 2;
+        if (request.waitForStatus() == null) {
+            waitFor--;
+        }
+        if (request.waitForRelocatingShards() == -1) {
+            waitFor--;
+        }
+        if (waitFor == 0) {
+            // no need to wait for anything
+            return clusterHealth(request);
+        }
+        long endTime = System.currentTimeMillis() + request.timeout().millis();
+        while (true) {
+            int waitForCounter = 0;
+            ClusterHealthResponse response = clusterHealth(request);
+            if (request.waitForStatus() != null && response.status().value() <= request.waitForStatus().value()) {
+                waitForCounter++;
+            }
+            if (request.waitForRelocatingShards() != -1 && response.relocatingShards() <= request.waitForRelocatingShards()) {
+                waitForCounter++;
+            }
+            if (waitForCounter == waitFor) {
+                return response;
+            }
+            if (timerService.estimatedTimeInMillis() > endTime) {
+                response.timedOut = true;
+                return response;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                response.timedOut = true;
+                // we got interrupted, bail
+                return response;
+            }
+        }
     }
 
-    /**
-     * Sets the parent id of this document. If routing is not set, automatically set it as the
-     * routing as well.
-     */
-    public IndexRequestBuilder setParent(String parent) {
-        request.parent(parent);
-        return this;
-    }
+    private ClusterHealthResponse clusterHealth(ClusterHealthRequest request) {
+        ClusterState clusterState = clusterService.state();
+        RoutingTableValidation validation = clusterState.routingTable().validate(clusterState.metaData());
+        ClusterHealthResponse response = new ClusterHealthResponse(clusterName.value(), validation.failures());
 
-    /**
-     * Sets the source.
-     */
-    public IndexRequestBuilder setSource(BytesReference source, boolean unsafe) {
-        request.source(source, unsafe);
-        return this;
-    }
+        request.indices(clusterState.metaData().concreteIndices(request.indices()));
 
-    /**
-     * Sets the source.
-     */
-    public IndexRequestBuilder setSource(BytesReference source) {
-        request.source(source, false);
-        return this;
-    }
+        for (String index : request.indices()) {
+            IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(index);
+            IndexMetaData indexMetaData = clusterState.metaData().index(index);
+            if (indexRoutingTable == null) {
+                continue;
+            }
+            ClusterIndexHealth indexHealth = new ClusterIndexHealth(index, indexMetaData.numberOfShards(), indexMetaData.numberOfReplicas(), validation.indexFailures(indexMetaData.index()));
 
-    /**
-     * Index the Map as a JSON.
-     *
-     * @param source The map to index
-     */
-    public IndexRequestBuilder setSource(Map<String, Object> source) {
-        request.source(source);
-        return this;
-    }
+            for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
+                ClusterShardHealth shardHealth = new ClusterShardHealth(shardRoutingTable.shardId().id());
+                for (ShardRouting shardRouting : shardRoutingTable) {
+                    if (shardRouting.active()) {
+                        shardHealth.activeShards++;
+                        if (shardRouting.relocating()) {
+                            // the shard is relocating, the one he is relocating to will be in initializing state, so we don't count it
+                            shardHealth.relocatingShards++;
+                        }
+                        if (shardRouting.primary()) {
+                            shardHealth.primaryActive = true;
+                        }
+                    }
+                }
+                if (shardHealth.primaryActive) {
+                    if (shardHealth.activeShards == shardRoutingTable.size()) {
+                        shardHealth.status = ClusterHealthStatus.GREEN;
+                    } else {
+                        shardHealth.status = ClusterHealthStatus.YELLOW;
+                    }
+                } else {
+                    shardHealth.status = ClusterHealthStatus.RED;
+                }
+                indexHealth.shards.put(shardHealth.id(), shardHealth);
+            }
 
-    /**
-     * Index the Map as the provided content type.
-     *
-     * @param source The map to index
-     */
-    public IndexRequestBuilder setSource(Map<String, Object> source, XContentType contentType) {
-        request.source(source, contentType);
-        return this;
-    }
+            for (ClusterShardHealth shardHealth : indexHealth) {
+                if (shardHealth.primaryActive()) {
+                    indexHealth.activePrimaryShards++;
+                }
+                indexHealth.activeShards += shardHealth.activeShards;
+                indexHealth.relocatingShards += shardHealth.relocatingShards;
+            }
+            // update the index status
+            indexHealth.status = ClusterHealthStatus.GREEN;
+            if (!indexHealth.validationFailures().isEmpty()) {
+                indexHealth.status = ClusterHealthStatus.RED;
+            } else {
+                for (ClusterShardHealth shardHealth : indexHealth) {
+                    if (shardHealth.status() == ClusterHealthStatus.RED) {
+                        indexHealth.status = ClusterHealthStatus.RED;
+                        break;
+                    }
+                    if (shardHealth.status() == ClusterHealthStatus.YELLOW) {
+                        indexHealth.status = ClusterHealthStatus.YELLOW;
+                    }
+                }
+            }
 
-    /**
-     * Sets the document source to index.
-     * <p/>
-     * <p>Note, its preferable to either set it using {@link #setSource(org.elasticsearch.common.xcontent.XContentBuilder)}
-     * or using the {@link #setSource(byte[])}.
-     */
-    public IndexRequestBuilder setSource(String source) {
-        request.source(source);
-        return this;
-    }
+            response.indices.put(indexHealth.index(), indexHealth);
+        }
 
-    /**
-     * Sets the content source to index.
-     */
-    public IndexRequestBuilder setSource(XContentBuilder sourceBuilder) {
-        request.source(sourceBuilder);
-        return this;
-    }
+        for (ClusterIndexHealth indexHealth : response) {
+            response.activePrimaryShards += indexHealth.activePrimaryShards;
+            response.activeShards += indexHealth.activeShards;
+            response.relocatingShards += indexHealth.relocatingShards;
+        }
 
-    /**
-     * Sets the document to index in bytes form.
-     */
-    public IndexRequestBuilder setSource(byte[] source) {
-        request.source(source);
-        return this;
-    }
+        response.status = ClusterHealthStatus.GREEN;
+        if (!response.validationFailures().isEmpty()) {
+            response.status = ClusterHealthStatus.RED;
+        } else {
+            for (ClusterIndexHealth indexHealth : response) {
+                if (indexHealth.status() == ClusterHealthStatus.RED) {
+                    response.status = ClusterHealthStatus.RED;
+                    break;
+                }
+                if (indexHealth.status() == ClusterHealthStatus.YELLOW) {
+                    response.status = ClusterHealthStatus.YELLOW;
+                }
+            }
+        }
 
-    /**
-     * Sets the document to index in bytes form (assumed to be safe to be used from different
-     * threads).
-     *
-     * @param source The source to index
-     * @param offset The offset in the byte array
-     * @param length The length of the data
-     */
-    public IndexRequestBuilder setSource(byte[] source, int offset, int length) {
-        request.source(source, offset, length);
-        return this;
-    }
-
-    /**
-     * Sets the document to index in bytes form.
-     *
-     * @param source The source to index
-     * @param offset The offset in the byte array
-     * @param length The length of the data
-     * @param unsafe Is the byte array safe to be used form a different thread
-     */
-    public IndexRequestBuilder setSource(byte[] source, int offset, int length, boolean unsafe) {
-        request.source(source, offset, length, unsafe);
-        return this;
-    }
-
-    /**
-     * Constructs a simple document with a field and a value.
-     */
-    public IndexRequestBuilder setSource(String field1, Object value1) {
-        request.source(field1, value1);
-        return this;
-    }
-
-    /**
-     * Constructs a simple document with a field and value pairs.
-     */
-    public IndexRequestBuilder setSource(String field1, Object value1, String field2, Object value2) {
-        request.source(field1, value1, field2, value2);
-        return this;
-    }
-
-    /**
-     * Constructs a simple document with a field and value pairs.
-     */
-    public IndexRequestBuilder setSource(String field1, Object value1, String field2, Object value2, String field3, Object value3) {
-        request.source(field1, value1, field2, value2, field3, value3);
-        return this;
-    }
-
-    /**
-     * Constructs a simple document with a field and value pairs.
-     */
-    public IndexRequestBuilder setSource(String field1, Object value1, String field2, Object value2, String field3, Object value3, String field4, Object value4) {
-        request.source(field1, value1, field2, value2, field3, value3, field4, value4);
-        return this;
-    }
-
-    /**
-     * Constructs a simple document with a field name and value pairs.
-     * <b>Note: the number of objects passed to this method must be an even number.</b> 
-     */
-    public IndexRequestBuilder setSource(Object... source) {
-        request.source(source);
-        return this;
-    }
-
-    /**
-     * The content type that will be used to generate a document from user provided objects (like Map).
-     */
-    public IndexRequestBuilder setContentType(XContentType contentType) {
-        request.contentType(contentType);
-        return this;
-    }
-
-    /**
-     * Sets the type of operation to perform.
-     */
-    public IndexRequestBuilder setOpType(IndexRequest.OpType opType) {
-        request.opType(opType);
-        return this;
-    }
-
-    /**
-     * Sets a string representation of the {@link #setOpType(org.elasticsearch.action.index.IndexRequest.OpType)}. Can
-     * be either "index" or "create".
-     */
-    public IndexRequestBuilder setOpType(String opType) {
-        request.opType(opType);
-        return this;
-    }
-
-    /**
-     * Set to <tt>true</tt> to force this index to use {@link org.elasticsearch.action.index.IndexRequest.OpType#CREATE}.
-     */
-    public IndexRequestBuilder setCreate(boolean create) {
-        request.create(create);
-        return this;
-    }
-
-    /**
-     * Should a refresh be executed post this index operation causing the operation to
-     * be searchable. Note, heavy indexing should not set this to <tt>true</tt>. Defaults
-     * to <tt>false</tt>.
-     */
-    public IndexRequestBuilder setRefresh(boolean refresh) {
-        request.refresh(refresh);
-        return this;
-    }
-
-    /**
-     * Set the replication type for this operation.
-     */
-    public IndexRequestBuilder setReplicationType(ReplicationType replicationType) {
-        request.replicationType(replicationType);
-        return this;
-    }
-
-    /**
-     * Sets the consistency level. Defaults to {@link org.elasticsearch.action.WriteConsistencyLevel#DEFAULT}.
-     */
-    public IndexRequestBuilder setConsistencyLevel(WriteConsistencyLevel consistencyLevel) {
-        request.consistencyLevel(consistencyLevel);
-        return this;
-    }
-
-    /**
-     * Set the replication type for this operation.
-     */
-    public IndexRequestBuilder setReplicationType(String replicationType) {
-        request.replicationType(replicationType);
-        return this;
-    }
-
-    /**
-     * Sets the version, which will cause the index operation to only be performed if a matching
-     * version exists and no changes happened on the doc since then.
-     */
-    public IndexRequestBuilder setVersion(long version) {
-        request.version(version);
-        return this;
-    }
-
-    /**
-     * Sets the versioning type. Defaults to {@link VersionType#INTERNAL}.
-     */
-    public IndexRequestBuilder setVersionType(VersionType versionType) {
-        request.versionType(versionType);
-        return this;
-    }
-
-    /**
-     * Sets the timestamp either as millis since the epoch, or, in the configured date format.
-     */
-    public IndexRequestBuilder setTimestamp(String timestamp) {
-        request.timestamp(timestamp);
-        return this;
-    }
-
-    // Sets the relative ttl value. It musts be > 0 as it makes little sense otherwise.
-    public IndexRequestBuilder setTTL(long ttl) {
-        request.ttl(ttl);
-        return this;
-    }
-
-    @Override
-    protected void doExecute(ActionListener<IndexResponse> listener) {
-        client.index(request, listener);
+        return response;
     }
 }

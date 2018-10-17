@@ -1,13 +1,12 @@
-IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, replicas_.size());
+DocsEnum docs = termsEnum.docs(MultiFields.getLiveDocs(r), null, 0);
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,178 +16,133 @@ IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, r
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.solr.search;
 
-package org.apache.cassandra.service;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.Fields;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.BytesRef;
+import org.apache.solr.SolrTestCaseJ4;
+import org.apache.solr.update.UpdateLog;
+
 import java.io.IOException;
-import java.net.InetAddress;
-import java.util.Arrays;
-import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 
-import org.apache.commons.lang.StringUtils;
+import static org.apache.solr.update.processor.DistributedUpdateProcessor.DistribPhase;
+import static org.apache.solr.update.processor.DistributingUpdateProcessorFactory.DISTRIB_UPDATE_PARAM;
 
-import org.apache.cassandra.cache.ICacheExpungeHook;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.ReadCommand;
-import org.apache.cassandra.db.ReadResponse;
-import org.apache.cassandra.db.Row;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.net.IAsyncCallback;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.ExpiringMap;
-import org.apache.cassandra.utils.FBUtilities;
+public class TestRTGBase extends SolrTestCaseJ4 {
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+  // means we've seen the leader and have version info (i.e. we are a non-leader replica)
+  public static String FROM_LEADER = DistribPhase.FROMLEADER.toString();
+
+  // since we make up fake versions in these tests, we can get messed up by a DBQ with a real version
+  // since Solr can think following updates were reordered.
+  @Override
+  public void clearIndex() {
+    try {
+      deleteByQueryAndGetVersion("*:*", params("_version_", Long.toString(-Long.MAX_VALUE), DISTRIB_UPDATE_PARAM,FROM_LEADER));
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  protected final ConcurrentHashMap<Integer,DocInfo> model = new ConcurrentHashMap<Integer,DocInfo>();
+  protected Map<Integer,DocInfo> committedModel = new HashMap<Integer,DocInfo>();
+  protected long snapshotCount;
+  protected long committedModelClock;
+  protected volatile int lastId;
+  protected final String field = "val_l";
+  protected Object[] syncArr;
+
+  protected Object globalLock = this;
+
+  protected void initModel(int ndocs) {
+    snapshotCount = 0;
+    committedModelClock = 0;
+    lastId = 0;
+
+    syncArr = new Object[ndocs];
+
+    for (int i=0; i<ndocs; i++) {
+      model.put(i, new DocInfo(0, -1L));
+      syncArr[i] = new Object();
+    }
+    committedModel.putAll(model);
+  }
 
 
-class ConsistencyChecker implements Runnable
-{
-    private static Logger logger_ = LoggerFactory.getLogger(ConsistencyChecker.class);
-    private static ExpiringMap<String, String> readRepairTable_ = new ExpiringMap<String, String>(DatabaseDescriptor.getRpcTimeout());
+  protected static class DocInfo {
+    long version;
+    long val;
 
-    private final String table_;
-    private final Row row_;
-    protected final List<InetAddress> replicas_;
-    private final ReadCommand readCommand_;
-
-    public ConsistencyChecker(String table, Row row, List<InetAddress> endpoints, ReadCommand readCommand)
-    {
-        table_ = table;
-        row_ = row;
-        replicas_ = endpoints;
-        readCommand_ = readCommand;
+    public DocInfo(long version, long val) {
+      this.version = version;
+      this.val = val;
     }
 
-    public void run()
-	{
-        ReadCommand readCommandDigestOnly = constructReadMessage(true);
-		try
-		{
-			Message message = readCommandDigestOnly.makeReadMessage();
-            if (logger_.isDebugEnabled())
-              logger_.debug("Reading consistency digest for " + readCommand_.key + " from " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
+    public String toString() {
+      return "{version="+version+",val="+val+"}";
+    }
+  }
 
-            MessagingService.instance.addCallback(new DigestResponseHandler(), message.getMessageId());
-            for (InetAddress endpoint : replicas_)
-            {
-                if (!endpoint.equals(FBUtilities.getLocalAddress()))
-                    MessagingService.instance.sendOneWay(message, endpoint);
-            }
-		}
-		catch (IOException ex)
-		{
-			throw new RuntimeException(ex);
-		}
-	}
-
-    private ReadCommand constructReadMessage(boolean isDigestQuery)
-    {
-        ReadCommand readCommand = readCommand_.copy();
-        readCommand.setDigestQuery(isDigestQuery);
-        return readCommand;
+  protected long badVersion(Random rand, long version) {
+    if (version > 0) {
+      // return a random number not equal to version
+      for (;;) {
+        long badVersion = rand.nextInt();
+        if (badVersion != version && badVersion != 0) return badVersion;
+      }
     }
 
-    class DigestResponseHandler implements IAsyncCallback
-	{
-        private boolean repairInvoked;
-
-		public synchronized void response(Message response)
-		{
-            if (repairInvoked)
-                return;
-
-            try
-            {
-                byte[] body = response.getMessageBody();
-                ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
-                ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
-                byte[] digest = result.digest();
-
-                if (!Arrays.equals(ColumnFamily.digest(row_.cf), digest))
-                {
-                    IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_);
-                    IAsyncCallback responseHandler;
-                    if (replicas_.contains(FBUtilities.getLocalAddress()))
-                        responseHandler = new DataRepairHandler(row_, replicas_.size(), readResponseResolver);
-                    else
-                        responseHandler = new DataRepairHandler(replicas_.size(), readResponseResolver);
-
-                    ReadCommand readCommand = constructReadMessage(false);
-                    Message message = readCommand.makeReadMessage();
-                    if (logger_.isDebugEnabled())
-                      logger_.debug("Performing read repair for " + readCommand_.key + " to " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
-                    MessagingService.instance.addCallback(responseHandler, message.getMessageId());
-                    for (InetAddress endpoint : replicas_)
-                    {
-                        if (!endpoint.equals(FBUtilities.getLocalAddress()))
-                            MessagingService.instance.sendOneWay(message, endpoint);
-                    }
-
-                    repairInvoked = true;
-                }
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException("Error handling responses for " + row_, e);
-            }
-        }
+    // if the version does not exist, then we can only specify a positive version
+    for (;;) {
+      long badVersion = rand.nextInt() & 0x7fffffff;  // mask off sign bit
+      if (badVersion != 0) return badVersion;
     }
+  }
 
-	static class DataRepairHandler implements IAsyncCallback, ICacheExpungeHook<String, String>
-	{
-		private final Collection<Message> responses_ = new LinkedBlockingQueue<Message>();
-		private final IResponseResolver<Row> readResponseResolver_;
-		private final int majority_;
-		
-		DataRepairHandler(int responseCount, IResponseResolver<Row> readResponseResolver)
-		{
-			readResponseResolver_ = readResponseResolver;
-			majority_ = (responseCount / 2) + 1;  
-		}
 
-        public DataRepairHandler(Row localRow, int responseCount, IResponseResolver<Row> readResponseResolver) throws IOException
-        {
-            this(responseCount, readResponseResolver);
-            // wrap localRow in a response Message so it doesn't need to be special-cased in the resolver
-            ReadResponse readResponse = new ReadResponse(localRow);
-            DataOutputBuffer out = new DataOutputBuffer();
-            ReadResponse.serializer().serialize(readResponse, out);
-            byte[] bytes = new byte[out.getLength()];
-            System.arraycopy(out.getData(), 0, bytes, 0, bytes.length);
-            responses_.add(new Message(FBUtilities.getLocalAddress(), StageManager.RESPONSE_STAGE, StorageService.Verb.READ_RESPONSE, bytes));
-        }
-
-        // synchronized so the " == majority" is safe
-		public synchronized void response(Message message)
-		{
-			if (logger_.isDebugEnabled())
-			  logger_.debug("Received responses in DataRepairHandler : " + message.toString());
-			responses_.add(message);
-            if (responses_.size() == majority_)
-            {
-                String messageId = message.getMessageId();
-                readRepairTable_.put(messageId, messageId, this);
-            }
-        }
-
-		public void callMe(String key, String value)
-		{
-            try
-			{
-				readResponseResolver_.resolve(responses_);
-            }
-            catch (Exception ex)
-            {
-                throw new RuntimeException(ex);
-            }
-        }
+  protected List<Long> getLatestVersions() {
+    List<Long> recentVersions;
+    UpdateLog.RecentUpdates startingRecentUpdates = h.getCore().getUpdateHandler().getUpdateLog().getRecentUpdates();
+    try {
+      recentVersions = startingRecentUpdates.getVersions(100);
+    } finally {
+      startingRecentUpdates.close();
     }
+    return recentVersions;
+  }
+
+
+
+  protected int getFirstMatch(IndexReader r, Term t) throws IOException {
+    Fields fields = MultiFields.getFields(r);
+    if (fields == null) return -1;
+    Terms terms = fields.terms(t.field());
+    if (terms == null) return -1;
+    BytesRef termBytes = t.bytes();
+    final TermsEnum termsEnum = terms.iterator(null);
+    if (!termsEnum.seekExact(termBytes, false)) {
+      return -1;
+    }
+    DocsEnum docs = termsEnum.docs(MultiFields.getLiveDocs(r), null, false);
+    int id = docs.nextDoc();
+    if (id != DocIdSetIterator.NO_MORE_DOCS) {
+      int next = docs.nextDoc();
+      assertEquals(DocIdSetIterator.NO_MORE_DOCS, next);
+    }
+    return id == DocIdSetIterator.NO_MORE_DOCS ? -1 : id;
+  }
+
 }

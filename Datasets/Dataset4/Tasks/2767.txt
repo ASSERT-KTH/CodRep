@@ -1,4 +1,4 @@
-GroupShardsIterator groupIt = clusterService.operationRouting().searchShards(clusterState, searchRequest.indices(), searchRequest.queryHint(), searchRequest.routing(), searchRequest.preference());
+import static org.elasticsearch.util.concurrent.ConcurrentCollections.*;
 
 /*
  * Licensed to Elastic Search and Shay Banon under one
@@ -19,136 +19,253 @@ GroupShardsIterator groupIt = clusterService.operationRouting().searchShards(clu
  * under the License.
  */
 
-package org.elasticsearch.action.search;
+package org.elasticsearch.discovery.zen.fd;
 
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.TransportActions;
-import org.elasticsearch.action.search.type.*;
-import org.elasticsearch.action.support.BaseAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.routing.GroupShardsIterator;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.indices.IndexMissingException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.BaseTransportRequestHandler;
-import org.elasticsearch.transport.TransportChannel;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.transport.*;
+import org.elasticsearch.util.TimeValue;
+import org.elasticsearch.util.component.AbstractComponent;
+import org.elasticsearch.util.io.stream.StreamInput;
+import org.elasticsearch.util.io.stream.StreamOutput;
+import org.elasticsearch.util.io.stream.Streamable;
+import org.elasticsearch.util.settings.Settings;
 
-import static org.elasticsearch.action.search.SearchType.*;
+import java.io.IOException;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import static org.elasticsearch.cluster.node.DiscoveryNodes.*;
+import static org.elasticsearch.util.TimeValue.*;
+import static org.elasticsearch.util.concurrent.ConcurrentMaps.*;
 
 /**
  * @author kimchy (shay.banon)
  */
-public class TransportSearchAction extends BaseAction<SearchRequest, SearchResponse> {
+public class NodesFaultDetection extends AbstractComponent {
 
-    private final ClusterService clusterService;
+    public static interface Listener {
 
-    private final TransportSearchDfsQueryThenFetchAction dfsQueryThenFetchAction;
-
-    private final TransportSearchQueryThenFetchAction queryThenFetchAction;
-
-    private final TransportSearchDfsQueryAndFetchAction dfsQueryAndFetchAction;
-
-    private final TransportSearchQueryAndFetchAction queryAndFetchAction;
-
-    private final TransportSearchScanAction scanAction;
-
-    private final TransportSearchCountAction countAction;
-
-    private final boolean optimizeSingleShard;
-
-    @Inject public TransportSearchAction(Settings settings, ThreadPool threadPool,
-                                         TransportService transportService, ClusterService clusterService,
-                                         TransportSearchDfsQueryThenFetchAction dfsQueryThenFetchAction,
-                                         TransportSearchQueryThenFetchAction queryThenFetchAction,
-                                         TransportSearchDfsQueryAndFetchAction dfsQueryAndFetchAction,
-                                         TransportSearchQueryAndFetchAction queryAndFetchAction,
-                                         TransportSearchScanAction scanAction,
-                                         TransportSearchCountAction countAction) {
-        super(settings, threadPool);
-        this.clusterService = clusterService;
-        this.dfsQueryThenFetchAction = dfsQueryThenFetchAction;
-        this.queryThenFetchAction = queryThenFetchAction;
-        this.dfsQueryAndFetchAction = dfsQueryAndFetchAction;
-        this.queryAndFetchAction = queryAndFetchAction;
-        this.scanAction = scanAction;
-        this.countAction = countAction;
-
-        this.optimizeSingleShard = componentSettings.getAsBoolean("optimize_single_shard", true);
-
-        transportService.registerHandler(TransportActions.SEARCH, new TransportHandler());
+        void onNodeFailure(DiscoveryNode node);
     }
 
-    @Override protected void doExecute(SearchRequest searchRequest, ActionListener<SearchResponse> listener) {
-        // optimize search type for cases where there is only one shard group to search on
-        if (optimizeSingleShard && searchRequest.searchType() != SCAN && searchRequest.searchType() != COUNT) {
+    private final ThreadPool threadPool;
+
+    private final TransportService transportService;
+
+
+    private final boolean connectOnNetworkDisconnect;
+
+    private final TimeValue pingInterval;
+
+    private final TimeValue pingRetryTimeout;
+
+    private final int pingRetryCount;
+
+
+    private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<Listener>();
+
+    private final ConcurrentMap<DiscoveryNode, NodeFD> nodesFD = newConcurrentMap();
+
+    private final FDConnectionListener connectionListener;
+
+    private volatile DiscoveryNodes latestNodes = EMPTY_NODES;
+
+    private volatile boolean running = false;
+
+    public NodesFaultDetection(Settings settings, ThreadPool threadPool, TransportService transportService) {
+        super(settings);
+        this.threadPool = threadPool;
+        this.transportService = transportService;
+
+        this.connectOnNetworkDisconnect = componentSettings.getAsBoolean("connect_on_network_disconnect", false);
+        this.pingInterval = componentSettings.getAsTime("ping_interval", timeValueSeconds(1));
+        this.pingRetryTimeout = componentSettings.getAsTime("ping_timeout", timeValueSeconds(6));
+        this.pingRetryCount = componentSettings.getAsInt("ping_retries", 5);
+
+        transportService.registerHandler(PingRequestHandler.ACTION, new PingRequestHandler());
+
+        this.connectionListener = new FDConnectionListener();
+        transportService.addConnectionListener(connectionListener);
+    }
+
+    public void addListener(Listener listener) {
+        listeners.add(listener);
+    }
+
+    public void removeListener(Listener listener) {
+        listeners.remove(listener);
+    }
+
+    public void updateNodes(DiscoveryNodes nodes) {
+        DiscoveryNodes prevNodes = latestNodes;
+        this.latestNodes = nodes;
+        if (!running) {
+            return;
+        }
+        DiscoveryNodes.Delta delta = nodes.delta(prevNodes);
+        for (DiscoveryNode newNode : delta.addedNodes()) {
+            if (!nodesFD.containsKey(newNode)) {
+                nodesFD.put(newNode, new NodeFD());
+                threadPool.schedule(new SendPingRequest(newNode), pingInterval);
+            }
+        }
+        for (DiscoveryNode removedNode : delta.removedNodes()) {
+            nodesFD.remove(removedNode);
+        }
+    }
+
+    public NodesFaultDetection start() {
+        if (running) {
+            return this;
+        }
+        running = true;
+        return this;
+    }
+
+    public NodesFaultDetection stop() {
+        if (!running) {
+            return this;
+        }
+        running = false;
+        return this;
+    }
+
+    public void close() {
+        stop();
+        transportService.removeHandler(PingRequestHandler.ACTION);
+        transportService.removeConnectionListener(connectionListener);
+    }
+
+    private void handleTransportDisconnect(DiscoveryNode node) {
+        if (!latestNodes.nodeExists(node.id())) {
+            return;
+        }
+        NodeFD nodeFD = nodesFD.remove(node);
+        if (nodeFD == null) {
+            return;
+        }
+        if (!running) {
+            return;
+        }
+        if (connectOnNetworkDisconnect) {
             try {
-                ClusterState clusterState = clusterService.state();
-                searchRequest.indices(clusterState.metaData().concreteIndices(searchRequest.indices()));
-                GroupShardsIterator groupIt = clusterService.operationRouting().searchShards(clusterState, searchRequest.indices(), searchRequest.queryHint(), searchRequest.routing());
-                if (groupIt.size() == 1) {
-                    // if we only have one group, then we always want Q_A_F, no need for DFS, and no need to do THEN since we hit one shard
-                    searchRequest.searchType(QUERY_AND_FETCH);
-                }
-            } catch (IndexMissingException e) {
-                // ignore this, we will notify the search response if its really the case
-                // from the actual action
+                transportService.connectToNode(node);
             } catch (Exception e) {
-                logger.debug("failed to optimize search type, continue as normal", e);
+                logger.trace("Node [{}] failed on disconnect (with verified connect)", node);
+                notifyNodeFailure(node);
             }
-        }
-
-        if (searchRequest.searchType() == DFS_QUERY_THEN_FETCH) {
-            dfsQueryThenFetchAction.execute(searchRequest, listener);
-        } else if (searchRequest.searchType() == SearchType.QUERY_THEN_FETCH) {
-            queryThenFetchAction.execute(searchRequest, listener);
-        } else if (searchRequest.searchType() == SearchType.DFS_QUERY_AND_FETCH) {
-            dfsQueryAndFetchAction.execute(searchRequest, listener);
-        } else if (searchRequest.searchType() == SearchType.QUERY_AND_FETCH) {
-            queryAndFetchAction.execute(searchRequest, listener);
-        } else if (searchRequest.searchType() == SearchType.SCAN) {
-            scanAction.execute(searchRequest, listener);
-        } else if (searchRequest.searchType() == SearchType.COUNT) {
-            countAction.execute(searchRequest, listener);
+        } else {
+            logger.trace("Node [{}] failed on disconnect", node);
+            notifyNodeFailure(node);
         }
     }
 
-    private class TransportHandler extends BaseTransportRequestHandler<SearchRequest> {
+    private void notifyNodeFailure(DiscoveryNode node) {
+        for (Listener listener : listeners) {
+            listener.onNodeFailure(node);
+        }
+    }
 
-        @Override public SearchRequest newInstance() {
-            return new SearchRequest();
+    private class SendPingRequest implements Runnable {
+
+        private final DiscoveryNode node;
+
+        private SendPingRequest(DiscoveryNode node) {
+            this.node = node;
         }
 
-        @Override public void messageReceived(SearchRequest request, final TransportChannel channel) throws Exception {
-            // no need for a threaded listener
-            request.listenerThreaded(false);
-            // we don't spawn, so if we get a request with no threading, change it to single threaded
-            if (request.operationThreading() == SearchOperationThreading.NO_THREADS) {
-                request.operationThreading(SearchOperationThreading.SINGLE_THREAD);
+        @Override public void run() {
+            if (!running) {
+                return;
             }
-            execute(request, new ActionListener<SearchResponse>() {
-                @Override public void onResponse(SearchResponse result) {
-                    try {
-                        channel.sendResponse(result);
-                    } catch (Exception e) {
-                        onFailure(e);
-                    }
-                }
+            transportService.sendRequest(node, PingRequestHandler.ACTION, new PingRequest(), pingRetryTimeout,
+                    new BaseTransportResponseHandler<PingResponse>() {
+                        @Override public PingResponse newInstance() {
+                            return new PingResponse();
+                        }
 
-                @Override public void onFailure(Throwable e) {
-                    try {
-                        channel.sendResponse(e);
-                    } catch (Exception e1) {
-                        logger.warn("Failed to send response for search", e1);
-                    }
-                }
-            });
+                        @Override public void handleResponse(PingResponse response) {
+                            if (running) {
+                                NodeFD nodeFD = nodesFD.get(node);
+                                if (nodeFD != null) {
+                                    nodeFD.retryCount = 0;
+                                    threadPool.schedule(SendPingRequest.this, pingInterval);
+                                }
+                            }
+                        }
+
+                        @Override public void handleException(RemoteTransportException exp) {
+                            // check if the master node did not get switched on us...
+                            if (running) {
+                                NodeFD nodeFD = nodesFD.get(node);
+                                if (nodeFD != null) {
+                                    int retryCount = ++nodeFD.retryCount;
+                                    logger.trace("Node [{}] failed to ping, retry [{}] out of [{}]", exp, node, retryCount, pingRetryCount);
+                                    if (retryCount >= pingRetryCount) {
+                                        logger.trace("Node [{}] failed on ping", node);
+                                        // not good, failure
+                                        if (nodesFD.remove(node) != null) {
+                                            notifyNodeFailure(node);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+        }
+    }
+
+    static class NodeFD {
+        volatile int retryCount;
+    }
+
+    private class FDConnectionListener implements TransportConnectionListener {
+        @Override public void onNodeConnected(DiscoveryNode node) {
         }
 
-        @Override public String executor() {
-            return ThreadPool.Names.SAME;
+        @Override public void onNodeDisconnected(DiscoveryNode node) {
+            handleTransportDisconnect(node);
+        }
+    }
+
+
+    private class PingRequestHandler extends BaseTransportRequestHandler<PingRequest> {
+
+        public static final String ACTION = "discovery/zen/fd/ping";
+
+        @Override public PingRequest newInstance() {
+            return new PingRequest();
+        }
+
+        @Override public void messageReceived(PingRequest request, TransportChannel channel) throws Exception {
+            channel.sendResponse(new PingResponse());
+        }
+    }
+
+
+    private class PingRequest implements Streamable {
+
+        private PingRequest() {
+        }
+
+        @Override public void readFrom(StreamInput in) throws IOException {
+        }
+
+        @Override public void writeTo(StreamOutput out) throws IOException {
+        }
+    }
+
+    private class PingResponse implements Streamable {
+
+        private PingResponse() {
+        }
+
+        @Override public void readFrom(StreamInput in) throws IOException {
+        }
+
+        @Override public void writeTo(StreamOutput out) throws IOException {
         }
     }
 }

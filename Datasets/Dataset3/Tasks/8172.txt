@@ -1,4 +1,4 @@
-package org.jboss.as.connector.dynamicresource;
+import org.jboss.as.ejb3.logging.EjbLogger;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,52 +22,130 @@ package org.jboss.as.connector.dynamicresource;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.connector.dynamicresource.operations;
+package org.jboss.as.ejb3.remote.protocol.versionone;
 
-import static org.jboss.as.connector.subsystems.resourceadapters.Constants.CONNECTIONDEFINITIONS_NAME;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinateTransaction;
+import com.arjuna.ats.internal.jta.transaction.arjunacore.jca.SubordinationManager;
+import org.jboss.as.ejb3.EjbLogger;
+import org.jboss.as.ejb3.remote.EJBRemoteTransactionsRepository;
+import org.jboss.ejb.client.XidTransactionID;
+import org.jboss.marshalling.MarshallerFactory;
 
-import java.util.Arrays;
-import java.util.List;
-
-import org.jboss.as.connector.subsystems.resourceadapters.Constants;
-import org.jboss.as.connector.subsystems.resourceadapters.ResourceAdaptersExtension;
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationDefinition;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.OperationStepHandler;
-import org.jboss.as.controller.SimpleOperationDefinitionBuilder;
-import org.jboss.dmr.ModelNode;
-import org.jboss.jca.core.spi.statistics.StatisticsPlugin;
+import javax.transaction.HeuristicCommitException;
+import javax.transaction.HeuristicMixedException;
+import javax.transaction.HeuristicRollbackException;
+import javax.transaction.RollbackException;
+import javax.transaction.SystemException;
+import javax.transaction.Transaction;
+import javax.transaction.xa.XAException;
+import javax.transaction.xa.Xid;
 
 /**
- * Clear stats from passed plugins
- *
- * @author Stefano Maestri
+ * @author Jaikiran Pai
  */
-public class ClearStatisticsHandler implements OperationStepHandler {
+class XidTransactionCommitTask extends XidTransactionManagementTask {
 
-    public static final OperationDefinition DEFINITION = new SimpleOperationDefinitionBuilder(Constants.CLEAR_STATISTICS, ResourceAdaptersExtension.getResourceDescriptionResolver(CONNECTIONDEFINITIONS_NAME))
-            .build();
+    private final boolean onePhaseCommit;
 
-    private final List<StatisticsPlugin> stats;
-
-    public ClearStatisticsHandler(StatisticsPlugin... stats) {
-        this.stats = Arrays.asList(stats);
+    XidTransactionCommitTask(final TransactionRequestHandler txRequestHandler, final EJBRemoteTransactionsRepository transactionsRepository,
+                             final MarshallerFactory marshallerFactory, final XidTransactionID xidTransactionID, final ChannelAssociation channelAssociation,
+                             final short invocationId, final boolean onePhaseCommit) {
+        super(txRequestHandler, transactionsRepository, marshallerFactory, xidTransactionID, channelAssociation, invocationId);
+        this.onePhaseCommit = onePhaseCommit;
     }
 
     @Override
-    public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
-
-        if (context.isNormalServer()) {
-            context.addStep(new OperationStepHandler() {
-                public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
-                    for (StatisticsPlugin statsPlugin : stats) {
-                        statsPlugin.clear();
-                    }
-                    context.completeStep(OperationContext.RollbackHandler.NOOP_ROLLBACK_HANDLER);
+    protected void manageTransaction() throws Throwable {
+        // first associate the tx on this thread, by resuming the tx
+        final Transaction transaction = this.transactionsRepository.getImportedTransaction(this.xidTransactionID);
+        if (transaction == null) {
+            // check the recovery store - it's possible that the commit is coming in as part of recovery operation and the subordinate
+            // tx may not yet be in memory, but might be in the recovery store
+            final Transaction recoveredTransaction = tryRecoveryForImportedTransaction();
+            // still not found, so just return
+            if (recoveredTransaction == null) {
+                if (EjbLogger.EJB3_INVOCATION_LOGGER.isDebugEnabled()) {
+                    EjbLogger.EJB3_INVOCATION_LOGGER.debug("Not committing " + this.xidTransactionID + " as is was not found on the server");
                 }
-            }, OperationContext.Stage.RUNTIME);
+                return;
+            }
         }
-        context.stepCompleted();
+        this.resumeTransaction(transaction);
+        // now commit
+        final Xid xid = this.xidTransactionID.getXid();
+        // Courtesy: com.arjuna.ats.internal.jta.transaction.arjunacore.jca.XATerminatorImple
+        try {
+            // get the subordinate tx
+            final SubordinateTransaction subordinateTransaction = SubordinationManager.getTransactionImporter().getImportedTransaction(xid);
+
+            if (subordinateTransaction == null) {
+                throw new XAException(XAException.XAER_INVAL);
+            }
+
+            if (subordinateTransaction.activated()) {
+                if (this.onePhaseCommit) {
+                    subordinateTransaction.doOnePhaseCommit();
+                } else {
+                    subordinateTransaction.doCommit();
+                }
+                // remove the tx
+                SubordinationManager.getTransactionImporter().removeImportedTransaction(xid);
+            } else {
+                throw new XAException(XAException.XA_RETRY);
+            }
+
+        } catch (RollbackException e) {
+            // remove the tx
+            SubordinationManager.getTransactionImporter().removeImportedTransaction(xid);
+            final XAException xaException = new XAException(XAException.XA_RBROLLBACK);
+            xaException.initCause(e);
+            throw xaException;
+
+        } catch (XAException ex) {
+            // resource hasn't had a chance to recover yet
+            if (ex.errorCode != XAException.XA_RETRY) {
+                // remove tx
+                SubordinationManager.getTransactionImporter().removeImportedTransaction(xid);
+            }
+            throw ex;
+
+        } catch (HeuristicRollbackException ex) {
+            final XAException xaException = new XAException(XAException.XA_HEURRB);
+            xaException.initCause(ex);
+            throw xaException;
+
+        } catch (HeuristicMixedException ex) {
+            final XAException xaException = new XAException(XAException.XA_HEURMIX);
+            xaException.initCause(ex);
+            throw xaException;
+
+        } catch (final HeuristicCommitException ex) {
+            final XAException xaException = new XAException(XAException.XA_HEURCOM);
+            xaException.initCause(ex);
+            throw xaException;
+
+        } catch (final IllegalStateException ex) {
+            // remove tx
+            SubordinationManager.getTransactionImporter().removeImportedTransaction(xid);
+
+            final XAException xaException = new XAException(XAException.XAER_NOTA);
+            xaException.initCause(ex);
+            throw xaException;
+
+        } catch (SystemException ex) {
+            // remove tx
+            SubordinationManager.getTransactionImporter().removeImportedTransaction(xid);
+
+            final XAException xaException = new XAException(XAException.XAER_RMERR);
+            xaException.initCause(ex);
+            throw xaException;
+
+
+        } finally {
+            // disassociate the tx that was associated (resumed) on this thread.
+            // This needs to be done explicitly because the SubOrdinationManager isn't responsible
+            // for clearing the tx context from the thread
+            this.transactionsRepository.getTransactionManager().suspend();
+        }
     }
 }

@@ -1,134 +1,239 @@
-String deploymentName = prefix + file.getName();
+_emittedToOffset = msg.nextOffset();
 
-/*
- * JBoss, Home of Professional Open Source.
- * Copyright 2010, Red Hat, Inc., and individual contributors
- * as indicated by the @author tags. See the copyright.txt file in the
- * distribution for a full listing of individual contributors.
- *
- * This is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Lesser General Public License as
- * published by the Free Software Foundation; either version 2.1 of
- * the License, or (at your option) any later version.
- *
- * This software is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this software; if not, write to the Free
- * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
- */
+package storm.kafka;
 
-package org.jboss.as.connector.deployers.ra.processors;
+import backtype.storm.Config;
+import backtype.storm.metric.api.CombinedMetric;
+import backtype.storm.metric.api.CountMetric;
+import backtype.storm.metric.api.MeanReducer;
+import backtype.storm.metric.api.ReducedMetric;
+import backtype.storm.spout.SpoutOutputCollector;
+import backtype.storm.utils.Utils;
+import com.google.common.collect.ImmutableMap;
+import kafka.api.FetchRequestBuilder;
+import kafka.api.OffsetRequest;
+import kafka.javaapi.consumer.SimpleConsumer;
+import kafka.javaapi.message.ByteBufferMessageSet;
+import kafka.message.MessageAndOffset;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import storm.kafka.KafkaSpout.EmitState;
+import storm.kafka.KafkaSpout.MessageAndRealOffset;
+import storm.kafka.trident.KafkaUtils;
+import storm.kafka.trident.MaxMetric;
 
+import java.util.*;
 
-import static org.jboss.as.connector.logging.ConnectorMessages.MESSAGES;
+public class PartitionManager {
+    public static final Logger LOG = LoggerFactory.getLogger(PartitionManager.class);
+    private final CombinedMetric _fetchAPILatencyMax;
+    private final ReducedMetric _fetchAPILatencyMean;
+    private final CountMetric _fetchAPICallCount;
+    private final CountMetric _fetchAPIMessageCount;
 
-import java.io.File;
-import java.io.InputStream;
-import java.net.URL;
-import java.util.Locale;
+    static class KafkaMessageId {
+        public GlobalPartitionId partition;
+        public long offset;
 
-import org.jboss.as.connector.deployers.Util;
-import org.jboss.as.connector.metadata.xmldescriptors.ConnectorXmlDescriptor;
-import org.jboss.as.server.deployment.Attachments;
-import org.jboss.as.server.deployment.DeploymentPhaseContext;
-import org.jboss.as.server.deployment.DeploymentUnit;
-import org.jboss.as.server.deployment.DeploymentUnitProcessingException;
-import org.jboss.as.server.deployment.DeploymentUnitProcessor;
-import org.jboss.as.server.deployment.module.ResourceRoot;
-import org.jboss.jca.common.api.metadata.ra.Connector;
-import org.jboss.jca.common.metadata.ra.RaParser;
-import org.jboss.vfs.VFSUtils;
-import org.jboss.vfs.VirtualFile;
-
-/**
- * DeploymentUnitProcessor responsible for parsing a standard jca xml descriptor
- * and attaching the corresponding metadata. It take care also to register this
- * metadata into IronJacamar's MetadataRepository
- *
- * @author <a href="mailto:stefano.maestri@redhat.com">Stefano Maestri</a>
- */
-public class RaDeploymentParsingProcessor implements DeploymentUnitProcessor {
-
-    /**
-     * Construct a new instance.
-     */
-    public RaDeploymentParsingProcessor() {
+        public KafkaMessageId(GlobalPartitionId partition, long offset) {
+            this.partition = partition;
+            this.offset = offset;
+        }
     }
 
-    /**
-     * Process a deployment for standard ra deployment files. Will parse the xml
-     * file and attach an configuration discovered during processing.
-     *
-     * @param phaseContext the deployment unit context
-     * @throws DeploymentUnitProcessingException
-     *
-     */
-    @Override
-    public void deploy(DeploymentPhaseContext phaseContext) throws DeploymentUnitProcessingException {
-        final DeploymentUnit deploymentUnit = phaseContext.getDeploymentUnit();
-        final ResourceRoot deploymentRoot = deploymentUnit.getAttachment(Attachments.DEPLOYMENT_ROOT);
-        final boolean resolveProperties = Util.shouldResolveSpec(deploymentUnit);
-
-        final VirtualFile file = deploymentRoot.getRoot();
-        if (file == null || !file.exists())
-            return;
-
-        final String deploymentRootName = file.getName().toLowerCase(Locale.ENGLISH);
-        if (!deploymentRootName.endsWith(".rar")) {
-            return;
-        }
-
-        final VirtualFile alternateDescriptor = deploymentRoot.getAttachment(org.jboss.as.ee.structure.Attachments.ALTERNATE_CONNECTOR_DEPLOYMENT_DESCRIPTOR);
-        String prefix = "";
-
-        if (deploymentUnit.getParent() != null) {
-            prefix = deploymentUnit.getParent().getName() + "#";
-        }
-
-        String deploymentName = prefix + file.getName().substring(0, file.getName().indexOf(".rar"));
-        ConnectorXmlDescriptor xmlDescriptor = process(resolveProperties, file, alternateDescriptor, deploymentName);
+    Long _emittedToOffset;
+    SortedSet<Long> _pending = new TreeSet<Long>();
+    Long _committedTo;
+    LinkedList<MessageAndRealOffset> _waitingToEmit = new LinkedList<MessageAndRealOffset>();
+    GlobalPartitionId _partition;
+    SpoutConfig _spoutConfig;
+    String _topologyInstanceId;
+    SimpleConsumer _consumer;
+    DynamicPartitionConnections _connections;
+    ZkState _state;
+    Map _stormConf;
 
 
-        phaseContext.getDeploymentUnit().putAttachment(ConnectorXmlDescriptor.ATTACHMENT_KEY, xmlDescriptor);
+    public PartitionManager(DynamicPartitionConnections connections, String topologyInstanceId, ZkState state, Map stormConf, SpoutConfig spoutConfig, GlobalPartitionId id) {
+        _partition = id;
+        _connections = connections;
+        _spoutConfig = spoutConfig;
+        _topologyInstanceId = topologyInstanceId;
+        _consumer = connections.register(id.host, id.partition);
+		_state = state;
+        _stormConf = stormConf;
 
-    }
-
-    public static ConnectorXmlDescriptor process(boolean resolveProperties, VirtualFile file, VirtualFile alternateDescriptor, String deploymentName) throws DeploymentUnitProcessingException {
-        // Locate the descriptor
-        final VirtualFile serviceXmlFile;
-        if (alternateDescriptor != null) {
-            serviceXmlFile = alternateDescriptor;
-        } else {
-            serviceXmlFile = file.getChild("/META-INF/ra.xml");
-        }
-        InputStream xmlStream = null;
-        Connector result = null;
+        String jsonTopologyId = null;
+        Long jsonOffset = null;
         try {
-            if (serviceXmlFile != null && serviceXmlFile.exists()) {
-
-                xmlStream = serviceXmlFile.openStream();
-                RaParser raParser = new RaParser();
-                raParser.setSystemPropertiesResolved(resolveProperties);
-                result = raParser.parse(xmlStream);
-                if (result == null)
-                    throw MESSAGES.failedToParseServiceXml(serviceXmlFile);
+            Map<Object, Object> json = _state.readJSON(committedPath());
+            if(json != null) {
+                jsonTopologyId = (String)((Map<Object,Object>)json.get("topology")).get("id");
+                jsonOffset = (Long)json.get("offset");
             }
-            File root = file.getPhysicalFile();
-            URL url = root.toURI().toURL();
-            return new ConnectorXmlDescriptor(result, root, url, deploymentName);
+        }
+        catch(Throwable e) {
+            LOG.warn("Error reading and/or parsing at ZkNode: " + committedPath(), e);
+        }
 
-        } catch (Exception e) {
-            throw MESSAGES.failedToParseServiceXml(e, serviceXmlFile);
-        } finally {
-            VFSUtils.safeClose(xmlStream);
+        if(!topologyInstanceId.equals(jsonTopologyId) && spoutConfig.forceFromStart) {
+            _committedTo = KafkaUtils.getOffset(_consumer, spoutConfig.topic, id.partition, spoutConfig.startOffsetTime);
+	    LOG.info("Using startOffsetTime to choose last commit offset.");
+        } else if(jsonTopologyId == null || jsonOffset == null) { // failed to parse JSON?
+            _committedTo = KafkaUtils.getOffset(_consumer, spoutConfig.topic, id.partition,  kafka.api.OffsetRequest.LatestTime());
+	    LOG.info("Setting last commit offset to HEAD.");
+        } else {
+            _committedTo = jsonOffset;
+	    LOG.info("Read last commit offset from zookeeper: " + _committedTo);
+        }
+
+        LOG.info("Starting Kafka " + _consumer.host() + ":" + id.partition + " from offset " + _committedTo);
+        _emittedToOffset = _committedTo;
+
+        _fetchAPILatencyMax = new CombinedMetric(new MaxMetric());
+        _fetchAPILatencyMean = new ReducedMetric(new MeanReducer());
+        _fetchAPICallCount = new CountMetric();
+        _fetchAPIMessageCount = new CountMetric();
+    }
+
+    public Map getMetricsDataMap() {
+        Map ret = new HashMap();
+        ret.put(_partition + "/fetchAPILatencyMax", _fetchAPILatencyMax.getValueAndReset());
+        ret.put(_partition + "/fetchAPILatencyMean", _fetchAPILatencyMean.getValueAndReset());
+        ret.put(_partition + "/fetchAPICallCount", _fetchAPICallCount.getValueAndReset());
+        ret.put(_partition + "/fetchAPIMessageCount", _fetchAPIMessageCount.getValueAndReset());
+        return ret;
+    }
+
+    //returns false if it's reached the end of current batch
+    public EmitState next(SpoutOutputCollector collector) {
+        if(_waitingToEmit.isEmpty()) fill();
+        while(true) {
+            MessageAndRealOffset toEmit = _waitingToEmit.pollFirst();
+            if(toEmit==null) {
+                return EmitState.NO_EMITTED;
+            }
+            Iterable<List<Object>> tups = _spoutConfig.scheme.deserialize(Utils.toByteArray(toEmit.msg.payload()));
+            if(tups!=null) {
+                for(List<Object> tup: tups)
+                    collector.emit(tup, new KafkaMessageId(_partition, toEmit.offset));
+                break;
+            } else {
+                ack(toEmit.offset);
+            }
+        }
+        if(!_waitingToEmit.isEmpty()) {
+            return EmitState.EMITTED_MORE_LEFT;
+        } else {
+            return EmitState.EMITTED_END;
         }
     }
 
-    public void undeploy(final DeploymentUnit context) {
+    private void fill() {
+        //LOG.info("Fetching from Kafka: " + _consumer.host() + ":" + _partition.partition + " from offset " + _emittedToOffset);
+        long start = System.nanoTime();
+        ByteBufferMessageSet msgs = _consumer.fetch(
+                new FetchRequestBuilder().addFetch(
+                    _spoutConfig.topic,
+                    _partition.partition,
+                    _emittedToOffset,
+                    _spoutConfig.fetchSizeBytes).build()).messageSet(_spoutConfig.topic,
+				_partition.partition);
+        long end = System.nanoTime();
+        long millis = (end - start) / 1000000;
+        _fetchAPILatencyMax.update(millis);
+        _fetchAPILatencyMean.update(millis);
+        _fetchAPICallCount.incr();
+        int numMessages = countMessages(msgs);
+        _fetchAPIMessageCount.incrBy(numMessages);
+
+        if(numMessages>0) {
+          LOG.info("Fetched " + numMessages + " messages from Kafka: " + _consumer.host() + ":" + _partition.partition);
+        }
+        for(MessageAndOffset msg: msgs) {
+            _pending.add(_emittedToOffset);
+            _waitingToEmit.add(new MessageAndRealOffset(msg.message(), _emittedToOffset));
+            _emittedToOffset = msg.offset();
+        }
+        if(numMessages>0) {
+          LOG.info("Added " + numMessages + " messages from Kafka: " + _consumer.host() + ":" + _partition.partition + " to internal buffers");
+        }
+    }
+
+	private int countMessages(ByteBufferMessageSet messageSet) {
+		int counter = 0;
+		for (MessageAndOffset messageAndOffset : messageSet) {
+			counter = counter + 1;
+		}
+		return counter;
+	}
+
+    public void ack(Long offset) {
+        _pending.remove(offset);
+    }
+
+    public void fail(Long offset) {
+        //TODO: should it use in-memory ack set to skip anything that's been acked but not committed???
+        // things might get crazy with lots of timeouts
+        if(_emittedToOffset > offset) {
+            _emittedToOffset = offset;
+            _pending.tailSet(offset).clear();
+        }
+    }
+
+    public void commit() {
+        LOG.info("Committing offset for " + _partition);
+        long committedTo;
+        if(_pending.isEmpty()) {
+            committedTo = _emittedToOffset;
+        } else {
+            committedTo = _pending.first();
+        }
+        if(committedTo!=_committedTo) {
+            LOG.info("Writing committed offset to ZK: " + committedTo);
+
+            Map<Object, Object> data = (Map<Object,Object>)ImmutableMap.builder()
+                .put("topology", ImmutableMap.of("id", _topologyInstanceId,
+                                                 "name", _stormConf.get(Config.TOPOLOGY_NAME)))
+                .put("offset", committedTo)
+                .put("partition", _partition.partition)
+                .put("broker", ImmutableMap.of("host", _partition.host.host,
+                                               "port", _partition.host.port))
+                .put("topic", _spoutConfig.topic).build();
+	    _state.writeJSON(committedPath(), data);
+
+            LOG.info("Wrote committed offset to ZK: " + committedTo);
+            _committedTo = committedTo;
+        }
+        LOG.info("Committed offset " + committedTo + " for " + _partition);
+    }
+
+    private String committedPath() {
+        return _spoutConfig.zkRoot + "/" + _spoutConfig.id + "/" + _partition;
+    }
+
+    public long queryPartitionOffsetLatestTime() {
+        return KafkaUtils.getOffset(_consumer, _spoutConfig.topic, _partition.partition,
+				OffsetRequest.LatestTime());
+    }
+
+    public long lastCommittedOffset() {
+        return _committedTo;
+    }
+
+    public long lastCompletedOffset() {
+        if(_pending.isEmpty()) {
+            return _emittedToOffset;
+        } else {
+            return _pending.first();
+        }
+    }
+
+    public GlobalPartitionId getPartition() {
+        return _partition;
+    }
+
+    public void close() {
+        _connections.unregister(_partition.host, _partition.partition);
     }
 }

@@ -1,4 +1,4 @@
-package org.jboss.as.test.smoke.mgmt.datasource;
+import org.wildfly.security.manager.GetAccessControlContextAction;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,95 +22,187 @@ package org.jboss.as.test.smoke.mgmt.datasource;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.test.smoke.embedded.mgmt.datasource;
+package org.jboss.as.host.controller;
 
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP;
-import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.OP_ADDR;
+import static java.security.AccessController.doPrivileged;
+import static org.jboss.as.server.ServerLogger.AS_ROOT_LOGGER;
+import static org.jboss.as.server.ServerLogger.CONFIG_LOGGER;
 
-import java.util.HashSet;
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
+import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
+import java.util.Properties;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
-import junit.framework.Assert;
-import org.jboss.arquillian.container.test.api.Deployment;
-import org.jboss.arquillian.container.test.api.RunAsClient;
-import org.jboss.arquillian.junit.Arquillian;
-import org.jboss.as.test.integration.management.jca.DsMgmtTestBase;
-import org.jboss.as.test.smoke.modular.utils.ShrinkWrapUtils;
-import org.jboss.dmr.ModelNode;
-import org.jboss.shrinkwrap.api.Archive;
-import org.junit.AfterClass;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import org.jboss.as.controller.ControlledProcessState;
+import org.jboss.as.remoting.management.ManagementRemotingServices;
+import org.jboss.as.server.BootstrapListener;
+import org.jboss.as.server.FutureServiceContainer;
+import org.jboss.as.util.security.GetAccessControlContextAction;
+import org.jboss.modules.Module;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceContainer;
+import org.jboss.msc.service.ServiceController;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.ServiceTarget;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.threads.AsyncFuture;
+import org.jboss.threads.JBossThreadFactory;
 
 /**
- * Datasource resources unit test.
- * @author <a href="mailto:stefano.maestri@redhat.com">Stefano Maestri</a>
- * @author <a href="mailto:jeff.zhang@jboss.org">Jeff Zhang</a>
- * @author <a href="mailto:vrastsel@redhat.com">Vladimir Rastseluev</a>
+ * The root service for a HostController process.
+ *
+ * @author Brian Stansberry (c) 2011 Red Hat Inc.
  */
-@RunWith(Arquillian.class)
-@RunAsClient
-public class DataSourceResourcesUnitTestCase  extends DsMgmtTestBase{
+public class HostControllerService implements Service<AsyncFuture<ServiceContainer>> {
 
-    @Deployment
-    public static Archive<?> getDeployment() {
-    	initModelControllerClient("localhost",9999);
-        return ShrinkWrapUtils.createEmptyJavaArchive("dummy");
+    public static final ServiceName HC_SERVICE_NAME = ServiceName.JBOSS.append("host", "controller");
+    static final ServiceName HC_EXECUTOR_SERVICE_NAME = HC_SERVICE_NAME.append("executor");
+    static final int DEFAULT_POOL_SIZE = 20;
+
+    private final HostControllerEnvironment environment;
+    private final HostRunningModeControl runningModeControl;
+    private final ControlledProcessState processState;
+    private final byte[] authCode;
+    private volatile FutureServiceContainer futureContainer;
+    private volatile long startTime;
+
+    HostControllerService(final HostControllerEnvironment environment, final HostRunningModeControl runningModeControl,
+                          final byte[] authCode, final ControlledProcessState processState) {
+        this.environment = environment;
+        this.runningModeControl = runningModeControl;
+        this.authCode = authCode;
+        this.processState = processState;
+        this.startTime = Module.getStartTime();
     }
 
-    @AfterClass
-    public static void tearDown()  throws Exception {
-    	closeModelControllerClient();
-    }
+    @Override
+    public void start(StartContext context) throws StartException {
 
-    @Test
-    public void testReadChildrenResources() throws Exception {
+        processState.setStarting();
 
-        final ModelNode address = new ModelNode();
-        address.add("subsystem", "datasources");
-        address.protect();
-
-        final ModelNode operation = new ModelNode();
-        operation.get(OP).set("read-children-resources");
-        operation.get("child-type").set("data-source");
-        operation.get(OP_ADDR).set(address);
-
-        final ModelNode result = executeOperation(operation);
-        final Map<String, ModelNode> children = getChildren(result);
-        Assert.assertFalse(children.isEmpty());
-        for (final Entry<String, ModelNode> child : children.entrySet()) {
-            Assert.assertNotNull("Default datasource not found",child.getKey());
-            Assert.assertTrue("Default datasource have no connection URL",child.getValue().hasDefined("connection-url"));
-            Assert.assertTrue("Default datasource have no JNDI name",child.getValue().hasDefined("jndi-name"));
-            Assert.assertTrue("Default datasource have no driver",child.getValue().hasDefined("driver-name"));
+        String prettyVersion = environment.getProductConfig().getPrettyVersionString();
+        AS_ROOT_LOGGER.serverStarting(prettyVersion);
+        if (CONFIG_LOGGER.isDebugEnabled()) {
+            final Properties properties = System.getProperties();
+            final StringBuilder b = new StringBuilder(8192);
+            b.append("Configured system properties:");
+            for (String property : new TreeSet<String>(properties.stringPropertyNames())) {
+                b.append("\n\t").append(property).append(" = ").append(properties.getProperty(property, "<undefined>"));
+            }
+            CONFIG_LOGGER.debug(b);
+            CONFIG_LOGGER.debugf("VM Arguments: %s", getVMArguments());
+            if (CONFIG_LOGGER.isTraceEnabled()) {
+                b.setLength(0);
+                final Map<String, String> env = System.getenv();
+                b.append("Configured system environment:");
+                for (String key : new TreeSet<String>(env.keySet())) {
+                    b.append("\n\t").append(key).append(" = ").append(env.get(key));
+                }
+                CONFIG_LOGGER.trace(b);
+            }
         }
+        final ServiceTarget serviceTarget = context.getChildTarget();
+        final ServiceController<?> myController = context.getController();
+        final ServiceContainer serviceContainer = myController.getServiceContainer();
+        futureContainer = new FutureServiceContainer();
+
+        long startTime = this.startTime;
+        if (startTime == -1) {
+            startTime = System.currentTimeMillis();
+        } else {
+            this.startTime = -1;
+        }
+
+        final BootstrapListener bootstrapListener = new BootstrapListener(serviceContainer, startTime, serviceTarget, futureContainer,  prettyVersion + " (Host Controller)");
+        serviceTarget.addListener(bootstrapListener);
+        myController.addListener(bootstrapListener);
+
+        // The first default services are registered before the bootstrap operations are executed.
+
+        // Install the process controller client
+        final ProcessControllerConnectionService processControllerClient = new ProcessControllerConnectionService(environment, authCode);
+        serviceTarget.addService(ProcessControllerConnectionService.SERVICE_NAME, processControllerClient).install();
+
+        // Executor Services
+        final HostControllerExecutorService executorService = new HostControllerExecutorService();
+        serviceTarget.addService(HC_EXECUTOR_SERVICE_NAME, executorService)
+                .addAliases(ManagementRemotingServices.SHUTDOWN_EXECUTOR_NAME) // Use this executor for mgmt shutdown for now
+                .install();
+
+        // Install required path services. (Only install those identified as required)
+        HostPathManagerService hostPathManagerService = new HostPathManagerService();
+        HostPathManagerService.addService(serviceTarget, hostPathManagerService, environment);
+
+        DomainModelControllerService.addService(serviceTarget, environment, runningModeControl, processState, bootstrapListener, hostPathManagerService);
     }
 
-    @Test
-    public void testReadResourceResources() throws Exception {
+    @Override
+    public void stop(StopContext context) {
+        String prettyVersion = environment.getProductConfig().getPrettyVersionString();
+        processState.setStopping();
+        AS_ROOT_LOGGER.serverStopped(prettyVersion, Integer.valueOf((int) (context.getElapsedTime() / 1000000L)));
+    }
 
-        final ModelNode address = new ModelNode();
-        address.add("subsystem", "datasources");
-        address.protect();
+    @Override
+    public AsyncFuture<ServiceContainer> getValue() throws IllegalStateException, IllegalArgumentException {
+        return futureContainer;
+    }
 
-        final ModelNode operation = new ModelNode();
-        operation.get(OP).set("read-resource-description");
+    public HostControllerEnvironment getEnvironment() {
+        return environment;
+    }
 
-        operation.get(OP_ADDR).set(address);
-
-        final ModelNode result = executeOperation(operation);
-        final Map<String, ModelNode> children = getChildren(
-            result.get("attributes").get("installed-drivers").get("value-type"));
-        Assert.assertFalse(children.isEmpty());
-
-        HashSet<String> keys = new HashSet<String>();
-        for (final Entry<String, ModelNode> child : children.entrySet()) {
-            Assert.assertNotNull("Default driver description have no attributes",child.getKey());
-            keys.add(child.getKey());
+    private String getVMArguments() {
+        final StringBuilder result = new StringBuilder(1024);
+        final RuntimeMXBean rmBean = ManagementFactory.getRuntimeMXBean();
+        final List<String> inputArguments = rmBean.getInputArguments();
+        for (String arg : inputArguments) {
+            result.append(arg).append(" ");
         }
-        Assert.assertTrue("Default driver description have no xa-datasource-class attribute",keys.contains("driver-xa-datasource-class-name"));
-        Assert.assertTrue("Default driver description have no module-slot attribute",keys.contains("module-slot"));
-        Assert.assertTrue("Default driver description have no driver-name attribute",keys.contains("driver-name"));
+        return result.toString();
+    }
+
+    static final class HostControllerExecutorService implements Service<ExecutorService> {
+        final ThreadFactory threadFactory = new JBossThreadFactory(new ThreadGroup("Host Controller Service Threads"), Boolean.FALSE, null, "%G - %t", null, null, doPrivileged(GetAccessControlContextAction.getInstance()));
+        private ExecutorService executorService;
+
+        @Override
+        public synchronized void start(final StartContext context) throws StartException {
+            executorService = new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                    5L, TimeUnit.SECONDS,
+                    new SynchronousQueue<Runnable>(),
+                    threadFactory);
+        }
+
+        @Override
+        public synchronized void stop(final StopContext context) {
+            context.asynchronous();
+            Thread executorShutdown = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        executorService.shutdown();
+                    } finally {
+                        executorService = null;
+                        context.complete();
+                    }
+                }
+            }, "HostController ExecutorService Shutdown Thread");
+            executorShutdown.start();
+        }
+
+        @Override
+        public synchronized ExecutorService getValue() throws IllegalStateException {
+            return executorService;
+        }
     }
 }

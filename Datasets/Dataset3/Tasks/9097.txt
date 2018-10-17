@@ -1,4 +1,4 @@
-import org.wildfly.clustering.ejb.infinispan.logging.InfinispanEjbLogger;
+import org.jboss.as.logging.LoggingLogger;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -21,94 +21,148 @@ import org.wildfly.clustering.ejb.infinispan.logging.InfinispanEjbLogger;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
-package org.wildfly.clustering.ejb.infinispan.group;
 
-import java.util.HashMap;
-import java.util.Map;
+package org.jboss.as.logging.deployments;
 
-import org.infinispan.Cache;
-import org.infinispan.context.Flag;
-import org.jboss.as.clustering.infinispan.invoker.CacheInvoker;
-import org.jboss.as.clustering.infinispan.invoker.Mutator;
-import org.jboss.as.clustering.marshalling.MarshalledValueFactory;
-import org.jboss.as.clustering.marshalling.MarshallingContext;
-import org.wildfly.clustering.ejb.infinispan.BeanGroup;
-import org.wildfly.clustering.ejb.infinispan.BeanGroupEntry;
-import org.wildfly.clustering.ejb.infinispan.BeanGroupFactory;
-import org.wildfly.clustering.ejb.infinispan.InfinispanEjbLogger;
+import java.io.Closeable;
+import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+import org.jboss.as.logging.logging.LoggingLogger;
+import org.jboss.as.logging.logmanager.WildFlyLogContextSelector;
+import org.jboss.as.server.deployment.AttachmentKey;
+import org.jboss.as.server.deployment.Attachments;
+import org.jboss.as.server.deployment.DeploymentPhaseContext;
+import org.jboss.as.server.deployment.DeploymentUnit;
+import org.jboss.as.server.deployment.DeploymentUnitProcessingException;
+import org.jboss.as.server.deployment.DeploymentUnitProcessor;
+import org.jboss.as.server.deployment.SubDeploymentMarker;
+import org.jboss.as.server.deployment.module.ResourceRoot;
+import org.jboss.logmanager.LogContext;
+import org.jboss.modules.Module;
+import org.wildfly.security.manager.WildFlySecurityManager;
 
 /**
- * Encapsulates the cache mapping strategy of a bean group.
- *
- * @author Paul Ferraro
- *
- * @param <G> the group identifier type
- * @param <I> the bean identifier type
- * @param <T> the bean type
+ * @author <a href="mailto:jperkins@redhat.com">James R. Perkins</a>
  */
-public class InfinispanBeanGroupFactory<G, I, T> implements BeanGroupFactory<G, I, T> {
+abstract class AbstractLoggingDeploymentProcessor implements DeploymentUnitProcessor {
 
-    private final Cache<G, BeanGroupEntry<I, T>> cache;
-    private final CacheInvoker invoker;
-    private final MarshalledValueFactory<MarshallingContext> factory;
-    private final MarshallingContext context;
+    public static final AttachmentKey<LogContext> LOG_CONTEXT_KEY = AttachmentKey.create(LogContext.class);
 
-    public InfinispanBeanGroupFactory(Cache<G, BeanGroupEntry<I, T>> cache, CacheInvoker invoker, MarshalledValueFactory<MarshallingContext> factory, MarshallingContext context) {
-        this.cache = cache;
-        this.invoker = invoker;
-        this.factory = factory;
-        this.context = context;
+    protected final WildFlyLogContextSelector logContextSelector;
+
+    protected AbstractLoggingDeploymentProcessor(final WildFlyLogContextSelector logContextSelector) {
+        this.logContextSelector = logContextSelector;
     }
 
     @Override
-    public BeanGroupEntry<I, T> createValue(G id) {
-        Map<I, T> beans = new HashMap<>();
-        BeanGroupEntry<I, T> entry = new InfinispanBeanGroupEntry<>(this.factory.createMarshalledValue(beans));
-        BeanGroupEntry<I, T> existing = this.invoker.invoke(this.cache, new CreateOperation<>(id, entry));
-        return (existing != null) ? existing : entry;
-    }
-
-    @Override
-    public BeanGroupEntry<I, T> findValue(G id) {
-        return this.invoker.invoke(this.cache, new FindOperation<G, BeanGroupEntry<I, T>>(id));
-    }
-
-    @Override
-    public void evict(G id) {
-        try {
-            this.cache.evict(id);
-        } catch (Throwable e) {
-            InfinispanEjbLogger.ROOT_LOGGER.failedToPassivateBeanGroup(e, id);
+    public final void deploy(final DeploymentPhaseContext phaseContext) throws DeploymentUnitProcessingException {
+        final DeploymentUnit deploymentUnit = phaseContext.getDeploymentUnit();
+        // If the log context is already defined, skip the rest of the processing
+        if (!hasRegisteredLogContext(deploymentUnit)) {
+            if (deploymentUnit.hasAttachment(Attachments.MODULE) && deploymentUnit.hasAttachment(Attachments.DEPLOYMENT_ROOT)) {
+                // don't process sub-deployments as they are processed by processing methods
+                final ResourceRoot root = deploymentUnit.getAttachment(Attachments.DEPLOYMENT_ROOT);
+                if (SubDeploymentMarker.isSubDeployment(root)) return;
+                processDeployment(phaseContext, deploymentUnit, root);
+            }
         }
     }
 
     @Override
-    public void remove(G id) {
-        this.invoker.invoke(this.cache, new RemoveOperation<G, BeanGroupEntry<I, T>>(id), Flag.IGNORE_RETURN_VALUES);
+    public final void undeploy(final DeploymentUnit context) {
+        // OSGi bundles deployments may not have a module attached
+        if (hasRegisteredLogContext(context) && context.hasAttachment(Attachments.MODULE)) {
+            // don't process sub-deployments as they are processed by processing methods
+            final ResourceRoot root = context.getAttachment(Attachments.DEPLOYMENT_ROOT);
+            if (SubDeploymentMarker.isSubDeployment(root)) return;
+            // Remove any log context selector references
+            final Module module = context.getAttachment(Attachments.MODULE);
+            unregisterLogContext(context, module);
+            // Unregister all sub-deployments
+            final List<DeploymentUnit> subDeployments = getSubDeployments(context);
+            for (DeploymentUnit subDeployment : subDeployments) {
+                final Module subDeploymentModule = subDeployment.getAttachment(Attachments.MODULE);
+                unregisterLogContext(subDeployment, subDeploymentModule);
+            }
+        }
     }
 
-    @Override
-    public BeanGroup<G, I, T> createGroup(final G id, final BeanGroupEntry<I, T> entry) {
-        Mutator mutator = new BeanGroupMutator<>(this.invoker, this.cache, id, entry);
-        return new InfinispanBeanGroup<>(id, entry, this.context, mutator, this);
+    /**
+     * Processes the deployment.
+     *
+     * @param phaseContext   the phase context
+     * @param deploymentUnit the deployment unit
+     * @param root           the root resource
+     *
+     * @throws DeploymentUnitProcessingException if an error occurs during processing
+     */
+    protected abstract void processDeployment(DeploymentPhaseContext phaseContext, DeploymentUnit deploymentUnit, ResourceRoot root) throws DeploymentUnitProcessingException;
+
+    protected void registerLogContext(final DeploymentUnit deploymentUnit, final Module module, final LogContext logContext) {
+        LoggingLogger.ROOT_LOGGER.tracef("Registering LogContext %s for deployment %s", logContext, deploymentUnit.getName());
+        if (WildFlySecurityManager.isChecking()) {
+            WildFlySecurityManager.doChecked(new PrivilegedAction<Object>() {
+                @Override
+                public Object run() {
+                    logContextSelector.registerLogContext(module.getClassLoader(), logContext);
+                    return null;
+                }
+            });
+        } else {
+            logContextSelector.registerLogContext(module.getClassLoader(), logContext);
+        }
+        // Add the log context to the sub-deployment unit for later removal
+        deploymentUnit.putAttachment(LOG_CONTEXT_KEY, logContext);
     }
 
-    private static class BeanGroupMutator<G, I, T> implements Mutator {
-        private final CacheInvoker invoker;
-        private final Cache<G, BeanGroupEntry<I, T>> cache;
-        private final G id;
-        private final BeanGroupEntry<I, T> entry;
-
-        BeanGroupMutator(CacheInvoker invoker, Cache<G, BeanGroupEntry<I, T>> cache, G id, BeanGroupEntry<I, T> entry) {
-            this.invoker = invoker;
-            this.cache = cache;
-            this.id = id;
-            this.entry = entry;
+    protected void unregisterLogContext(final DeploymentUnit deploymentUnit, final Module module) {
+        final LogContext logContext = deploymentUnit.removeAttachment(LOG_CONTEXT_KEY);
+        final boolean success;
+        if (WildFlySecurityManager.isChecking()) {
+            success = WildFlySecurityManager.doChecked(new PrivilegedAction<Boolean>() {
+                @Override
+                public Boolean run() {
+                    return logContextSelector.unregisterLogContext(module.getClassLoader(), logContext);
+                }
+            });
+        } else {
+            success = logContextSelector.unregisterLogContext(module.getClassLoader(), logContext);
         }
-
-        @Override
-        public void mutate() {
-            this.invoker.invoke(this.cache, new MutateOperation<>(this.id, this.entry), Flag.IGNORE_RETURN_VALUES);
+        if (success) {
+            LoggingLogger.ROOT_LOGGER.tracef("Removed LogContext '%s' from '%s'", logContext, module);
+        } else {
+            LoggingLogger.ROOT_LOGGER.logContextNotRemoved(logContext, deploymentUnit.getName());
         }
+    }
+
+    protected static List<DeploymentUnit> getSubDeployments(final DeploymentUnit deploymentUnit) {
+        if (deploymentUnit.hasAttachment(Attachments.SUB_DEPLOYMENTS)) {
+            final List<DeploymentUnit> result = new ArrayList<DeploymentUnit>();
+            result.addAll(deploymentUnit.getAttachmentList(Attachments.SUB_DEPLOYMENTS));
+            return result;
+        }
+        return Collections.emptyList();
+    }
+
+    protected static void safeClose(final Closeable closable) {
+        if (closable != null) try {
+            closable.close();
+        } catch (Exception e) {
+            // no-op
+        }
+    }
+
+    /**
+     * Checks the deployment to see if it has a registered {@link org.jboss.logmanager.LogContext log context}.
+     *
+     * @param deploymentUnit the deployment unit to check
+     *
+     * @return {@code true} if the deployment unit has a log context, otherwise {@code false}
+     */
+    public static boolean hasRegisteredLogContext(final DeploymentUnit deploymentUnit) {
+        return deploymentUnit.hasAttachment(LOG_CONTEXT_KEY);
     }
 }

@@ -1,221 +1,251 @@
-public Actor hit (float x, float y, boolean touchable) {
+import static org.elasticsearch.common.util.concurrent.DynamicExecutors.*;
 
+/*
+ * Licensed to Elastic Search and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Elastic Search licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-package com.badlogic.gdx.scenes.scene2d.ui;
+package org.elasticsearch.http.netty;
 
-import com.badlogic.gdx.graphics.Color;
-import com.badlogic.gdx.graphics.g2d.SpriteBatch;
-import com.badlogic.gdx.math.Circle;
-import com.badlogic.gdx.math.Vector2;
-import com.badlogic.gdx.scenes.scene2d.Actor;
-import com.badlogic.gdx.scenes.scene2d.InputEvent;
-import com.badlogic.gdx.scenes.scene2d.InputListener;
-import com.badlogic.gdx.scenes.scene2d.utils.ChangeListener.ChangeEvent;
-import com.badlogic.gdx.scenes.scene2d.utils.Drawable;
-import com.badlogic.gdx.utils.Pools;
+import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.netty.OpenChannelsHandler;
+import org.elasticsearch.common.netty.bootstrap.ServerBootstrap;
+import org.elasticsearch.common.netty.channel.*;
+import org.elasticsearch.common.netty.channel.socket.nio.NioServerSocketChannelFactory;
+import org.elasticsearch.common.netty.handler.codec.http.HttpChunkAggregator;
+import org.elasticsearch.common.netty.handler.codec.http.HttpRequestDecoder;
+import org.elasticsearch.common.netty.handler.codec.http.HttpResponseEncoder;
+import org.elasticsearch.common.netty.handler.timeout.ReadTimeoutException;
+import org.elasticsearch.common.netty.logging.InternalLogger;
+import org.elasticsearch.common.netty.logging.InternalLoggerFactory;
+import org.elasticsearch.common.network.NetworkService;
+import org.elasticsearch.common.network.NetworkUtils;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.transport.BoundTransportAddress;
+import org.elasticsearch.common.transport.InetSocketTransportAddress;
+import org.elasticsearch.common.transport.NetworkExceptionHelper;
+import org.elasticsearch.common.transport.PortsRange;
+import org.elasticsearch.http.*;
+import org.elasticsearch.transport.BindTransportException;
+import org.elasticsearch.transport.netty.NettyInternalESLoggerFactory;
+import org.elasticsearch.util.SizeUnit;
+import org.elasticsearch.util.SizeValue;
 
-/** An on-screen joystick. The movement area of the joystick is circular, centered on the touchpad, and its size determined by the
- * smaller touchpad dimension.
- * <p>
- * The preferred size of the touchpad is determined by the background.
- * <p>
- * {@link ChangeEvent} is fired when the touchpad knob is moved. Cancelling the event will move the knob to where it was
- * previously.
- * @author Josh Street */
-public class Touchpad extends Widget {
-	private TouchpadStyle style;
-	boolean touched;
-	private float deadzoneRadius;
-	private final Circle padBounds = new Circle(0, 0, 0);
-	private final Circle deadzoneBounds = new Circle(0, 0, 0);
-	private final Vector2 knobPosition = new Vector2();
-	private final Vector2 knobPercent = new Vector2();
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 
-	/** @param deadzoneRadius The distance in pixels from the center of the touchpad required for the knob to be moved. */
-	public Touchpad (float deadzoneRadius, Skin skin) {
-		this(deadzoneRadius, skin.get(TouchpadStyle.class));
-	}
+import static org.elasticsearch.common.network.NetworkService.TcpSettings.*;
+import static org.elasticsearch.util.concurrent.DynamicExecutors.*;
 
-	/** @param deadzoneRadius The distance in pixels from the center of the touchpad required for the knob to be moved. */
-	public Touchpad (float deadzoneRadius, Skin skin, String styleName) {
-		this(deadzoneRadius, skin.get(styleName, TouchpadStyle.class));
-	}
+/**
+ * @author kimchy (shay.banon)
+ */
+public class NettyHttpServerTransport extends AbstractLifecycleComponent<HttpServerTransport> implements HttpServerTransport {
 
-	/** @param deadzoneRadius The distance in pixels from the center of the touchpad required for the knob to be moved. */
-	public Touchpad (float deadzoneRadius, TouchpadStyle style) {
-		if (deadzoneRadius < 0) throw new IllegalArgumentException("deadzoneRadius must be > 0");
-		this.deadzoneRadius = deadzoneRadius;
+    static {
+        InternalLoggerFactory.setDefaultFactory(new NettyInternalESLoggerFactory() {
+            @Override public InternalLogger newInstance(String name) {
+                return super.newInstance(name.replace("org.elasticsearch.common.netty.", "netty.").replace("org.jboss.netty.", "netty."));
+            }
+        });
+    }
 
-		knobPosition.set(getWidth() / 2f, getHeight() / 2f);
+    private final NetworkService networkService;
 
-		setStyle(style);
-		setWidth(getPrefWidth());
-		setHeight(getPrefHeight());
+    private final SizeValue maxContentLength;
 
-		addListener(new InputListener() {
-			@Override
-			public boolean touchDown (InputEvent event, float x, float y, int pointer, int button) {
-				if (touched) return false;
-				touched = true;
-				calculatePositionAndValue(x, y, false);
-				return true;
-			}
+    private final int workerCount;
 
-			@Override
-			public void touchDragged (InputEvent event, float x, float y, int pointer) {
-				calculatePositionAndValue(x, y, false);
-			}
+    private final String port;
 
-			@Override
-			public void touchUp (InputEvent event, float x, float y, int pointer, int button) {
-				touched = false;
-				calculatePositionAndValue(x, y, true);
-			}
-		});
-	}
+    private final String bindHost;
 
-	void calculatePositionAndValue (float x, float y, boolean isTouchUp) {
-		float oldPositionX = knobPosition.x;
-		float oldPositionY = knobPosition.y;
-		float oldPercentX = knobPercent.x;
-		float oldPercentY = knobPercent.y;
-		knobPosition.set(getWidth() / 2f, getHeight() / 2f);
-		knobPercent.set(0f, 0f);
-		if (!isTouchUp) {
-			if (!deadzoneBounds.contains(x, y)) {
-				knobPercent.set(x - padBounds.x, y - padBounds.y).nor();
-				if (padBounds.contains(x, y)) {
-					knobPosition.set(x, y);
-				} else {
-					knobPosition.set(knobPercent).mul(padBounds.radius).add(padBounds.x, padBounds.y);
-				}
-			}
-		}
-		if (oldPercentX != knobPercent.x || oldPercentY != knobPercent.y) {
-			ChangeEvent changeEvent = Pools.obtain(ChangeEvent.class);
-			if (fire(changeEvent)) {
-				knobPercent.set(oldPercentX, oldPercentY);
-				knobPosition.set(oldPositionX, oldPositionY);
-			}
-			Pools.free(changeEvent);
-		}
-	}
+    private final String publishHost;
 
-	public void setStyle (TouchpadStyle style) {
-		if (style == null) throw new IllegalArgumentException("style cannot be null");
-		this.style = style;
-		invalidateHierarchy();
-	}
+    private final Boolean tcpNoDelay;
 
-	/** Returns the touchpad's style. Modifying the returned style may not have an effect until {@link #setStyle(TouchpadStyle)} is
-	 * called. */
-	public TouchpadStyle getStyle () {
-		return style;
-	}
+    private final Boolean tcpKeepAlive;
 
-	@Override
-	public Actor hit (float x, float y) {
-		return padBounds.contains(x, y) ? this : null;
-	}
+    private final Boolean reuseAddress;
 
-	@Override
-	public void layout () {
-		// Recalc pad and deadzone bounds
-		float radius = Math.min(getWidth(), getHeight()) / 2;
-		if (style.knob != null) radius -= Math.max(style.knob.getMinWidth(), style.knob.getMinHeight()) / 2;
-		padBounds.set(getWidth() / 2f, getHeight() / 2f, radius);
-		deadzoneBounds.set(getWidth() / 2f, getHeight() / 2f, deadzoneRadius);
-		// Recalc pad values and knob position
-		knobPosition.set(getWidth() / 2f, getHeight() / 2f);
-		knobPercent.set(0, 0);
-	}
+    private final SizeValue tcpSendBufferSize;
 
-	@Override
-	public void draw (SpriteBatch batch, float parentAlpha) {
-		validate();
+    private final SizeValue tcpReceiveBufferSize;
 
-		Color c = getColor();
-		batch.setColor(c.r, c.g, c.b, c.a * parentAlpha);
+    private volatile ServerBootstrap serverBootstrap;
 
-		float x = getX();
-		float y = getY();
-		float w = getWidth();
-		float h = getHeight();
+    private volatile BoundTransportAddress boundAddress;
 
-		final Drawable bg = style.background;
-		if (bg != null) bg.draw(batch, x, y, w, h);
+    private volatile Channel serverChannel;
 
-		final Drawable knob = style.knob;
-		if (knob != null) {
-			x += knobPosition.x - knob.getMinWidth() / 2f;
-			y += knobPosition.y - knob.getMinHeight() / 2f;
-			knob.draw(batch, x, y, knob.getMinWidth(), knob.getMinHeight());
-		}
-	}
+    private volatile OpenChannelsHandler serverOpenChannels;
 
-	@Override
-	public float getPrefWidth () {
-		return style.background != null ? style.background.getMinWidth() : 0;
-	}
+    private volatile HttpServerAdapter httpServerAdapter;
 
-	@Override
-	public float getPrefHeight () {
-		return style.background != null ? style.background.getMinHeight() : 0;
-	}
+    @Inject public NettyHttpServerTransport(Settings settings, NetworkService networkService) {
+        super(settings);
+        this.networkService = networkService;
+        SizeValue maxContentLength = componentSettings.getAsSize("max_content_length", settings.getAsSize("http.max_content_length", new SizeValue(100, SizeUnit.MB)));
+        this.workerCount = componentSettings.getAsInt("worker_count", Runtime.getRuntime().availableProcessors());
+        this.port = componentSettings.get("port", settings.get("http.port", "9200-9300"));
+        this.bindHost = componentSettings.get("bind_host");
+        this.publishHost = componentSettings.get("publish_host");
+        this.tcpNoDelay = componentSettings.getAsBoolean("tcp_no_delay", settings.getAsBoolean(TCP_NO_DELAY, true));
+        this.tcpKeepAlive = componentSettings.getAsBoolean("tcp_keep_alive", settings.getAsBoolean(TCP_KEEP_ALIVE, null));
+        this.reuseAddress = componentSettings.getAsBoolean("reuse_address", settings.getAsBoolean(TCP_REUSE_ADDRESS, NetworkUtils.defaultReuseAddress()));
+        this.tcpSendBufferSize = componentSettings.getAsSize("tcp_send_buffer_size", settings.getAsSize(TCP_SEND_BUFFER_SIZE, null));
+        this.tcpReceiveBufferSize = componentSettings.getAsSize("tcp_receive_buffer_size", settings.getAsSize(TCP_RECEIVE_BUFFER_SIZE, null));
 
-	public boolean isTouched () {
-		return touched;
-	}
+        // validate max content length
+        if (maxContentLength.bytes() > Integer.MAX_VALUE) {
+            logger.warn("maxContentLength[" + maxContentLength + "] set to high value, resetting it to [100mb]");
+            maxContentLength = new SizeValue(100, SizeUnit.MB);
+        }
+        this.maxContentLength = maxContentLength;
+    }
 
-	/** @param deadzoneRadius The distance in pixels from the center of the touchpad required for the knob to be moved. */
-	public void setDeadzone (float deadzoneRadius) {
-		if (deadzoneRadius < 0) throw new IllegalArgumentException("deadzoneRadius must be > 0");
-		this.deadzoneRadius = deadzoneRadius;
-		invalidate();
-	}
+    public void httpServerAdapter(HttpServerAdapter httpServerAdapter) {
+        this.httpServerAdapter = httpServerAdapter;
+    }
 
-	/** Returns the x-position of the knob relative to the center of the widget. The positive direction is right. */
-	public float getKnobX () {
-		return knobPosition.x;
-	}
+    @Override protected void doStart() throws ElasticSearchException {
+        this.serverOpenChannels = new OpenChannelsHandler();
 
-	/** Returns the y-position of the knob relative to the center of the widget. The positive direction is up. */
-	public float getKnobY () {
-		return knobPosition.y;
-	}
+        serverBootstrap = new ServerBootstrap(new NioServerSocketChannelFactory(
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "httpBoss")),
+                Executors.newCachedThreadPool(daemonThreadFactory(settings, "httpIoWorker")),
+                workerCount));
 
-	/** Returns the x-position of the knob as a percentage from the center of the touchpad to the edge of the circular movement
-	 * area. The positive direction is right. */
-	public float getKnobPercentX () {
-		return knobPercent.x;
-	}
+        final HttpRequestHandler requestHandler = new HttpRequestHandler(this);
 
-	/** Returns the y-position of the knob as a percentage from the center of the touchpad to the edge of the circular movement
-	 * area. The positive direction is up. */
-	public float getKnobPercentY () {
-		return knobPercent.y;
-	}
+        ChannelPipelineFactory pipelineFactory = new ChannelPipelineFactory() {
+            @Override public ChannelPipeline getPipeline() throws Exception {
+                ChannelPipeline pipeline = Channels.pipeline();
+                pipeline.addLast("openChannels", serverOpenChannels);
+                pipeline.addLast("decoder", new HttpRequestDecoder());
+                pipeline.addLast("aggregator", new HttpChunkAggregator((int) maxContentLength.bytes()));
+                pipeline.addLast("encoder", new HttpResponseEncoder());
+                pipeline.addLast("handler", requestHandler);
+                return pipeline;
+            }
+        };
 
-	/** The style for a {@link Touchpad}.
-	 * @author Josh Street */
-	public static class TouchpadStyle {
-		/** Stretched in both directions. Optional. */
-		public Drawable background;
+        serverBootstrap.setPipelineFactory(pipelineFactory);
 
-		/** Optional. */
-		public Drawable knob;
+        if (tcpNoDelay != null) {
+            serverBootstrap.setOption("child.tcpNoDelay", tcpNoDelay);
+        }
+        if (tcpKeepAlive != null) {
+            serverBootstrap.setOption("child.keepAlive", tcpKeepAlive);
+        }
+        if (tcpSendBufferSize != null) {
+            serverBootstrap.setOption("child.sendBufferSize", tcpSendBufferSize.bytes());
+        }
+        if (tcpReceiveBufferSize != null) {
+            serverBootstrap.setOption("child.receiveBufferSize", tcpReceiveBufferSize.bytes());
+        }
+        if (reuseAddress != null) {
+            serverBootstrap.setOption("reuseAddress", reuseAddress);
+            serverBootstrap.setOption("child.reuseAddress", reuseAddress);
+        }
 
-		public TouchpadStyle () {
-		}
+        // Bind and start to accept incoming connections.
+        InetAddress hostAddressX;
+        try {
+            hostAddressX = networkService.resolveBindHostAddress(bindHost);
+        } catch (IOException e) {
+            throw new BindHttpException("Failed to resolve host [" + bindHost + "]", e);
+        }
+        final InetAddress hostAddress = hostAddressX;
 
-		public TouchpadStyle (Drawable background, Drawable knob) {
-			this.background = background;
-			this.knob = knob;
-		}
+        PortsRange portsRange = new PortsRange(port);
+        final AtomicReference<Exception> lastException = new AtomicReference<Exception>();
+        boolean success = portsRange.iterate(new PortsRange.PortCallback() {
+            @Override public boolean onPortNumber(int portNumber) {
+                try {
+                    serverChannel = serverBootstrap.bind(new InetSocketAddress(hostAddress, portNumber));
+                } catch (Exception e) {
+                    lastException.set(e);
+                    return false;
+                }
+                return true;
+            }
+        });
+        if (!success) {
+            throw new BindHttpException("Failed to bind to [" + port + "]", lastException.get());
+        }
 
-		public TouchpadStyle (TouchpadStyle style) {
-			this.background = style.background;
-			this.knob = style.knob;
-		}
-	}
+        InetSocketAddress boundAddress = (InetSocketAddress) serverChannel.getLocalAddress();
+        InetSocketAddress publishAddress;
+        try {
+            publishAddress = new InetSocketAddress(networkService.resolvePublishHostAddress(publishHost), boundAddress.getPort());
+        } catch (Exception e) {
+            throw new BindTransportException("Failed to resolve publish address", e);
+        }
+        this.boundAddress = new BoundTransportAddress(new InetSocketTransportAddress(boundAddress), new InetSocketTransportAddress(publishAddress));
+    }
+
+    @Override protected void doStop() throws ElasticSearchException {
+        if (serverChannel != null) {
+            serverChannel.close().awaitUninterruptibly();
+            serverChannel = null;
+        }
+
+        if (serverOpenChannels != null) {
+            serverOpenChannels.close();
+            serverOpenChannels = null;
+        }
+
+        if (serverBootstrap != null) {
+            serverBootstrap.releaseExternalResources();
+            serverBootstrap = null;
+        }
+    }
+
+    @Override protected void doClose() throws ElasticSearchException {
+    }
+
+    public BoundTransportAddress boundAddress() {
+        return this.boundAddress;
+    }
+
+    void dispatchRequest(HttpRequest request, HttpChannel channel) {
+        httpServerAdapter.dispatchRequest(request, channel);
+    }
+
+    void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e) throws Exception {
+        if (e.getCause() instanceof ReadTimeoutException) {
+            if (logger.isTraceEnabled()) {
+                logger.trace("Connection timeout [{}]", ctx.getChannel().getRemoteAddress());
+            }
+            ctx.getChannel().close();
+        } else {
+            if (!lifecycle.started()) {
+                // ignore
+                return;
+            }
+            if (!NetworkExceptionHelper.isCloseConnectionException(e.getCause())) {
+                logger.warn("Caught exception while handling client http traffic", e.getCause());
+            }
+        }
+    }
 }

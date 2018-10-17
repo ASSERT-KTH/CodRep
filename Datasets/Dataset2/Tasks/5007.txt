@@ -1,497 +1,606 @@
-String newValue = String.valueOf(value);
+options = new CompilerOptions(settings);
 
 /*******************************************************************************
- * Copyright (c) 2005 IBM Corporation and others.
- * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the Eclipse Public License v1.0
+ * Copyright (c) 2000, 2003 IBM Corporation and others.
+ * All rights reserved. This program and the accompanying materials 
+ * are made available under the terms of the Common Public License v1.0
  * which accompanies this distribution, and is available at
- * http://www.eclipse.org/legal/epl-v10.html
- *
+ * http://www.eclipse.org/legal/cpl-v10.html
+ * 
  * Contributors:
  *     IBM Corporation - initial API and implementation
  *******************************************************************************/
-
-package org.eclipse.ui.internal.preferences;
-
-import java.util.*;
-import org.eclipse.core.runtime.preferences.IEclipsePreferences;
-import org.eclipse.core.runtime.preferences.IPreferenceNodeVisitor;
-import org.eclipse.jface.util.ListenerList;
-import org.osgi.service.prefs.BackingStoreException;
-import org.osgi.service.prefs.Preferences;
+package org.eclipse.jdt.internal.core.hierarchy;
 
 /**
- * Represents a working copy of a preference node, backed by the real node.
- * <p>
- * Note: Working copy nodes do not fire node change events.
- * </p>
- * <p>
- * Note: Preference change listeners registered on this node will only receive 
- * events from this node and not events based on the original backing node.
- * </p>
- * @since 3.1
+ * This is the public entry point to resolve type hierarchies.
+ *
+ * When requesting additional types from the name environment, the resolver
+ * accepts all forms (binary, source & compilation unit) for additional types.
+ *
+ * Side notes: Binary types already know their resolved supertypes so this
+ * only makes sense for source types. Even though the compiler finds all binary
+ * types to complete the hierarchy of a given source type, is there any reason
+ * why the requestor should be informed that binary type X subclasses Y &
+ * implements I & J?
  */
-public class WorkingCopyPreferences implements IEclipsePreferences {
 
-	private static final String TRUE = "true"; //$NON-NLS-1$
+import java.util.Map;
 
-	private final Map temporarySettings;
-	private final IEclipsePreferences original;
-	private ListenerList preferenceListeners;
-	private boolean removed = false;
-	private WorkingCopyManager manager;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.OperationCanceledException;
+import org.eclipse.jdt.core.compiler.CharOperation;
+import org.eclipse.jdt.internal.compiler.CompilationResult;
+import org.eclipse.jdt.internal.compiler.DefaultErrorHandlingPolicies;
+import org.eclipse.jdt.internal.compiler.IErrorHandlingPolicy;
+import org.eclipse.jdt.internal.compiler.IProblemFactory;
+import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
+import org.eclipse.jdt.internal.compiler.ast.MemberTypeDeclaration;
+import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
+import org.eclipse.jdt.internal.compiler.ast.TypeReference;
+import org.eclipse.jdt.internal.compiler.env.IBinaryType;
+import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+import org.eclipse.jdt.internal.compiler.env.IGenericType;
+import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+import org.eclipse.jdt.internal.compiler.env.ISourceType;
+import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+import org.eclipse.jdt.internal.compiler.impl.ITypeRequestor;
+import org.eclipse.jdt.internal.compiler.lookup.*;
+import org.eclipse.jdt.internal.compiler.lookup.BinaryTypeBinding;
+import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
+import org.eclipse.jdt.internal.compiler.lookup.PackageBinding;
+import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
+import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
+import org.eclipse.jdt.internal.compiler.parser.Parser;
+import org.eclipse.jdt.internal.compiler.parser.SourceTypeConverter;
+import org.eclipse.jdt.internal.compiler.problem.AbortCompilation;
+import org.eclipse.jdt.internal.compiler.problem.ProblemReporter;
+import org.eclipse.jdt.internal.compiler.util.Util;
 
-	/**
-	 * @param original the underlying preference node
-	 * @param manager the working copy manager
+public class HierarchyResolver implements ITypeRequestor {
+	IHierarchyRequestor requestor;
+	LookupEnvironment lookupEnvironment;
+
+	private int typeIndex;
+	private IGenericType[] typeModels;
+	private ReferenceBinding[] typeBindings;
+	private ReferenceBinding focusType;
+	private CompilerOptions options;
+	private boolean hasMissingSuperClass;
+	
+/**
+ * A wrapper around the simple name of a type that is missing.
+ */
+public class MissingType implements IGenericType {
+	public String simpleName;
+	
+	public MissingType(String simpleName) {
+		this.simpleName = simpleName;
+	}
+	
+	/*
+	 * @see IGenericType#getModifiers()
 	 */
-	public WorkingCopyPreferences(IEclipsePreferences original, WorkingCopyManager manager) {
-		super();
-		this.original = original;
-		this.manager = manager;
-		this.temporarySettings = new HashMap();
-		this.preferenceListeners = new ListenerList();
+	public int getModifiers() {
+		return 0;
 	}
 
 	/*
-	 * Convenience method for throwing an exception when methods
-	 * are called on a removed node.
+	 * @see IGenericType#isBinaryType()
 	 */
-	private void checkRemoved() {
-		if (removed) {
-			String message = "Preference node: " + absolutePath() + " has been removed."; //$NON-NLS-1$ //$NON-NLS-2$
-			throw new IllegalStateException(message);
+	public boolean isBinaryType() {
+		return false;
+	}
+
+	/*
+	 * @see IGenericType#isClass()
+	 */
+	public boolean isClass() {
+		return false;
+	}
+
+	/*
+	 * @see IGenericType#isInterface()
+	 */
+	public boolean isInterface() {
+		return false;
+	}
+
+	/*
+	 * @see IDependent#getFileName()
+	 */
+	public char[] getFileName() {
+		return null;
+	}
+	
+	public String toString() {
+		return "Missing type: " + this.simpleName; //$NON-NLS-1$
+	}
+
+}
+	
+public HierarchyResolver(INameEnvironment nameEnvironment, Map settings, IHierarchyRequestor requestor, IProblemFactory problemFactory) {
+	// create a problem handler with the 'exit after all problems' handling policy
+	options = settings == null ? new CompilerOptions() : new CompilerOptions(settings);
+	IErrorHandlingPolicy policy = DefaultErrorHandlingPolicies.exitAfterAllProblems();
+	ProblemReporter problemReporter = new ProblemReporter(policy, options, problemFactory);
+
+	this.setEnvironment(
+		new LookupEnvironment(this, options, problemReporter, nameEnvironment),
+		requestor);
+}
+public HierarchyResolver(LookupEnvironment lookupEnvironment, IHierarchyRequestor requestor) {
+	this.setEnvironment(lookupEnvironment, requestor);
+}
+/**
+ * Add an additional binary type
+ */
+
+public void accept(IBinaryType binaryType, PackageBinding packageBinding) {
+	BinaryTypeBinding typeBinding = lookupEnvironment.createBinaryTypeFrom(binaryType, packageBinding);
+	try {
+		this.remember(binaryType, typeBinding);
+	} catch (AbortCompilation e) {
+	}
+}
+/**
+ * Add an additional compilation unit.
+ */
+
+public void accept(ICompilationUnit sourceUnit) {
+	//System.out.println("Cannot accept compilation units inside the HierarchyResolver.");
+	lookupEnvironment.problemReporter.abortDueToInternalError(
+		new StringBuffer(Util.bind("accept.cannot")) //$NON-NLS-1$
+			.append(sourceUnit.getFileName())
+			.toString());
+}
+/**
+ * Add additional source types
+ */
+public void accept(ISourceType[] sourceTypes, PackageBinding packageBinding) {
+	// find most enclosing type first (needed when explicit askForType(...) is done 
+	// with a member type (e.g. p.A$B))
+	ISourceType sourceType = sourceTypes[0];
+	while (sourceType.getEnclosingType() != null)
+		sourceType = sourceType.getEnclosingType();
+	
+	// build corresponding compilation unit
+	CompilationResult result = new CompilationResult(sourceType.getFileName(), 1, 1, this.options.maxProblemsPerUnit);
+	CompilationUnitDeclaration unit =
+		SourceTypeConverter.buildCompilationUnit(
+			new ISourceType[] {sourceType}, // ignore secondary types, to improve laziness
+			false, // no need for field and methods
+			true, // need member types
+			false, // no need for field initialization
+			lookupEnvironment.problemReporter, 
+			result);
+		
+	// build bindings
+	if (unit != null) {
+		try {
+			lookupEnvironment.buildTypeBindings(unit);
+			rememberWithMemberTypes(sourceType, unit.types[0].binding);
+			lookupEnvironment.completeTypeBindings(unit, false);
+		} catch (AbortCompilation e) {
+			// missing 'java.lang' package: ignore
+		}
+	}
+}
+/*
+ * Find the super class of the given type in the cache.
+ * Returns a MissingType if the class is not found,
+ * or null if type has no super class.
+ */
+private IGenericType findSuperClass(IGenericType type, ReferenceBinding typeBinding) {
+	ReferenceBinding superBinding = typeBinding.superclass();
+	if (superBinding != null) {
+		if (superBinding.id == TypeIds.T_JavaLangObject && typeBinding.isHierarchyInconsistent()) {
+			char[] superclassName;
+			char separator;
+			if (type instanceof IBinaryType) {
+				superclassName = ((IBinaryType)type).getSuperclassName();
+				separator = '/';
+			} else if (type instanceof ISourceType) {
+				superclassName = ((ISourceType)type).getSuperclassName();
+				separator = '.';
+			} else if (type instanceof HierarchyType) {
+				superclassName = ((HierarchyType)type).superclassName;
+				separator = '.';
+			} else {
+				return null;
+			}
+			
+			if (superclassName != null) { // check whether subclass of Object due to broken hierarchy (as opposed to explicitly extending it)
+				int lastSeparator = CharOperation.lastIndexOf(separator, superclassName);
+				char[] simpleName = lastSeparator == -1 ? superclassName : CharOperation.subarray(superclassName, lastSeparator+1, superclassName.length);
+				if (!CharOperation.equals(simpleName, TypeConstants.OBJECT)) {
+					this.hasMissingSuperClass = true;
+					return new MissingType(new String(simpleName));
+				}
+			}
+		}
+		for (int t = typeIndex; t >= 0; t--) {
+			if (typeBindings[t] == superBinding) {
+				return typeModels[t];
+			}
+		}
+	} 
+	return null;
+}
+/*
+ * Find the super interfaces of the given type in the cache.
+ * Returns a MissingType if the interface is not found.
+ */
+private IGenericType[] findSuperInterfaces(IGenericType type, ReferenceBinding typeBinding) {
+	char[][] superInterfaceNames;
+	char separator;
+	if (type instanceof IBinaryType) {
+		superInterfaceNames = ((IBinaryType)type).getInterfaceNames();
+		separator = '/';
+	} else if (type instanceof ISourceType) {
+		superInterfaceNames = ((ISourceType)type).getInterfaceNames();
+		separator = '.';
+	} else if (type instanceof HierarchyType) {
+		superInterfaceNames = ((HierarchyType)type).superInterfaceNames;
+		separator = '.';
+	} else{
+		return null;
+	}
+	
+	ReferenceBinding[] interfaceBindings = typeBinding.superInterfaces();
+	int bindingIndex = 0;
+	int bindingLength = interfaceBindings == null ? 0 : interfaceBindings.length;
+	int length = superInterfaceNames == null ? 0 : superInterfaceNames.length;
+	IGenericType[] superinterfaces = new IGenericType[length];
+	next : for (int i = 0; i < length; i++) {
+		char[] superInterfaceName = superInterfaceNames[i];
+		int lastSeparator = CharOperation.lastIndexOf(separator, superInterfaceName);
+		char[] simpleName = lastSeparator == -1 ? superInterfaceName : CharOperation.subarray(superInterfaceName, lastSeparator+1, superInterfaceName.length);
+		if (bindingIndex < bindingLength) {
+			ReferenceBinding interfaceBinding = interfaceBindings[bindingIndex];
+
+			// ensure that the binding corresponds to the interface defined by the user
+			if (CharOperation.equals(simpleName, interfaceBinding.sourceName)) {
+				bindingIndex++;
+				for (int t = typeIndex; t >= 0; t--) {
+					if (typeBindings[t] == interfaceBinding) {
+						superinterfaces[i] = typeModels[t];
+						continue next;
+					}
+				}
+			}
+		}
+		superinterfaces[i] = new MissingType(new String(simpleName));
+	}
+	return superinterfaces;
+}
+private void remember(IGenericType suppliedType, ReferenceBinding typeBinding) {
+	if (typeBinding == null) return;
+	
+	if (suppliedType.isBinaryType()) {
+		// fault in its hierarchy...
+		// NB: AbortCompilation is handled by caller
+		typeBinding.superclass();
+		typeBinding.superInterfaces();
+	}
+	
+	if (++typeIndex == typeModels.length) {
+		System.arraycopy(typeModels, 0, typeModels = new IGenericType[typeIndex * 2], 0, typeIndex);
+		System.arraycopy(typeBindings, 0, typeBindings = new ReferenceBinding[typeIndex * 2], 0, typeIndex);
+	}
+	typeModels[typeIndex] = suppliedType;
+	typeBindings[typeIndex] = typeBinding;
+}
+private void rememberWithMemberTypes(TypeDeclaration typeDeclaration, HierarchyType enclosingType, ICompilationUnit unit) {
+
+	if (typeDeclaration.binding == null) return;
+
+	// simple super class name
+	char[] superclassName = null;
+	TypeReference superclass = typeDeclaration.superclass;
+	if (superclass != null) {
+		char[][] typeName = superclass.getTypeName();
+		superclassName = typeName == null ? null : typeName[typeName.length-1];
+	}
+	
+	// simple super interface names
+	char[][] superInterfaceNames = null;
+	TypeReference[] superInterfaces = typeDeclaration.superInterfaces;
+	if (superInterfaces != null) {
+		int length = superInterfaces.length;
+		superInterfaceNames = new char[length][];
+		for (int i = 0; i < length; i++) {
+			TypeReference superInterface = superInterfaces[i];
+			char[][] typeName = superInterface.getTypeName();
+			superInterfaceNames[i] = typeName[typeName.length-1];
 		}
 	}
 
-	/* (non-Javadoc)
-	 * @see org.eclipse.core.runtime.preferences.IEclipsePreferences#addNodeChangeListener(org.eclipse.core.runtime.preferences.IEclipsePreferences.INodeChangeListener)
-	 */
-	public void addNodeChangeListener(INodeChangeListener listener) {
-		// no-op - working copy nodes don't fire node change events
+	HierarchyType hierarchyType = new HierarchyType(
+		enclosingType, 
+		!typeDeclaration.isInterface(),
+		typeDeclaration.name,
+		typeDeclaration.binding.modifiers,
+		superclassName,
+		superInterfaceNames,
+		unit);
+	remember(hierarchyType, typeDeclaration.binding);
+
+	// propagate into member types
+	if (typeDeclaration.memberTypes == null) return;
+	MemberTypeDeclaration[] memberTypes = typeDeclaration.memberTypes;
+	for (int i = 0, max = memberTypes.length; i < max; i++){
+		rememberWithMemberTypes(memberTypes[i], hierarchyType, unit);
 	}
+}
+private void rememberWithMemberTypes(ISourceType suppliedType, ReferenceBinding typeBinding) {
+	if (typeBinding == null) return;
 
-	/* (non-Javadoc)
-	 * @see org.eclipse.core.runtime.preferences.IEclipsePreferences#removeNodeChangeListener(org.eclipse.core.runtime.preferences.IEclipsePreferences.INodeChangeListener)
-	 */
-	public void removeNodeChangeListener(INodeChangeListener listener) {
-		// no-op - working copy nodes don't fire node change events
+	remember(suppliedType, typeBinding);
+
+	ISourceType[] memberTypes = suppliedType.getMemberTypes();
+	if (memberTypes == null) return;
+	for (int m = memberTypes.length; --m >= 0;) {
+		ISourceType memberType = memberTypes[m];
+		rememberWithMemberTypes(memberType, typeBinding.getMemberType(memberType.getName()));
 	}
+}
+private void reportHierarchy() {
+	int objectIndex = -1;
+	for (int current = typeIndex; current >= 0; current--) {
+		ReferenceBinding typeBinding = typeBindings[current];
 
-	/* (non-Javadoc)
-	 * @see org.eclipse.core.runtime.preferences.IEclipsePreferences#addPreferenceChangeListener(org.eclipse.core.runtime.preferences.IEclipsePreferences.IPreferenceChangeListener)
-	 */
-	public void addPreferenceChangeListener(IPreferenceChangeListener listener) {
-		checkRemoved();
-		preferenceListeners.add(listener);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.eclipse.core.runtime.preferences.IEclipsePreferences#removePreferenceChangeListener(org.eclipse.core.runtime.preferences.IEclipsePreferences.IPreferenceChangeListener)
-	 */
-	public void removePreferenceChangeListener(IPreferenceChangeListener listener) {
-		checkRemoved();
-		preferenceListeners.remove(listener);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#removeNode()
-	 */
-	public void removeNode() throws BackingStoreException {
-		checkRemoved();
-		// mark as removed
-		removed = true;
-
-		// clear all values (long way so people get notified)
-		String[] keys = keys();
-		for (int i = 0; i < keys.length; i++)
-			remove(keys[i]);
-
-		// remove children
-		String[] childNames = childrenNames();
-		for (int i = 0; i < childNames.length; i++)
-			node(childNames[i]).removeNode();
-	}
-
-	private WorkingCopyManager getManager() {
-		return manager;
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#node(java.lang.String)
-	 */
-	public Preferences node(String path) {
-		checkRemoved();
-		return getManager().getWorkingCopy((IEclipsePreferences) getOriginal().node(path));
-	}
-
-	/* (non-Javadoc)
-	 * @see org.eclipse.core.runtime.preferences.IEclipsePreferences#accept(org.eclipse.core.runtime.preferences.IPreferenceNodeVisitor)
-	 */
-	public void accept(IPreferenceNodeVisitor visitor) throws BackingStoreException {
-		checkRemoved();
-		if (!visitor.visit(this))
-			return;
-		String[] childNames = childrenNames();
-		for (int i = 0; i < childNames.length; i++)
-			((IEclipsePreferences) node(childNames[i])).accept(visitor);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#put(java.lang.String, java.lang.String)
-	 */
-	public void put(String key, String value) {
-		checkRemoved();
-		if (key == null || value == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		temporarySettings.put(key, value);
-		if (!value.equals(oldValue))
-			firePropertyChangeEvent(key, oldValue, value);
-	}
-
-	private void firePropertyChangeEvent(String key, Object oldValue, Object newValue) {
-		Object[] listeners = preferenceListeners.getListeners();
-		if (listeners.length == 0)
-			return;
-		PreferenceChangeEvent event = new PreferenceChangeEvent(this, key, oldValue, newValue);
-		for (int i = 0; i < listeners.length; i++)
-			((IPreferenceChangeListener) listeners[i]).preferenceChange(event);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#get(java.lang.String, java.lang.String)
-	 */
-	public String get(String key, String defaultValue) {
-		checkRemoved();
-		return internalGet(key, defaultValue);
-	}
-
-	private String internalGet(String key, String defaultValue) {
-		if (key == null)
-			throw new NullPointerException();
-		if (temporarySettings.containsKey(key)) {
-			Object value = temporarySettings.get(key);
-			return value == null ? defaultValue : (String) value;
+		// java.lang.Object treated at the end
+		if (typeBinding.id == TypeIds.T_JavaLangObject) {
+			objectIndex = current;
+			continue;
 		}
-		return getOriginal().get(key, defaultValue);
-	}
 
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#remove(java.lang.String)
-	 */
-	public void remove(String key) {
-		checkRemoved();
-		if (key == null)
-			throw new NullPointerException();
-		if (!temporarySettings.containsKey(key))
-			return;
-		Object oldValue = temporarySettings.get(key);
-		if (oldValue == null)
-			return;
-		temporarySettings.put(key, null);
-		firePropertyChangeEvent(key, oldValue, null);
-	}
+		IGenericType suppliedType = typeModels[current];
 
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#clear()
-	 */
-	public void clear() {
-		checkRemoved();
-		for (Iterator i = temporarySettings.keySet().iterator(); i.hasNext();) {
-			String key = (String) i.next();
-			Object value = temporarySettings.get(key);
-			if (value != null) {
-				temporarySettings.put(key, null);
-				firePropertyChangeEvent(key, value, null);
+		if (!subOrSuperOfFocus(typeBinding)) {
+			continue; // ignore types outside of hierarchy
+		}
+
+		IGenericType superclass;
+		if (typeBinding.isInterface()){ // do not connect interfaces to Object
+			superclass = null;
+		} else {
+			superclass = this.findSuperClass(suppliedType, typeBinding);
+		}
+		IGenericType[] superinterfaces = this.findSuperInterfaces(suppliedType, typeBinding);
+		
+		requestor.connect(suppliedType, superclass, superinterfaces);
+	}
+	// add java.lang.Object only if the super class is not missing
+	if (!this.hasMissingSuperClass && objectIndex > -1) {
+		requestor.connect(typeModels[objectIndex], null, null);
+	}
+}
+private void reset(){
+	lookupEnvironment.reset();
+
+	this.typeIndex = -1;
+	this.typeModels = new IGenericType[5];
+	this.typeBindings = new ReferenceBinding[5];
+}
+/**
+ * Resolve the supertypes for the supplied source types.
+ * Inform the requestor of the resolved supertypes for each
+ * supplied source type using:
+ *    connect(ISourceType suppliedType, IGenericType superclass, IGenericType[] superinterfaces)
+ *
+ * Also inform the requestor of the supertypes of each
+ * additional requested super type which is also a source type
+ * instead of a binary type.
+ */
+
+public void resolve(IGenericType[] suppliedTypes, IProgressMonitor monitor) {
+	resolve(suppliedTypes, null, monitor);
+}
+/**
+ * Resolve the supertypes for the supplied source types.
+ * Inform the requestor of the resolved supertypes for each
+ * supplied source type using:
+ *    connect(ISourceType suppliedType, IGenericType superclass, IGenericType[] superinterfaces)
+ *
+ * Also inform the requestor of the supertypes of each
+ * additional requested super type which is also a source type
+ * instead of a binary type.
+ */
+
+public void resolve(IGenericType[] suppliedTypes, ICompilationUnit[] sourceUnits, IProgressMonitor monitor) {
+	try {
+		int suppliedLength = suppliedTypes == null ? 0 : suppliedTypes.length;
+		int sourceLength = sourceUnits == null ? 0 : sourceUnits.length;
+		CompilationUnitDeclaration[] units = new CompilationUnitDeclaration[suppliedLength + sourceLength];
+		
+		// cache binary type bidings
+		BinaryTypeBinding[] binaryBindings = new BinaryTypeBinding[suppliedLength];
+		for (int i = 0; i < suppliedLength; i++) {
+			if (suppliedTypes[i].isBinaryType()) {
+				IBinaryType binaryType = (IBinaryType) suppliedTypes[i];
+				try {
+					binaryBindings[i] = lookupEnvironment.cacheBinaryType(binaryType, false);
+				} catch (AbortCompilation e) {
+					// classpath problem for this type: ignore
+				}
 			}
 		}
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#putInt(java.lang.String, int)
-	 */
-	public void putInt(String key, int value) {
-		checkRemoved();
-		if (key == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		String newValue = Integer.toString(value);
-		temporarySettings.put(key, newValue);
-		if (!newValue.equals(oldValue))
-			firePropertyChangeEvent(key, oldValue, newValue);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#getInt(java.lang.String, int)
-	 */
-	public int getInt(String key, int defaultValue) {
-		checkRemoved();
-		String value = internalGet(key, null);
-		int result = defaultValue;
-		if (value != null)
-			try {
-				result = Integer.parseInt(value);
-			} catch (NumberFormatException e) {
-				// use default
+		
+		// build type bindings
+		for (int i = 0; i < suppliedLength; i++) {
+			if (suppliedTypes[i].isBinaryType()) {
+				if (binaryBindings[i] != null) {
+					try {
+						remember((IBinaryType) suppliedTypes[i], binaryBindings[i]);
+					} catch (AbortCompilation e) {
+						// classpath problem for this type: ignore
+					}
+				}
+			} else {
+				// must start with the top level type
+				ISourceType topLevelType = (ISourceType) suppliedTypes[i];
+				while (topLevelType.getEnclosingType() != null)
+					topLevelType = topLevelType.getEnclosingType();
+				CompilationResult result = new CompilationResult(topLevelType.getFileName(), i, suppliedLength, this.options.maxProblemsPerUnit);
+				units[i] = 
+					SourceTypeConverter.buildCompilationUnit(
+						new ISourceType[]{topLevelType}, 
+						false, // no need for field and methods
+						true, // need member types
+						false, // no need for field initialization
+						lookupEnvironment.problemReporter, 
+						result);
+				if (units[i] != null) {
+					try {
+						lookupEnvironment.buildTypeBindings(units[i]);
+					} catch (AbortCompilation e) {
+						// classpath problem for this type: ignore
+					}
+				}
 			}
-		return result;
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#putLong(java.lang.String, long)
-	 */
-	public void putLong(String key, long value) {
-		checkRemoved();
-		if (key == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		String newValue = Long.toString(value);
-		temporarySettings.put(key, newValue);
-		if (!newValue.equals(oldValue))
-			firePropertyChangeEvent(key, oldValue, newValue);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#getLong(java.lang.String, long)
-	 */
-	public long getLong(String key, long defaultValue) {
-		checkRemoved();
-		String value = internalGet(key, null);
-		long result = defaultValue;
-		if (value != null)
-			try {
-				result = Long.parseLong(value);
-			} catch (NumberFormatException e) {
-				// use default
-			}
-		return result;
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#putBoolean(java.lang.String, boolean)
-	 */
-	public void putBoolean(String key, boolean value) {
-		checkRemoved();
-		if (key == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		String newValue = Boolean.toString(value);
-		temporarySettings.put(key, newValue);
-		if (!newValue.equalsIgnoreCase(oldValue))
-			firePropertyChangeEvent(key, oldValue, newValue);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#getBoolean(java.lang.String, boolean)
-	 */
-	public boolean getBoolean(String key, boolean defaultValue) {
-		checkRemoved();
-		String value = internalGet(key, null);
-		return value == null ? defaultValue : TRUE.equalsIgnoreCase(value);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#putFloat(java.lang.String, float)
-	 */
-	public void putFloat(String key, float value) {
-		checkRemoved();
-		if (key == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		String newValue = Float.toString(value);
-		temporarySettings.put(key, newValue);
-		if (!newValue.equals(oldValue))
-			firePropertyChangeEvent(key, oldValue, newValue);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#getFloat(java.lang.String, float)
-	 */
-	public float getFloat(String key, float defaultValue) {
-		checkRemoved();
-		String value = internalGet(key, null);
-		float result = defaultValue;
-		if (value != null)
-			try {
-				result = Float.parseFloat(value);
-			} catch (NumberFormatException e) {
-				// use default
-			}
-		return result;
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#putDouble(java.lang.String, double)
-	 */
-	public void putDouble(String key, double value) {
-		checkRemoved();
-		if (key == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		String newValue = Double.toString(value);
-		temporarySettings.put(key, newValue);
-		if (!newValue.equals(oldValue))
-			firePropertyChangeEvent(key, oldValue, newValue);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#getDouble(java.lang.String, double)
-	 */
-	public double getDouble(String key, double defaultValue) {
-		checkRemoved();
-		String value = internalGet(key, null);
-		double result = defaultValue;
-		if (value != null)
-			try {
-				result = Double.parseDouble(value);
-			} catch (NumberFormatException e) {
-				// use default
-			}
-		return result;
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#putByteArray(java.lang.String, byte[])
-	 */
-	public void putByteArray(String key, byte[] value) {
-		checkRemoved();
-		if (key == null || value == null)
-			throw new NullPointerException();
-		String oldValue = null;
-		if (temporarySettings.containsKey(key))
-			oldValue = (String) temporarySettings.get(key);
-		else
-			oldValue = getOriginal().get(key, null);
-		String newValue = new String(Base64.encode(value));
-		temporarySettings.put(key, newValue);
-		if (!newValue.equals(oldValue))
-			firePropertyChangeEvent(key, oldValue, newValue);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#getByteArray(java.lang.String, byte[])
-	 */
-	public byte[] getByteArray(String key, byte[] defaultValue) {
-		checkRemoved();
-		String value = internalGet(key, null);
-		return value == null ? defaultValue : Base64.decode(value.getBytes());
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#keys()
-	 */
-	public String[] keys() throws BackingStoreException {
-		checkRemoved();
-		HashSet allKeys = new HashSet(Arrays.asList(getOriginal().keys()));
-		allKeys.addAll(temporarySettings.keySet());
-		return (String[]) allKeys.toArray(new String[allKeys.size()]);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#childrenNames()
-	 */
-	public String[] childrenNames() throws BackingStoreException {
-		checkRemoved();
-		return getOriginal().childrenNames();
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#parent()
-	 */
-	public Preferences parent() {
-		checkRemoved();
-		return getManager().getWorkingCopy((IEclipsePreferences) getOriginal().parent());
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#nodeExists(java.lang.String)
-	 */
-	public boolean nodeExists(String pathName) throws BackingStoreException {
-		// short circuit for this node
-		if (pathName.length() == 0)
-			return removed ? false : getOriginal().nodeExists(pathName);
-		return getOriginal().nodeExists(pathName);
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#name()
-	 */
-	public String name() {
-		return getOriginal().name();
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#absolutePath()
-	 */
-	public String absolutePath() {
-		return getOriginal().absolutePath();
-	}
-
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#flush()
-	 */
-	public void flush() throws BackingStoreException {
-		if (removed) {
-			getOriginal().removeNode();
-			return;
+			worked(monitor, 1);
 		}
-		checkRemoved();
-		// update underlying preferences
-		for (Iterator i = temporarySettings.keySet().iterator(); i.hasNext();) {
-			String key = (String) i.next();
-			String value = (String) temporarySettings.get(key);
-			if (value == null)
-				getOriginal().remove(key);
-			else
-				getOriginal().put(key, value);
+		Parser parser = new Parser(lookupEnvironment.problemReporter, true);
+		for (int i = 0; i < sourceLength; i++){
+			ICompilationUnit sourceUnit = sourceUnits[i];
+			CompilationResult unitResult = new CompilationResult(sourceUnit, suppliedLength+i, suppliedLength+sourceLength, this.options.maxProblemsPerUnit); 
+			CompilationUnitDeclaration parsedUnit = parser.dietParse(sourceUnit, unitResult);
+			if (parsedUnit != null) {
+				units[suppliedLength+i] = parsedUnit;
+				lookupEnvironment.buildTypeBindings(parsedUnit);
+			}
+			worked(monitor, 1);
 		}
-		// clear our settings
-		temporarySettings.clear();
+		
+		// complete type bindings (ie. connect super types) and remember them
+		for (int i = 0; i < suppliedLength; i++) {
+			if (!suppliedTypes[i].isBinaryType()) { // note that binary types have already been remembered above
+				CompilationUnitDeclaration parsedUnit = units[i];
+				if (parsedUnit != null) {
+					// must start with the top level type
+					ISourceType topLevelType = (ISourceType) suppliedTypes[i];
+					suppliedTypes[i] = null; // no longer needed pass this point				
+					while (topLevelType.getEnclosingType() != null)
+						topLevelType = topLevelType.getEnclosingType();
+					try {
+						lookupEnvironment.completeTypeBindings(parsedUnit, false);
+						rememberWithMemberTypes(topLevelType, parsedUnit.types[0].binding);
+					} catch (AbortCompilation e) {
+						// classpath problem for this type: ignore
+					}
+				}
+			}
+			worked(monitor, 1);
+		}
+		for (int i = 0; i < sourceLength; i++) {
+			CompilationUnitDeclaration parsedUnit = units[suppliedLength+i];
+			if (parsedUnit != null) {
+				lookupEnvironment.completeTypeBindings(parsedUnit, false);
+				int typeCount = parsedUnit.types == null ? 0 : parsedUnit.types.length;
+				ICompilationUnit sourceUnit = sourceUnits[i];
+				sourceUnits[i] = null; // no longer needed pass this point
+				for (int j = 0; j < typeCount; j++){
+					rememberWithMemberTypes(parsedUnit.types[j], null, sourceUnit);
+				}
+			}
+			worked(monitor, 1);
+		}
 
-		// save the underlying preference store
-		getOriginal().flush();
+		reportHierarchy();
+		
+	} catch (ClassCastException e){ // work-around for 1GF5W1S - can happen in case duplicates are fed to the hierarchy with binaries hiding sources
+	} catch (AbortCompilation e) { // ignore this exception for now since it typically means we cannot find java.lang.Object
+	} finally {
+		reset();
 	}
+}
+/**
+ * Resolve the supertypes for the supplied source type.
+ * Inform the requestor of the resolved supertypes using:
+ *    connect(ISourceType suppliedType, IGenericType superclass, IGenericType[] superinterfaces)
+ */
 
-	/* (non-Javadoc)
-	 * @see org.osgi.service.prefs.Preferences#sync()
-	 */
-	public void sync() throws BackingStoreException {
-		checkRemoved();
-		// forget our settings
-		temporarySettings.clear();
-		// load the underlying preference store
-		getOriginal().sync();
-	}
+public void resolve(IGenericType suppliedType) {
+	try {
+		if (suppliedType.isBinaryType()) {
+			remember(suppliedType, lookupEnvironment.cacheBinaryType((IBinaryType) suppliedType));
+		} else {
+			// must start with the top level type
+			ISourceType topLevelType = (ISourceType) suppliedType;
+			while (topLevelType.getEnclosingType() != null)
+				topLevelType = topLevelType.getEnclosingType();
+			CompilationResult result = new CompilationResult(topLevelType.getFileName(), 1, 1, this.options.maxProblemsPerUnit);
+			CompilationUnitDeclaration unit =
+				SourceTypeConverter.buildCompilationUnit(
+					new ISourceType[]{topLevelType}, 
+					false, // no need for field and methods
+					true, // need member types
+					false, // no need for field initialization
+					lookupEnvironment.problemReporter, 
+					result);
 
-	/**
-	 * @return Returns the original preference node.
-	 */
-	private IEclipsePreferences getOriginal() {
-		return original;
+			if (unit != null) {
+				lookupEnvironment.buildTypeBindings(unit);
+				rememberWithMemberTypes(topLevelType, unit.types[0].binding);
+
+				lookupEnvironment.completeTypeBindings(unit, false);
+			}
+		}
+		reportHierarchy();
+	} catch (AbortCompilation e) { // ignore this exception for now since it typically means we cannot find java.lang.Object
+	} finally {
+		reset();
 	}
+}
+/**
+ * Set the focus type (ie. the type that this resolver is computing the hierarch for.
+ * Returns the binding of this focus type or null if it could not be found.
+ */
+public ReferenceBinding setFocusType(char[][] compoundName) {
+	if (compoundName == null || this.lookupEnvironment == null) return null;
+	this.focusType = this.lookupEnvironment.getCachedType(compoundName);
+	if (this.focusType == null) {
+		this.focusType = this.lookupEnvironment.askForType(compoundName);
+	}
+	return this.focusType;
+}
+private void setEnvironment(LookupEnvironment lookupEnvironment, IHierarchyRequestor requestor) {
+	this.lookupEnvironment = lookupEnvironment;
+	this.requestor = requestor;
+
+	this.typeIndex = -1;
+	this.typeModels = new IGenericType[5];
+	this.typeBindings = new ReferenceBinding[5];
+}
+public boolean subOrSuperOfFocus(ReferenceBinding typeBinding) {
+	if (this.focusType == null) return true; // accept all types (case of hierarchy in a region)
+	if (this.subTypeOfType(this.focusType, typeBinding)) return true;
+	if (this.subTypeOfType(typeBinding, this.focusType)) return true;
+	return false;
+}
+private boolean subTypeOfType(ReferenceBinding subType, ReferenceBinding typeBinding) {
+	if (typeBinding == null || subType == null) return false;
+	if (subType == typeBinding) return true;
+	ReferenceBinding superclass = subType.superclass();
+//	if (superclass != null && superclass.id == TypeIds.T_JavaLangObject && subType.isHierarchyInconsistent()) return false;
+	if (this.subTypeOfType(superclass, typeBinding)) return true;
+	ReferenceBinding[] superInterfaces = subType.superInterfaces();
+	if (superInterfaces != null) {
+		for (int i = 0, length = superInterfaces.length; i < length; i++) {
+			if (this.subTypeOfType(superInterfaces[i], typeBinding)) return true;
+		} 
+	}
+	return false;
+}
+protected void worked(IProgressMonitor monitor, int work) {
+	if (monitor != null) {
+		if (monitor.isCanceled()) {
+			throw new OperationCanceledException();
+		} else {
+			monitor.worked(work);
+		}
+	}
+}
 }

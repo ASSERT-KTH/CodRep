@@ -1,4 +1,4 @@
-ear.addAsManifestResource(new StringAsset("Dependencies: org.hibernate.envers export,org.hibernate\n"), "MANIFEST.MF");
+import static org.jboss.as.domain.management.logging.DomainManagementLogger.SECURITY_LOGGER;
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,140 +22,217 @@ ear.addAsManifestResource(new StringAsset("Dependencies: org.hibernate.envers ex
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.test.integration.hibernate.envers;
+package org.jboss.as.domain.management.security;
 
-import static org.junit.Assert.assertTrue;
+import static org.jboss.as.domain.management.DomainManagementLogger.SECURITY_LOGGER;
 
-import javax.naming.InitialContext;
-import javax.naming.NameClassPair;
-import javax.naming.NamingEnumeration;
+import java.io.IOException;
+import java.security.Principal;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.Stack;
+
 import javax.naming.NamingException;
+import javax.security.auth.Subject;
 
-import org.jboss.arquillian.container.test.api.Deployment;
-import org.jboss.arquillian.junit.Arquillian;
-import org.jboss.arquillian.test.api.ArquillianResource;
-import org.jboss.shrinkwrap.api.Archive;
-import org.jboss.shrinkwrap.api.ShrinkWrap;
-import org.jboss.shrinkwrap.api.asset.StringAsset;
-import org.jboss.shrinkwrap.api.spec.EnterpriseArchive;
-import org.jboss.shrinkwrap.api.spec.JavaArchive;
-import org.jboss.shrinkwrap.api.spec.WebArchive;
-import org.junit.BeforeClass;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import org.jboss.as.core.security.RealmGroup;
+import org.jboss.as.core.security.RealmUser;
+import org.jboss.as.domain.management.SecurityRealm;
+import org.jboss.as.domain.management.connections.ldap.LdapConnectionManager;
+import org.jboss.as.domain.management.security.BaseLdapGroupSearchResource.GroupName;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
 
 /**
- * Test that Hibernate Envers is working over Native Hibernate API in AS7 container without any JPA assistance
- * 
- * @author Madhumita Sadhukhan
+ * A {@link SubjectSupplemental} for loading a users groups from LDAP.
+ *
+ * @author <a href="mailto:flemming.harms@gmail.com">Flemming Harms</a>
+ * @author <a href="mailto:darran.lofthouse@jboss.com">Darran Lofthouse</a>
  */
-@RunWith(Arquillian.class)
-public class Hibernate4NativeAPIEnversTestCase {
+public class LdapSubjectSupplementalService implements Service<SubjectSupplementalService>, SubjectSupplementalService {
 
-    private static final String ARCHIVE_NAME = "hibernate4native_test";
+    private final InjectedValue<LdapConnectionManager> connectionManager = new InjectedValue<LdapConnectionManager>();
+    private final InjectedValue<LdapSearcherCache<LdapEntry, String>> userSearcherInjector = new InjectedValue<LdapSearcherCache<LdapEntry, String>>();
+    private final InjectedValue<LdapSearcherCache<LdapEntry[], LdapEntry>> groupSearcherInjector = new InjectedValue<LdapSearcherCache<LdapEntry[], LdapEntry>>();
 
-    public static final String hibernate_cfg = "<?xml version='1.0' encoding='utf-8'?>"
-            + "<!DOCTYPE hibernate-configuration PUBLIC " + "\"//Hibernate/Hibernate Configuration DTD 3.0//EN\" "
-            + "\"http://www.hibernate.org/dtd/hibernate-configuration-3.0.dtd\">"
-            + "<hibernate-configuration><session-factory>" + "<property name=\"show_sql\">true</property>"
-            + "<property name=\"current_session_context_class\">thread</property>"
-            + "<mapping resource=\"testmapping.hbm.xml\"/>" + "</session-factory></hibernate-configuration>";
+    private LdapSearcherCache<LdapEntry, String> userSearcher;
+    private LdapSearcherCache<LdapEntry[], LdapEntry> groupSearcher;
 
-    public static final String testmapping = "<?xml version=\"1.0\"?>" + "<!DOCTYPE hibernate-mapping PUBLIC "
-            + "\"-//Hibernate/Hibernate Mapping DTD 3.0//EN\" " + "\"http://www.hibernate.org/dtd/hibernate-mapping-3.0.dtd\">"
-            + "<hibernate-mapping package=\"org.jboss.as.test.integration.hibernate\">"
-            + "<class name=\"org.jboss.as.test.integration.hibernate.envers.StudentAudited\" table=\"STUDENT\">"
-            + "<id name=\"studentId\" column=\"student_id\">" + "<generator class=\"native\"/>" + "</id>"
-            + "<property name=\"firstName\" column=\"first_name\"/>" + "<property name=\"lastName\" column=\"last_name\"/>"
-            + "<property name=\"address\"/>"
-            // + "<set name=\"courses\" table=\"student_courses\">"
-            // + "<key column=\"student_id\"/>"
-            // + "<many-to-many column=\"course_id\" class=\"org.jboss.as.test.integration.nonjpa.hibernate.Course\"/>"
-            // + "</set>" +
-            + "</class></hibernate-mapping>";
+    protected final int searchTimeLimit = 10000; // TODO - Maybe make configurable.
 
-    @ArquillianResource
-    private static InitialContext iniCtx;
+    private final String realmName;
+    private final boolean shareConnection;
+    private final boolean forceUserDnSearch;
+    private final boolean iterative;
+    private final GroupName groupName;
 
-    @BeforeClass
-    public static void beforeClass() throws NamingException {
-        iniCtx = new InitialContext();
+    public LdapSubjectSupplementalService(final String realmName, final boolean shareConnection, final boolean forceUserDnSearch, final boolean iterative, final GroupName groupName) {
+        this.realmName = realmName;
+        this.shareConnection = shareConnection;
+        this.forceUserDnSearch = forceUserDnSearch;
+        this.iterative = iterative;
+        this.groupName = groupName;
     }
 
-    @Deployment
-    public static Archive<?> deploy() throws Exception {
+    /*
+     * Service Methods
+     */
 
-        EnterpriseArchive ear = ShrinkWrap.create(EnterpriseArchive.class, ARCHIVE_NAME + ".ear");
-        // add required jars as manifest dependencies
-        ear.addAsManifestResource(new StringAsset("Dependencies: org.hibernate\n"), "MANIFEST.MF");
-
-        JavaArchive lib = ShrinkWrap.create(JavaArchive.class, "beans.jar");
-        lib.addClasses(SFSBHibernateEnversSessionFactory.class);
-        ear.addAsModule(lib);
-
-        lib = ShrinkWrap.create(JavaArchive.class, "entities.jar");
-        lib.addClasses(StudentAudited.class);
-        lib.addAsResource(new StringAsset(testmapping), "testmapping.hbm.xml");
-        lib.addAsResource(new StringAsset(hibernate_cfg), "hibernate.cfg.xml");
-        ear.addAsLibraries(lib);
-
-        final WebArchive main = ShrinkWrap.create(WebArchive.class, "main.war");
-        main.addClasses(Hibernate4NativeAPIEnversTestCase.class);
-        ear.addAsModule(main);
-
-        // add application dependency on H2 JDBC driver, so that the Hibernate classloader (same as app classloader)
-        // will see the H2 JDBC driver.
-        // equivalent hack for use of shared Hiberante module, would be to add the H2 dependency directly to the
-        // shared Hibernate module.
-        // also add dependency on org.slf4j
-        ear.addAsManifestResource(new StringAsset("<jboss-deployment-structure>" + " <deployment>" + " <dependencies>"
-                + " <module name=\"com.h2database.h2\" />" + " <module name=\"org.slf4j\"/>" + " </dependencies>"
-                + " </deployment>" + "</jboss-deployment-structure>"), "jboss-deployment-structure.xml");
-
-        return ear;
+    public SubjectSupplementalService getValue() throws IllegalStateException, IllegalArgumentException {
+        return this;
     }
 
-    protected static <T> T lookup(String beanName, Class<T> interfaceType) throws NamingException {
-        try {
-            return interfaceType.cast(iniCtx.lookup("java:global/" + ARCHIVE_NAME + "/" + "beans/" + beanName + "!"
-                    + interfaceType.getName()));
-        } catch (NamingException e) {
-            dumpJndi("");
-            throw e;
+    public void start(StartContext context) throws StartException {
+        userSearcher = userSearcherInjector.getOptionalValue();
+        groupSearcher = groupSearcherInjector.getValue();
+
+        if (SECURITY_LOGGER.isTraceEnabled()) {
+            SECURITY_LOGGER.tracef("LdapSubjectSupplementalService realmName=%s", realmName);
+            SECURITY_LOGGER.tracef("LdapSubjectSupplementalService shareConnection=%b", shareConnection);
+            SECURITY_LOGGER.tracef("LdapSubjectSupplementalService forceUserDnSearch=%b", forceUserDnSearch);
+            SECURITY_LOGGER.tracef("LdapSubjectSupplementalService iterative=%b", iterative);
+            SECURITY_LOGGER.tracef("LdapSubjectSupplementalService groupName=%s", groupName);
         }
     }
 
-    // TODO: move this logic to a common base class (might be helpful for writing new tests)
-    private static void dumpJndi(String s) {
-        try {
-            dumpTreeEntry(iniCtx.list(s), s);
-        } catch (NamingException ignore) {
-        }
+    public void stop(StopContext context) {
+        groupSearcher = null;
+        userSearcher = null;
     }
 
-    private static void dumpTreeEntry(NamingEnumeration<NameClassPair> list, String s) throws NamingException {
-        System.out.println("\ndump " + s);
-        while (list.hasMore()) {
-            NameClassPair ncp = list.next();
-            System.out.println(ncp.toString());
-            if (s.length() == 0) {
-                dumpJndi(ncp.getName());
+    /*
+     *  Access to Injectors
+     */
+    public Injector<LdapConnectionManager> getConnectionManagerInjector() {
+        return connectionManager;
+    }
+
+    public Injector<LdapSearcherCache<LdapEntry, String>> getLdapUserSearcherInjector() {
+        return userSearcherInjector;
+    }
+
+    public Injector<LdapSearcherCache<LdapEntry[], LdapEntry>> getLdapGroupSearcherInjector() {
+        return groupSearcherInjector;
+    }
+
+    /*
+     * SubjectSupplementalService Method
+     */
+
+    public SubjectSupplemental getSubjectSupplemental(Map<String, Object> sharedState) {
+        return new LdapSubjectSupplemental(sharedState);
+    }
+
+    /*
+     * SubjectSupplementalMethods
+     */
+
+    public class LdapSubjectSupplemental implements SubjectSupplemental {
+
+        private final Set<LdapEntry> searchedPerformed = new HashSet<LdapEntry>();
+        private final Map<String, Object> sharedState;
+
+        protected LdapSubjectSupplemental(final Map<String, Object> sharedState) {
+            this.sharedState = sharedState;
+        }
+
+        /**
+         * @see org.jboss.as.domain.management.security.SubjectSupplemental#supplementSubject(javax.security.auth.Subject)
+         */
+        public void supplementSubject(Subject subject) throws IOException {
+            Set<RealmUser> users = subject.getPrincipals(RealmUser.class);
+            Set<Principal> principals = subject.getPrincipals();
+
+            final LdapConnectionHandler connectionHandler;
+            if (sharedState.containsKey(LdapConnectionHandler.class.getName())) {
+                SECURITY_LOGGER.trace("Using existing LdapConnectionHandler from shared state.");
+                connectionHandler = (LdapConnectionHandler) sharedState.remove(LdapConnectionHandler.class.getName());
             } else {
-                dumpJndi(s + "/" + ncp.getName());
+                SECURITY_LOGGER.trace("Creating new LdapConnectionHandler.");
+                connectionHandler = LdapConnectionHandler.newInstance(connectionManager.getValue());
+            }
+            try {
+                // In general we expect exactly one RealmUser, however we could cope with multiple
+                // identities so load the groups for them all.
+                for (RealmUser current : users) {
+                    SECURITY_LOGGER.tracef("Loading groups for '%s'", current);
+                    principals.addAll(loadGroups(current, connectionHandler));
+                }
+
+            } catch (Exception e) {
+                SECURITY_LOGGER.trace("Failure supplementing Subject", e);
+                if (e instanceof IOException) {
+                    throw (IOException) e;
+                }
+                throw new IOException(e);
+            } finally {
+                connectionHandler.close();
             }
         }
+
+        private Set<RealmGroup> loadGroups(RealmUser user, LdapConnectionHandler connectionHandler) throws IOException, NamingException {
+            LdapEntry entry = null;
+            if (forceUserDnSearch == false && sharedState.containsKey(LdapEntry.class.getName())) {
+                entry = (LdapEntry) sharedState.get(LdapEntry.class.getName());
+                SECURITY_LOGGER.tracef("Loaded from sharedState '%s'", entry);
+            }
+            if (entry == null || user.getName().equals(entry.getSimpleName())==false) {
+                entry = userSearcher.search(connectionHandler, user.getName()).getResult();
+                SECURITY_LOGGER.tracef("Performed userSearch '%s'", entry);
+            }
+
+            return loadGroups(entry, connectionHandler);
+        }
+
+        private Set<RealmGroup> loadGroups(LdapEntry entry, LdapConnectionHandler connectionHandler) throws IOException, NamingException {
+            Set<RealmGroup> realmGroups = new HashSet<RealmGroup>();
+
+            Stack<LdapEntry[]> entries = new Stack<LdapEntry[]>();
+            entries.push(loadGroupEntries(entry, connectionHandler));
+            while (entries.isEmpty() == false) {
+                LdapEntry[] found = entries.pop();
+                for (LdapEntry current : found) {
+                    RealmGroup group = new RealmGroup(realmName, groupName == GroupName.SIMPLE ? current.getSimpleName() : current.getDistinguishedName());
+                    SECURITY_LOGGER.tracef("Adding RealmGroup '%s'", group);
+                    realmGroups.add(group);
+                    if (iterative) {
+                        SECURITY_LOGGER.tracef("Performing iterative load for %s", current);
+                        entries.push(loadGroupEntries(current, connectionHandler));
+                    }
+                }
+            }
+
+            return realmGroups;
+        }
+
+        private LdapEntry[] loadGroupEntries(LdapEntry entry, LdapConnectionHandler connectionHandler) throws IOException, NamingException {
+            if (searchedPerformed.add(entry) == false) {
+                SECURITY_LOGGER.tracef("A search has already been performed for %s", entry);
+                return new LdapEntry[0];
+            }
+
+            return groupSearcher.search(connectionHandler, entry).getResult();
+        }
+
     }
 
-    @Test
-    public void testEnversonHibernateNativeAPI() throws Exception {
-        SFSBHibernateEnversSessionFactory sfsb = lookup("SFSBHibernateEnversSessionFactory",
-                SFSBHibernateEnversSessionFactory.class);
-        // setup Configuration and SessionFactory
-        sfsb.setupConfig();
-        StudentAudited s1 = sfsb.createStudent("MADHUMITA", "SADHUKHAN", "99 Purkynova REDHAT BRNO CZ", 1);
-        StudentAudited s2 = sfsb.updateStudent("REDHAT Brisbane,Australia", 1);
-        StudentAudited st = sfsb.retrieveOldStudentVersion(s2.getStudentId());
-        assertTrue("address read from audit tables after envers implementation is 99 Purkynova REDHAT BRNO CZ",
-                "99 Purkynova REDHAT BRNO CZ".equals(st.getAddress()));
+    public static final class ServiceUtil {
+
+        private static final String SERVICE_SUFFIX = "ldap-authorization";
+
+        private ServiceUtil() {
+        }
+
+        public static ServiceName createServiceName(final String realmName) {
+            return SecurityRealm.ServiceUtil.createServiceName(realmName).append(SERVICE_SUFFIX);
+        }
+
     }
+
 }

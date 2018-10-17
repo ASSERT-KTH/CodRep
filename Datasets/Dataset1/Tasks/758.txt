@@ -1,6 +1,6 @@
-private static final Logger logger = LoggerFactory.getLogger(ColumnFamilyInputFormat.class);
+Range<RowPosition> range = Util.range("", "");
 
-package org.apache.cassandra.hadoop;
+package org.apache.cassandra.io.sstable;
 /*
  * 
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -23,221 +23,257 @@ package org.apache.cassandra.hadoop;
  */
 
 
+import java.io.File;
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutionException;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Random;
-import java.util.SortedMap;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 
-import org.apache.cassandra.db.IColumn;
+import org.junit.Test;
+
+import org.apache.cassandra.CleanupHelper;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.MmappedSegmentedFile;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.Cassandra;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.TokenRange;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.mapreduce.InputFormat;
-import org.apache.hadoop.mapreduce.InputSplit;
-import org.apache.hadoop.mapreduce.JobContext;
-import org.apache.hadoop.mapreduce.RecordReader;
-import org.apache.hadoop.mapreduce.TaskAttemptContext;
-import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransport;
-import org.apache.thrift.transport.TTransportException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.thrift.IndexClause;
+import org.apache.cassandra.thrift.IndexExpression;
+import org.apache.cassandra.thrift.IndexOperator;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.CLibrary;
+import org.apache.cassandra.utils.Pair;
 
-/**
- * Hadoop InputFormat allowing map/reduce against Cassandra rows within one ColumnFamily.
- *
- * At minimum, you need to set the CF and predicate (description of columns to extract from each row)
- * in your Hadoop job Configuration.  The ConfigHelper class is provided to make this
- * simple:
- *   ConfigHelper.setColumnFamily
- *   ConfigHelper.setSlicePredicate
- *
- * You can also configure the number of rows per InputSplit with
- *   ConfigHelper.setInputSplitSize
- * This should be "as big as possible, but no bigger."  Each InputSplit is read from Cassandra
- * with multiple get_slice_range queries, and the per-call overhead of get_slice_range is high,
- * so larger split sizes are better -- but if it is too large, you will run out of memory.
- *
- * The default split size is 64k rows.
- */
-public class ColumnFamilyInputFormat extends InputFormat<ByteBuffer, SortedMap<ByteBuffer, IColumn>>
+import org.apache.cassandra.Util;
+
+import static org.junit.Assert.assertEquals;
+
+public class SSTableReaderTest extends CleanupHelper
 {
-    private static final Logger logger = LoggerFactory.getLogger(StorageService.class);
-    
-    private String keyspace;
-    private String cfName;
-
-    private static void validateConfiguration(Configuration conf)
+    static Token t(int i)
     {
-        if (ConfigHelper.getInputKeyspace(conf) == null || ConfigHelper.getInputColumnFamily(conf) == null)
+        return StorageService.getPartitioner().getToken(ByteBufferUtil.bytes(String.valueOf(i)));
+    }
+
+    @Test
+    public void testGetPositionsForRanges() throws IOException, ExecutionException, InterruptedException
+    {
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard2");
+
+        // insert data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 10; j++)
         {
-            throw new UnsupportedOperationException("you must set the keyspace and columnfamily with setColumnFamily()");
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard2", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
         }
-        if (ConfigHelper.getInputSlicePredicate(conf) == null)
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store);
+
+        List<Range<Token>> ranges = new ArrayList<Range<Token>>();
+        // 1 key
+        ranges.add(new Range<Token>(t(0), t(1)));
+        // 2 keys
+        ranges.add(new Range<Token>(t(2), t(4)));
+        // wrapping range from key to end
+        ranges.add(new Range<Token>(t(6), StorageService.getPartitioner().getMinimumToken()));
+        // empty range (should be ignored)
+        ranges.add(new Range<Token>(t(9), t(91)));
+
+        // confirm that positions increase continuously
+        SSTableReader sstable = store.getSSTables().iterator().next();
+        long previous = -1;
+        for (Pair<Long,Long> section : sstable.getPositionsForRanges(ranges))
         {
-            throw new UnsupportedOperationException("you must set the predicate with setPredicate");
+            assert previous <= section.left : previous + " ! < " + section.left;
+            assert section.left < section.right : section.left + " ! < " + section.right;
+            previous = section.right;
         }
     }
 
-    public List<InputSplit> getSplits(JobContext context) throws IOException
+    @Test
+    public void testSpannedIndexPositions() throws IOException, ExecutionException, InterruptedException
     {
-        Configuration conf = context.getConfiguration();
+        MmappedSegmentedFile.MAX_SEGMENT_SIZE = 40; // each index entry is ~11 bytes, so this will generate lots of segments
 
-        validateConfiguration(conf);
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
 
-        // cannonical ranges and nodes holding replicas
-        List<TokenRange> masterRangeNodes = getRangeMap(conf);
-
-        keyspace = ConfigHelper.getInputKeyspace(context.getConfiguration());
-        cfName = ConfigHelper.getInputColumnFamily(context.getConfiguration());
-        
-        // cannonical ranges, split into pieces, fetching the splits in parallel 
-        ExecutorService executor = Executors.newCachedThreadPool();
-        List<InputSplit> splits = new ArrayList<InputSplit>();
-
-        try
+        // insert a bunch of data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 100; j += 2)
         {
-            List<Future<List<InputSplit>>> splitfutures = new ArrayList<Future<List<InputSplit>>>();
-            for (TokenRange range : masterRangeNodes)
-            {
-                // for each range, pick a live owner and ask it to compute bite-sized splits
-                splitfutures.add(executor.submit(new SplitCallable(range, conf)));
-            }
-    
-            // wait until we have all the results back
-            for (Future<List<InputSplit>> futureInputSplits : splitfutures)
-            {
-                try
-                {
-                    splits.addAll(futureInputSplits.get());
-                } 
-                catch (Exception e)
-                {
-                    throw new IOException("Could not get input splits", e);
-                } 
-            }
-        } 
-        finally
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard1", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
+        }
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store);
+
+        // check that all our keys are found correctly
+        SSTableReader sstable = store.getSSTables().iterator().next();
+        for (int j = 0; j < 100; j += 2)
         {
-            executor.shutdownNow();
+            DecoratedKey dk = Util.dk(String.valueOf(j));
+            FileDataInput file = sstable.getFileDataInput(dk, DatabaseDescriptor.getIndexedReadBufferSizeInKB() * 1024);
+            DecoratedKey keyInDisk = SSTableReader.decodeKey(sstable.partitioner,
+                                                             sstable.descriptor,
+                                                             ByteBufferUtil.readWithShortLength(file));
+            assert keyInDisk.equals(dk) : String.format("%s != %s in %s", keyInDisk, dk, file.getPath());
         }
 
-        assert splits.size() > 0;
-        Collections.shuffle(splits, new Random(System.nanoTime()));
-        return splits;
-    }
-
-    /**
-     * Gets a token range and splits it up according to the suggested
-     * size into input splits that Hadoop can use. 
-     */
-    class SplitCallable implements Callable<List<InputSplit>>
-    {
-
-        private final TokenRange range;
-        private final Configuration conf;
-
-        public SplitCallable(TokenRange tr, Configuration conf)
+        // check no false positives
+        for (int j = 1; j < 110; j += 2)
         {
-            this.range = tr;
-            this.conf = conf;
-        }
-
-        public List<InputSplit> call() throws Exception
-        {
-            ArrayList<InputSplit> splits = new ArrayList<InputSplit>();
-            List<String> tokens = getSubSplits(keyspace, cfName, range, conf);
-
-            // turn the sub-ranges into InputSplits
-            String[] endpoints = range.endpoints.toArray(new String[range.endpoints.size()]);
-            // hadoop needs hostname, not ip
-            for (int i = 0; i < endpoints.length; i++)
-            {
-                endpoints[i] = InetAddress.getByName(endpoints[i]).getHostName();
-            }
-            
-            for (int i = 1; i < tokens.size(); i++)
-            {
-                ColumnFamilySplit split = new ColumnFamilySplit(tokens.get(i - 1), tokens.get(i), endpoints);
-                logger.debug("adding " + split);
-                splits.add(split);
-            }
-            return splits;
+            DecoratedKey dk = Util.dk(String.valueOf(j));
+            assert sstable.getPosition(dk, SSTableReader.Operator.EQ) == -1;
         }
     }
 
-    private List<String> getSubSplits(String keyspace, String cfName, TokenRange range, Configuration conf) throws IOException
+    @Test
+    public void testPersistentStatistics() throws IOException, ExecutionException, InterruptedException
     {
-        // TODO handle failure of range replicas & retry
-        List<String> splits;
-        int splitsize = ConfigHelper.getInputSplitSize(conf);
-        try
+
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
+
+        for (int j = 0; j < 100; j += 2)
         {
-            Cassandra.Client client = createConnection(range.endpoints.get(0), ConfigHelper.getRpcPort(conf), true);
-            client.set_keyspace(keyspace);
-            splits = client.describe_splits(cfName, range.start_token, range.end_token, splitsize);
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard1", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
         }
-        catch (TException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (InvalidRequestException e)
-        {
-            throw new RuntimeException(e);
-        }
-        return splits;
+        store.forceBlockingFlush();
+
+        store.clearUnsafe();
+        store.loadNewSSTables();
+        assert store.getMaxRowSize() != 0;
     }
 
-    private static Cassandra.Client createConnection(String host, Integer port, boolean framed) throws IOException
+    @Test
+    public void testGetPositionsForRangesWithKeyCache() throws IOException, ExecutionException, InterruptedException
     {
-        TSocket socket = new TSocket(host, port);
-        TTransport trans = framed ? new TFramedTransport(socket) : socket;
-        try
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard2");
+        store.getKeyCache().setCapacity(100);
+
+        // insert data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 10; j++)
         {
-            trans.open();
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard2", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
         }
-        catch (TTransportException e)
-        {
-            throw new IOException("unable to connect to server", e);
-        }
-        return new Cassandra.Client(new TBinaryProtocol(trans));
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store);
+
+        SSTableReader sstable = store.getSSTables().iterator().next();
+        long p2 = sstable.getPosition(k(2), SSTableReader.Operator.EQ);
+        long p3 = sstable.getPosition(k(3), SSTableReader.Operator.EQ);
+        long p6 = sstable.getPosition(k(6), SSTableReader.Operator.EQ);
+        long p7 = sstable.getPosition(k(7), SSTableReader.Operator.EQ);
+
+        Pair<Long, Long> p = sstable.getPositionsForRanges(makeRanges(t(2), t(6))).iterator().next();
+
+        // range are start exclusive so we should start at 3
+        assert p.left == p3;
+
+        // to capture 6 we have to stop at the start of 7
+        assert p.right == p7;
     }
 
-    private List<TokenRange> getRangeMap(Configuration conf) throws IOException
+    @Test
+    public void testPersistentStatisticsWithSecondaryIndex() throws IOException, ExecutionException, InterruptedException
     {
-        Cassandra.Client client = createConnection(ConfigHelper.getInitialAddress(conf), ConfigHelper.getRpcPort(conf), true);
+        // Create secondary index and flush to disk
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Indexed1");
+        ByteBuffer key = ByteBufferUtil.bytes(String.valueOf("k1"));
+        RowMutation rm = new RowMutation("Keyspace1", key);
+        rm.add(new QueryPath("Indexed1", null, ByteBufferUtil.bytes("birthdate")), ByteBufferUtil.bytes(1L), System.currentTimeMillis());
+        rm.apply();
+        store.forceBlockingFlush();
 
-        List<TokenRange> map;
-        try
-        {
-            map = client.describe_ring(ConfigHelper.getInputKeyspace(conf));
-        }
-        catch (TException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (InvalidRequestException e)
-        {
-            throw new RuntimeException(e);
-        }
-        return map;
+        // check if opening and querying works
+        assertIndexQueryWorks(store);
     }
 
-    public RecordReader<ByteBuffer, SortedMap<ByteBuffer, IColumn>> createRecordReader(InputSplit inputSplit, TaskAttemptContext taskAttemptContext) throws IOException, InterruptedException
+    @Test
+    public void testPersistentStatisticsFromOlderIndexedSSTable() throws IOException, ExecutionException, InterruptedException
     {
-        return new ColumnFamilyRecordReader();
+        // copy legacy indexed sstables
+        String root = System.getProperty("legacy-sstable-root");
+        assert root != null;
+        File rootDir = new File(root + File.separator + "hb" + File.separator + "Keyspace1");
+        assert rootDir.isDirectory();
+
+        String[] destDirs = DatabaseDescriptor.getAllDataFileLocationsForTable("Keyspace1");
+        assert destDirs != null;
+        assert destDirs.length > 0;
+
+        FileUtils.createDirectory(destDirs[0]);
+        for (File srcFile : rootDir.listFiles())
+        {
+            if (!srcFile.getName().startsWith("Indexed1"))
+                continue;
+            File destFile = new File(destDirs[0] + File.separator + srcFile.getName());
+            CLibrary.createHardLinkWithExec(srcFile, destFile);
+
+            destFile = new File(destDirs[0] + File.separator + srcFile.getName());
+
+            assert destFile.exists() : destFile.getAbsoluteFile();
+        }
+        ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Indexed1");
+
+        // check if opening and querying works
+        assertIndexQueryWorks(store);
+    }
+
+    private void assertIndexQueryWorks(ColumnFamilyStore indexedCFS)
+    {
+        assert "Indexed1".equals(indexedCFS.getColumnFamilyName());
+
+        // make sure all sstables including 2ary indexes load from disk
+        indexedCFS.clearUnsafe();
+        for (ColumnFamilyStore indexCfs : indexedCFS.indexManager.getIndexesBackedByCfs())
+        {
+            indexCfs.clearUnsafe();
+            indexCfs.loadNewSSTables(); // v1.0.4 would fail here (see CASSANDRA-3540)
+        }
+        indexedCFS.loadNewSSTables();
+
+        // query using index to see if sstable for secondary index opens
+        IndexExpression expr = new IndexExpression(ByteBufferUtil.bytes("birthdate"), IndexOperator.EQ, ByteBufferUtil.bytes(1L));
+        IndexClause clause = new IndexClause(Arrays.asList(expr), ByteBufferUtil.EMPTY_BYTE_BUFFER, 100);
+        IPartitioner p = StorageService.getPartitioner();
+        Range range = new Range(p.getMinimumToken(), p.getMinimumToken());
+        List<Row> rows = indexedCFS.search(clause, range, new IdentityQueryFilter());
+        assert rows.size() == 1;
+    }
+
+    private List<Range<Token>> makeRanges(Token left, Token right)
+    {
+        return Arrays.<Range<Token>>asList(new Range[]{ new Range<Token>(left, right) });
+    }
+
+    private DecoratedKey k(int i)
+    {
+        return new DecoratedKey(t(i), ByteBufferUtil.bytes(String.valueOf(i)));
     }
 }

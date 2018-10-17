@@ -2,7 +2,7 @@ import org.jboss.as.controller.ControllerLogger;
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2013, Red Hat, Inc., and individual contributors
+ * Copyright 2012, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,215 +22,243 @@ import org.jboss.as.controller.ControllerLogger;
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.controller.access.constraint;
-
-import java.util.Collection;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
+package org.jboss.as.controller.remote;
 
 import org.jboss.as.controller.logging.ControllerLogger;
-import org.jboss.as.controller.access.Action;
-import org.jboss.as.controller.access.HostEffect;
-import org.jboss.as.controller.access.TargetAttribute;
-import org.jboss.as.controller.access.TargetResource;
-import org.jboss.as.controller.access.rbac.StandardRole;
+import org.jboss.as.controller.descriptions.ModelDescriptionConstants;
+import org.jboss.dmr.ModelNode;
+import org.jboss.threads.AsyncFuture;
+
+import java.util.Collection;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
- * Constraint related to whether the target resource is associated with one or more managed domain hosts.
+ * Basic operation listener backed by a blocking queue. If the limit of the queue is reached prepared operations
+ * are going to be rolled back automatically.
  *
- * @author Brian Stansberry (c) 2013 Red Hat Inc.
+ * @param <T> the operation type
  */
-public class HostEffectConstraint extends AbstractConstraint implements Constraint, ScopingConstraint {
+public class BlockingQueueOperationListener<T extends TransactionalProtocolClient.Operation> implements TransactionalProtocolClient.TransactionalOperationListener<T> {
 
+    private final BlockingQueue<TransactionalProtocolClient.PreparedOperation<T>> queue;
 
-    public static final ScopingConstraintFactory FACTORY = new Factory();
-
-    private static final HostEffectConstraint GLOBAL_USER = new HostEffectConstraint(true);
-    private static final HostEffectConstraint GLOBAL_REQUIRED = new HostEffectConstraint(false);
-
-    private final boolean user;
-    private final boolean global;
-    private final HostsHolder hostsHolder;
-    private final boolean readOnly;
-    private final HostEffectConstraint readOnlyConstraint;
-
-    private HostEffectConstraint(final boolean user) {
-        super();
-        this.user = user;
-        this.global = true;
-        this.readOnly = false;
-        this.readOnlyConstraint = null;
-        this.hostsHolder = new HostsHolder();
+    public BlockingQueueOperationListener() {
+        this(new LinkedBlockingQueue<TransactionalProtocolClient.PreparedOperation<T>>());
     }
 
-    private HostEffectConstraint(Set<String> allowed) {
-        super();
-        this.user = false;
-        this.global = false;
-        this.hostsHolder = new HostsHolder(allowed);
-        this.readOnly = false;
-        this.readOnlyConstraint = null;
+    public BlockingQueueOperationListener(final int capacity) {
+        this(new ArrayBlockingQueue<TransactionalProtocolClient.PreparedOperation<T>>(capacity));
     }
 
-    public HostEffectConstraint(List<String> allowed) {
-        super();
-        this.user = true;
-        this.global = false;
-        this.hostsHolder = new HostsHolder(allowed);
-        this.readOnly = false;
-        this.readOnlyConstraint = new HostEffectConstraint(this.hostsHolder, true);
+    public BlockingQueueOperationListener(final BlockingQueue<TransactionalProtocolClient.PreparedOperation<T>> queue) {
+        this.queue = queue;
+    }
+
+    @Override
+    public void operationPrepared(final TransactionalProtocolClient.PreparedOperation<T> prepared) {
+        ControllerLogger.MGMT_OP_LOGGER.tracef("received prepared operation  %s", prepared.getOperation());
+        if(! queue.offer(prepared)) {
+            prepared.rollback();
+        }
+    }
+
+    @Override
+    public void operationFailed(T operation, ModelNode result) {
+        ControllerLogger.MGMT_OP_LOGGER.tracef("received failed operation  %s", operation);
+        queue.offer(new FailedOperation<T>(operation, result));
+    }
+
+    @Override
+    public void operationComplete(T operation, ModelNode result) {
+        //
     }
 
     /**
-     * Creates the constraint the standard constraint will return from {@link #getOutofScopeReadConstraint()}
-     * Only call from {@link HostEffectConstraint#HostEffectConstraint(java.util.List)}
+     * Retrieves and removes the head of the underlying queue, waiting if necessary until an element becomes available.
+     *
+     * @return the prepared operation
+     * @throws InterruptedException
      */
-    private HostEffectConstraint(HostsHolder hostsHolder, boolean readOnly) {
-        super();
-        this.user = true;
-        this.global = false;
-        this.hostsHolder = hostsHolder;
-        this.readOnly = readOnly;
-        this.readOnlyConstraint = null;
+    public TransactionalProtocolClient.PreparedOperation<T> retrievePreparedOperation() throws InterruptedException {
+        return queue.take();
     }
 
-    public void setAllowedHosts(List<String> allowed) {
-        assert !global : "constraint is global";
-        assert readOnlyConstraint != null : "invalid cast";
-        this.hostsHolder.specific = new LinkedHashSet<String>(allowed);
+    protected void drainTo(final Collection<TransactionalProtocolClient.PreparedOperation<T>> collection) {
+        if(queue.size() > 0) {
+            queue.drainTo(collection);
+        }
     }
 
-    @Override
-    public boolean violates(Constraint other, Action.ActionEffect actionEffect) {
-        if (other instanceof HostEffectConstraint) {
-            HostEffectConstraint hec = (HostEffectConstraint) other;
-            Set<String> ourSpecific = hostsHolder.specific;
-            Set<String> hecSpecific = hec.hostsHolder.specific;
-            if (user) {
-                assert !hec.user : "illegal comparison";
-                if (readOnly) {
-                    // Allow global or any matching server group
-                    if (!hec.global) {
-                        boolean anyMatch = anyMatch(ourSpecific, hecSpecific);
-                        if (!anyMatch) ControllerLogger.ACCESS_LOGGER.tracef("read-only host constraint violated " +
-                                "for action %s due to no match between hosts %s and allowed hosts %s",
-                                actionEffect, hecSpecific, ourSpecific);
-                        return !anyMatch;
-                    }
-                } else if (!global) {
-                    if (hec.global) {
-                        // Only the readOnlyConstraint gets global
-                        ControllerLogger.ACCESS_LOGGER.tracef("host constraint violated for action %s due to " +
-                                "requirement for access to global resources", actionEffect);
-                        return true;
-                    } else {
-                        if (actionEffect == Action.ActionEffect.WRITE_RUNTIME || actionEffect == Action.ActionEffect.WRITE_CONFIG) {
-                            //  Writes must not effect other groups
-                            boolean containsAll = ourSpecific.containsAll(hecSpecific);
-                            if (!containsAll) {
-                                ControllerLogger.ACCESS_LOGGER.tracef("host constraint violated for action %s due to " +
-                                        "mismatch of hosts %s vs hosts %s", actionEffect, hecSpecific, ourSpecific);
-                            }
-                            return !containsAll;
-                        } else {
-                            // Reads ok as long as one of our groups match
-                            boolean anyMatch = anyMatch(ourSpecific, hecSpecific);
-                            if (!anyMatch) ControllerLogger.ACCESS_LOGGER.tracef("host constraint violated " +
-                                    "for action %s due to no match between hosts %s and allowed hosts %s",
-                                    actionEffect, hecSpecific, ourSpecific);
-                            return !anyMatch;
-                        }
-                    } // else fall through
-                }
-            } else {
-                assert hec.user : "illegal comparison";
-                return other.violates(this, actionEffect);
+    /**
+     * Retrieves and removes the head of this queue, waiting up to the specified wait time if necessary for an element to become available.
+     *
+     * @param timeout the timeout
+     * @param timeUnit the time unit
+     * @return the prepared operation
+     * @throws InterruptedException
+     */
+    public TransactionalProtocolClient.PreparedOperation<T> retrievePreparedOperation(final long timeout, final TimeUnit timeUnit) throws InterruptedException {
+        return queue.poll(timeout, timeUnit);
+    }
+
+    public static class FailedOperation<T extends TransactionalProtocolClient.Operation> implements TransactionalProtocolClient.PreparedOperation<T> {
+
+        private final T operation;
+        private final ModelNode finalResult;
+
+        /**
+         * Create a failed operation.
+         *
+         * @param operation the operation
+         * @param t the throwable
+         * @param <T> the operation type
+         * @return the failed operation
+         */
+        public static <T extends TransactionalProtocolClient.Operation> TransactionalProtocolClient.PreparedOperation<T> create(final T operation, final Throwable t) {
+            final String failureDescription = t.getLocalizedMessage() == null ? t.getClass().getName() : t.getLocalizedMessage();
+            return create(operation, failureDescription);
+        }
+
+        /**
+         * Create a failed operation.
+         *
+         * @param operation the operation
+         * @param failureDescription the failure description
+         * @param <T> the operation type
+         * @return the failed operation
+         */
+        public static <T extends TransactionalProtocolClient.Operation> TransactionalProtocolClient.PreparedOperation<T> create(final T operation, final String failureDescription) {
+            final ModelNode failedResult = new ModelNode();
+            failedResult.get(ModelDescriptionConstants.OUTCOME).set(ModelDescriptionConstants.FAILED);
+            failedResult.get(ModelDescriptionConstants.FAILURE_DESCRIPTION).set(failureDescription);
+            return new FailedOperation<T>(operation, failedResult);
+        }
+
+        public FailedOperation(final T operation, final ModelNode finalResult) {
+            this.operation = operation;
+            this.finalResult = finalResult;
+        }
+
+        @Override
+        public T getOperation() {
+            return operation;
+        }
+
+        @Override
+        public ModelNode getPreparedResult() {
+            return finalResult;
+        }
+
+        @Override
+        public boolean isDone() {
+            return true;
+        }
+
+        @Override
+        public boolean isFailed() {
+            return true;
+        }
+
+        @Override
+        public AsyncFuture<ModelNode> getFinalResult() {
+            return new CompletedResult<ModelNode>(finalResult);
+        }
+
+        @Override
+        public void commit() {
+            throw new IllegalStateException();
+        }
+
+        @Override
+        public void rollback() {
+            throw new IllegalStateException();
+        }
+
+    }
+
+    static class CompletedResult<T> implements AsyncFuture<T> {
+        private final T result;
+        CompletedResult(T result) {
+            this.result = result;
+        }
+
+        @Override
+        public Status await() throws InterruptedException {
+            return Status.COMPLETE;
+        }
+
+        @Override
+        public Status await(long timeout, TimeUnit unit) throws InterruptedException {
+            return Status.COMPLETE;
+        }
+
+        @Override
+        public T getUninterruptibly() throws CancellationException, ExecutionException {
+            return result;
+        }
+
+        @Override
+        public T getUninterruptibly(long timeout, TimeUnit unit) throws CancellationException, ExecutionException, TimeoutException {
+            return result;
+        }
+
+        @Override
+        public Status awaitUninterruptibly() {
+            return Status.COMPLETE;
+        }
+
+        @Override
+        public Status awaitUninterruptibly(long timeout, TimeUnit unit) {
+            return Status.COMPLETE;
+        }
+
+        @Override
+        public Status getStatus() {
+            return Status.COMPLETE;
+        }
+
+        @Override
+        public <A> void addListener(Listener<? super T, A> listener, A attachment) {
+            if(listener != null) {
+                listener.handleComplete(this, attachment);
             }
         }
-        return false;
-    }
-
-    private boolean anyMatch(Set<String> ourSpecific, Set<String> hecSpecific) {
-
-        boolean matched = false;
-        for (String ourGroup : ourSpecific) {
-            if (hecSpecific.contains(ourGroup)) {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) {
-            // WFLY-2089
-            matched = hecSpecific.size() == 1 && hecSpecific.contains("*");
-        }
-        return matched;
-    }
-
-
-    @Override
-    public boolean replaces(Constraint other) {
-        return other instanceof HostEffectConstraint && (readOnly || readOnlyConstraint != null);
-    }
-
-    // Scoping Constraint
-
-    @Override
-    public ScopingConstraintFactory getFactory() {
-        assert readOnlyConstraint != null : "invalid cast";
-        return FACTORY;
-    }
-
-    @Override
-    public Constraint getStandardConstraint() {
-        assert readOnlyConstraint != null : "invalid cast";
-        return this;
-    }
-
-    @Override
-    public Constraint getOutofScopeReadConstraint() {
-        assert readOnlyConstraint != null : "invalid cast";
-        return readOnlyConstraint;
-    }
-
-    private static class HostsHolder {
-        private volatile Set<String> specific = new LinkedHashSet<String>();
-        private HostsHolder() {
-            // no-op
-        }
-        private HostsHolder(Collection<String> hosts) {
-            this.specific.addAll(hosts);
-        }
-    }
-
-    private static class Factory extends AbstractConstraintFactory implements ScopingConstraintFactory {
 
         @Override
-        public Constraint getStandardUserConstraint(StandardRole role, Action.ActionEffect actionEffect) {
-            return GLOBAL_USER;
+        public boolean cancel(boolean interruptionDesired) {
+            return false;
         }
 
         @Override
-        public Constraint getRequiredConstraint(Action.ActionEffect actionEffect, Action action, TargetAttribute target) {
-            return getRequiredConstraint(target.getHostEffect());
+        public void asyncCancel(boolean interruptionDesired) {
+            //
         }
 
         @Override
-        public Constraint getRequiredConstraint(Action.ActionEffect actionEffect, Action action, TargetResource target) {
-            return getRequiredConstraint(target.getHostEffect());
-        }
-
-        private Constraint getRequiredConstraint(HostEffect hostEffect) {
-            if (hostEffect == null || hostEffect.isHostEffectGlobal()) {
-                return GLOBAL_REQUIRED;
-            }
-            return new HostEffectConstraint(hostEffect.getAffectedHosts());
+        public boolean isCancelled() {
+            return false;
         }
 
         @Override
-        protected int internalCompare(AbstractConstraintFactory other) {
-            // We prefer going first
-            return this.equals(other) ? 0 : -1;
+        public boolean isDone() {
+            return true;
+        }
+
+        @Override
+        public T get() throws InterruptedException, ExecutionException {
+            return result;
+        }
+
+        @Override
+        public T get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+            return result;
         }
     }
+
 }

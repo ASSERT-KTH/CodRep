@@ -1,4 +1,4 @@
-RowMutation rm = RowMutation.fromBytes(message.getMessageBody(), message.getVersion());
+? CompressedRandomAccessReader.open(header.file.getFilename(), header.file.sstable.getCompressionMetadata(), true)
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,102 +18,216 @@ RowMutation rm = RowMutation.fromBytes(message.getMessageBody(), message.getVers
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
+package org.apache.cassandra.streaming;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
+import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetAddress;
-import java.net.UnknownHostException;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 
-import com.google.common.base.Charsets;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.io.compress.CompressedRandomAccessReader;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.Throttle;
+import org.apache.cassandra.utils.WrappedRunnable;
+
+import com.ning.compress.lzf.LZFOutputStream;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-
-
-public class RowMutationVerbHandler implements IVerbHandler
+public class FileStreamTask extends WrappedRunnable
 {
-    private static Logger logger_ = LoggerFactory.getLogger(RowMutationVerbHandler.class);
+    private static Logger logger = LoggerFactory.getLogger(FileStreamTask.class);
+    
+    public static final int CHUNK_SIZE = 64 * 1024;
+    // around 10 minutes at the default rpctimeout
+    public static final int MAX_CONNECT_ATTEMPTS = 8;
 
-    public void doVerb(Message message)
+    protected final StreamHeader header;
+    protected final InetAddress to;
+
+    // communication socket
+    private Socket socket;
+    // socket's output stream
+    private OutputStream output;
+    // allocate buffer to use for transfers only once
+    private final byte[] transferBuffer = new byte[CHUNK_SIZE];
+    // outbound global throughput limiter
+    private final Throttle throttle;
+
+    public FileStreamTask(StreamHeader header, InetAddress to)
+    {
+        this.header = header;
+        this.to = to;
+        this.throttle = new Throttle(toString(), new Throttle.ThroughputFunction()
+        {
+            /** @return Instantaneous throughput target in bytes per millisecond. */
+            public int targetThroughput()
+            {
+                if (DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() < 1)
+                    // throttling disabled
+                    return 0;
+                // total throughput
+                int totalBytesPerMS = DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() * 1024 * 1024 / 8 / 1000;
+                // per stream throughput (target bytes per MS)
+                return totalBytesPerMS / Math.max(1, MessagingService.instance().getActiveStreamsOutbound());
+            }
+        });
+    }
+    
+    public void runMayThrow() throws IOException
     {
         try
         {
-            RowMutation rm = RowMutation.fromBytes(message.getMessageBody());
-            if (logger_.isDebugEnabled())
-              logger_.debug("Applying " + rm);
-
-            /* Check if there were any hints in this message */
-            byte[] hintedBytes = message.getHeader(RowMutation.HINT);
-            if (hintedBytes != null)
+            connectAttempt();
+            // successfully connected: stream.
+            // (at this point, if we fail, it is the receiver's job to re-request)
+            stream();
+        }
+        finally
+        {
+            try
             {
-                assert hintedBytes.length > 0;
-                DataInputStream dis = new DataInputStream(new ByteArrayInputStream(hintedBytes));
-                while (dis.available() > 0)
+                close();
+            }
+            catch (IOException e)
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("error closing socket", e);
+            }
+        }
+        if (logger.isDebugEnabled())
+            logger.debug("Done streaming " + header.file);
+    }
+
+    /**
+     * Stream file by it's sections specified by this.header
+     * @throws IOException on any I/O error
+     */
+    private void stream() throws IOException
+    {
+        ByteBuffer HeaderBuffer = MessagingService.instance().constructStreamHeader(header, false, Gossiper.instance.getVersion(to));
+        // write header (this should not be compressed for compatibility with other messages)
+        output.write(ByteBufferUtil.getArray(HeaderBuffer));
+
+        if (header.file == null)
+            return;
+
+        // TODO just use a raw RandomAccessFile since we're managing our own buffer here
+        RandomAccessReader file = (header.file.sstable.compression) // try to skip kernel page cache if possible
+                                ? CompressedRandomAccessReader.open(header.file.getFilename(), true)
+                                : RandomAccessReader.open(new File(header.file.getFilename()), true);
+
+        // setting up data compression stream
+        output = new LZFOutputStream(output);
+
+        try
+        {
+            // stream each of the required sections of the file
+            for (Pair<Long, Long> section : header.file.sections)
+            {
+                // seek to the beginning of the section
+                file.seek(section.left);
+
+                // length of the section to stream
+                long length = section.right - section.left;
+                // tracks write progress
+                long bytesTransferred = 0;
+
+                while (bytesTransferred < length)
                 {
-                    ByteBuffer addressBytes = ByteBufferUtil.readWithShortLength(dis);
-                    if (logger_.isDebugEnabled())
-                        logger_.debug("Adding hint for " + InetAddress.getByName(ByteBufferUtil.string(addressBytes, Charsets.UTF_8)));
-                    RowMutation hintedMutation = new RowMutation(Table.SYSTEM_TABLE, addressBytes);
-                    hintedMutation.addHints(rm);
-                    hintedMutation.apply();
+                    long lastWrite = write(file, length, bytesTransferred);
+                    bytesTransferred += lastWrite;
+                    // store streaming progress
+                    header.file.progress += lastWrite;
+                }
+
+                // make sure that current section is send
+                output.flush();
+
+                if (logger.isDebugEnabled())
+                    logger.debug("Bytes transferred " + bytesTransferred + "/" + header.file.size);
+            }
+        }
+        finally
+        {
+            // no matter what happens close file
+            FileUtils.closeQuietly(file);
+        }
+    }
+
+    /**
+     * Sequentially read bytes from the file and write them to the output stream
+     *
+     * @param reader The file reader to read from
+     * @param length The full length that should be transferred
+     * @param bytesTransferred Number of bytes remaining to transfer
+     *
+     * @return Number of bytes transferred
+     *
+     * @throws IOException on any I/O error
+     */
+    protected long write(RandomAccessReader reader, long length, long bytesTransferred) throws IOException
+    {
+        int toTransfer = (int) Math.min(CHUNK_SIZE, length - bytesTransferred);
+
+        reader.readFully(transferBuffer, 0, toTransfer);
+        output.write(transferBuffer, 0, toTransfer);
+        throttle.throttleDelta(toTransfer);
+
+        return toTransfer;
+    }
+
+    /**
+     * Connects to the destination, with backoff for failed attempts.
+     * TODO: all nodes on a cluster must currently use the same storage port
+     * @throws IOException If all attempts fail.
+     */
+    private void connectAttempt() throws IOException
+    {
+        int attempts = 0;
+        while (true)
+        {
+            try
+            {
+                socket = MessagingService.instance().getConnectionPool(to).newSocket();
+                output = socket.getOutputStream();
+                break;
+            }
+            catch (IOException e)
+            {
+                if (++attempts >= MAX_CONNECT_ATTEMPTS)
+                    throw e;
+
+                long waitms = DatabaseDescriptor.getRpcTimeout() * (long)Math.pow(2, attempts);
+                logger.warn("Failed attempt " + attempts + " to connect to " + to + " to stream " + header.file + ". Retrying in " + waitms + " ms. (" + e + ")");
+                try
+                {
+                    Thread.sleep(waitms);
+                }
+                catch (InterruptedException wtf)
+                {
+                    throw new RuntimeException(wtf);
                 }
             }
-        
-            // Check if there were any forwarding headers in this message
-            byte[] forwardBytes = message.getHeader(RowMutation.FORWARD_HEADER);
-            if (forwardBytes != null)
-                forwardToLocalNodes(message, forwardBytes);
-
-            Table.open(rm.getTable()).apply(rm, true);
-
-            WriteResponse response = new WriteResponse(rm.getTable(), rm.key(), true);
-            Message responseMessage = WriteResponse.makeWriteResponseMessage(message, response);
-            if (logger_.isDebugEnabled())
-              logger_.debug(rm + " applied.  Sending response to " + message.getMessageId() + "@" + message.getFrom());
-            MessagingService.instance().sendOneWay(responseMessage, message.getFrom());
         }
-        catch (IOException e)
-        {
-            logger_.error("Error in row mutation", e);
-        }
-    }  
-    
-    private void forwardToLocalNodes(Message message, byte[] forwardBytes) throws UnknownHostException
+    }
+
+    protected void close() throws IOException
     {
-        // remove fwds from message to avoid infinite loop
-        message.removeHeader(RowMutation.FORWARD_HEADER);
+        output.close();
+    }
 
-        int bytesPerInetAddress = FBUtilities.getLocalAddress().getAddress().length;
-        assert forwardBytes.length >= bytesPerInetAddress;
-        assert forwardBytes.length % bytesPerInetAddress == 0;
-
-        int offset = 0;
-        byte[] addressBytes = new byte[bytesPerInetAddress];
-
-        // Send a message to each of the addresses on our Forward List
-        while (offset < forwardBytes.length)
-        {
-            System.arraycopy(forwardBytes, offset, addressBytes, 0, bytesPerInetAddress);
-            InetAddress address = InetAddress.getByAddress(addressBytes);
-
-            if (logger_.isDebugEnabled())
-                logger_.debug("Forwarding message to " + address);
-
-            // Send the original message to the address specified by the FORWARD_HINT
-            // Let the response go back to the coordinator
-            MessagingService.instance().sendOneWay(message, address);
-
-            offset += bytesPerInetAddress;
-        }
+    public String toString()
+    {
+        return String.format("FileStreamTask(session=%s, to=%s)", header.sessionId, to);
     }
 }

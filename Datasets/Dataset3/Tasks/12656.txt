@@ -1,115 +1,192 @@
-final ServiceName serviceName = MailSessionAdd.MAIL_SESSION_SERVICE_NAME.append(jndiName);
+Set<Partition> latestPartitions = new HashSet();
 
-/*
- * JBoss, Home of Professional Open Source.
- * Copyright 2012, Red Hat, Inc., and individual contributors
- * as indicated by the @author tags. See the copyright.txt file in the
- * distribution for a full listing of individual contributors.
- *
- * This is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Lesser General Public License as
- * published by the Free Software Foundation; either version 2.1 of
- * the License, or (at your option) any later version.
- *
- * This software is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this software; if not, write to the Free
- * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
- */
+package storm.kafka;
 
-package org.jboss.as.mail.extension;
+import backtype.storm.Config;
+import backtype.storm.metric.api.IMetric;
+import backtype.storm.spout.SpoutOutputCollector;
+import backtype.storm.task.TopologyContext;
+import backtype.storm.topology.OutputFieldsDeclarer;
+import backtype.storm.topology.base.BaseRichSpout;
+import kafka.message.Message;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import storm.kafka.PartitionManager.KafkaMessageId;
+import storm.kafka.trident.KafkaUtils;
 
-import org.jboss.as.controller.AbstractWriteAttributeHandler;
-import org.jboss.as.controller.AttributeDefinition;
-import org.jboss.as.controller.OperationContext;
-import org.jboss.as.controller.OperationFailedException;
-import org.jboss.as.controller.PathAddress;
-import org.jboss.as.controller.ReloadRequiredRemoveStepHandler;
-import org.jboss.as.controller.ReloadRequiredWriteAttributeHandler;
-import org.jboss.as.controller.SimpleAttributeDefinition;
-import org.jboss.as.controller.SimpleAttributeDefinitionBuilder;
-import org.jboss.as.controller.SimpleResourceDefinition;
-import org.jboss.as.controller.registry.ManagementResourceRegistration;
-import org.jboss.dmr.ModelNode;
-import org.jboss.dmr.ModelType;
-import org.jboss.msc.service.ServiceController;
-import org.jboss.msc.service.ServiceName;
+import java.util.*;
 
-/**
- * @author Tomaz Cerar
- * @created 19.12.11 21:04
- */
-class MailSessionDefinition extends SimpleResourceDefinition {
+// TODO: need to add blacklisting
+// TODO: need to make a best effort to not re-emit messages if don't have to
+public class KafkaSpout extends BaseRichSpout {
+    public static class MessageAndRealOffset {
+        public Message msg;
+        public long offset;
 
-    static final MailSessionDefinition INSTANCE = new MailSessionDefinition();
-
-    private MailSessionDefinition() {
-        super(MailExtension.MAIL_SESSION_PATH,
-                MailExtension.getResourceDescriptionResolver(MailSubsystemModel.MAIL_SESSION),
-                MailSessionAdd.INSTANCE, ReloadRequiredRemoveStepHandler.INSTANCE);
+        public MessageAndRealOffset(Message msg, long offset) {
+            this.msg = msg;
+            this.offset = offset;
+        }
     }
 
-    protected static final SimpleAttributeDefinition JNDI_NAME =
-            new SimpleAttributeDefinitionBuilder(MailSubsystemModel.JNDI_NAME, ModelType.STRING, false)
-                    .setAllowExpression(true)
-                    .setRestartAllServices()
-                    .build();
-    protected static final SimpleAttributeDefinition FROM =
-            new SimpleAttributeDefinitionBuilder(MailSubsystemModel.FROM, ModelType.STRING, true)
-                    .setRestartAllServices()
-                    .setAllowExpression(true)
-                    .setAllowNull(true)
-                    .build();
-    protected static final SimpleAttributeDefinition DEBUG =
-            new SimpleAttributeDefinitionBuilder(MailSubsystemModel.DEBUG, ModelType.BOOLEAN, true)
-                    .setAllowExpression(true)
-                    .setDefaultValue(new ModelNode(false))
-                    .setRestartAllServices()
-                    .build();
+    static enum EmitState {
+        EMITTED_MORE_LEFT,
+        EMITTED_END,
+        NO_EMITTED
+    }
 
-    private static final AttributeDefinition[] ATTRIBUTES = {DEBUG, JNDI_NAME, FROM};
+    public static final Logger LOG = LoggerFactory.getLogger(KafkaSpout.class);
+
+    String _uuid = UUID.randomUUID().toString();
+    SpoutConfig _spoutConfig;
+    SpoutOutputCollector _collector;
+    PartitionCoordinator _coordinator;
+    DynamicPartitionConnections _connections;
+    ZkState _state;
+
+    long _lastUpdateMs = 0;
+
+    int _currPartitionIndex = 0;
+
+    public KafkaSpout(SpoutConfig spoutConf) {
+        _spoutConfig = spoutConf;
+    }
 
     @Override
-    public void registerAttributes(final ManagementResourceRegistration rootResourceRegistration) {
-        ReloadRequiredWriteAttributeHandler handler = new ReloadRequiredWriteAttributeHandler(ATTRIBUTES);
-        for (AttributeDefinition attr : ATTRIBUTES) {
-            rootResourceRegistration.registerReadWriteAttribute(attr, null, handler);
+    public void open(Map conf, final TopologyContext context, final SpoutOutputCollector collector) {
+        _collector = collector;
+
+	Map stateConf = new HashMap(conf);
+        List<String> zkServers = _spoutConfig.zkServers;
+        if(zkServers==null) zkServers = (List<String>) conf.get(Config.STORM_ZOOKEEPER_SERVERS);
+        Integer zkPort = _spoutConfig.zkPort;
+        if(zkPort==null) zkPort = ((Number) conf.get(Config.STORM_ZOOKEEPER_PORT)).intValue();
+        stateConf.put(Config.TRANSACTIONAL_ZOOKEEPER_SERVERS, zkServers);
+        stateConf.put(Config.TRANSACTIONAL_ZOOKEEPER_PORT, zkPort);
+        stateConf.put(Config.TRANSACTIONAL_ZOOKEEPER_ROOT, _spoutConfig.zkRoot);
+	    _state = new ZkState(stateConf);
+
+        _connections = new DynamicPartitionConnections(_spoutConfig, KafkaUtils.makeBrokerReader(conf, _spoutConfig));
+
+        // using TransactionalState like this is a hack
+        int totalTasks = context.getComponentTasks(context.getThisComponentId()).size();
+        if(_spoutConfig.hosts instanceof StaticHosts) {
+            _coordinator = new StaticCoordinator(_connections, conf, _spoutConfig, _state, context.getThisTaskIndex(), totalTasks, _uuid);
+        } else {
+            _coordinator = new ZkCoordinator(_connections, conf, _spoutConfig, _state, context.getThisTaskIndex(), totalTasks, _uuid);
         }
-    }
 
-    private static class SessionAttributeWriteHandler extends AbstractWriteAttributeHandler {
-        protected static SessionAttributeWriteHandler INSTANCE = new SessionAttributeWriteHandler();
-
-        private SessionAttributeWriteHandler() {
-            super(ATTRIBUTES);
-        }
-
-        @Override
-        protected boolean applyUpdateToRuntime(OperationContext context, ModelNode operation, String attributeName, ModelNode resolvedValue, ModelNode currentValue, HandbackHolder handbackHolder) throws OperationFailedException {
-            String jndiName = JNDI_NAME.resolveModelAttribute(context, context.readResource(PathAddress.EMPTY_ADDRESS).getModel()).asString();
-            final ServiceName serviceName = MailSessionAdd.SERVICE_NAME_BASE.append(jndiName);
-            AttributeDefinition def = getAttributeDefinition(attributeName);
-            ServiceController svcCtrl = context.getServiceRegistry(false).getService(serviceName);
-            context.removeService(svcCtrl);
-            MailSessionService service = (MailSessionService) svcCtrl.getService();
-            if (def == DEBUG) {
-                service.getConfig().setDebug(resolvedValue.asBoolean());
-            } else if (def == FROM) {
-                service.getConfig().setFrom(resolvedValue.asString());
+        context.registerMetric("kafkaOffset", new IMetric() {
+            KafkaUtils.KafkaOffsetMetric _kafkaOffsetMetric = new KafkaUtils.KafkaOffsetMetric(_spoutConfig.topic, _connections);
+            @Override
+            public Object getValueAndReset() {
+                List<PartitionManager> pms = _coordinator.getMyManagedPartitions();
+                Set<GlobalPartitionId> latestPartitions = new HashSet();
+                for(PartitionManager pm : pms) { latestPartitions.add(pm.getPartition()); }
+                _kafkaOffsetMetric.refreshPartitions(latestPartitions);
+                for(PartitionManager pm : pms) {
+                    _kafkaOffsetMetric.setLatestEmittedOffset(pm.getPartition(), pm.lastCompletedOffset());
+                }
+                return _kafkaOffsetMetric.getValueAndReset();
             }
-            return false;
+        }, 60);
+
+        context.registerMetric("kafkaPartition", new IMetric() {
+            @Override
+            public Object getValueAndReset() {
+                List<PartitionManager> pms = _coordinator.getMyManagedPartitions();
+                Map concatMetricsDataMaps = new HashMap();
+                for(PartitionManager pm : pms) {
+                    concatMetricsDataMaps.putAll(pm.getMetricsDataMap());
+                }
+                return concatMetricsDataMaps;
+            }
+        }, 60);
+    }
+
+    @Override
+    public void close() {
+	_state.close();
+    }
+
+    @Override
+    public void nextTuple() {
+        List<PartitionManager> managers = _coordinator.getMyManagedPartitions();
+        for(int i=0; i<managers.size(); i++) {
+            
+            // in case the number of managers decreased
+            _currPartitionIndex = _currPartitionIndex % managers.size();
+            EmitState state = managers.get(_currPartitionIndex).next(_collector);
+            if(state!=EmitState.EMITTED_MORE_LEFT) {
+                _currPartitionIndex = (_currPartitionIndex + 1) % managers.size();
+            }
+            if(state!=EmitState.NO_EMITTED) {
+                break;
+            }
         }
 
-        @Override
-        protected void revertUpdateToRuntime(OperationContext context, ModelNode operation, String attributeName, ModelNode valueToRestore, ModelNode valueToRevert, Object handback) throws OperationFailedException {
-
+        long now = System.currentTimeMillis();
+        if((now - _lastUpdateMs) > _spoutConfig.stateUpdateIntervalMs) {
+            commit();
         }
     }
 
+    @Override
+    public void ack(Object msgId) {
+        KafkaMessageId id = (KafkaMessageId) msgId;
+        PartitionManager m = _coordinator.getManager(id.partition);
+        if(m!=null) {
+            m.ack(id.offset);
+        }                
+    }
 
+    @Override
+    public void fail(Object msgId) {
+        KafkaMessageId id = (KafkaMessageId) msgId;
+        PartitionManager m = _coordinator.getManager(id.partition);
+        if(m!=null) {
+            m.fail(id.offset);
+        } 
+    }
+
+    @Override
+    public void deactivate() {
+        commit();
+    }
+
+    @Override
+    public void declareOutputFields(OutputFieldsDeclarer declarer) {
+        declarer.declare(_spoutConfig.scheme.getOutputFields());
+    }
+
+    private void commit() {
+        _lastUpdateMs = System.currentTimeMillis();
+        for(PartitionManager manager: _coordinator.getMyManagedPartitions()) {
+            manager.commit();
+        }
+    }
+
+    public static void main(String[] args) {
+//        TopologyBuilder builder = new TopologyBuilder();
+//        List<String> hosts = new ArrayList<String>();
+//        hosts.add("localhost");
+//        SpoutConfig spoutConf = SpoutConfig.fromHostStrings(hosts, 8, "clicks", "/kafkastorm", "id");
+//        spoutConf.scheme = new SchemeAsMultiScheme(new StringScheme());
+//        spoutConf.forceStartOffsetTime(-2);
+//
+// //       spoutConf.zkServers = new ArrayList<String>() {{
+// //          add("localhost");
+// //       }};
+// //       spoutConf.zkPort = 2181;
+//
+//        builder.setSpout("spout", new KafkaSpout(spoutConf), 3);
+//
+//        Config conf = new Config();
+//        //conf.setDebug(true);
+//
+//        LocalCluster cluster = new LocalCluster();
+//        cluster.submitTopology("kafka-test", conf, builder.createTopology());
+//
+//        Utils.sleep(600000);
+    }
 }

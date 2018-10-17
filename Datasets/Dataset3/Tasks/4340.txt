@@ -1,4 +1,4 @@
-int getRemoteDomainControllerPort();
+serverInventory.shutdown(-1, true); // TODO graceful shutdown // TODO async
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -22,96 +22,145 @@ int getRemoteDomainControllerPort();
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.domain.controller;
+package org.jboss.as.host.controller;
 
-import org.jboss.as.controller.ControlledProcessState;
+import org.jboss.as.remoting.management.ManagementChannelRegistryService;
+
+import static org.jboss.msc.service.ServiceController.Mode.ON_DEMAND;
+import static org.jboss.as.host.controller.HostControllerLogger.ROOT_LOGGER;
+
+import java.net.InetSocketAddress;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+
+import org.jboss.as.domain.controller.DomainController;
+import org.jboss.as.network.NetworkInterfaceBinding;
+import org.jboss.as.server.services.net.NetworkInterfaceService;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.ServiceName;
+import org.jboss.msc.service.ServiceTarget;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
+import org.jboss.threads.AsyncFutureTask;
 
 /**
- * Core information about the local host controller.
+ * Service providing the {@link ServerInventory}
  *
- * @author Brian Stansberry (c) 2011 Red Hat Inc.
+ * @author Emanuel Muckenhuber
+ * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
  */
-public interface LocalHostControllerInfo {
+class ServerInventoryService implements Service<ServerInventory> {
+
+    static final ServiceName SERVICE_NAME = ServiceName.JBOSS.append("host", "controller", "server-inventory");
+
+    private final InjectedValue<ProcessControllerConnectionService> client = new InjectedValue<ProcessControllerConnectionService>();
+    private final InjectedValue<NetworkInterfaceBinding> interfaceBinding = new InjectedValue<NetworkInterfaceBinding>();
+    private final DomainController domainController;
+    private final HostControllerEnvironment environment;
+    private final HostRunningModeControl runningModeControl;
+    private final int port;
+    private final InjectedValue<ExecutorService> executorService = new InjectedValue<ExecutorService>();
+
+    private final FutureServerInventory futureInventory = new FutureServerInventory();
+
+    private ServerInventoryImpl serverInventory;
+
+    private ServerInventoryService(final DomainController domainController, final HostRunningModeControl runningModeControl, final HostControllerEnvironment environment, final int port) {
+        this.domainController = domainController;
+        this.runningModeControl = runningModeControl;
+        this.environment = environment;
+        this.port = port;
+    }
+
+    static Future<ServerInventory> install(final ServiceTarget serviceTarget, final DomainController domainController, final HostRunningModeControl runningModeControl, final HostControllerEnvironment environment,
+                                           final String interfaceBinding, final int port){
+        final ServerInventoryCallbackService callbackService = new ServerInventoryCallbackService();
+        serviceTarget.addService(ServerInventoryCallbackService.SERVICE_NAME, callbackService)
+                .addDependency(ServerInventoryService.SERVICE_NAME, ServerInventory.class, callbackService.getServerInventoryInjectedValue())
+                .setInitialMode(ON_DEMAND)
+                .install();
+
+        final ServerInventoryService inventory = new ServerInventoryService(domainController, runningModeControl, environment, port);
+        serviceTarget.addService(ServerInventoryService.SERVICE_NAME, inventory)
+                .addDependency(HostControllerService.HC_EXECUTOR_SERVICE_NAME, ExecutorService.class, inventory.executorService)
+                .addDependency(ProcessControllerConnectionService.SERVICE_NAME, ProcessControllerConnectionService.class, inventory.getClient())
+                .addDependency(NetworkInterfaceService.JBOSS_NETWORK_INTERFACE.append(interfaceBinding), NetworkInterfaceBinding.class, inventory.interfaceBinding)
+                .addDependency(ManagementChannelRegistryService.SERVICE_NAME)
+                .install();
+        return inventory.futureInventory;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public synchronized void start(StartContext context) throws StartException {
+        ROOT_LOGGER.debug("Starting Host Controller Server Inventory");
+        try {
+            final ProcessControllerConnectionService processControllerConnectionService = client.getValue();
+            final InetSocketAddress binding = new InetSocketAddress(interfaceBinding.getValue().getAddress(), port);
+            serverInventory = new ServerInventoryImpl(domainController, environment, binding, processControllerConnectionService.getClient());
+            processControllerConnectionService.setServerInventory(serverInventory);
+            futureInventory.setInventory(serverInventory);
+        } catch (Exception e) {
+            futureInventory.setFailure(e);
+            throw new StartException(e);
+        }
+    }
 
     /**
-     * Gets the host controller's name.
+     * Stops all servers.
      *
-     * @return the name
-     *
-     * @throws IllegalStateException if {@link #getProcessState()} is {@link org.jboss.as.controller.ControlledProcessState.State#STARTING}
+     * {@inheritDoc}
      */
-    String getLocalHostName();
+    @Override
+    public synchronized void stop(final StopContext context) {
+        if (runningModeControl.getRestartMode() == RestartMode.SERVERS) {
+            context.asynchronous();
+            Runnable r = new Runnable() {
 
-    /**
-     * Gets whether the local host controllers is acting as the master domain controller.
-     *
-     * @return {@code true} if the local host controller is the master
-     *
-     * @throws IllegalStateException if {@link #getProcessState()} is {@link org.jboss.as.controller.ControlledProcessState.State#STARTING}
-     */
-     boolean isMasterDomainController();
+                @Override
+                public void run() {
+                    try {
+                        serverInventory.stopServers(-1, true); // TODO graceful shutdown // TODO async
+                        serverInventory = null;
+                        // client.getValue().setServerInventory(null);
+                    } finally {
+                        context.complete();
+                    }
+                }
+            };
+            executorService.getValue().execute(r);
+        }
+    }
 
-    /**
-     * Gets the name of the interface on which the host listens for native management requests.
-     *
-     * @return the logical interface name
-     */
-    String getNativeManagementInterface();
+    /** {@inheritDoc} */
+    @Override
+    public synchronized ServerInventory getValue() throws IllegalStateException, IllegalArgumentException {
+        final ServerInventory serverInventory = this.serverInventory;
+        if(serverInventory == null) {
+            throw new IllegalStateException();
+        }
+        return serverInventory;
+    }
 
-    /**
-     * Gets the name of the port on which the host listens for native management requests.
-     * @return  the port number
-     */
-    int getNativeManagementPort();
+    InjectedValue<ProcessControllerConnectionService> getClient() {
+        return client;
+    }
 
-    /**
-     * Gets the name of the security realm to use for for native management requests.
-     *
-     * @return the logical interface name
-     */
-    String getNativeManagementSecurityRealm();
+    private class FutureServerInventory extends AsyncFutureTask<ServerInventory>{
 
-    /**
-     * Gets the name of the interface on which the host listens for HTTP management requests.
-     *
-     * @return the logical interface name
-     */
-    String getHttpManagementInterface();
+        protected FutureServerInventory() {
+            super(null);
+        }
 
-    /**
-     * Gets the name of the port on which the host listens for HTTP management requests.
-     * @return  the port number
-     */
-    int getHttpManagementPort();
+        private void setInventory(ServerInventory inventory) {
+            super.setResult(inventory);
+        }
 
-    /**
-     * Gets the name of the port on which the host listens for HTTPS management requests.
-     * @return  the port number
-     */
-    int getHttpManagementSecurePort();
+        private void setFailure(final Throwable t) {
+            super.setFailed(t);
+        }
+    }
 
-    /**
-     * Gets the name of the security realm to use for for HTTP management requests.
-     *
-     * @return the logical interface name
-     */
-    String getHttpManagementSecurityRealm();
-
-    /**
-     *  Gets the host name of the remote domain controller
-     *  @return the host name
-     */
-    String getRemoteDomainControllerHost();
-
-    /**
-     * Gets the port of the remote domain controller
-     * @return the port number
-     */
-    int getRemoteDomainControllertPort();
-
-    /**
-     * Gets the current state of the host controller process.
-     * @return the state
-     */
-    ControlledProcessState.State getProcessState();
 }

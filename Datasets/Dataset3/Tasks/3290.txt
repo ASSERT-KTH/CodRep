@@ -1,114 +1,235 @@
-private final Map<String, Boolean> eligibleBeans = new ConcurrentHashMap<String, Boolean>(64);
+import org.jboss.as.server.services.net.SocketBinding;
 
-/*
- * Copyright 2002-2012 the original author or authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+package org.jboss.as.messaging;
 
-package org.springframework.aop.framework;
+import org.hornetq.api.core.TransportConfiguration;
+import org.hornetq.core.config.Configuration;
+import org.hornetq.core.journal.impl.AIOSequentialFileFactory;
+import org.hornetq.core.server.HornetQServer;
+import org.hornetq.core.server.JournalType;
+import org.hornetq.core.server.impl.HornetQServerImpl;
+import org.jboss.as.services.net.SocketBinding;
+import org.jboss.logging.Logger;
+import org.jboss.msc.inject.InjectionException;
+import org.jboss.msc.inject.Injector;
+import org.jboss.msc.service.Service;
+import org.jboss.msc.service.StartContext;
+import org.jboss.msc.service.StartException;
+import org.jboss.msc.service.StopContext;
+import org.jboss.msc.value.InjectedValue;
+import org.jboss.msc.value.Value;
 
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
-import org.springframework.aop.Advisor;
-import org.springframework.aop.support.AopUtils;
-import org.springframework.beans.factory.BeanClassLoaderAware;
-import org.springframework.beans.factory.config.BeanPostProcessor;
-import org.springframework.core.Ordered;
-import org.springframework.util.ClassUtils;
+import javax.management.MBeanServer;
 
 /**
- * Base class for {@link BeanPostProcessor} implementations that apply a
- * Spring AOP {@link Advisor} to specific beans.
+ * Service configuring and starting the {@code HornetQService}.
  *
- * @author Juergen Hoeller
- * @since 3.2
+ * @author scott.stark@jboss.org
+ * @author Emanuel Muckenhuber
  */
-public abstract class AbstractAdvisingBeanPostProcessor extends ProxyConfig
-		implements BeanPostProcessor, BeanClassLoaderAware, Ordered {
+class HornetQService implements Service<HornetQServer> {
+    private static final Logger log = Logger.getLogger("org.jboss.as.messaging");
 
-	protected Advisor advisor;
+    /** */
+    private static final String HOST = "host";
+    private static final String PORT = "port";
+    private static final String LOGGING_FACTORY = "org.jboss.as.messaging.HornetQLoggerFactory";
 
-	private ClassLoader beanClassLoader = ClassUtils.getDefaultClassLoader();
+    /**
+     * The name of the SocketBinding reference to use for HOST/PORT
+     * configuration
+     */
+    private static final String SOCKET_REF = "socket-ref";
 
-	/**
-	 * This should run after all other post-processors, so that it can just add
-	 * an advisor to existing proxies rather than double-proxy.
-	 */
-	private int order = Ordered.LOWEST_PRECEDENCE;
+    private Configuration configuration;
 
-	private final Map<String, Boolean> eligibleBeans = new ConcurrentHashMap<String, Boolean>();
+    private HornetQServer server;
+    private Map<String, String> paths = new HashMap<String, String>();
+    private Map<String, SocketBinding> socketBindings = new HashMap<String, SocketBinding>();
+    private final InjectedValue<MBeanServer> mbeanServer = new InjectedValue<MBeanServer>();
 
+    Injector<String> getPathInjector(String name) {
+        return new PathInjector(name);
+    }
 
-	public void setBeanClassLoader(ClassLoader beanClassLoader) {
-		this.beanClassLoader = beanClassLoader;
-	}
+    Injector<SocketBinding> getSocketBindingInjector(String name) {
+        SocketBindingInjector injector = new SocketBindingInjector(name);
+        return injector;
+    }
 
-	public void setOrder(int order) {
-		this.order = order;
-	}
+    InjectedValue<MBeanServer> getMBeanServer() {
+        return mbeanServer;
+    }
 
-	public int getOrder() {
-		return this.order;
-	}
+    /**
+     * {@inheritDoc}
+     */
+    public synchronized void start(final StartContext context) throws StartException {
+        ClassLoader origTCCL = SecurityActions.getContextClassLoader();
+        // Validate whether the AIO native layer can be used
+        JournalType jtype = configuration.getJournalType();
+        if (jtype == JournalType.ASYNCIO) {
+            boolean supportsAIO = AIOSequentialFileFactory.isSupported();
 
+            if (supportsAIO == false) {
+                log.warn("AIO wasn't located on this platform, it will fall back to using pure Java NIO. If your platform is Linux, install LibAIO to enable the AIO journal");
+                configuration.setJournalType(JournalType.NIO);
+            }
+        }
 
-	public Object postProcessBeforeInitialization(Object bean, String beanName) {
-		return bean;
-	}
+        // Disable file deployment
+        configuration.setFileDeploymentEnabled(false);
+        // Setup Logging
+        configuration.setLogDelegateFactoryClassName(LOGGING_FACTORY);
+        // Setup paths
+        configuration.setBindingsDirectory(paths.get("bindings"));
+        configuration.setLargeMessagesDirectory(paths.get("largemessages"));
+        configuration.setJournalDirectory(paths.get("journal"));
+        configuration.setPagingDirectory(paths.get("paging"));
 
-	public Object postProcessAfterInitialization(Object bean, String beanName) {
-		if (bean instanceof AopInfrastructureBean) {
-			// Ignore AOP infrastructure such as scoped proxies.
-			return bean;
-		}
-		if (isEligible(bean, beanName)) {
-			if (bean instanceof Advised) {
-				((Advised) bean).addAdvisor(0, this.advisor);
-				return bean;
-			}
-			else {
-				ProxyFactory proxyFactory = new ProxyFactory(bean);
-				// Copy our properties (proxyTargetClass etc) inherited from ProxyConfig.
-				proxyFactory.copyFrom(this);
-				proxyFactory.addAdvisor(this.advisor);
-				return proxyFactory.getProxy(this.beanClassLoader);
-			}
-		}
-		else {
-			// No async proxy needed.
-			return bean;
-		}
-	}
+        // FIXME securityEnabled be true? (true is the default) and we
+        // should use the constructor that takes a SecurityManager
+        configuration.setSecurityEnabled(false);
 
-	/**
-	 * Check whether the given bean is eligible for advising with this
-	 * post-processor's {@link Advisor}.
-	 * <p>Implements caching of <code>canApply</code> results per bean name.
-	 * @param bean the bean instance
-	 * @param beanName the name of the bean
-	 * @see AopUtils#canApply(Advisor, Class)
-	 */
-	protected boolean isEligible(Object bean, String beanName) {
-		Boolean eligible = this.eligibleBeans.get(beanName);
-		if (eligible != null) {
-			return eligible;
-		}
-		Class<?> targetClass = AopUtils.getTargetClass(bean);
-		eligible = AopUtils.canApply(this.advisor, targetClass);
-		this.eligibleBeans.put(beanName, eligible);
-		return eligible;
-	}
+        try {
+            // Update the acceptor/connector port/host values from the
+            // Map the socket bindings onto the connectors/acceptors
+            Collection<TransportConfiguration> acceptors = configuration.getAcceptorConfigurations();
+            Collection<TransportConfiguration> connectors = configuration.getConnectorConfigurations().values();
+            if (connectors != null) {
+                for (TransportConfiguration tc : connectors) {
+                    // If there is a socket binding set the HOST/PORT values
+                    Object socketRef = tc.getParams().remove(SOCKET_REF);
+                    if (socketRef != null) {
+                        String name = socketRef.toString();
+                        SocketBinding binding = socketBindings.get(name);
+                        if (binding == null) {
+                            throw new StartException("Failed to find SocketBinding for connector: " + tc.getName());
+                        }
+                        tc.getParams().put(HOST, binding.getSocketAddress().getHostName());
+                        tc.getParams().put(PORT, "" + binding.getSocketAddress().getPort());
+                    }
+                }
+            }
+            if (acceptors != null) {
+                for (TransportConfiguration tc : acceptors) {
+                    // If there is a socket binding set the HOST/PORT values
+                    Object socketRef = tc.getParams().remove(SOCKET_REF);
+                    if (socketRef != null) {
+                        String name = socketRef.toString();
+                        SocketBinding binding = socketBindings.get(name);
+                        if (binding == null) {
+                            throw new StartException("Failed to find SocketBinding for connector: " + tc.getName());
+                        }
+                        tc.getParams().put(HOST, binding.getSocketAddress().getHostName());
+                        tc.getParams().put(PORT, "" + binding.getSocketAddress().getPort());
+                    }
+                }
+            }
 
+            // Now start the server
+            server = new HornetQServerImpl(configuration, mbeanServer.getOptionalValue(), null);
+
+            // FIXME started by the JMSService
+            // HornetQ expects the TCCL to be set to something that can find the
+            // log factory class.
+            // ClassLoader loader = getClass().getClassLoader();
+            // SecurityActions.setContextClassLoader(loader);
+            // server.start();
+        } catch (Exception e) {
+            throw new StartException("Failed to start service", e);
+        } finally {
+            SecurityActions.setContextClassLoader(origTCCL);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public synchronized void stop(final StopContext context) {
+        try {
+            if (server != null) {
+                // FIXME stopped by the JMSService
+                // server.stop();
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to shutdown HornetQ server", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public synchronized HornetQServer getValue() throws IllegalStateException {
+        final HornetQServer server = this.server;
+        if (server == null) {
+            throw new IllegalStateException();
+        }
+        return server;
+    }
+
+    public Configuration getConfiguration() {
+        return configuration;
+    }
+
+    public void setConfiguration(Configuration hqConfig) {
+        this.configuration = hqConfig;
+    }
+
+    /**
+     * An injector that manages a name/SocketBinding pair mapping in
+     * #socketBindings
+     */
+    class SocketBindingInjector implements Injector<SocketBinding>, Value<SocketBinding> {
+        private final String name;
+        private SocketBinding value;
+
+        SocketBindingInjector(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public void inject(SocketBinding value) throws InjectionException {
+            this.value = value;
+            socketBindings.put(name, value);
+        }
+
+        @Override
+        public void uninject() {
+            socketBindings.remove(name);
+        }
+
+        @Override
+        public SocketBinding getValue() throws IllegalStateException {
+            return value;
+        }
+    }
+
+    class PathInjector implements Injector<String>, Value<String> {
+        private final String name;
+        private String value;
+
+        public PathInjector(String name) {
+            this.name = name;
+        }
+
+        /** {@inheritDoc} */
+        public String getValue() throws IllegalStateException {
+            return value;
+        }
+
+        /** {@inheritDoc} */
+        public void inject(String value) throws InjectionException {
+            HornetQService.this.paths.put(name, value);
+        }
+
+        /** {@inheritDoc} */
+        public void uninject() {
+            HornetQService.this.paths.remove(name);
+        }
+    }
 }

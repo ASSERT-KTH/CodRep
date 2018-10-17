@@ -1,13 +1,13 @@
-item.index(clusterState.metaData().concreteSingleIndex(item.index()));
+keyValues = keyIndexFieldData.load(context).getBytesValues(true);
 
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to ElasticSearch and Shay Banon under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. ElasticSearch licenses this
+ * file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,152 +19,216 @@ item.index(clusterState.metaData().concreteSingleIndex(item.index()));
  * under the License.
  */
 
-package org.elasticsearch.action.get;
+package org.elasticsearch.search.facet.termsstats.strings;
 
-import org.elasticsearch.ExceptionsHelper;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.support.TransportAction;
-import org.elasticsearch.cluster.ClusterService;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.block.ClusterBlockLevel;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.util.concurrent.AtomicArray;
-import org.elasticsearch.index.shard.ShardId;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.BaseTransportRequestHandler;
-import org.elasticsearch.transport.TransportChannel;
-import org.elasticsearch.transport.TransportService;
+import com.carrotsearch.hppc.ObjectObjectOpenHashMap;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.lucene.HashedBytesRef;
+import org.elasticsearch.common.recycler.Recycler;
+import org.elasticsearch.index.fielddata.BytesValues;
+import org.elasticsearch.index.fielddata.DoubleValues;
+import org.elasticsearch.index.fielddata.IndexFieldData;
+import org.elasticsearch.index.fielddata.IndexNumericFieldData;
+import org.elasticsearch.script.SearchScript;
+import org.elasticsearch.search.facet.DoubleFacetAggregatorBase;
+import org.elasticsearch.search.facet.FacetExecutor;
+import org.elasticsearch.search.facet.InternalFacet;
+import org.elasticsearch.search.facet.terms.strings.HashedAggregator;
+import org.elasticsearch.search.facet.termsstats.TermsStatsFacet;
+import org.elasticsearch.search.internal.SearchContext;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 
-public class TransportMultiGetAction extends TransportAction<MultiGetRequest, MultiGetResponse> {
+public class TermsStatsStringFacetExecutor extends FacetExecutor {
 
-    private final ClusterService clusterService;
+    private final TermsStatsFacet.ComparatorType comparatorType;
+    final IndexFieldData keyIndexFieldData;
+    final IndexNumericFieldData valueIndexFieldData;
+    final SearchScript script;
+    private final int size;
+    private final int shardSize;
 
-    private final TransportShardMultiGetAction shardAction;
+    final Recycler.V<ObjectObjectOpenHashMap<HashedBytesRef, InternalTermsStatsStringFacet.StringEntry>> entries;
+    long missing;
 
-    @Inject
-    public TransportMultiGetAction(Settings settings, ThreadPool threadPool, TransportService transportService, ClusterService clusterService, TransportShardMultiGetAction shardAction) {
-        super(settings, threadPool);
-        this.clusterService = clusterService;
-        this.shardAction = shardAction;
+    public TermsStatsStringFacetExecutor(IndexFieldData keyIndexFieldData, IndexNumericFieldData valueIndexFieldData, SearchScript valueScript,
+                                         int size, int shardSize, TermsStatsFacet.ComparatorType comparatorType, SearchContext context) {
+        this.keyIndexFieldData = keyIndexFieldData;
+        this.valueIndexFieldData = valueIndexFieldData;
+        this.script = valueScript;
+        this.size = size;
+        this.shardSize = shardSize;
+        this.comparatorType = comparatorType;
 
-        transportService.registerHandler(MultiGetAction.NAME, new TransportHandler());
+        this.entries = context.cacheRecycler().hashMap(-1);
     }
 
     @Override
-    protected void doExecute(final MultiGetRequest request, final ActionListener<MultiGetResponse> listener) {
-        ClusterState clusterState = clusterService.state();
+    public Collector collector() {
+        return new Collector();
+    }
 
-        clusterState.blocks().globalBlockedRaiseException(ClusterBlockLevel.READ);
-
-        final AtomicArray<MultiGetItemResponse> responses = new AtomicArray<>(request.items.size());
-
-        Map<ShardId, MultiGetShardRequest> shardRequests = new HashMap<>();
-        for (int i = 0; i < request.items.size(); i++) {
-            MultiGetRequest.Item item = request.items.get(i);
-            if (!clusterState.metaData().hasConcreteIndex(item.index())) {
-                responses.set(i, new MultiGetItemResponse(null, new MultiGetResponse.Failure(item.index(), item.type(), item.id(), "[" + item.index() + "] missing")));
-                continue;
+    @Override
+    public InternalFacet buildFacet(String facetName) {
+        if (entries.v().isEmpty()) {
+            entries.release();
+            return new InternalTermsStatsStringFacet(facetName, comparatorType, size, ImmutableList.<InternalTermsStatsStringFacet.StringEntry>of(), missing);
+        }
+        if (size == 0) { // all terms
+            // all terms, just return the collection, we will sort it on the way back
+            List<InternalTermsStatsStringFacet.StringEntry> stringEntries = new ArrayList<InternalTermsStatsStringFacet.StringEntry>();
+            final boolean[] states = entries.v().allocated;
+            final Object[] values = entries.v().values;
+            for (int i = 0; i < states.length; i++) {
+                if (states[i]) {
+                    stringEntries.add((InternalTermsStatsStringFacet.StringEntry) values[i]);
+                }
             }
-            if (item.routing() == null && clusterState.getMetaData().routingRequired(item.index(), item.type())) {
-                responses.set(i, new MultiGetItemResponse(null, new MultiGetResponse.Failure(item.index(), item.type(), item.id(), "routing is required, but hasn't been specified")));
-                continue;
-            }
+            return new InternalTermsStatsStringFacet(facetName, comparatorType, 0 /* indicates all terms*/, stringEntries, missing);
+        }
+        Object[] values = entries.v().values;
+        Arrays.sort(values, (Comparator) comparatorType.comparator());
 
-            item.routing(clusterState.metaData().resolveIndexRouting(item.routing(), item.index()));
-            item.index(clusterState.metaData().concreteIndex(item.index()));
-            ShardId shardId = clusterService.operationRouting()
-                    .getShards(clusterState, item.index(), item.type(), item.id(), item.routing(), null).shardId();
-            MultiGetShardRequest shardRequest = shardRequests.get(shardId);
-            if (shardRequest == null) {
-                shardRequest = new MultiGetShardRequest(shardId.index().name(), shardId.id());
-                shardRequest.preference(request.preference);
-                shardRequest.realtime(request.realtime);
-                shardRequest.refresh(request.refresh);
-
-                shardRequests.put(shardId, shardRequest);
+        List<InternalTermsStatsStringFacet.StringEntry> ordered = Lists.newArrayList();
+        int limit = shardSize;
+        for (int i = 0; i < limit; i++) {
+            InternalTermsStatsStringFacet.StringEntry value = (InternalTermsStatsStringFacet.StringEntry) values[i];
+            if (value == null) {
+                break;
             }
-            shardRequest.add(i, item.type(), item.id(), item.fields(), item.version(), item.versionType(), item.fetchSourceContext());
+            ordered.add(value);
         }
 
-        if (shardRequests.size() == 0) {
-            // only failures..
-            listener.onResponse(new MultiGetResponse(responses.toArray(new MultiGetItemResponse[responses.length()])));
+        entries.release();
+        return new InternalTermsStatsStringFacet(facetName, comparatorType, size, ordered, missing);
+    }
+
+    class Collector extends FacetExecutor.Collector {
+
+        private final Aggregator aggregator;
+        private BytesValues keyValues;
+
+        public Collector() {
+            if (script != null) {
+                this.aggregator = new ScriptAggregator(entries.v(), script);
+            } else {
+                this.aggregator = new Aggregator(entries.v());
+            }
         }
 
-        final AtomicInteger counter = new AtomicInteger(shardRequests.size());
+        @Override
+        public void setScorer(Scorer scorer) throws IOException {
+            if (script != null) {
+                script.setScorer(scorer);
+            }
+        }
 
-        for (final MultiGetShardRequest shardRequest : shardRequests.values()) {
-            shardAction.execute(shardRequest, new ActionListener<MultiGetShardResponse>() {
-                @Override
-                public void onResponse(MultiGetShardResponse response) {
-                    for (int i = 0; i < response.locations.size(); i++) {
-                        responses.set(response.locations.get(i), new MultiGetItemResponse(response.responses.get(i), response.failures.get(i)));
-                    }
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
-                    }
-                }
+        @Override
+        public void setNextReader(AtomicReaderContext context) throws IOException {
+            keyValues = keyIndexFieldData.load(context).getBytesValues();
+            if (script != null) {
+                script.setNextReader(context);
+            } else {
+                aggregator.valueValues = valueIndexFieldData.load(context).getDoubleValues();
+            }
+        }
 
-                @Override
-                public void onFailure(Throwable e) {
-                    // create failures for all relevant requests
-                    String message = ExceptionsHelper.detailedMessage(e);
-                    for (int i = 0; i < shardRequest.locations.size(); i++) {
-                        responses.set(shardRequest.locations.get(i), new MultiGetItemResponse(null,
-                                new MultiGetResponse.Failure(shardRequest.index(), shardRequest.types.get(i), shardRequest.ids.get(i), message)));
-                    }
-                    if (counter.decrementAndGet() == 0) {
-                        finishHim();
-                    }
-                }
+        @Override
+        public void collect(int doc) throws IOException {
+            aggregator.onDoc(doc, keyValues);
+        }
 
-                private void finishHim() {
-                    listener.onResponse(new MultiGetResponse(responses.toArray(new MultiGetItemResponse[responses.length()])));
-                }
-            });
+        @Override
+        public void postCollection() {
+            TermsStatsStringFacetExecutor.this.missing = aggregator.missing;
+            aggregator.release();
         }
     }
 
-    class TransportHandler extends BaseTransportRequestHandler<MultiGetRequest> {
+    public static class Aggregator extends HashedAggregator {
 
-        @Override
-        public MultiGetRequest newInstance() {
-            return new MultiGetRequest();
+        final ObjectObjectOpenHashMap<HashedBytesRef, InternalTermsStatsStringFacet.StringEntry> entries;
+        final HashedBytesRef spare = new HashedBytesRef();
+        int missing = 0;
+
+        DoubleValues valueValues;
+
+        ValueAggregator valueAggregator = new ValueAggregator();
+
+        public Aggregator(ObjectObjectOpenHashMap<HashedBytesRef, InternalTermsStatsStringFacet.StringEntry> entries) {
+            this.entries = entries;
         }
 
         @Override
-        public void messageReceived(final MultiGetRequest request, final TransportChannel channel) throws Exception {
-            // no need to use threaded listener, since we just send a response
-            request.listenerThreaded(false);
-            execute(request, new ActionListener<MultiGetResponse>() {
-                @Override
-                public void onResponse(MultiGetResponse response) {
-                    try {
-                        channel.sendResponse(response);
-                    } catch (Throwable e) {
-                        onFailure(e);
-                    }
-                }
+        public void onValue(int docId, BytesRef value, int hashCode, BytesValues values) {
+            spare.reset(value, hashCode);
+            InternalTermsStatsStringFacet.StringEntry stringEntry = entries.get(spare);
+            if (stringEntry == null) {
+                HashedBytesRef theValue = new HashedBytesRef(values.copyShared(), hashCode);
+                stringEntry = new InternalTermsStatsStringFacet.StringEntry(theValue, 0, 0, 0, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY);
+                entries.put(theValue, stringEntry);
+            }
+            stringEntry.count++;
+            valueAggregator.stringEntry = stringEntry;
+            valueAggregator.onDoc(docId, valueValues);
+        }
 
-                @Override
-                public void onFailure(Throwable e) {
-                    try {
-                        channel.sendResponse(e);
-                    } catch (Exception e1) {
-                        logger.warn("Failed to send error response for action [" + MultiGetAction.NAME + "] and request [" + request + "]", e1);
-                    }
+        public static class ValueAggregator extends DoubleFacetAggregatorBase {
+
+            InternalTermsStatsStringFacet.StringEntry stringEntry;
+
+            @Override
+            public void onValue(int docId, double value) {
+                if (value < stringEntry.min) {
+                    stringEntry.min = value;
                 }
-            });
+                if (value > stringEntry.max) {
+                    stringEntry.max = value;
+                }
+                stringEntry.total += value;
+                stringEntry.totalCount++;
+            }
+        }
+    }
+
+    public static class ScriptAggregator extends Aggregator {
+        private final SearchScript script;
+
+        public ScriptAggregator(ObjectObjectOpenHashMap<HashedBytesRef, InternalTermsStatsStringFacet.StringEntry> entries, SearchScript script) {
+            super(entries);
+            this.script = script;
         }
 
         @Override
-        public String executor() {
-            return ThreadPool.Names.SAME;
+        public void onValue(int docId, BytesRef value, int hashCode, BytesValues values) {
+            spare.reset(value, hashCode);
+            InternalTermsStatsStringFacet.StringEntry stringEntry = entries.get(spare);
+            if (stringEntry == null) {
+                HashedBytesRef theValue = new HashedBytesRef(values.copyShared(), hashCode);
+                stringEntry = new InternalTermsStatsStringFacet.StringEntry(theValue, 1, 0, 0, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY);
+                entries.put(theValue, stringEntry);
+            } else {
+                stringEntry.count++;
+            }
+
+            script.setNextDocId(docId);
+            double valueValue = script.runAsDouble();
+            if (valueValue < stringEntry.min) {
+                stringEntry.min = valueValue;
+            }
+            if (valueValue > stringEntry.max) {
+                stringEntry.max = valueValue;
+            }
+            stringEntry.total += valueValue;
+            stringEntry.totalCount++;
         }
     }
 }

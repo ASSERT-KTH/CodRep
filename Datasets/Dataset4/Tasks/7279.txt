@@ -1,4 +1,4 @@
-int numberOfUpdates = childIdToParentId.isEmpty() ? 0 : scaledRandomIntBetween(1, 5);
+private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
 
 /*
  * Licensed to Elasticsearch under one or more contributor
@@ -18,242 +18,347 @@ int numberOfUpdates = childIdToParentId.isEmpty() ? 0 : scaledRandomIntBetween(1
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.elasticsearch.index.search.child;
 
-import com.carrotsearch.hppc.FloatArrayList;
-import com.carrotsearch.hppc.IntIntOpenHashMap;
-import com.carrotsearch.hppc.ObjectObjectOpenHashMap;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.index.*;
-import org.apache.lucene.queries.TermFilter;
-import org.apache.lucene.search.*;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.LuceneTestCase;
-import org.elasticsearch.common.lucene.search.NotFilter;
-import org.elasticsearch.common.lucene.search.XFilteredQuery;
-import org.elasticsearch.index.engine.Engine;
-import org.elasticsearch.index.fielddata.plain.ParentChildIndexFieldData;
-import org.elasticsearch.index.mapper.Uid;
-import org.elasticsearch.index.mapper.internal.ParentFieldMapper;
-import org.elasticsearch.index.mapper.internal.TypeFieldMapper;
-import org.elasticsearch.index.mapper.internal.UidFieldMapper;
-import org.elasticsearch.search.internal.ContextIndexSearcher;
-import org.elasticsearch.search.internal.SearchContext;
-import org.elasticsearch.test.ElasticsearchLuceneTestCase;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+package org.elasticsearch.common.network;
 
-import java.io.IOException;
+import com.google.common.collect.Maps;
+import org.apache.lucene.util.IOUtils;
+
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.logging.ESLogger;
+import org.elasticsearch.common.logging.ESLoggerFactory;
+import org.elasticsearch.common.settings.ImmutableSettings;
+
+import java.io.Closeable;
+import java.net.*;
 import java.util.Map;
-import java.util.NavigableMap;
-import java.util.Random;
-import java.util.TreeMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.elasticsearch.index.search.child.ChildrenConstantScoreQueryTests.assertBitSet;
-import static org.elasticsearch.index.search.child.ChildrenConstantScoreQueryTests.createSearchContext;
-import static org.elasticsearch.index.search.child.ChildrenQueryTests.assertTopDocs;
+import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadFactory;
 
-public class ParentQueryTests extends ElasticsearchLuceneTestCase {
+/**
+ * A multicast channel that supports registering for receive events, and sending datagram packets. Allows
+ * to easily share the same multicast socket if it holds the same config.
+ */
+public abstract class MulticastChannel implements Closeable {
 
-    @BeforeClass
-    public static void before() throws IOException {
-        forceDefaultCodec();
-        SearchContext.setCurrent(createSearchContext("test", "parent", "child"));
+    /**
+     * Builds a channel based on the provided config, allowing to control if sharing a channel that uses
+     * the same config is allowed or not.
+     */
+    public static MulticastChannel getChannel(String name, boolean shared, Config config, Listener listener) throws Exception {
+        if (!shared) {
+            return new Plain(listener, name, config);
+        }
+        return Shared.getSharedChannel(listener, config);
     }
 
-    @AfterClass
-    public static void after() throws IOException {
-        SearchContext.removeCurrent();
-    }
+    /**
+     * Config of multicast channel.
+     */
+    public static final class Config {
+        public final int port;
+        public final String group;
+        public final int bufferSize;
+        public final int ttl;
+        public final InetAddress multicastInterface;
 
-    @Test
-    public void testBasicQuerySanities() {
-        Query parentQuery = new TermQuery(new Term("field", "value"));
-        ParentFieldMapper parentFieldMapper = SearchContext.current().mapperService().documentMapper("child").parentFieldMapper();
-        ParentChildIndexFieldData parentChildIndexFieldData = SearchContext.current().fieldData().getForField(parentFieldMapper);
-        Filter childrenFilter = new TermFilter(new Term(TypeFieldMapper.NAME, "child"));
-        Query query = new ParentQuery(parentChildIndexFieldData, parentQuery, "parent", childrenFilter);
-        QueryUtils.check(query);
-    }
-
-    @Test
-    public void testRandom() throws Exception {
-        Directory directory = newDirectory();
-        final Random r = random();
-        final IndexWriterConfig iwc = LuceneTestCase.newIndexWriterConfig(r,
-                LuceneTestCase.TEST_VERSION_CURRENT, new MockAnalyzer(r))
-                .setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH)
-                .setRAMBufferSizeMB(scaledRandomIntBetween(16, 64)); // we might index a lot - don't go crazy here
-        RandomIndexWriter indexWriter = new RandomIndexWriter(r, directory, iwc);
-        int numUniqueParentValues = scaledRandomIntBetween(100, 2000);
-        String[] parentValues = new String[numUniqueParentValues];
-        for (int i = 0; i < numUniqueParentValues; i++) {
-            parentValues[i] = Integer.toString(i);
+        public Config(int port, String group, int bufferSize, int ttl, InetAddress multicastInterface) {
+            this.port = port;
+            this.group = group;
+            this.bufferSize = bufferSize;
+            this.ttl = ttl;
+            this.multicastInterface = multicastInterface;
         }
 
-        int childDocId = 0;
-        int numParentDocs = scaledRandomIntBetween(1, numUniqueParentValues);
-        ObjectObjectOpenHashMap<String, NavigableMap<String, Float>> parentValueToChildIds = new ObjectObjectOpenHashMap<>();
-        IntIntOpenHashMap childIdToParentId = new IntIntOpenHashMap();
-        for (int parentDocId = 0; parentDocId < numParentDocs; parentDocId++) {
-            boolean markParentAsDeleted = rarely();
-            String parentValue = parentValues[random().nextInt(parentValues.length)];
-            String parent = Integer.toString(parentDocId);
-            Document document = new Document();
-            document.add(new StringField(UidFieldMapper.NAME, Uid.createUid("parent", parent), Field.Store.NO));
-            document.add(new StringField(TypeFieldMapper.NAME, "parent", Field.Store.NO));
-            document.add(new StringField("field1", parentValue, Field.Store.NO));
-            if (markParentAsDeleted) {
-                document.add(new StringField("delete", "me", Field.Store.NO));
-            }
-            indexWriter.addDocument(document);
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
 
-            int numChildDocs = scaledRandomIntBetween(0, 100);
-            if (parentDocId == numParentDocs - 1 && childIdToParentId.isEmpty()) {
-                // ensure there is at least one child in the index
-                numChildDocs = Math.max(1, numChildDocs);
-            }
-            for (int i = 0; i < numChildDocs; i++) {
-                String child = Integer.toString(childDocId++);
-                boolean markChildAsDeleted = rarely();
-                boolean filterMe = rarely();
-                document = new Document();
-                document.add(new StringField(UidFieldMapper.NAME, Uid.createUid("child", child), Field.Store.YES));
-                document.add(new StringField(TypeFieldMapper.NAME, "child", Field.Store.NO));
-                document.add(new StringField(ParentFieldMapper.NAME, Uid.createUid("parent", parent), Field.Store.NO));
-                if (markChildAsDeleted) {
-                    document.add(new StringField("delete", "me", Field.Store.NO));
-                }
-                if (filterMe) {
-                    document.add(new StringField("filter", "me", Field.Store.NO));
-                }
-                indexWriter.addDocument(document);
+            Config config = (Config) o;
 
-                if (!markParentAsDeleted) {
-                    NavigableMap<String, Float> childIdToScore;
-                    if (parentValueToChildIds.containsKey(parentValue)) {
-                        childIdToScore = parentValueToChildIds.lget();
-                    } else {
-                        parentValueToChildIds.put(parentValue, childIdToScore = new TreeMap<>());
-                    }
-                    if (!markChildAsDeleted && !filterMe) {
-                        assertFalse("child ["+ child + "] already has a score", childIdToScore.containsKey(child));
-                        childIdToScore.put(child, 1f);
-                        childIdToParentId.put(Integer.valueOf(child), parentDocId);
-                    }
+            if (bufferSize != config.bufferSize) return false;
+            if (port != config.port) return false;
+            if (ttl != config.ttl) return false;
+            if (group != null ? !group.equals(config.group) : config.group != null) return false;
+            if (multicastInterface != null ? !multicastInterface.equals(config.multicastInterface) : config.multicastInterface != null)
+                return false;
+
+            return true;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = port;
+            result = 31 * result + (group != null ? group.hashCode() : 0);
+            result = 31 * result + bufferSize;
+            result = 31 * result + ttl;
+            result = 31 * result + (multicastInterface != null ? multicastInterface.hashCode() : 0);
+            return result;
+        }
+    }
+
+    /**
+     * Listener that gets called when data is received on the multicast channel.
+     */
+    public static interface Listener {
+        void onMessage(BytesReference data, SocketAddress address);
+    }
+
+    /**
+     * Simple listener that wraps multiple listeners into one.
+     */
+    public static class MultiListener implements Listener {
+
+        private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<Listener>();
+
+        public void add(Listener listener) {
+            this.listeners.add(listener);
+        }
+
+        public boolean remove(Listener listener) {
+            return this.listeners.remove(listener);
+        }
+
+        @Override
+        public void onMessage(BytesReference data, SocketAddress address) {
+            for (Listener listener : listeners) {
+                listener.onMessage(data, address);
+            }
+        }
+    }
+
+    protected final Listener listener;
+    private AtomicBoolean closed = new AtomicBoolean();
+
+    protected MulticastChannel(Listener listener) {
+        this.listener = listener;
+    }
+
+    /**
+     * Send the data over the multicast channel.
+     */
+    public abstract void send(BytesReference data) throws Exception;
+
+    /**
+     * Close the channel.
+     */
+    public void close() {
+        if (closed.compareAndSet(false, true)) {
+            close(listener);
+        }
+    }
+
+    protected abstract void close(Listener listener);
+
+    /**
+     * A shared channel that keeps a static map of Config -> Shared channels, and closes shared
+     * channel once their reference count has reached 0. It also handles de-registering relevant
+     * listener from the shared list of listeners.
+     */
+    private final static class Shared extends MulticastChannel {
+
+        private static final Map<Config, Shared> sharedChannels = Maps.newHashMap();
+        private static final Object mutex = new Object(); // global mutex so we don't sync on static methods (.class)
+
+        static MulticastChannel getSharedChannel(Listener listener, Config config) throws Exception {
+
+            synchronized (mutex) {
+                Shared shared = sharedChannels.get(config);
+                if (shared != null) {
+                    shared.incRef();
+                    ((MultiListener) shared.listener).add(listener);
+                } else {
+                    MultiListener multiListener = new MultiListener();
+                    multiListener.add(listener);
+                    shared = new Shared(multiListener, new Plain(multiListener, "#shared#", config));
+                    sharedChannels.put(config, shared);
+                }
+                return new Delegate(listener, shared);
+            }
+        }
+
+        static void close(Shared shared, Listener listener) {
+            synchronized (mutex) {
+                // remove this
+                boolean removed = ((MultiListener) shared.listener).remove(listener);
+                assert removed : "a listener should be removed";
+                if (shared.decRef() == 0) {
+                    assert ((MultiListener) shared.listener).listeners.isEmpty();
+                    sharedChannels.remove(shared.channel.getConfig());
+                    shared.channel.close();
                 }
             }
         }
 
-        // Delete docs that are marked to be deleted.
-        indexWriter.deleteDocuments(new Term("delete", "me"));
-        indexWriter.commit();
+        final Plain channel;
+        private int refCount = 1;
 
-        IndexReader indexReader = DirectoryReader.open(directory);
-        IndexSearcher searcher = new IndexSearcher(indexReader);
-        Engine.Searcher engineSearcher = new Engine.SimpleSearcher(
-                ParentQueryTests.class.getSimpleName(), searcher
-        );
-        ((TestSearchContext) SearchContext.current()).setSearcher(new ContextIndexSearcher(SearchContext.current(), engineSearcher));
+        Shared(MultiListener listener, Plain channel) {
+            super(listener);
+            this.channel = channel;
+        }
 
-        ParentFieldMapper parentFieldMapper = SearchContext.current().mapperService().documentMapper("child").parentFieldMapper();
-        ParentChildIndexFieldData parentChildIndexFieldData = SearchContext.current().fieldData().getForField(parentFieldMapper);
-        TermFilter rawChildrenFilter = new TermFilter(new Term(TypeFieldMapper.NAME, "child"));
-        Filter rawFilterMe = new NotFilter(new TermFilter(new Term("filter", "me")));
-        int max = numUniqueParentValues / 4;
-        for (int i = 0; i < max; i++) {
-            // Randomly pick a cached version: there is specific logic inside ChildrenQuery that deals with the fact
-            // that deletes are applied at the top level when filters are cached.
-            Filter childrenFilter;
-            if (random().nextBoolean()) {
-                childrenFilter = SearchContext.current().filterCache().cache(rawChildrenFilter);
-            } else {
-                childrenFilter = rawChildrenFilter;
+        private void incRef() {
+            refCount++;
+        }
+
+        private int decRef() {
+            --refCount;
+            assert refCount >= 0 : "illegal ref counting, close called multiple times";
+            return refCount;
+        }
+
+        @Override
+        public void send(BytesReference data) throws Exception {
+            channel.send(data);
+        }
+
+        @Override
+        public void close() {
+            assert false : "Shared references should never be closed directly, only via Delegate";
+        }
+
+        @Override
+        protected void close(Listener listener) {
+            close(this, listener);
+        }
+    }
+
+    /**
+     * A light weight delegate that wraps another channel, mainly to support delegating
+     * the close method with the provided listener and not holding existing listener.
+     */
+    private final static class Delegate extends MulticastChannel {
+
+        private final MulticastChannel channel;
+
+        Delegate(Listener listener, MulticastChannel channel) {
+            super(listener);
+            this.channel = channel;
+        }
+
+        @Override
+        public void send(BytesReference data) throws Exception {
+            channel.send(data);
+        }
+
+        @Override
+        protected void close(Listener listener) {
+            channel.close(listener); // we delegate here to the close with our listener, not with the delegate listener
+        }
+    }
+
+    /**
+     * Simple implementation of a channel.
+     */
+    private static class Plain extends MulticastChannel {
+        private final ESLogger logger;
+        private final Config config;
+
+        private volatile MulticastSocket multicastSocket;
+        private final DatagramPacket datagramPacketSend;
+        private final DatagramPacket datagramPacketReceive;
+
+        private final Object sendMutex = new Object();
+        private final Object receiveMutex = new Object();
+
+        private final Receiver receiver;
+        private final Thread receiverThread;
+
+        Plain(Listener listener, String name, Config config) throws Exception {
+            super(listener);
+            this.logger = ESLoggerFactory.getLogger(name);
+            this.config = config;
+            this.datagramPacketReceive = new DatagramPacket(new byte[config.bufferSize], config.bufferSize);
+            this.datagramPacketSend = new DatagramPacket(new byte[config.bufferSize], config.bufferSize, InetAddress.getByName(config.group), config.port);
+            this.multicastSocket = buildMulticastSocket(config);
+            this.receiver = new Receiver();
+            this.receiverThread = daemonThreadFactory(ImmutableSettings.builder().put("name", name).build(), "discovery#multicast#receiver").newThread(receiver);
+            this.receiverThread.start();
+        }
+
+        private MulticastSocket buildMulticastSocket(Config config) throws Exception {
+            MulticastSocket multicastSocket = new MulticastSocket(config.port);
+            try {
+                multicastSocket.setTimeToLive(config.ttl);
+                // set the send interface
+                multicastSocket.setInterface(config.multicastInterface);
+                multicastSocket.joinGroup(InetAddress.getByName(config.group));
+                multicastSocket.setReceiveBufferSize(config.bufferSize);
+                multicastSocket.setSendBufferSize(config.bufferSize);
+                multicastSocket.setSoTimeout(60000);
+            } catch (Throwable e) {
+                IOUtils.closeWhileHandlingException(multicastSocket);
+                throw e;
+            }
+            return multicastSocket;
+        }
+
+        public Config getConfig() {
+            return this.config;
+        }
+
+        public void send(BytesReference data) throws Exception {
+            synchronized (sendMutex) {
+                datagramPacketSend.setData(data.toBytes());
+                multicastSocket.send(datagramPacketSend);
+            }
+        }
+
+        @Override
+        protected void close(Listener listener) {
+            receiver.stop();
+            receiverThread.interrupt();
+            if (multicastSocket != null) {
+                IOUtils.closeWhileHandlingException(multicastSocket);
+                multicastSocket = null;
+            }
+        }
+
+        private class Receiver implements Runnable {
+
+            private volatile boolean running = true;
+
+            public void stop() {
+                running = false;
             }
 
-            // Using this in FQ, will invoke / test the Scorer#advance(..) and also let the Weight#scorer not get live docs as acceptedDocs
-            Filter filterMe;
-            if (random().nextBoolean()) {
-                filterMe = SearchContext.current().filterCache().cache(rawFilterMe);
-            } else {
-                filterMe = rawFilterMe;
-            }
-
-            // Simulate a child update
-            if (random().nextBoolean()) {
-                int numberOfUpdates = scaledRandomIntBetween(1, 5);
-                int[] childIds = childIdToParentId.keys().toArray();
-                for (int j = 0; j < numberOfUpdates; j++) {
-                    int childId = childIds[random().nextInt(childIds.length)];
-                    String childUid = Uid.createUid("child", Integer.toString(childId));
-                    indexWriter.deleteDocuments(new Term(UidFieldMapper.NAME, childUid));
-
-                    Document document = new Document();
-                    document.add(new StringField(UidFieldMapper.NAME, childUid, Field.Store.YES));
-                    document.add(new StringField(TypeFieldMapper.NAME, "child", Field.Store.NO));
-                    String parentUid = Uid.createUid("parent", Integer.toString(childIdToParentId.get(childId)));
-                    document.add(new StringField(ParentFieldMapper.NAME, parentUid, Field.Store.NO));
-                    indexWriter.addDocument(document);
-                }
-
-                indexReader.close();
-                indexReader = DirectoryReader.open(indexWriter.w, true);
-                searcher = new IndexSearcher(indexReader);
-                engineSearcher = new Engine.SimpleSearcher(
-                        ParentConstantScoreQueryTests.class.getSimpleName(), searcher
-                );
-                ((TestSearchContext) SearchContext.current()).setSearcher(new ContextIndexSearcher(SearchContext.current(), engineSearcher));
-            }
-
-            String parentValue = parentValues[random().nextInt(numUniqueParentValues)];
-            Query parentQuery = new ConstantScoreQuery(new TermQuery(new Term("field1", parentValue)));
-            Query query = new ParentQuery(parentChildIndexFieldData, parentQuery,"parent", childrenFilter);
-            query = new XFilteredQuery(query, filterMe);
-            BitSetCollector collector = new BitSetCollector(indexReader.maxDoc());
-            int numHits = 1 + random().nextInt(25);
-            TopScoreDocCollector actualTopDocsCollector = TopScoreDocCollector.create(numHits, false);
-            searcher.search(query, MultiCollector.wrap(collector, actualTopDocsCollector));
-            FixedBitSet actualResult = collector.getResult();
-
-            FixedBitSet expectedResult = new FixedBitSet(indexReader.maxDoc());
-            MockScorer mockScorer = new MockScorer(ScoreType.MAX); // just save one score per parent...
-            mockScorer.scores = new FloatArrayList();
-            TopScoreDocCollector expectedTopDocsCollector = TopScoreDocCollector.create(numHits, false);
-            expectedTopDocsCollector.setScorer(mockScorer);
-            if (parentValueToChildIds.containsKey(parentValue)) {
-                AtomicReader slowAtomicReader = SlowCompositeReaderWrapper.wrap(indexReader);
-                Terms terms = slowAtomicReader.terms(UidFieldMapper.NAME);
-                if (terms != null) {
-                    NavigableMap<String, Float> childIdsAndScore = parentValueToChildIds.lget();
-                    TermsEnum termsEnum = terms.iterator(null);
-                    DocsEnum docsEnum = null;
-                    for (Map.Entry<String, Float> entry : childIdsAndScore.entrySet()) {
-                        TermsEnum.SeekStatus seekStatus = termsEnum.seekCeil(Uid.createUidAsBytes("child", entry.getKey()));
-                        if (seekStatus == TermsEnum.SeekStatus.FOUND) {
-                            docsEnum = termsEnum.docs(slowAtomicReader.getLiveDocs(), docsEnum, DocsEnum.FLAG_NONE);
-                            expectedResult.set(docsEnum.nextDoc());
-                            mockScorer.scores.add(entry.getValue());
-                            expectedTopDocsCollector.collect(docsEnum.docID());
-                            mockScorer.scores.clear();
-                        } else if (seekStatus == TermsEnum.SeekStatus.END) {
-                            break;
+            @Override
+            public void run() {
+                while (running) {
+                    try {
+                        synchronized (receiveMutex) {
+                            try {
+                                multicastSocket.receive(datagramPacketReceive);
+                            } catch (SocketTimeoutException ignore) {
+                                continue;
+                            } catch (Exception e) {
+                                if (running) {
+                                    if (multicastSocket.isClosed()) {
+                                        logger.warn("multicast socket closed while running, restarting...");
+                                        multicastSocket = buildMulticastSocket(config);
+                                    } else {
+                                        logger.warn("failed to receive packet, throttling...", e);
+                                        Thread.sleep(500);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        if (datagramPacketReceive.getData().length > 0) {
+                            listener.onMessage(new BytesArray(datagramPacketReceive.getData()), datagramPacketReceive.getSocketAddress());
+                        }
+                    } catch (Throwable e) {
+                        if (running) {
+                            logger.warn("unexpected exception in multicast receiver", e);
                         }
                     }
                 }
             }
-
-            assertBitSet(actualResult, expectedResult, searcher);
-            assertTopDocs(actualTopDocsCollector.topDocs(), expectedTopDocsCollector.topDocs());
         }
-
-        indexWriter.close();
-        indexReader.close();
-        directory.close();
     }
-
 }

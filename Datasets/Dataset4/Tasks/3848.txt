@@ -1,13 +1,13 @@
-refresh(new Engine.Refresh(false));
+request.index(state.metaData().concreteSingleIndex(request.index(), request.indicesOptions()));
 
 /*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,706 +19,778 @@ refresh(new Engine.Refresh(false));
  * under the License.
  */
 
-package org.elasticsearch.index.shard.service;
+package org.elasticsearch.action.support.replication;
 
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.CheckIndex;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.FilteredQuery;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.util.ThreadInterruptedException;
-import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchIllegalArgumentException;
-import org.elasticsearch.ElasticSearchIllegalStateException;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.ElasticsearchIllegalStateException;
+import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.UnavailableShardsException;
+import org.elasticsearch.action.WriteConsistencyLevel;
+import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.TransportAction;
+import org.elasticsearch.action.support.TransportActions;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateObserver;
+import org.elasticsearch.cluster.action.shard.ShardStateAction;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.ShardIterator;
 import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.routing.ShardRoutingState;
 import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.io.FastByteArrayOutputStream;
-import org.elasticsearch.common.lucene.Lucene;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Streamable;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.util.concurrent.ThreadSafe;
-import org.elasticsearch.index.cache.IndexCache;
-import org.elasticsearch.index.engine.*;
-import org.elasticsearch.index.mapper.*;
-import org.elasticsearch.index.merge.scheduler.MergeSchedulerProvider;
-import org.elasticsearch.index.query.IndexQueryParser;
-import org.elasticsearch.index.query.IndexQueryParserMissingException;
-import org.elasticsearch.index.query.IndexQueryParserService;
-import org.elasticsearch.index.settings.IndexSettings;
-import org.elasticsearch.index.settings.IndexSettingsService;
-import org.elasticsearch.index.shard.*;
-import org.elasticsearch.index.shard.recovery.RecoveryStatus;
-import org.elasticsearch.index.store.Store;
-import org.elasticsearch.index.translog.Translog;
-import org.elasticsearch.indices.IndicesLifecycle;
-import org.elasticsearch.indices.InternalIndicesLifecycle;
+import org.elasticsearch.common.util.concurrent.AbstractRunnable;
+import org.elasticsearch.index.engine.DocumentAlreadyExistsException;
+import org.elasticsearch.index.engine.VersionConflictEngineException;
+import org.elasticsearch.index.service.IndexService;
+import org.elasticsearch.index.shard.service.IndexShard;
+import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.node.NodeClosedException;
+import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.*;
 
 import java.io.IOException;
-import java.io.PrintStream;
-import java.nio.channels.ClosedByInterruptException;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ScheduledFuture;
-
-import static org.elasticsearch.index.mapper.SourceToParse.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * @author kimchy (shay.banon)
  */
-@ThreadSafe
-public class InternalIndexShard extends AbstractIndexShardComponent implements IndexShard {
+public abstract class TransportShardReplicationOperationAction<Request extends ShardReplicationOperationRequest, ReplicaRequest extends ShardReplicationOperationRequest, Response extends ActionResponse> extends TransportAction<Request, Response> {
 
-    private final ThreadPool threadPool;
+    protected final TransportService transportService;
+    protected final ClusterService clusterService;
+    protected final IndicesService indicesService;
+    protected final ShardStateAction shardStateAction;
+    protected final ReplicationType defaultReplicationType;
+    protected final WriteConsistencyLevel defaultWriteConsistencyLevel;
+    protected final TransportRequestOptions transportOptions;
 
-    private final IndexSettingsService indexSettingsService;
+    final String transportReplicaAction;
+    final String executor;
+    final boolean checkWriteConsistency;
 
-    private final MapperService mapperService;
+    protected TransportShardReplicationOperationAction(Settings settings, String actionName, TransportService transportService,
+                                                       ClusterService clusterService, IndicesService indicesService,
+                                                       ThreadPool threadPool, ShardStateAction shardStateAction, ActionFilters actionFilters) {
+        super(settings, actionName, threadPool, actionFilters);
+        this.transportService = transportService;
+        this.clusterService = clusterService;
+        this.indicesService = indicesService;
+        this.shardStateAction = shardStateAction;
 
-    private final IndexQueryParserService queryParserService;
+        this.transportReplicaAction = transportReplicaAction();
+        this.executor = executor();
+        this.checkWriteConsistency = checkWriteConsistency();
 
-    private final IndexCache indexCache;
+        transportService.registerHandler(actionName, new OperationTransportHandler());
+        transportService.registerHandler(transportReplicaAction, new ReplicaOperationTransportHandler());
 
-    private final InternalIndicesLifecycle indicesLifecycle;
+        this.transportOptions = transportOptions();
 
-    private final Store store;
-
-    private final MergeSchedulerProvider mergeScheduler;
-
-    private final Engine engine;
-
-    private final Translog translog;
-
-    private final Object mutex = new Object();
-
-
-    private final boolean checkIndex;
-
-    private volatile IndexShardState state;
-
-    private TimeValue refreshInterval;
-    private final TimeValue mergeInterval;
-
-    private volatile ScheduledFuture refreshScheduledFuture;
-
-    private volatile ScheduledFuture mergeScheduleFuture;
-
-    private volatile ShardRouting shardRouting;
-
-    private RecoveryStatus peerRecoveryStatus;
-
-    private CopyOnWriteArrayList<OperationListener> listeners = null;
-
-    private ApplyRefreshSettings applyRefreshSettings = new ApplyRefreshSettings();
-
-    @Inject public InternalIndexShard(ShardId shardId, @IndexSettings Settings indexSettings, IndexSettingsService indexSettingsService, IndicesLifecycle indicesLifecycle, Store store, Engine engine, MergeSchedulerProvider mergeScheduler, Translog translog,
-                                      ThreadPool threadPool, MapperService mapperService, IndexQueryParserService queryParserService, IndexCache indexCache) {
-        super(shardId, indexSettings);
-        this.indicesLifecycle = (InternalIndicesLifecycle) indicesLifecycle;
-        this.indexSettingsService = indexSettingsService;
-        this.store = store;
-        this.engine = engine;
-        this.mergeScheduler = mergeScheduler;
-        this.translog = translog;
-        this.threadPool = threadPool;
-        this.mapperService = mapperService;
-        this.queryParserService = queryParserService;
-        this.indexCache = indexCache;
-        state = IndexShardState.CREATED;
-
-        this.refreshInterval = indexSettings.getAsTime("engine.robin.refresh_interval", indexSettings.getAsTime("index.refresh_interval", engine.defaultRefreshInterval()));
-        this.mergeInterval = indexSettings.getAsTime("index.merge.async_interval", TimeValue.timeValueSeconds(1));
-
-        indexSettingsService.addListener(applyRefreshSettings);
-
-        logger.debug("state: [CREATED]");
-
-        this.checkIndex = indexSettings.getAsBoolean("index.shard.check_index", false);
+        this.defaultReplicationType = ReplicationType.fromString(settings.get("action.replication_type", "sync"));
+        this.defaultWriteConsistencyLevel = WriteConsistencyLevel.fromString(settings.get("action.write_consistency", "quorum"));
     }
 
-    @Override public synchronized void addListener(OperationListener listener) {
-        if (listeners == null) {
-            listeners = new CopyOnWriteArrayList<OperationListener>();
-        }
-        listeners.add(listener);
+    @Override
+    protected void doExecute(Request request, ActionListener<Response> listener) {
+        new AsyncShardOperationAction(request, listener).start();
     }
 
-    @Override public synchronized void removeListener(OperationListener listener) {
-        if (listeners == null) {
-            return;
-        }
-        listeners.remove(listener);
-        if (listeners.isEmpty()) {
-            listeners = null;
-        }
+    protected abstract Request newRequestInstance();
+
+    protected abstract ReplicaRequest newReplicaRequestInstance();
+
+    protected abstract Response newResponseInstance();
+
+    protected abstract String executor();
+
+    protected abstract PrimaryResponse<Response, ReplicaRequest> shardOperationOnPrimary(ClusterState clusterState, PrimaryOperationRequest shardRequest);
+
+    protected abstract void shardOperationOnReplica(ReplicaOperationRequest shardRequest);
+
+    /**
+     * Called once replica operations have been dispatched on the
+     */
+    protected void postPrimaryOperation(Request request, PrimaryResponse<Response, ReplicaRequest> response) {
+
     }
 
-    public MergeSchedulerProvider mergeScheduler() {
-        return this.mergeScheduler;
+    protected abstract ShardIterator shards(ClusterState clusterState, Request request) throws ElasticsearchException;
+
+    protected abstract boolean checkWriteConsistency();
+
+    protected abstract ClusterBlockException checkGlobalBlock(ClusterState state, Request request);
+
+    protected abstract ClusterBlockException checkRequestBlock(ClusterState state, Request request);
+
+    /**
+     * Resolves the request, by default, simply setting the concrete index (if its aliased one). If the resolve
+     * means a different execution, then return false here to indicate not to continue and execute this request.
+     */
+    protected boolean resolveRequest(ClusterState state, Request request, ActionListener<Response> listener) {
+        request.index(state.metaData().concreteSingleIndex(request.index()));
+        return true;
     }
 
-    public Store store() {
-        return this.store;
-    }
-
-    public Engine engine() {
-        return engine;
-    }
-
-    public Translog translog() {
-        return translog;
-    }
-
-    @Override public ShardRouting routingEntry() {
-        return this.shardRouting;
-    }
-
-    public InternalIndexShard routingEntry(ShardRouting shardRouting) {
-        if (!shardRouting.shardId().equals(shardId())) {
-            throw new ElasticSearchIllegalArgumentException("Trying to set a routing entry with shardId [" + shardRouting.shardId() + "] on a shard with shardId [" + shardId() + "]");
-        }
-        if (this.shardRouting != null) {
-            if (!shardRouting.primary() && this.shardRouting.primary()) {
-                logger.warn("suspect illegal state: trying to move shard from primary mode to backup mode");
-            }
-        }
-        this.shardRouting = shardRouting;
-        return this;
+    protected TransportRequestOptions transportOptions() {
+        return TransportRequestOptions.EMPTY;
     }
 
     /**
-     * Marks the shard as recovering, fails with exception is recovering is not allowed to be set.
+     * Should the operations be performed on the replicas as well. Defaults to <tt>false</tt> meaning operations
+     * will be executed on the replica.
      */
-    public IndexShardState recovering(String reason) throws IndexShardStartedException,
-            IndexShardRelocatedException, IndexShardRecoveringException, IndexShardClosedException {
-        synchronized (mutex) {
-            IndexShardState returnValue = state;
-            if (state == IndexShardState.CLOSED) {
-                throw new IndexShardClosedException(shardId);
-            }
-            if (state == IndexShardState.STARTED) {
-                throw new IndexShardStartedException(shardId);
-            }
-            if (state == IndexShardState.RELOCATED) {
-                throw new IndexShardRelocatedException(shardId);
-            }
-            if (state == IndexShardState.RECOVERING) {
-                throw new IndexShardRecoveringException(shardId);
-            }
-            logger.debug("state: [{}]->[{}], reason [{}]", state, IndexShardState.RECOVERING, reason);
-            state = IndexShardState.RECOVERING;
-            return returnValue;
-        }
+    protected boolean ignoreReplicas() {
+        return false;
     }
 
-    public InternalIndexShard relocated(String reason) throws IndexShardNotStartedException {
-        synchronized (mutex) {
-            if (state != IndexShardState.STARTED) {
-                throw new IndexShardNotStartedException(shardId, state);
-            }
-            logger.debug("state: [{}]->[{}], reason [{}]", state, IndexShardState.RELOCATED, reason);
-            state = IndexShardState.RELOCATED;
-        }
-        return this;
+    private String transportReplicaAction() {
+        return actionName + "/replica";
     }
 
-    public InternalIndexShard start(String reason) throws IndexShardStartedException, IndexShardRelocatedException, IndexShardClosedException {
-        synchronized (mutex) {
-            if (state == IndexShardState.CLOSED) {
-                throw new IndexShardClosedException(shardId);
-            }
-            if (state == IndexShardState.STARTED) {
-                throw new IndexShardStartedException(shardId);
-            }
-            if (state == IndexShardState.RELOCATED) {
-                throw new IndexShardRelocatedException(shardId);
-            }
-            if (checkIndex) {
-                checkIndex(true);
-            }
-            engine.start();
-            startScheduledTasksIfNeeded();
-            logger.debug("state: [{}]->[{}], reason [{}]", state, IndexShardState.STARTED, reason);
-            state = IndexShardState.STARTED;
-        }
-        indicesLifecycle.afterIndexShardStarted(this);
-        return this;
-    }
-
-    @Override public IndexShardState state() {
-        return state;
+    protected boolean retryPrimaryException(Throwable e) {
+        return TransportActions.isShardNotAvailableException(e);
     }
 
     /**
-     * Returns the estimated flushable memory size. Returns <tt>null</tt> if not available.
+     * Should an exception be ignored when the operation is performed on the replica.
      */
-    @Override public ByteSizeValue estimateFlushableMemorySize() throws ElasticSearchException {
-        writeAllowed();
-        return engine.estimateFlushableMemorySize();
+    boolean ignoreReplicaException(Throwable e) {
+        if (TransportActions.isShardNotAvailableException(e)) {
+            return true;
+        }
+        Throwable cause = ExceptionsHelper.unwrapCause(e);
+        // on version conflict or document missing, it means
+        // that a news change has crept into the replica, and its fine
+        if (cause instanceof VersionConflictEngineException) {
+            return true;
+        }
+        // same here
+        if (cause instanceof DocumentAlreadyExistsException) {
+            return true;
+        }
+        return false;
     }
 
-    @Override public Engine.Create prepareCreate(SourceToParse source) throws ElasticSearchException {
-        DocumentMapper docMapper = mapperService.documentMapperWithAutoCreate(source.type());
-        ParsedDocument doc = docMapper.parse(source);
-        return new Engine.Create(docMapper.uidMapper().term(doc.uid()), doc);
-    }
+    class OperationTransportHandler extends BaseTransportRequestHandler<Request> {
 
-    @Override public ParsedDocument create(Engine.Create create) throws ElasticSearchException {
-        writeAllowed();
-        if (listeners != null) {
-            for (OperationListener listener : listeners) {
-                create = listener.beforeCreate(create);
-            }
-        }
-        if (logger.isTraceEnabled()) {
-            logger.trace("index {}", create.doc());
-        }
-        engine.create(create);
-        return create.parsedDoc();
-    }
-
-    @Override public Engine.Index prepareIndex(SourceToParse source) throws ElasticSearchException {
-        DocumentMapper docMapper = mapperService.documentMapperWithAutoCreate(source.type());
-        ParsedDocument doc = docMapper.parse(source);
-        return new Engine.Index(docMapper.uidMapper().term(doc.uid()), doc);
-    }
-
-    @Override public ParsedDocument index(Engine.Index index) throws ElasticSearchException {
-        writeAllowed();
-        if (listeners != null) {
-            for (OperationListener listener : listeners) {
-                index = listener.beforeIndex(index);
-            }
-        }
-        if (logger.isTraceEnabled()) {
-            logger.trace("index {}", index.doc());
-        }
-        engine.index(index);
-        return index.parsedDoc();
-    }
-
-    @Override public Engine.Delete prepareDelete(String type, String id, long version) throws ElasticSearchException {
-        DocumentMapper docMapper = mapperService.documentMapperWithAutoCreate(type);
-        return new Engine.Delete(type, id, docMapper.uidMapper().term(type, id)).version(version);
-    }
-
-    @Override public void delete(Engine.Delete delete) throws ElasticSearchException {
-        writeAllowed();
-        if (listeners != null) {
-            for (OperationListener listener : listeners) {
-                delete = listener.beforeDelete(delete);
-            }
-        }
-        if (logger.isTraceEnabled()) {
-            logger.trace("delete [{}]", delete.uid().text());
-        }
-        engine.delete(delete);
-    }
-
-    @Override public void deleteByQuery(byte[] querySource, @Nullable String queryParserName, String... types) throws ElasticSearchException {
-        writeAllowed();
-        if (types == null) {
-            types = Strings.EMPTY_ARRAY;
-        }
-        innerDeleteByQuery(querySource, queryParserName, types);
-    }
-
-    private void innerDeleteByQuery(byte[] querySource, String queryParserName, String... types) {
-        IndexQueryParser queryParser = queryParserService.defaultIndexQueryParser();
-        if (queryParserName != null) {
-            queryParser = queryParserService.indexQueryParser(queryParserName);
-            if (queryParser == null) {
-                throw new IndexQueryParserMissingException(queryParserName);
-            }
-        }
-        Query query = queryParser.parse(querySource).query();
-        query = filterByTypesIfNeeded(query, types);
-
-        if (logger.isTraceEnabled()) {
-            logger.trace("delete_by_query [{}]", query);
+        @Override
+        public Request newInstance() {
+            return newRequestInstance();
         }
 
-        engine.delete(new Engine.DeleteByQuery(query, querySource, queryParserName, types));
-    }
-
-    @Override public byte[] get(String type, String id) throws ElasticSearchException {
-        readAllowed();
-        DocumentMapper docMapper = mapperService.documentMapperWithAutoCreate(type);
-        Engine.Searcher searcher = engine.searcher();
-        try {
-            int docId = Lucene.docId(searcher.reader(), docMapper.uidMapper().term(type, id));
-            if (docId == Lucene.NO_DOC) {
-                if (logger.isTraceEnabled()) {
-                    logger.trace("get for [{}#{}] returned no result", type, id);
-                }
-                return null;
-            }
-            Document doc = searcher.reader().document(docId, docMapper.sourceMapper().fieldSelector());
-            if (logger.isTraceEnabled()) {
-                logger.trace("get for [{}#{}] returned [{}]", type, id, doc);
-            }
-            return docMapper.sourceMapper().value(doc);
-        } catch (IOException e) {
-            throw new ElasticSearchException("Failed to get type [" + type + "] and id [" + id + "]", e);
-        } finally {
-            searcher.release();
+        @Override
+        public String executor() {
+            return ThreadPool.Names.SAME;
         }
-    }
 
-    @Override public long count(float minScore, byte[] querySource, @Nullable String queryParserName, String... types) throws ElasticSearchException {
-        return count(minScore, querySource, 0, querySource.length, queryParserName, types);
-    }
-
-    @Override public long count(float minScore, byte[] querySource, int querySourceOffset, int querySourceLength,
-                                @Nullable String queryParserName, String... types) throws ElasticSearchException {
-        readAllowed();
-        IndexQueryParser queryParser = queryParserService.defaultIndexQueryParser();
-        if (queryParserName != null) {
-            queryParser = queryParserService.indexQueryParser(queryParserName);
-            if (queryParser == null) {
-                throw new IndexQueryParserMissingException(queryParserName);
-            }
-        }
-        Query query = queryParser.parse(querySource, querySourceOffset, querySourceLength).query();
-        // wrap it in filter, cache it, and constant score it
-        // Don't cache it, since it might be very different queries each time...
-//        query = new ConstantScoreQuery(filterCache.cache(new QueryWrapperFilter(query)));
-        query = filterByTypesIfNeeded(query, types);
-        Engine.Searcher searcher = engine.searcher();
-        try {
-            long count = Lucene.count(searcher.searcher(), query, minScore);
-            if (logger.isTraceEnabled()) {
-                logger.trace("count of [{}] is [{}]", query, count);
-            }
-            return count;
-        } catch (IOException e) {
-            throw new ElasticSearchException("Failed to count query [" + query + "]", e);
-        } finally {
-            searcher.release();
-        }
-    }
-
-    @Override public void refresh(Engine.Refresh refresh) throws ElasticSearchException {
-        writeAllowed();
-        if (logger.isTraceEnabled()) {
-            logger.trace("refresh with {}", refresh);
-        }
-        engine.refresh(refresh);
-    }
-
-    @Override public void flush(Engine.Flush flush) throws ElasticSearchException {
-        writeAllowed();
-        if (logger.isTraceEnabled()) {
-            logger.trace("flush with {}", flush);
-        }
-        engine.flush(flush);
-    }
-
-    @Override public void optimize(Engine.Optimize optimize) throws ElasticSearchException {
-        writeAllowed();
-        if (logger.isTraceEnabled()) {
-            logger.trace("optimize with {}", optimize);
-        }
-        engine.optimize(optimize);
-    }
-
-    @Override public <T> T snapshot(Engine.SnapshotHandler<T> snapshotHandler) throws EngineException {
-        IndexShardState state = this.state; // one time volatile read
-        // we allow snapshot on closed index shard, since we want to do one after we close the shard and before we close the engine
-        if (state != IndexShardState.STARTED && state != IndexShardState.RELOCATED && state != IndexShardState.CLOSED) {
-            throw new IllegalIndexShardStateException(shardId, state, "snapshot is not allowed");
-        }
-        return engine.snapshot(snapshotHandler);
-    }
-
-    @Override public void recover(Engine.RecoveryHandler recoveryHandler) throws EngineException {
-        writeAllowed();
-        engine.recover(recoveryHandler);
-    }
-
-    @Override public Engine.Searcher searcher() {
-        readAllowed();
-        return engine.searcher();
-    }
-
-    public void close(String reason) {
-        synchronized (mutex) {
-            if (listeners != null) {
-                listeners.clear();
-            }
-            listeners = null;
-            indexSettingsService.removeListener(applyRefreshSettings);
-            if (state != IndexShardState.CLOSED) {
-                if (refreshScheduledFuture != null) {
-                    refreshScheduledFuture.cancel(true);
-                    refreshScheduledFuture = null;
-                }
-                if (mergeScheduleFuture != null) {
-                    mergeScheduleFuture.cancel(true);
-                    mergeScheduleFuture = null;
-                }
-            }
-            logger.debug("state: [{}]->[{}], reason [{}]", state, IndexShardState.CLOSED, reason);
-            state = IndexShardState.CLOSED;
-        }
-    }
-
-    /**
-     * After the store has been recovered, we need to start the engine in order to apply operations
-     */
-    public void performRecoveryPrepareForTranslog() throws ElasticSearchException {
-        if (state != IndexShardState.RECOVERING) {
-            throw new IndexShardNotRecoveringException(shardId, state);
-        }
-        // also check here, before we apply the translog
-        if (checkIndex) {
-            checkIndex(true);
-        }
-        engine.start();
-    }
-
-    /**
-     * The peer recovery status if this shard recovered from a peer shard.
-     */
-    public RecoveryStatus peerRecoveryStatus() {
-        return this.peerRecoveryStatus;
-    }
-
-    public void performRecoveryFinalization(boolean withFlush, RecoveryStatus peerRecoveryStatus) throws ElasticSearchException {
-        performRecoveryFinalization(withFlush);
-        this.peerRecoveryStatus = peerRecoveryStatus;
-    }
-
-    public void performRecoveryFinalization(boolean withFlush) throws ElasticSearchException {
-        if (withFlush) {
-            engine.flush(new Engine.Flush());
-        }
-        synchronized (mutex) {
-            logger.debug("state: [{}]->[{}], reason [post recovery]", state, IndexShardState.STARTED);
-            state = IndexShardState.STARTED;
-        }
-        startScheduledTasksIfNeeded();
-        engine.refresh(new Engine.Refresh(true));
-
-        // clear unreferenced files
-        translog.clearUnreferenced();
-        indicesLifecycle.afterIndexShardStarted(this);
-    }
-
-    public void performRecoveryOperation(Translog.Operation operation) throws ElasticSearchException {
-        if (state != IndexShardState.RECOVERING) {
-            throw new IndexShardNotRecoveringException(shardId, state);
-        }
-        switch (operation.opType()) {
-            case CREATE:
-                Translog.Create create = (Translog.Create) operation;
-                engine.create(prepareCreate(source(create.source()).type(create.type()).id(create.id())
-                        .routing(create.routing()).parent(create.parent())).version(create.version())
-                        .origin(Engine.Operation.Origin.RECOVERY));
-                break;
-            case SAVE:
-                Translog.Index index = (Translog.Index) operation;
-                engine.index(prepareIndex(source(index.source()).type(index.type()).id(index.id())
-                        .routing(index.routing()).parent(index.parent())).version(index.version())
-                        .origin(Engine.Operation.Origin.RECOVERY));
-                break;
-            case DELETE:
-                Translog.Delete delete = (Translog.Delete) operation;
-                Uid uid = Uid.createUid(delete.uid().text());
-                engine.delete(new Engine.Delete(uid.type(), uid.id(), delete.uid()).version(delete.version())
-                        .origin(Engine.Operation.Origin.RECOVERY));
-                break;
-            case DELETE_BY_QUERY:
-                Translog.DeleteByQuery deleteByQuery = (Translog.DeleteByQuery) operation;
-                innerDeleteByQuery(deleteByQuery.source(), deleteByQuery.queryParserName(), deleteByQuery.types());
-                break;
-            default:
-                throw new ElasticSearchIllegalStateException("No operation defined for [" + operation + "]");
-        }
-    }
-
-    /**
-     * Returns <tt>true</tt> if this shard can ignore a recovery attempt made to it (since the already doing/done it)
-     */
-    public boolean ignoreRecoveryAttempt() {
-        IndexShardState state = state(); // one time volatile read
-        return state == IndexShardState.RECOVERING || state == IndexShardState.STARTED ||
-                state == IndexShardState.RELOCATED || state == IndexShardState.CLOSED;
-    }
-
-    public void readAllowed() throws IllegalIndexShardStateException {
-        IndexShardState state = this.state; // one time volatile read
-        if (state != IndexShardState.STARTED && state != IndexShardState.RELOCATED) {
-            throw new IllegalIndexShardStateException(shardId, state, "Read operations only allowed when started/relocated");
-        }
-    }
-
-    public void writeAllowed() throws IllegalIndexShardStateException {
-        IndexShardState state = this.state; // one time volatile read
-        if (state != IndexShardState.STARTED) {
-            throw new IndexShardNotStartedException(shardId, state);
-        }
-    }
-
-    private void startScheduledTasksIfNeeded() {
-        if (refreshInterval.millis() > 0) {
-            refreshScheduledFuture = threadPool.schedule(refreshInterval, ThreadPool.Names.SAME, new EngineRefresher());
-            logger.debug("scheduling refresher every {}", refreshInterval);
-        } else {
-            logger.debug("scheduled refresher disabled");
-        }
-        // since we can do async merging, it will not be called explicitly when indexing (adding / deleting docs), and only when flushing
-        // so, make sure we periodically call it, this need to be a small enough value so mergine will actually
-        // happen and reduce the number of segments
-        if (mergeInterval.millis() > 0) {
-            mergeScheduleFuture = threadPool.schedule(mergeInterval, ThreadPool.Names.SAME, new EngineMerger());
-            logger.debug("scheduling optimizer / merger every {}", mergeInterval);
-        } else {
-            logger.debug("scheduled optimizer / merger disabled");
-        }
-    }
-
-    private Query filterByTypesIfNeeded(Query query, String[] types) {
-        if (types != null && types.length > 0) {
-            query = new FilteredQuery(query, indexCache.filter().cache(mapperService.typesFilter(types)));
-        }
-        return query;
-    }
-
-    private class ApplyRefreshSettings implements IndexSettingsService.Listener {
-        @Override public void onRefreshSettings(Settings settings) {
-            synchronized (mutex) {
-                if (state == IndexShardState.CLOSED) {
-                    return;
-                }
-                TimeValue refreshInterval = settings.getAsTime("engine.robin.refresh_interval", settings.getAsTime("index.refresh_interval", InternalIndexShard.this.refreshInterval));
-                if (!refreshInterval.equals(InternalIndexShard.this.refreshInterval)) {
-                    logger.info("updating refresh_interval from [{}] to [{}]", InternalIndexShard.this.refreshInterval, refreshInterval);
-                    if (refreshScheduledFuture != null) {
-                        refreshScheduledFuture.cancel(false);
-                        refreshScheduledFuture = null;
-                    }
-                    InternalIndexShard.this.refreshInterval = refreshInterval;
-                    if (refreshInterval.millis() > 0) {
-                        refreshScheduledFuture = threadPool.schedule(refreshInterval, ThreadPool.Names.SAME, new EngineRefresher());
-                    }
-                }
-            }
-        }
-    }
-
-    private class EngineRefresher implements Runnable {
-        @Override public void run() {
-            // we check before if a refresh is needed, if not, we reschedule, otherwise, we fork, refresh, and then reschedule
-            if (!engine().refreshNeeded()) {
-                synchronized (mutex) {
-                    if (state != IndexShardState.CLOSED) {
-                        refreshScheduledFuture = threadPool.schedule(refreshInterval, ThreadPool.Names.SAME, this);
-                    }
-                }
-                return;
-            }
-            threadPool.cached().execute(new Runnable() {
-                @Override public void run() {
+        @Override
+        public void messageReceived(final Request request, final TransportChannel channel) throws Exception {
+            // no need to have a threaded listener since we just send back a response
+            request.listenerThreaded(false);
+            // if we have a local operation, execute it on a thread since we don't spawn
+            request.operationThreaded(true);
+            execute(request, new ActionListener<Response>() {
+                @Override
+                public void onResponse(Response result) {
                     try {
-                        if (engine.refreshNeeded()) {
-                            engine.refresh(new Engine.Refresh(false));
-                        }
-                    } catch (EngineClosedException e) {
-                        // we are being closed, ignore
-                    } catch (RefreshFailedEngineException e) {
-                        if (e.getCause() instanceof InterruptedException) {
-                            // ignore, we are being shutdown
-                        } else if (e.getCause() instanceof ClosedByInterruptException) {
-                            // ignore, we are being shutdown
-                        } else if (e.getCause() instanceof ThreadInterruptedException) {
-                            // ignore, we are being shutdown
-                        } else {
-                            logger.warn("Failed to perform scheduled engine refresh", e);
-                        }
-                    } catch (Exception e) {
-                        logger.warn("Failed to perform scheduled engine refresh", e);
+                        channel.sendResponse(result);
+                    } catch (Throwable e) {
+                        onFailure(e);
                     }
-                    synchronized (mutex) {
-                        if (state != IndexShardState.CLOSED) {
-                            refreshScheduledFuture = threadPool.schedule(refreshInterval, ThreadPool.Names.SAME, EngineRefresher.this);
-                        }
+                }
+
+                @Override
+                public void onFailure(Throwable e) {
+                    try {
+                        channel.sendResponse(e);
+                    } catch (Throwable e1) {
+                        logger.warn("Failed to send response for " + actionName, e1);
                     }
                 }
             });
         }
     }
 
-    private class EngineMerger implements Runnable {
-        @Override public void run() {
-            if (!engine().possibleMergeNeeded()) {
-                synchronized (mutex) {
-                    if (state != IndexShardState.CLOSED) {
-                        mergeScheduleFuture = threadPool.schedule(mergeInterval, ThreadPool.Names.SAME, this);
-                    }
-                }
-                return;
+    class ReplicaOperationTransportHandler extends BaseTransportRequestHandler<ReplicaOperationRequest> {
+
+        @Override
+        public ReplicaOperationRequest newInstance() {
+            return new ReplicaOperationRequest();
+        }
+
+        @Override
+        public String executor() {
+            return executor;
+        }
+
+        // we must never reject on because of thread pool capacity on replicas
+        @Override
+        public boolean isForceExecution() {
+            return true;
+        }
+
+        @Override
+        public void messageReceived(final ReplicaOperationRequest request, final TransportChannel channel) throws Exception {
+            try {
+                shardOperationOnReplica(request);
+            } catch (Throwable t) {
+                failReplicaIfNeeded(request.request.index(), request.shardId, t);
+                throw t;
             }
-            threadPool.executor(ThreadPool.Names.MERGE).execute(new Runnable() {
-                @Override public void run() {
-                    try {
-                        engine.maybeMerge();
-                    } catch (EngineClosedException e) {
-                        // we are being closed, ignore
-                    } catch (OptimizeFailedEngineException e) {
-                        if (e.getCause() instanceof EngineClosedException) {
-                            // ignore, we are being shutdown
-                        } else if (e.getCause() instanceof InterruptedException) {
-                            // ignore, we are being shutdown
-                        } else if (e.getCause() instanceof ClosedByInterruptException) {
-                            // ignore, we are being shutdown
-                        } else if (e.getCause() instanceof ThreadInterruptedException) {
-                            // ignore, we are being shutdown
-                        } else {
-                            logger.warn("Failed to perform scheduled engine optimize/merge", e);
-                        }
-                    } catch (Exception e) {
-                        logger.warn("Failed to perform scheduled engine optimize/merge", e);
-                    }
-                    synchronized (mutex) {
-                        if (state != IndexShardState.CLOSED) {
-                            mergeScheduleFuture = threadPool.schedule(mergeInterval, ThreadPool.Names.SAME, EngineMerger.this);
-                        }
-                    }
-                }
-            });
+            channel.sendResponse(TransportResponse.Empty.INSTANCE);
         }
     }
 
-    private void checkIndex(boolean throwException) throws IndexShardException {
-        try {
-            if (!IndexReader.indexExists(store.directory())) {
-                return;
-            }
-            CheckIndex checkIndex = new CheckIndex(store.directory());
-            FastByteArrayOutputStream os = new FastByteArrayOutputStream();
-            PrintStream out = new PrintStream(os);
-            checkIndex.setInfoStream(out);
-            out.flush();
-            CheckIndex.Status status = checkIndex.checkIndex();
-            if (!status.clean) {
-                if (state == IndexShardState.CLOSED) {
-                    // ignore if closed....
-                    return;
-                }
-                logger.warn("check index [failure]\n{}", new String(os.unsafeByteArray(), 0, os.size()));
-                if (throwException) {
-                    throw new IndexShardException(shardId, "index check failure");
-                }
+    protected class PrimaryOperationRequest implements Streamable {
+
+        public int shardId;
+
+        public Request request;
+
+        public PrimaryOperationRequest() {
+        }
+
+        public PrimaryOperationRequest(int shardId, Request request) {
+            this.shardId = shardId;
+            this.request = request;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            shardId = in.readVInt();
+            request = newRequestInstance();
+            request.readFrom(in);
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeVInt(shardId);
+            request.writeTo(out);
+        }
+    }
+
+    protected class ReplicaOperationRequest extends TransportRequest {
+
+        public int shardId;
+        public ReplicaRequest request;
+
+        public ReplicaOperationRequest() {
+        }
+
+        public ReplicaOperationRequest(int shardId, ReplicaRequest request) {
+            super(request);
+            this.shardId = shardId;
+            this.request = request;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            super.readFrom(in);
+            shardId = in.readVInt();
+            request = newReplicaRequestInstance();
+            request.readFrom(in);
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            out.writeVInt(shardId);
+            request.writeTo(out);
+        }
+    }
+
+    protected class AsyncShardOperationAction {
+
+        private final ActionListener<Response> listener;
+        private final Request request;
+        private volatile ShardIterator shardIt;
+        private final AtomicBoolean primaryOperationStarted = new AtomicBoolean();
+        private final ReplicationType replicationType;
+        private volatile ClusterStateObserver observer;
+
+        AsyncShardOperationAction(Request request, ActionListener<Response> listener) {
+            this.request = request;
+            this.listener = listener;
+
+            if (request.replicationType() != ReplicationType.DEFAULT) {
+                replicationType = request.replicationType();
             } else {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("check index [success]\n{}", new String(os.unsafeByteArray(), 0, os.size()));
+                replicationType = defaultReplicationType;
+            }
+        }
+
+        public void start() {
+            observer = new ClusterStateObserver(clusterService, request.timeout(), logger);
+            doStart();
+        }
+
+        /**
+         * Returns <tt>true</tt> if the action starting to be performed on the primary (or is done).
+         */
+        protected boolean doStart() throws ElasticsearchException {
+            try {
+                ClusterBlockException blockException = checkGlobalBlock(observer.observedState(), request);
+                if (blockException != null) {
+                    if (blockException.retryable()) {
+                        logger.trace("cluster is blocked ({}), scheduling a retry", blockException.getMessage());
+                        retry(blockException);
+                        return false;
+                    } else {
+                        throw blockException;
+                    }
+                }
+                // check if we need to execute, and if not, return
+                if (!resolveRequest(observer.observedState(), request, listener)) {
+                    return true;
+                }
+                blockException = checkRequestBlock(observer.observedState(), request);
+                if (blockException != null) {
+                    if (blockException.retryable()) {
+                        logger.trace("cluster is blocked ({}), scheduling a retry", blockException.getMessage());
+                        retry(blockException);
+                        return false;
+                    } else {
+                        throw blockException;
+                    }
+                }
+                shardIt = shards(observer.observedState(), request);
+            } catch (Throwable e) {
+                listener.onFailure(e);
+                return true;
+            }
+
+            // no shardIt, might be in the case between index gateway recovery and shardIt initialization
+            if (shardIt.size() == 0) {
+                logger.trace("no shard instances known for shard [{}], scheduling a retry", shardIt.shardId());
+
+                retry(null);
+                return false;
+            }
+
+            boolean foundPrimary = false;
+            ShardRouting shardX;
+            while ((shardX = shardIt.nextOrNull()) != null) {
+                final ShardRouting shard = shardX;
+                // we only deal with primary shardIt here...
+                if (!shard.primary()) {
+                    continue;
+                }
+                if (!shard.active() || !observer.observedState().nodes().nodeExists(shard.currentNodeId())) {
+                    logger.trace("primary shard [{}] is not yet active or we do not know the node it is assigned to [{}], scheduling a retry.", shard.shardId(), shard.currentNodeId());
+                    retry(null);
+                    return false;
+                }
+
+                // check here for consistency
+                if (checkWriteConsistency) {
+                    WriteConsistencyLevel consistencyLevel = defaultWriteConsistencyLevel;
+                    if (request.consistencyLevel() != WriteConsistencyLevel.DEFAULT) {
+                        consistencyLevel = request.consistencyLevel();
+                    }
+                    int requiredNumber = 1;
+                    if (consistencyLevel == WriteConsistencyLevel.QUORUM && shardIt.size() > 2) {
+                        // only for more than 2 in the number of shardIt it makes sense, otherwise its 1 shard with 1 replica, quorum is 1 (which is what it is initialized to)
+                        requiredNumber = (shardIt.size() / 2) + 1;
+                    } else if (consistencyLevel == WriteConsistencyLevel.ALL) {
+                        requiredNumber = shardIt.size();
+                    }
+
+                    if (shardIt.sizeActive() < requiredNumber) {
+                        logger.trace("not enough active copies of shard [{}] to meet write consistency of [{}] (have {}, needed {}), scheduling a retry.",
+                                shard.shardId(), consistencyLevel, shardIt.sizeActive(), requiredNumber);
+                        retry(null);
+                        return false;
+                    }
+                }
+
+                if (!primaryOperationStarted.compareAndSet(false, true)) {
+                    return true;
+                }
+
+                foundPrimary = true;
+                if (shard.currentNodeId().equals(observer.observedState().nodes().localNodeId())) {
+                    try {
+                        if (request.operationThreaded()) {
+                            request.beforeLocalFork();
+                            threadPool.executor(executor).execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        performOnPrimary(shard.id(), shard, observer.observedState());
+                                    } catch (Throwable t) {
+                                        listener.onFailure(t);
+                                    }
+                                }
+                            });
+                        } else {
+                            performOnPrimary(shard.id(), shard, observer.observedState());
+                        }
+                    } catch (Throwable t) {
+                        listener.onFailure(t);
+                    }
+                } else {
+                    DiscoveryNode node = observer.observedState().nodes().get(shard.currentNodeId());
+                    transportService.sendRequest(node, actionName, request, transportOptions, new BaseTransportResponseHandler<Response>() {
+
+                        @Override
+                        public Response newInstance() {
+                            return newResponseInstance();
+                        }
+
+                        @Override
+                        public String executor() {
+                            return ThreadPool.Names.SAME;
+                        }
+
+                        @Override
+                        public void handleResponse(Response response) {
+                            listener.onResponse(response);
+                        }
+
+                        @Override
+                        public void handleException(TransportException exp) {
+                            // if we got disconnected from the node, or the node / shard is not in the right state (being closed)
+                            if (exp.unwrapCause() instanceof ConnectTransportException || exp.unwrapCause() instanceof NodeClosedException ||
+                                    retryPrimaryException(exp)) {
+                                primaryOperationStarted.set(false);
+                                // we already marked it as started when we executed it (removed the listener) so pass false
+                                // to re-add to the cluster listener
+                                logger.trace("received an error from node the primary was assigned to ({}), scheduling a retry", exp.getMessage());
+                                retry(null);
+                            } else {
+                                listener.onFailure(exp);
+                            }
+                        }
+                    });
+                }
+                break;
+            }
+            // we won't find a primary if there are no shards in the shard iterator, retry...
+            if (!foundPrimary) {
+                logger.trace("couldn't find a eligible primary shard, scheduling for retry.");
+                retry(null);
+                return false;
+            }
+            return true;
+        }
+
+        void retry(@Nullable final Throwable failure) {
+            if (observer.isTimedOut()) {
+                // we running as a last attempt after a timeout has happened. don't retry
+                return;
+            }
+            // make it threaded operation so we fork on the discovery listener thread
+            request.beforeLocalFork();
+            request.operationThreaded(true);
+
+            observer.waitForNextChange(new ClusterStateObserver.Listener() {
+                @Override
+                public void onNewClusterState(ClusterState state) {
+                    doStart();
+                }
+
+                @Override
+                public void onClusterServiceClose() {
+                    listener.onFailure(new NodeClosedException(clusterService.localNode()));
+                }
+
+                @Override
+                public void onTimeout(TimeValue timeout) {
+                    if (doStart()) {
+                        return;
+                    }
+                    raiseTimeoutFailure(timeout, failure);
+                }
+            });
+        }
+
+        void raiseTimeoutFailure(TimeValue timeout, @Nullable Throwable failure) {
+            if (failure == null) {
+                if (shardIt == null) {
+                    failure = new UnavailableShardsException(null, "no available shards: Timeout waiting for [" + timeout + "], request: " + request.toString());
+                } else {
+                    failure = new UnavailableShardsException(shardIt.shardId(), "[" + shardIt.size() + "] shardIt, [" + shardIt.sizeActive() + "] active : Timeout waiting for [" + timeout + "], request: " + request.toString());
                 }
             }
-        } catch (Exception e) {
-            logger.warn("failed to check index", e);
+            listener.onFailure(failure);
+        }
+
+        void performOnPrimary(int primaryShardId, final ShardRouting shard, ClusterState clusterState) {
+            try {
+                PrimaryResponse<Response, ReplicaRequest> response = shardOperationOnPrimary(clusterState, new PrimaryOperationRequest(primaryShardId, request));
+                performReplicas(response);
+            } catch (Throwable e) {
+                // shard has not been allocated yet, retry it here
+                if (retryPrimaryException(e)) {
+                    primaryOperationStarted.set(false);
+                    logger.trace("had an error while performing operation on primary ({}), scheduling a retry.", e.getMessage());
+                    retry(e);
+                    return;
+                }
+                if (e instanceof ElasticsearchException && ((ElasticsearchException) e).status() == RestStatus.CONFLICT) {
+                    if (logger.isTraceEnabled()) {
+                        logger.trace(shard.shortSummary() + ": Failed to execute [" + request + "]", e);
+                    }
+                } else {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug(shard.shortSummary() + ": Failed to execute [" + request + "]", e);
+                    }
+                }
+                listener.onFailure(e);
+            }
+        }
+
+        void performReplicas(final PrimaryResponse<Response, ReplicaRequest> response) {
+            if (ignoreReplicas()) {
+                postPrimaryOperation(request, response);
+                listener.onResponse(response.response());
+                return;
+            }
+            ShardRouting shard;
+
+            // we double check on the state, if it got changed we need to make sure we take the latest one cause
+            // maybe a replica shard started its recovery process and we need to apply it there...
+
+            // we also need to make sure if the new state has a new primary shard (that we indexed to before) started
+            // and assigned to another node (while the indexing happened). In that case, we want to apply it on the
+            // new primary shard as well...
+            ClusterState newState = clusterService.state();
+            ShardRouting newPrimaryShard = null;
+            if (observer.observedState() != newState) {
+                shardIt.reset();
+                ShardRouting originalPrimaryShard = null;
+                while ((shard = shardIt.nextOrNull()) != null) {
+                    if (shard.primary()) {
+                        originalPrimaryShard = shard;
+                        break;
+                    }
+                }
+                if (originalPrimaryShard == null || !originalPrimaryShard.active()) {
+                    throw new ElasticsearchIllegalStateException("unexpected state, failed to find primary shard on an index operation that succeeded");
+                }
+
+                observer.reset(newState);
+                shardIt = shards(newState, request);
+                while ((shard = shardIt.nextOrNull()) != null) {
+                    if (shard.primary()) {
+                        if (originalPrimaryShard.currentNodeId().equals(shard.currentNodeId())) {
+                            newPrimaryShard = null;
+                        } else {
+                            newPrimaryShard = shard;
+                        }
+                        break;
+                    }
+                }
+                shardIt.reset();
+                request.setCanHaveDuplicates(); // safe side, cluster state changed, we might have dups
+            } else{
+                shardIt.reset();
+                while ((shard = shardIt.nextOrNull()) != null) {
+                    if (shard.state() != ShardRoutingState.STARTED) {
+                        request.setCanHaveDuplicates();
+                    }
+                }
+                shardIt.reset();
+            }
+
+            // initialize the counter
+            int replicaCounter = shardIt.assignedReplicasIncludingRelocating();
+
+            if (newPrimaryShard != null) {
+                replicaCounter++;
+            }
+
+            if (replicaCounter == 0) {
+                postPrimaryOperation(request, response);
+                listener.onResponse(response.response());
+                return;
+            }
+
+            if (replicationType == ReplicationType.ASYNC) {
+                postPrimaryOperation(request, response);
+                // async replication, notify the listener
+                listener.onResponse(response.response());
+                // now, trick the counter so it won't decrease to 0 and notify the listeners
+                replicaCounter = Integer.MIN_VALUE;
+            }
+
+            // we add one to the replica count to do the postPrimaryOperation
+            replicaCounter++;
+            AtomicInteger counter = new AtomicInteger(replicaCounter);
+
+
+            IndexMetaData indexMetaData = observer.observedState().metaData().index(request.index());
+
+            if (newPrimaryShard != null) {
+                performOnReplica(response, counter, newPrimaryShard, newPrimaryShard.currentNodeId(), indexMetaData);
+            }
+
+            shardIt.reset(); // reset the iterator
+            while ((shard = shardIt.nextOrNull()) != null) {
+                // if its unassigned, nothing to do here...
+                if (shard.unassigned()) {
+                    continue;
+                }
+
+                // if the shard is primary and relocating, add one to the counter since we perform it on the replica as well
+                // (and we already did it on the primary)
+                boolean doOnlyOnRelocating = false;
+                if (shard.primary()) {
+                    if (shard.relocating()) {
+                        doOnlyOnRelocating = true;
+                    } else {
+                        continue;
+                    }
+                }
+                // we index on a replica that is initializing as well since we might not have got the event
+                // yet that it was started. We will get an exception IllegalShardState exception if its not started
+                // and that's fine, we will ignore it
+                if (!doOnlyOnRelocating) {
+                    performOnReplica(response, counter, shard, shard.currentNodeId(), indexMetaData);
+                }
+                if (shard.relocating()) {
+                    performOnReplica(response, counter, shard, shard.relocatingNodeId(), indexMetaData);
+                }
+            }
+
+            // now do the postPrimary operation, and check if the listener needs to be invoked
+            postPrimaryOperation(request, response);
+            // we also invoke here in case replicas finish before postPrimaryAction does
+            if (counter.decrementAndGet() == 0) {
+                listener.onResponse(response.response());
+            }
+        }
+
+        void performOnReplica(final PrimaryResponse<Response, ReplicaRequest> response, final AtomicInteger counter, final ShardRouting shard, String nodeId, final IndexMetaData indexMetaData) {
+            // if we don't have that node, it means that it might have failed and will be created again, in
+            // this case, we don't have to do the operation, and just let it failover
+            if (!observer.observedState().nodes().nodeExists(nodeId)) {
+                if (counter.decrementAndGet() == 0) {
+                    listener.onResponse(response.response());
+                }
+                return;
+            }
+
+            final ReplicaOperationRequest shardRequest = new ReplicaOperationRequest(shardIt.shardId().id(), response.replicaRequest());
+            if (!nodeId.equals(observer.observedState().nodes().localNodeId())) {
+                final DiscoveryNode node = observer.observedState().nodes().get(nodeId);
+                transportService.sendRequest(node, transportReplicaAction, shardRequest, transportOptions, new EmptyTransportResponseHandler(ThreadPool.Names.SAME) {
+                    @Override
+                    public void handleResponse(TransportResponse.Empty vResponse) {
+                        finishIfPossible();
+                    }
+
+                    @Override
+                    public void handleException(TransportException exp) {
+                        logger.trace("[{}] Transport failure during replica request [{}] ", exp, node, request);
+                        if (!ignoreReplicaException(exp)) {
+                            logger.warn("Failed to perform " + actionName + " on remote replica " + node + shardIt.shardId(), exp);
+                            shardStateAction.shardFailed(shard, indexMetaData.getUUID(),
+                                    "Failed to perform [" + actionName + "] on replica, message [" + ExceptionsHelper.detailedMessage(exp) + "]");
+                        }
+                        finishIfPossible();
+                    }
+
+                    private void finishIfPossible() {
+                        if (counter.decrementAndGet() == 0) {
+                            listener.onResponse(response.response());
+                        }
+                    }
+                });
+            } else {
+                if (request.operationThreaded()) {
+                    request.beforeLocalFork();
+                    try {
+                        threadPool.executor(executor).execute(new AbstractRunnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    shardOperationOnReplica(shardRequest);
+                                } catch (Throwable e) {
+                                    failReplicaIfNeeded(shard.index(), shard.id(), e);
+                                }
+                                if (counter.decrementAndGet() == 0) {
+                                    listener.onResponse(response.response());
+                                }
+                            }
+
+                            // we must never reject on because of thread pool capacity on replicas
+                            @Override
+                            public boolean isForceExecution() {
+                                return true;
+                            }
+                        });
+                    } catch (Throwable e) {
+                        failReplicaIfNeeded(shard.index(), shard.id(), e);
+                        // we want to decrement the counter here, in teh failure handling, cause we got rejected
+                        // from executing on the thread pool
+                        if (counter.decrementAndGet() == 0) {
+                            listener.onResponse(response.response());
+                        }
+                    }
+                } else {
+                    try {
+                        shardOperationOnReplica(shardRequest);
+                    } catch (Throwable e) {
+                        failReplicaIfNeeded(shard.index(), shard.id(), e);
+                    }
+                    if (counter.decrementAndGet() == 0) {
+                        listener.onResponse(response.response());
+                    }
+                }
+            }
+        }
+
+    }
+
+    private void failReplicaIfNeeded(String index, int shardId, Throwable t) {
+        logger.trace("failure on replica [{}][{}]", t, index, shardId);
+        if (!ignoreReplicaException(t)) {
+            IndexService indexService = indicesService.indexService(index);
+            if (indexService == null) {
+                logger.debug("ignoring failed replica [{}][{}] because index was already removed.", index, shardId);
+                return;
+            }
+            IndexShard indexShard = indexService.shard(shardId);
+            if (indexShard == null) {
+                logger.debug("ignoring failed replica [{}][{}] because index was already removed.", index, shardId);
+                return;
+            }
+            indexShard.failShard(actionName + " failed on replica", t);
+        }
+    }
+
+    public static class PrimaryResponse<Response, ReplicaRequest> {
+        private final ReplicaRequest replicaRequest;
+        private final Response response;
+        private final Object payload;
+
+        public PrimaryResponse(ReplicaRequest replicaRequest, Response response, Object payload) {
+            this.replicaRequest = replicaRequest;
+            this.response = response;
+            this.payload = payload;
+        }
+
+        public ReplicaRequest replicaRequest() {
+            return this.replicaRequest;
+        }
+
+        public Response response() {
+            return response;
+        }
+
+        public Object payload() {
+            return payload;
         }
     }
 }

@@ -1,4 +1,4 @@
-import org.jboss.as.controller.logging.ControllerLogger;
+return new RequestOptions(ResponseMode.GET_ALL, this.timeout, false, FILTER);
 
 /*
  * JBoss, Home of Professional Open Source.
@@ -21,257 +21,252 @@ import org.jboss.as.controller.logging.ControllerLogger;
  * Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
+package org.wildfly.clustering.server.dispatcher;
 
-package org.jboss.as.controller.access.constraint;
-
-import java.util.Collection;
-import java.util.LinkedHashSet;
-import java.util.List;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
-import org.jboss.as.controller.ControllerLogger;
-import org.jboss.as.controller.access.Action;
-import org.jboss.as.controller.access.ServerGroupEffect;
-import org.jboss.as.controller.access.TargetAttribute;
-import org.jboss.as.controller.access.TargetResource;
-import org.jboss.as.controller.access.rbac.StandardRole;
+import org.jboss.as.clustering.jgroups.Addressable;
+import org.jgroups.Address;
+import org.jgroups.Message;
+import org.jgroups.blocks.MessageDispatcher;
+import org.jgroups.blocks.RequestOptions;
+import org.jgroups.blocks.ResponseMode;
+import org.jgroups.blocks.RspFilter;
+import org.jgroups.util.Rsp;
+import org.wildfly.clustering.dispatcher.Command;
+import org.wildfly.clustering.dispatcher.CommandDispatcher;
+import org.wildfly.clustering.dispatcher.CommandResponse;
+import org.wildfly.clustering.group.Node;
+import org.wildfly.clustering.group.NodeFactory;
 
 /**
- * Constraint related to whether the target resource is associated with one or more managed domain server groups.
+ * MessageDispatcher-based command dispatcher.
+ * @author Paul Ferraro
  *
- * @author Brian Stansberry (c) 2013 Red Hat Inc.
+ * @param <C> command execution context
  */
-public class ServerGroupEffectConstraint extends AbstractConstraint implements Constraint, ScopingConstraint {
+public abstract class ServiceCommandDispatcher<C> implements CommandDispatcher<C> {
 
+    private static final RspFilter FILTER = new RspFilter() {
+        @Override
+        public boolean isAcceptable(Object response, Address sender) {
+            return !(response instanceof NoSuchService);
+        }
 
-    public static final ScopingConstraintFactory FACTORY = new Factory();
+        @Override
+        public boolean needMoreResponses() {
+            return true;
+        }
+    };
 
-    private static final ServerGroupEffectConstraint GLOBAL_USER = new ServerGroupEffectConstraint(true);
-    private static final ServerGroupEffectConstraint GLOBAL_REQUIRED = new ServerGroupEffectConstraint(false);
-    private static final ServerGroupEffectConstraint UNASSIGNED = new ServerGroupEffectConstraint();
+    private final MessageDispatcher dispatcher;
+    private final CommandMarshaller<C> marshaller;
+    private final NodeFactory<Address> factory;
+    private final long timeout;
 
-    private final boolean user;
-    private final boolean global;
-    private final boolean unassigned;
-    private final GroupsHolder groupsHolder;
-    private final boolean readOnly;
-    private final boolean groupAdd;
-    private final boolean groupRemove;
-    private final ServerGroupEffectConstraint readOnlyConstraint;
-
-    // For unassigned resources
-    private ServerGroupEffectConstraint() {
-        this.user = false;
-        this.global = false;
-        this.unassigned = true;
-        this.readOnly = false;
-        this.readOnlyConstraint = null;
-        this.groupAdd = false;
-        this.groupRemove = false;
-        this.groupsHolder = new GroupsHolder();
-    }
-
-    // For GLOBAL cases
-    private ServerGroupEffectConstraint(final boolean user) {
-        this.user = user;
-        this.global = true;
-        this.unassigned = false;
-        this.readOnly = false;
-        this.readOnlyConstraint = null;
-        this.groupAdd = false;
-        this.groupRemove = false;
-        this.groupsHolder = new GroupsHolder();
-    }
-
-    private ServerGroupEffectConstraint(Set<String> allowed, boolean groupAdd, boolean groupRemove) {
-        this.user = false;
-        this.global = false;
-        this.unassigned = false;
-        this.groupsHolder = new GroupsHolder(allowed);
-        this.readOnly = false;
-        this.groupAdd = groupAdd;
-        this.groupRemove = groupRemove;
-        this.readOnlyConstraint = null;
-    }
-
-    // For server group scoped role creation
-    public ServerGroupEffectConstraint(List<String> allowed) {
-        this.user = true;
-        this.global = false;
-        this.unassigned = false;
-        this.groupsHolder = new GroupsHolder(allowed);
-        this.readOnly = false;
-        this.groupAdd = false;
-        this.groupRemove = false;
-        this.readOnlyConstraint = new ServerGroupEffectConstraint(groupsHolder, true);
-    }
-
-    /**
-     * Creates the constraint the standard constraint will return from {@link #getOutofScopeReadConstraint()}
-     * Only call from {@link ServerGroupEffectConstraint#ServerGroupEffectConstraint(java.util.List)}
-     */
-    private ServerGroupEffectConstraint(GroupsHolder groupsHolder, boolean readOnly) {
-        this.user = true;
-        this.global = false;
-        this.unassigned = false;
-        this.groupsHolder = groupsHolder;
-        this.readOnly = readOnly;
-        this.groupAdd = false;
-        this.groupRemove = false;
-        this.readOnlyConstraint = null;
-    }
-
-    public void setAllowedGroups(List<String> allowed) {
-        assert !global : "constraint is global";
-        assert readOnlyConstraint != null : "invalid cast";
-        this.groupsHolder.specific = new LinkedHashSet<String>(allowed);
+    public ServiceCommandDispatcher(MessageDispatcher dispatcher, CommandMarshaller<C> marshaller, NodeFactory<Address> factory, long timeout) {
+        this.dispatcher = dispatcher;
+        this.marshaller = marshaller;
+        this.factory = factory;
+        this.timeout = timeout;
     }
 
     @Override
-    public boolean violates(Constraint other, Action.ActionEffect actionEffect) {
-        if (other instanceof ServerGroupEffectConstraint) {
-            ServerGroupEffectConstraint sgec = (ServerGroupEffectConstraint) other;
-            Set<String> ourSpecific = groupsHolder.specific;
-            Set<String> sgecSpecific = sgec.groupsHolder.specific;
-            if (user) {
-                assert !sgec.user : "illegal comparison";
-                if (readOnly) {
-                    // Allow global or any matching server group
-                    if (!sgec.global) {
-                        boolean anyMatch = anyMatch(ourSpecific, sgecSpecific);
-                        if (!anyMatch) ControllerLogger.ACCESS_LOGGER.tracef("read-only server-group constraint violated " +
-                                "for action %s due to no match between groups %s and allowed groups %s",
-                                actionEffect, sgecSpecific, ourSpecific);
-                        return !anyMatch;
-                    }
-                } else if (!global) {
-                    if (sgec.global) {
-                        // Only the readOnlyConstraint gets global
-                        ControllerLogger.ACCESS_LOGGER.tracef("server-group constraint violated for action %s due to " +
-                            "requirement for access to global resources", actionEffect);
-                        return true;
-                    } else if (!sgec.unassigned) {
-                        if (actionEffect == Action.ActionEffect.WRITE_RUNTIME || actionEffect == Action.ActionEffect.WRITE_CONFIG) {
-                            //  Writes must not effect other groups
-                            boolean containsAll = ourSpecific.containsAll(sgecSpecific);
-                            if (!containsAll) {
-                                ControllerLogger.ACCESS_LOGGER.tracef("server-group constraint violated for action %s due to " +
-                                        "mismatch of groups %s vs allowed %s", actionEffect, sgecSpecific, ourSpecific);
-                            } else if (sgec.groupAdd) {
-                                ControllerLogger.ACCESS_LOGGER.tracef("server-group constraint violated for action %s due to " +
-                                        "attempt to add the server group", actionEffect);
-                            } else if (sgec.groupRemove) {
-                                ControllerLogger.ACCESS_LOGGER.tracef("server-group constraint violated for action %s due to " +
-                                        "attempt to remove the server group", actionEffect);
-                            }
-                            return !containsAll || sgec.groupAdd || sgec.groupRemove;
-                        } else {
-                            // Reads ok as long as one of our groups match
-                            boolean anyMatch = anyMatch(ourSpecific, sgecSpecific);
-                            if (!anyMatch)  {
-                                // Allow access for server-group add so there's no bizarre "no such resource"
-                                if (sgec.groupAdd && actionEffect == Action.ActionEffect.ADDRESS) {
-                                    return false;
-                                }
-                                ControllerLogger.ACCESS_LOGGER.tracef("server-group constraint violated " +
-                                    "for action %s due to no match between groups %s and allowed groups %s",
-                                    actionEffect, sgecSpecific, ourSpecific);
-                            }
-                            return !anyMatch;
-                        }
-                    } // else fall through
+    public <R> Map<Node, CommandResponse<R>> executeOnCluster(Command<R, C> command, Node... excludedNodes) {
+        try {
+            RequestOptions options = this.createRequestOptions(excludedNodes);
+            Map<Address, Rsp<R>> responses = this.dispatcher.castMessage(null, this.createMessage(command), options);
+            if (responses == null) return Collections.emptyMap();
+
+            Map<Node, CommandResponse<R>> results = new HashMap<>();
+            for (Map.Entry<Address, Rsp<R>> entry: responses.entrySet()) {
+                Address address = entry.getKey();
+                Rsp<R> response = entry.getValue();
+                if (response.wasReceived()) {
+                    results.put(this.factory.createNode(address), createCommandResponse(response));
                 }
-            } else {
-                assert sgec.user : "illegal comparison";
-                return other.violates(this, actionEffect);
             }
+
+            return results;
+        } catch (Exception e) {
+            return Collections.emptyMap();
         }
-        return false;
     }
 
-    private boolean anyMatch(Set<String> ourSpecific, Set<String> sgecSpecific) {
+    @Override
+    public <R> Map<Node, Future<R>> submitOnCluster(Command<R, C> command, Node... excludedNodes) {
+        try {
+            final Future<? extends Map<Address, Rsp<R>>> responses = this.dispatcher.castMessageWithFuture(null, this.createMessage(command), this.createRequestOptions(excludedNodes));
+            if (responses == null) return Collections.emptyMap();
 
-        boolean matched = false;
-        for (String ourGroup : ourSpecific) {
-            if (sgecSpecific.contains(ourGroup)) {
-                matched = true;
-                break;
+            Map<Node, Future<R>> results = new HashMap<>();
+            Set<Node> excluded = (excludedNodes != null) ? new HashSet<>(Arrays.asList(excludedNodes)) : Collections.<Node>emptySet();
+            for (Address address: this.dispatcher.getChannel().getView().getMembers()) {
+                final Node node = this.factory.createNode(address);
+                if (!excluded.contains(node)) {
+                    Future<R> future = new Future<R>() {
+                        @Override
+                        public boolean cancel(boolean mayInterruptIfRunning) {
+                            return responses.cancel(mayInterruptIfRunning);
+                        }
+
+                        @Override
+                        public R get() throws InterruptedException, ExecutionException {
+                            return createCommandResponse(responses.get().get(node)).get();
+                        }
+
+                        @Override
+                        public R get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+                            return createCommandResponse(responses.get(timeout, unit).get(node)).get();
+                        }
+
+                        @Override
+                        public boolean isCancelled() {
+                            return responses.isCancelled();
+                        }
+
+                        @Override
+                        public boolean isDone() {
+                            return responses.isDone();
+                        }
+                    };
+                    results.put(node, future);
+                }
             }
+            return results;
+        } catch (Exception e) {
+            return Collections.emptyMap();
         }
-        if (!matched) {
-            // WFLY-2089
-            matched = sgecSpecific.size() == 1 && sgecSpecific.contains("*");
-        }
-
-        return matched;
     }
 
     @Override
-    public boolean replaces(Constraint other) {
-        return other instanceof ServerGroupEffectConstraint && (readOnly || readOnlyConstraint != null);
-    }
-
-    // Scoping Constraint
-
-    @Override
-    public ScopingConstraintFactory getFactory() {
-        assert readOnlyConstraint != null : "invalid cast";
-        return FACTORY;
+    public <R> CommandResponse<R> executeOnNode(Command<R, C> command, Node node) {
+        try {
+            R result = this.dispatcher.sendMessage(this.createMessage(command, node), this.createRequestOptions());
+            return new SimpleCommandResponse<>(result);
+        } catch (Throwable e) {
+            return new SimpleCommandResponse<>(e);
+        }
     }
 
     @Override
-    public Constraint getStandardConstraint() {
-        assert readOnlyConstraint != null : "invalid cast";
-        return this;
-    }
-
-    @Override
-    public Constraint getOutofScopeReadConstraint() {
-        assert readOnlyConstraint != null : "invalid cast";
-        return readOnlyConstraint;
-    }
-
-    private static class GroupsHolder {
-        private volatile Set<String> specific = new LinkedHashSet<String>();
-        private GroupsHolder() {
-          // no-op
-        }
-        private GroupsHolder(Collection<String> groups) {
-            this.specific.addAll(groups);
+    public <R> Future<R> submitOnNode(Command<R, C> command, Node node) {
+        try {
+            return this.dispatcher.sendMessageWithFuture(this.createMessage(command, node), this.createRequestOptions());
+        } catch (Throwable e) {
+            return new SimpleFuture<>(e);
         }
     }
 
-    private static class Factory extends AbstractConstraintFactory implements ScopingConstraintFactory {
-
-        @Override
-        public Constraint getStandardUserConstraint(StandardRole role, Action.ActionEffect actionEffect) {
-            return GLOBAL_USER;
+    private <R> Message createMessage(Command<R, C> command) {
+        try {
+            return new Message(null, this.getLocalAddress(), this.marshaller.marshal(command));
+        } catch (IOException e) {
+            throw new IllegalArgumentException(e);
         }
+    }
 
-        @Override
-        public Constraint getRequiredConstraint(Action.ActionEffect actionEffect, Action action, TargetAttribute target) {
-            return getRequiredConstraint(target.getServerGroupEffect());
+    private <R> Message createMessage(Command<R, C> command, Node node) {
+        try {
+            return new Message(getAddress(node), this.getLocalAddress(), this.marshaller.marshal(command));
+        } catch (IOException e) {
+            throw new IllegalArgumentException(e);
         }
+    }
 
-        @Override
-        public Constraint getRequiredConstraint(Action.ActionEffect actionEffect, Action action, TargetResource target) {
-            return getRequiredConstraint(target.getServerGroupEffect());
+    private static Address getAddress(Node node) {
+        if (node instanceof Addressable) {
+            return ((Addressable) node).getAddress();
         }
+        throw new IllegalArgumentException(node.getName());
+    }
 
-        private Constraint getRequiredConstraint(ServerGroupEffect serverGroupEffect) {
-            if (serverGroupEffect == null || serverGroupEffect.isServerGroupEffectGlobal()) {
-                return GLOBAL_REQUIRED;
-            } else if (serverGroupEffect.isServerGroupEffectUnassigned()) {
-                return UNASSIGNED;
+    private RequestOptions createRequestOptions(Node... excludedNodes) {
+        RequestOptions options = this.createRequestOptions();
+        if ((excludedNodes != null) && (excludedNodes.length > 0)) {
+            Address[] addresses = new Address[excludedNodes.length];
+            for (int i = 0; i < excludedNodes.length; ++i) {
+                addresses[i] = getAddress(excludedNodes[i]);
             }
-            return new ServerGroupEffectConstraint(serverGroupEffect.getAffectedServerGroups(),
-                    serverGroupEffect.isServerGroupAdd(), serverGroupEffect.isServerGroupRemove());
+            options.setExclusionList(addresses);
+        }
+        return options;
+    }
+
+    private RequestOptions createRequestOptions() {
+        return new RequestOptions(ResponseMode.GET_ALL, this.timeout, false, FILTER, Message.Flag.DONT_BUNDLE);
+    }
+
+    static <R> CommandResponse<R> createCommandResponse(Rsp<R> response) {
+        Throwable exception = response.getException();
+        return (exception != null) ? new SimpleCommandResponse<R>(exception) : new SimpleCommandResponse<>(response.wasReceived() ? response.getValue() : null);
+    }
+
+    private Address getLocalAddress() {
+        return this.dispatcher.getChannel().getAddress();
+    }
+
+    private static class SimpleCommandResponse<T> implements CommandResponse<T> {
+        private final T value;
+        private final ExecutionException exception;
+
+        SimpleCommandResponse(T value) {
+            this.value = value;
+            this.exception = null;
+        }
+
+        SimpleCommandResponse(Throwable exception) {
+            this.value = null;
+            this.exception = new ExecutionException(exception);
         }
 
         @Override
-        protected int internalCompare(AbstractConstraintFactory other) {
-            // We prefer going first
-            return this.equals(other) ? 0 : -1;
+        public T get() throws ExecutionException {
+            if (this.exception != null) {
+                throw this.exception;
+            }
+            return this.value;
+        }
+    }
+
+    private static class SimpleFuture<T> extends SimpleCommandResponse<T> implements Future<T> {
+
+        SimpleFuture(T value) {
+            super(value);
+        }
+
+        SimpleFuture(Throwable exception) {
+            super(exception);
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            return false;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return false;
+        }
+
+        @Override
+        public boolean isDone() {
+            return true;
+        }
+
+        @Override
+        public T get(long timeout, TimeUnit unit) throws ExecutionException {
+            return this.get();
         }
     }
 }

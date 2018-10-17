@@ -1,8 +1,8 @@
-AtomicReader sr = SlowCompositeReaderWrapper.wrap(reader);
+indexStream.seek((docStoreOffset+startDocID) * 8L);
 
 package org.apache.lucene.index;
 
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,635 +19,551 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.document.*;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.BufferedIndexInput;
+
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.Reader;
-import java.io.StringReader;
-import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
 
-import org.apache.lucene.analysis.*;
-import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.IndexWriterConfig.OpenMode;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
+/**
+ * Class responsible for access to stored document fields.
+ * <p/>
+ * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
+ *
+ * @version $Id$
+ */
+final class FieldsReader {
+  private final FieldInfos fieldInfos;
 
-public class TestPayloads extends LuceneTestCase {
-    
-    // Simple tests to test the payloads
-    public void testPayload() throws Exception {
-        BytesRef payload = new BytesRef("This is a test!");
-        assertEquals("Wrong payload length.", "This is a test!".length(), payload.length);
-        
-        BytesRef clone = payload.clone();
-        assertEquals(payload.length, clone.length);
-        for (int i = 0; i < payload.length; i++) {
-          assertEquals(payload.bytes[i + payload.offset], clone.bytes[i + clone.offset]);
-        }
-        
-    }
+  // The main fieldStream, used only for cloning.
+  private final IndexInput cloneableFieldsStream;
 
-    // Tests whether the DocumentWriter and SegmentMerger correctly enable the
-    // payload bit in the FieldInfo
-    public void testPayloadFieldBit() throws Exception {
-        Directory ram = newDirectory();
-        PayloadAnalyzer analyzer = new PayloadAnalyzer();
-        IndexWriter writer = new IndexWriter(ram, newIndexWriterConfig( TEST_VERSION_CURRENT, analyzer));
-        Document d = new Document();
-        // this field won't have any payloads
-        d.add(newTextField("f1", "This field has no payloads", Field.Store.NO));
-        // this field will have payloads in all docs, however not for all term positions,
-        // so this field is used to check if the DocumentWriter correctly enables the payloads bit
-        // even if only some term positions have payloads
-        d.add(newTextField("f2", "This field has payloads in all docs", Field.Store.NO));
-        d.add(newTextField("f2", "This field has payloads in all docs NO PAYLOAD", Field.Store.NO));
-        // this field is used to verify if the SegmentMerger enables payloads for a field if it has payloads 
-        // enabled in only some documents
-        d.add(newTextField("f3", "This field has payloads in some docs", Field.Store.NO));
-        // only add payload data for field f2
-        analyzer.setPayloadData("f2", "somedata".getBytes("UTF-8"), 0, 1);
-        writer.addDocument(d);
-        // flush
-        writer.close();
+  // This is a clone of cloneableFieldsStream used for reading documents.
+  // It should not be cloned outside of a synchronized context.
+  private final IndexInput fieldsStream;
 
-      SegmentReader reader = getOnlySegmentReader(DirectoryReader.open(ram));
-        FieldInfos fi = reader.getFieldInfos();
-        assertFalse("Payload field bit should not be set.", fi.fieldInfo("f1").hasPayloads());
-        assertTrue("Payload field bit should be set.", fi.fieldInfo("f2").hasPayloads());
-        assertFalse("Payload field bit should not be set.", fi.fieldInfo("f3").hasPayloads());
-        reader.close();
-        
-        // now we add another document which has payloads for field f3 and verify if the SegmentMerger
-        // enabled payloads for that field
-        analyzer = new PayloadAnalyzer(); // Clear payload state for each field
-        writer = new IndexWriter(ram, newIndexWriterConfig( TEST_VERSION_CURRENT,
-            analyzer).setOpenMode(OpenMode.CREATE));
-        d = new Document();
-        d.add(newTextField("f1", "This field has no payloads", Field.Store.NO));
-        d.add(newTextField("f2", "This field has payloads in all docs", Field.Store.NO));
-        d.add(newTextField("f2", "This field has payloads in all docs", Field.Store.NO));
-        d.add(newTextField("f3", "This field has payloads in some docs", Field.Store.NO));
-        // add payload data for field f2 and f3
-        analyzer.setPayloadData("f2", "somedata".getBytes("UTF-8"), 0, 1);
-        analyzer.setPayloadData("f3", "somedata".getBytes("UTF-8"), 0, 3);
-        writer.addDocument(d);
+  private final IndexInput indexStream;
+  private int numTotalDocs;
+  private int size;
+  private boolean closed;
 
-        // force merge
-        writer.forceMerge(1);
-        // flush
-        writer.close();
+  // The docID offset where our docs begin in the index
+  // file.  This will be 0 if we have our own private file.
+  private int docStoreOffset;
 
-      reader = getOnlySegmentReader(DirectoryReader.open(ram));
-        fi = reader.getFieldInfos();
-        assertFalse("Payload field bit should not be set.", fi.fieldInfo("f1").hasPayloads());
-        assertTrue("Payload field bit should be set.", fi.fieldInfo("f2").hasPayloads());
-        assertTrue("Payload field bit should be set.", fi.fieldInfo("f3").hasPayloads());
-        reader.close();
-        ram.close();
-    }
+  private ThreadLocal fieldsStreamTL = new ThreadLocal();
 
-    // Tests if payloads are correctly stored and loaded using both RamDirectory and FSDirectory
-    public void testPayloadsEncoding() throws Exception {
-        Directory dir = newDirectory();
-        performTest(dir);
-        dir.close();
-    }
-    
-    // builds an index with payloads in the given Directory and performs
-    // different tests to verify the payload encoding
-    private void performTest(Directory dir) throws Exception {
-        PayloadAnalyzer analyzer = new PayloadAnalyzer();
-        IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
-            TEST_VERSION_CURRENT, analyzer)
-            .setOpenMode(OpenMode.CREATE)
-            .setMergePolicy(newLogMergePolicy()));
-        
-        // should be in sync with value in TermInfosWriter
-        final int skipInterval = 16;
-        
-        final int numTerms = 5;
-        final String fieldName = "f1";
-        
-        int numDocs = skipInterval + 1; 
-        // create content for the test documents with just a few terms
-        Term[] terms = generateTerms(fieldName, numTerms);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < terms.length; i++) {
-            sb.append(terms[i].text());
-            sb.append(" ");
-        }
-        String content = sb.toString();
-        
-        
-        int payloadDataLength = numTerms * numDocs * 2 + numTerms * numDocs * (numDocs - 1) / 2;
-        byte[] payloadData = generateRandomData(payloadDataLength);
-        
-        Document d = new Document();
-        d.add(newTextField(fieldName, content, Field.Store.NO));
-        // add the same document multiple times to have the same payload lengths for all
-        // occurrences within two consecutive skip intervals
-        int offset = 0;
-        for (int i = 0; i < 2 * numDocs; i++) {
-            analyzer = new PayloadAnalyzer(fieldName, payloadData, offset, 1);
-            offset += numTerms;
-            writer.addDocument(d, analyzer);
-        }
-        
-        // make sure we create more than one segment to test merging
-        writer.commit();
-        
-        // now we make sure to have different payload lengths next at the next skip point        
-        for (int i = 0; i < numDocs; i++) {
-            analyzer = new PayloadAnalyzer(fieldName, payloadData, offset, i);
-            offset += i * numTerms;
-            writer.addDocument(d, analyzer);
-        }
-        
-        writer.forceMerge(1);
-        // flush
-        writer.close();
-        
-        
-        /*
-         * Verify the index
-         * first we test if all payloads are stored correctly
-         */        
-        IndexReader reader = DirectoryReader.open(dir);
+  FieldsReader(Directory d, String segment, FieldInfos fn) throws IOException {
+    this(d, segment, fn, BufferedIndexInput.BUFFER_SIZE, -1, 0);
+  }
 
-        byte[] verifyPayloadData = new byte[payloadDataLength];
-        offset = 0;
-        DocsAndPositionsEnum[] tps = new DocsAndPositionsEnum[numTerms];
-        for (int i = 0; i < numTerms; i++) {
-          tps[i] = MultiFields.getTermPositionsEnum(reader,
-                                                    MultiFields.getLiveDocs(reader),
-                                                    terms[i].field(),
-                                                    new BytesRef(terms[i].text()));
-        }
-        
-        while (tps[0].nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-            for (int i = 1; i < numTerms; i++) {
-                tps[i].nextDoc();
-            }
-            int freq = tps[0].freq();
+  FieldsReader(Directory d, String segment, FieldInfos fn, int readBufferSize) throws IOException {
+    this(d, segment, fn, readBufferSize, -1, 0);
+  }
 
-            for (int i = 0; i < freq; i++) {
-                for (int j = 0; j < numTerms; j++) {
-                    tps[j].nextPosition();
-                    BytesRef br = tps[j].getPayload();
-                    if (br != null) {
-                      System.arraycopy(br.bytes, br.offset, verifyPayloadData, offset, br.length);
-                      offset += br.length;
-                    }
-                }
-            }
-        }
-        
-        assertByteArrayEquals(payloadData, verifyPayloadData);
-        
-        /*
-         *  test lazy skipping
-         */        
-        DocsAndPositionsEnum tp = MultiFields.getTermPositionsEnum(reader,
-                                                                   MultiFields.getLiveDocs(reader),
-                                                                   terms[0].field(),
-                                                                   new BytesRef(terms[0].text()));
-        tp.nextDoc();
-        tp.nextPosition();
-        // NOTE: prior rev of this test was failing to first
-        // call next here:
-        tp.nextDoc();
-        // now we don't read this payload
-        tp.nextPosition();
-        BytesRef payload = tp.getPayload();
-        assertEquals("Wrong payload length.", 1, payload.length);
-        assertEquals(payload.bytes[payload.offset], payloadData[numTerms]);
-        tp.nextDoc();
-        tp.nextPosition();
-        
-        // we don't read this payload and skip to a different document
-        tp.advance(5);
-        tp.nextPosition();
-        payload = tp.getPayload();
-        assertEquals("Wrong payload length.", 1, payload.length);
-        assertEquals(payload.bytes[payload.offset], payloadData[5 * numTerms]);
-                
-        
-        /*
-         * Test different lengths at skip points
-         */
-        tp = MultiFields.getTermPositionsEnum(reader,
-                                              MultiFields.getLiveDocs(reader),
-                                              terms[1].field(),
-                                              new BytesRef(terms[1].text()));
-        tp.nextDoc();
-        tp.nextPosition();
-        assertEquals("Wrong payload length.", 1, tp.getPayload().length);
-        tp.advance(skipInterval - 1);
-        tp.nextPosition();
-        assertEquals("Wrong payload length.", 1, tp.getPayload().length);
-        tp.advance(2 * skipInterval - 1);
-        tp.nextPosition();
-        assertEquals("Wrong payload length.", 1, tp.getPayload().length);
-        tp.advance(3 * skipInterval - 1);
-        tp.nextPosition();
-        assertEquals("Wrong payload length.", 3 * skipInterval - 2 * numDocs - 1, tp.getPayload().length);
-        
-        reader.close();
-        
-        // test long payload
-        analyzer = new PayloadAnalyzer();
-        writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT,
-            analyzer).setOpenMode(OpenMode.CREATE));
-        String singleTerm = "lucene";
-        
-        d = new Document();
-        d.add(newTextField(fieldName, singleTerm, Field.Store.NO));
-        // add a payload whose length is greater than the buffer size of BufferedIndexOutput
-        payloadData = generateRandomData(2000);
-        analyzer.setPayloadData(fieldName, payloadData, 100, 1500);
-        writer.addDocument(d);
+  FieldsReader(Directory d, String segment, FieldInfos fn, int readBufferSize, int docStoreOffset, int size) throws IOException {
+    boolean success = false;
 
-        
-        writer.forceMerge(1);
-        // flush
-        writer.close();
-        
-        reader = DirectoryReader.open(dir);
-        tp = MultiFields.getTermPositionsEnum(reader,
-                                              MultiFields.getLiveDocs(reader),
-                                              fieldName,
-                                              new BytesRef(singleTerm));
-        tp.nextDoc();
-        tp.nextPosition();
-        
-        BytesRef br = tp.getPayload();
-        verifyPayloadData = new byte[br.length];
-        byte[] portion = new byte[1500];
-        System.arraycopy(payloadData, 100, portion, 0, 1500);
-        
-        assertByteArrayEquals(portion, br.bytes, br.offset, br.length);
-        reader.close();
-        
-    }
-    
-    static final Charset utf8 = Charset.forName("UTF-8");
-    private void generateRandomData(byte[] data) {
-      // this test needs the random data to be valid unicode
-      String s = _TestUtil.randomFixedByteLengthUnicodeString(random(), data.length);
-      byte b[] = s.getBytes(utf8);
-      assert b.length == data.length;
-      System.arraycopy(b, 0, data, 0, b.length);
-    }
+    try {
+      fieldInfos = fn;
 
-    private byte[] generateRandomData(int n) {
-        byte[] data = new byte[n];
-        generateRandomData(data);
-        return data;
-    }
-    
-    private Term[] generateTerms(String fieldName, int n) {
-        int maxDigits = (int) (Math.log(n) / Math.log(10));
-        Term[] terms = new Term[n];
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < n; i++) {
-            sb.setLength(0);
-            sb.append("t");
-            int zeros = maxDigits - (int) (Math.log(i) / Math.log(10));
-            for (int j = 0; j < zeros; j++) {
-                sb.append("0");
-            }
-            sb.append(i);
-            terms[i] = new Term(fieldName, sb.toString());
-        }
-        return terms;
-    }
+      cloneableFieldsStream = d.openInput(segment + ".fdt", readBufferSize);
+      fieldsStream = (IndexInput) cloneableFieldsStream.clone();
+      indexStream = d.openInput(segment + ".fdx", readBufferSize);
 
+      if (docStoreOffset != -1) {
+        // We read only a slice out of this shared fields file
+        this.docStoreOffset = docStoreOffset;
+        this.size = size;
 
-    void assertByteArrayEquals(byte[] b1, byte[] b2) {
-        if (b1.length != b2.length) {
-          fail("Byte arrays have different lengths: " + b1.length + ", " + b2.length);
-        }
-        
-        for (int i = 0; i < b1.length; i++) {
-          if (b1[i] != b2[i]) {
-            fail("Byte arrays different at index " + i + ": " + b1[i] + ", " + b2[i]);
-          }
-        }
-      }    
-    
-  void assertByteArrayEquals(byte[] b1, byte[] b2, int b2offset, int b2length) {
-        if (b1.length != b2length) {
-          fail("Byte arrays have different lengths: " + b1.length + ", " + b2length);
-        }
-        
-        for (int i = 0; i < b1.length; i++) {
-          if (b1[i] != b2[b2offset+i]) {
-            fail("Byte arrays different at index " + i + ": " + b1[i] + ", " + b2[b2offset+i]);
-          }
-        }
-      }    
-    
-    
-    /**
-     * This Analyzer uses an WhitespaceTokenizer and PayloadFilter.
-     */
-    private static class PayloadAnalyzer extends Analyzer {
-        Map<String,PayloadData> fieldToData = new HashMap<String,PayloadData>();
+        // Verify the file is long enough to hold all of our
+        // docs
+        assert ((int) (indexStream.length() / 8)) >= size + this.docStoreOffset;
+      } else {
+        this.docStoreOffset = 0;
+        this.size = (int) (indexStream.length() >> 3);
+      }
 
-        public PayloadAnalyzer() {
-          super(new PerFieldReuseStrategy());
-        }
-        
-        public PayloadAnalyzer(String field, byte[] data, int offset, int length) {
-            super(new PerFieldReuseStrategy());
-            setPayloadData(field, data, offset, length);
-        }
-
-        void setPayloadData(String field, byte[] data, int offset, int length) {
-            fieldToData.put(field, new PayloadData(data, offset, length));
-        }
-        
-        @Override
-        public TokenStreamComponents createComponents(String fieldName, Reader reader) {
-            PayloadData payload =  fieldToData.get(fieldName);
-            Tokenizer ts = new MockTokenizer(reader, MockTokenizer.WHITESPACE, false);
-            TokenStream tokenStream = (payload != null) ?
-                new PayloadFilter(ts, payload.data, payload.offset, payload.length) : ts;
-            return new TokenStreamComponents(ts, tokenStream);
-        }
-        
-        private static class PayloadData {
-            byte[] data;
-            int offset;
-            int length;
-
-            PayloadData(byte[] data, int offset, int length) {
-                this.data = data;
-                this.offset = offset;
-                this.length = length;
-            }
-        }
-    }
-
-    
-    /**
-     * This Filter adds payloads to the tokens.
-     */
-    private static class PayloadFilter extends TokenFilter {
-        private byte[] data;
-        private int length;
-        private int offset;
-        private int startOffset;
-        PayloadAttribute payloadAtt;
-        CharTermAttribute termAttribute;
-        
-        public PayloadFilter(TokenStream in, byte[] data, int offset, int length) {
-            super(in);
-            this.data = data;
-            this.length = length;
-            this.offset = offset;
-            this.startOffset = offset;
-            payloadAtt = addAttribute(PayloadAttribute.class);
-            termAttribute = addAttribute(CharTermAttribute.class);
-        }
-        
-        @Override
-        public boolean incrementToken() throws IOException {
-            boolean hasNext = input.incrementToken();
-            if (!hasNext) {
-              return false;
-            }
-
-            // Some values of the same field are to have payloads and others not
-            if (offset + length <= data.length && !termAttribute.toString().endsWith("NO PAYLOAD")) {
-              BytesRef p = new BytesRef(data, offset, length);
-              payloadAtt.setPayload(p);
-              offset += length;
-            } else {
-              payloadAtt.setPayload(null);
-            }
-
-            return true;
-        }
-
-      @Override
-      public void reset() throws IOException {
-        super.reset();
-        this.offset = startOffset;
+      numTotalDocs = (int) (indexStream.length() >> 3);
+      success = true;
+    } finally {
+      // With lock-less commits, it's entirely possible (and
+      // fine) to hit a FileNotFound exception above. In
+      // this case, we want to explicitly close any subset
+      // of things that were opened so that we don't have to
+      // wait for a GC to do so.
+      if (!success) {
+        close();
       }
     }
-    
-    public void testThreadSafety() throws Exception {
-        final int numThreads = 5;
-        final int numDocs = atLeast(50);
-        final ByteArrayPool pool = new ByteArrayPool(numThreads, 5);
-        
-        Directory dir = newDirectory();
-        final IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( 
-            TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-        final String field = "test";
-        
-        Thread[] ingesters = new Thread[numThreads];
-        for (int i = 0; i < numThreads; i++) {
-            ingesters[i] = new Thread() {
-                @Override
-                public void run() {
-                    try {
-                        for (int j = 0; j < numDocs; j++) {
-                            Document d = new Document();
-                            d.add(new TextField(field, new PoolingPayloadTokenStream(pool)));
-                            writer.addDocument(d);
-                        }
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                        fail(e.toString());
-                    }
-                }
-            };
-            ingesters[i].start();
+  }
+
+  /**
+   * @throws AlreadyClosedException if this FieldsReader is closed
+   */
+  protected final void ensureOpen() throws AlreadyClosedException {
+    if (closed) {
+      throw new AlreadyClosedException("this FieldsReader is closed");
+    }
+  }
+
+  /**
+   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams, including any ones associated with a
+   * lazy implementation of a Field.  This means that the Fields values will not be accessible.
+   *
+   * @throws IOException
+   */
+  final void close() throws IOException {
+    if (!closed) {
+      if (fieldsStream != null) {
+        fieldsStream.close();
+      }
+      if (cloneableFieldsStream != null) {
+        cloneableFieldsStream.close();
+      }
+      if (indexStream != null) {
+        indexStream.close();
+      }
+      IndexInput localFieldsStream = (IndexInput) fieldsStreamTL.get();
+      if (localFieldsStream != null) {
+        localFieldsStream.close();
+        fieldsStreamTL.set(null);
+      }
+      closed = true;
+    }
+  }
+
+  final int size() {
+    return size;
+  }
+
+  final Document doc(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+    indexStream.seek((n + docStoreOffset) * 8L);
+    long position = indexStream.readLong();
+    fieldsStream.seek(position);
+
+    Document doc = new Document();
+    int numFields = fieldsStream.readVInt();
+    for (int i = 0; i < numFields; i++) {
+      int fieldNumber = fieldsStream.readVInt();
+      FieldInfo fi = fieldInfos.fieldInfo(fieldNumber);
+      FieldSelectorResult acceptField = fieldSelector == null ? FieldSelectorResult.LOAD : fieldSelector.accept(fi.name);
+      
+      byte bits = fieldsStream.readByte();
+      assert bits <= FieldsWriter.FIELD_IS_COMPRESSED + FieldsWriter.FIELD_IS_TOKENIZED + FieldsWriter.FIELD_IS_BINARY;
+
+      boolean compressed = (bits & FieldsWriter.FIELD_IS_COMPRESSED) != 0;
+      boolean tokenize = (bits & FieldsWriter.FIELD_IS_TOKENIZED) != 0;
+      boolean binary = (bits & FieldsWriter.FIELD_IS_BINARY) != 0;
+      //TODO: Find an alternative approach here if this list continues to grow beyond the
+      //list of 5 or 6 currently here.  See Lucene 762 for discussion
+      if (acceptField.equals(FieldSelectorResult.LOAD)) {
+        addField(doc, fi, binary, compressed, tokenize);
+      }
+      else if (acceptField.equals(FieldSelectorResult.LOAD_FOR_MERGE)) {
+        addFieldForMerge(doc, fi, binary, compressed, tokenize);
+      }
+      else if (acceptField.equals(FieldSelectorResult.LOAD_AND_BREAK)){
+        addField(doc, fi, binary, compressed, tokenize);
+        break;//Get out of this loop
+      }
+      else if (acceptField.equals(FieldSelectorResult.LAZY_LOAD)) {
+        addFieldLazy(doc, fi, binary, compressed, tokenize);
+      }
+      else if (acceptField.equals(FieldSelectorResult.SIZE)){
+        skipField(binary, compressed, addFieldSize(doc, fi, binary, compressed));
+      }
+      else if (acceptField.equals(FieldSelectorResult.SIZE_AND_BREAK)){
+        addFieldSize(doc, fi, binary, compressed);
+        break;
+      }
+      else {
+        skipField(binary, compressed);
+      }
+    }
+
+    return doc;
+  }
+
+  /** Returns the length in bytes of each raw document in a
+   *  contiguous range of length numDocs starting with
+   *  startDocID.  Returns the IndexInput (the fieldStream),
+   *  already seeked to the starting point for startDocID.*/
+  final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
+    indexStream.seek(startDocID * 8L);
+    long startOffset = indexStream.readLong();
+    long lastOffset = startOffset;
+    int count = 0;
+    while (count < numDocs) {
+      final long offset;
+      final int docID = docStoreOffset + startDocID + count + 1;
+      assert docID <= numTotalDocs;
+      if (docID < numTotalDocs) 
+        offset = indexStream.readLong();
+      else
+        offset = fieldsStream.length();
+      lengths[count++] = (int) (offset-lastOffset);
+      lastOffset = offset;
+    }
+
+    fieldsStream.seek(startOffset);
+
+    return fieldsStream;
+  }
+
+  /**
+   * Skip the field.  We still have to read some of the information about the field, but can skip past the actual content.
+   * This will have the most payoff on large fields.
+   */
+  private void skipField(boolean binary, boolean compressed) throws IOException {
+    skipField(binary, compressed, fieldsStream.readVInt());
+  }
+  
+  private void skipField(boolean binary, boolean compressed, int toRead) throws IOException {
+    if (binary || compressed) {
+      long pointer = fieldsStream.getFilePointer();
+      fieldsStream.seek(pointer + toRead);
+    } else {
+      //We need to skip chars.  This will slow us down, but still better
+      fieldsStream.skipChars(toRead);
+    }
+  }
+
+  private void addFieldLazy(Document doc, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) throws IOException {
+    if (binary == true) {
+      int toRead = fieldsStream.readVInt();
+      long pointer = fieldsStream.getFilePointer();
+      if (compressed) {
+        //was: doc.add(new Fieldable(fi.name, uncompress(b), Fieldable.Store.COMPRESS));
+        doc.add(new LazyField(fi.name, Field.Store.COMPRESS, toRead, pointer));
+      } else {
+        //was: doc.add(new Fieldable(fi.name, b, Fieldable.Store.YES));
+        doc.add(new LazyField(fi.name, Field.Store.YES, toRead, pointer));
+      }
+      //Need to move the pointer ahead by toRead positions
+      fieldsStream.seek(pointer + toRead);
+    } else {
+      Field.Store store = Field.Store.YES;
+      Field.Index index = getIndexType(fi, tokenize);
+      Field.TermVector termVector = getTermVectorType(fi);
+
+      Fieldable f;
+      if (compressed) {
+        store = Field.Store.COMPRESS;
+        int toRead = fieldsStream.readVInt();
+        long pointer = fieldsStream.getFilePointer();
+        f = new LazyField(fi.name, store, toRead, pointer);
+        //skip over the part that we aren't loading
+        fieldsStream.seek(pointer + toRead);
+        f.setOmitNorms(fi.omitNorms);
+      } else {
+        int length = fieldsStream.readVInt();
+        long pointer = fieldsStream.getFilePointer();
+        //Skip ahead of where we are by the length of what is stored
+        fieldsStream.skipChars(length);
+        f = new LazyField(fi.name, store, index, termVector, length, pointer);
+        f.setOmitNorms(fi.omitNorms);
+      }
+      doc.add(f);
+    }
+
+  }
+
+  // in merge mode we don't uncompress the data of a compressed field
+  private void addFieldForMerge(Document doc, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) throws IOException {
+    Object data;
+      
+    if (binary || compressed) {
+      int toRead = fieldsStream.readVInt();
+      final byte[] b = new byte[toRead];
+      fieldsStream.readBytes(b, 0, b.length);
+      data = b;
+    } else {
+      data = fieldsStream.readString();
+    }
+      
+    doc.add(new FieldForMerge(data, fi, binary, compressed, tokenize));
+  }
+  
+  private void addField(Document doc, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) throws CorruptIndexException, IOException {
+
+    //we have a binary stored field, and it may be compressed
+    if (binary) {
+      int toRead = fieldsStream.readVInt();
+      final byte[] b = new byte[toRead];
+      fieldsStream.readBytes(b, 0, b.length);
+      if (compressed)
+        doc.add(new Field(fi.name, uncompress(b), Field.Store.COMPRESS));
+      else
+        doc.add(new Field(fi.name, b, Field.Store.YES));
+
+    } else {
+      Field.Store store = Field.Store.YES;
+      Field.Index index = getIndexType(fi, tokenize);
+      Field.TermVector termVector = getTermVectorType(fi);
+
+      Fieldable f;
+      if (compressed) {
+        store = Field.Store.COMPRESS;
+        int toRead = fieldsStream.readVInt();
+
+        final byte[] b = new byte[toRead];
+        fieldsStream.readBytes(b, 0, b.length);
+        f = new Field(fi.name,      // field name
+                new String(uncompress(b), "UTF-8"), // uncompress the value and add as string
+                store,
+                index,
+                termVector);
+        f.setOmitNorms(fi.omitNorms);
+      } else {
+        f = new Field(fi.name,     // name
+                fieldsStream.readString(), // read value
+                store,
+                index,
+                termVector);
+        f.setOmitNorms(fi.omitNorms);
+      }
+      doc.add(f);
+    }
+  }
+  
+  // Add the size of field as a byte[] containing the 4 bytes of the integer byte size (high order byte first; char = 2 bytes)
+  // Read just the size -- caller must skip the field content to continue reading fields
+  // Return the size in bytes or chars, depending on field type
+  private int addFieldSize(Document doc, FieldInfo fi, boolean binary, boolean compressed) throws IOException {
+    int size = fieldsStream.readVInt(), bytesize = binary || compressed ? size : 2*size;
+    byte[] sizebytes = new byte[4];
+    sizebytes[0] = (byte) (bytesize>>>24);
+    sizebytes[1] = (byte) (bytesize>>>16);
+    sizebytes[2] = (byte) (bytesize>>> 8);
+    sizebytes[3] = (byte)  bytesize      ;
+    doc.add(new Field(fi.name, sizebytes, Field.Store.YES));
+    return size;
+  }
+
+  private Field.TermVector getTermVectorType(FieldInfo fi) {
+    Field.TermVector termVector = null;
+    if (fi.storeTermVector) {
+      if (fi.storeOffsetWithTermVector) {
+        if (fi.storePositionWithTermVector) {
+          termVector = Field.TermVector.WITH_POSITIONS_OFFSETS;
+        } else {
+          termVector = Field.TermVector.WITH_OFFSETS;
         }
-        
-        for (int i = 0; i < numThreads; i++) {
-          ingesters[i].join();
-        }
-        writer.close();
-        IndexReader reader = DirectoryReader.open(dir);
-        TermsEnum terms = MultiFields.getFields(reader).terms(field).iterator(null);
-        Bits liveDocs = MultiFields.getLiveDocs(reader);
-        DocsAndPositionsEnum tp = null;
-        while (terms.next() != null) {
-          String termText = terms.term().utf8ToString();
-          tp = terms.docsAndPositions(liveDocs, tp);
-          while(tp.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-            int freq = tp.freq();
-            for (int i = 0; i < freq; i++) {
-              tp.nextPosition();
-              final BytesRef payload = tp.getPayload();
-              assertEquals(termText, payload.utf8ToString());
-            }
+      } else if (fi.storePositionWithTermVector) {
+        termVector = Field.TermVector.WITH_POSITIONS;
+      } else {
+        termVector = Field.TermVector.YES;
+      }
+    } else {
+      termVector = Field.TermVector.NO;
+    }
+    return termVector;
+  }
+
+  private Field.Index getIndexType(FieldInfo fi, boolean tokenize) {
+    Field.Index index;
+    if (fi.isIndexed && tokenize)
+      index = Field.Index.TOKENIZED;
+    else if (fi.isIndexed && !tokenize)
+      index = Field.Index.UN_TOKENIZED;
+    else
+      index = Field.Index.NO;
+    return index;
+  }
+
+  /**
+   * A Lazy implementation of Fieldable that differs loading of fields until asked for, instead of when the Document is
+   * loaded.
+   */
+  private class LazyField extends AbstractField implements Fieldable {
+    private int toRead;
+    private long pointer;
+
+    public LazyField(String name, Field.Store store, int toRead, long pointer) {
+      super(name, store, Field.Index.NO, Field.TermVector.NO);
+      this.toRead = toRead;
+      this.pointer = pointer;
+      lazy = true;
+    }
+
+    public LazyField(String name, Field.Store store, Field.Index index, Field.TermVector termVector, int toRead, long pointer) {
+      super(name, store, index, termVector);
+      this.toRead = toRead;
+      this.pointer = pointer;
+      lazy = true;
+    }
+
+    private IndexInput getFieldStream() {
+      IndexInput localFieldsStream = (IndexInput) fieldsStreamTL.get();
+      if (localFieldsStream == null) {
+        localFieldsStream = (IndexInput) cloneableFieldsStream.clone();
+        fieldsStreamTL.set(localFieldsStream);
+      }
+      return localFieldsStream;
+    }
+
+    /** The value of the field in Binary, or null.  If null, the Reader value,
+     * String value, or TokenStream value is used. Exactly one of stringValue(), 
+     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
+    public byte[] binaryValue() {
+      ensureOpen();
+      if (fieldsData == null) {
+        final byte[] b = new byte[toRead];
+        IndexInput localFieldsStream = getFieldStream();
+        //Throw this IO Exception since IndexREader.document does so anyway, so probably not that big of a change for people
+        //since they are already handling this exception when getting the document
+        try {
+          localFieldsStream.seek(pointer);
+          localFieldsStream.readBytes(b, 0, b.length);
+          if (isCompressed == true) {
+            fieldsData = uncompress(b);
+          } else {
+            fieldsData = b;
           }
+        } catch (IOException e) {
+          throw new FieldReaderException(e);
         }
-        reader.close();
-        dir.close();
-        assertEquals(pool.size(), numThreads);
-    }
-    
-    private class PoolingPayloadTokenStream extends TokenStream {
-        private byte[] payload;
-        private boolean first;
-        private ByteArrayPool pool;
-        private String term;
-
-        CharTermAttribute termAtt;
-        PayloadAttribute payloadAtt;
-        
-        PoolingPayloadTokenStream(ByteArrayPool pool) {
-            this.pool = pool;
-            payload = pool.get();
-            generateRandomData(payload);
-            term = new String(payload, 0, payload.length, utf8);
-            first = true;
-            payloadAtt = addAttribute(PayloadAttribute.class);
-            termAtt = addAttribute(CharTermAttribute.class);
-        }
-        
-        @Override
-        public boolean incrementToken() throws IOException {
-            if (!first) return false;
-            first = false;
-            clearAttributes();
-            termAtt.append(term);
-            payloadAtt.setPayload(new BytesRef(payload));
-            return true;
-        }
-        
-        @Override
-        public void close() throws IOException {
-            pool.release(payload);
-        }
-        
-    }
-    
-    private static class ByteArrayPool {
-        private List<byte[]> pool;
-        
-        ByteArrayPool(int capacity, int size) {
-            pool = new ArrayList<byte[]>();
-            for (int i = 0; i < capacity; i++) {
-                pool.add(new byte[size]);
-            }
-        }
-    
-        synchronized byte[] get() {
-            return pool.remove(0);
-        }
-        
-        synchronized void release(byte[] b) {
-            pool.add(b);
-        }
-        
-        synchronized int size() {
-            return pool.size();
-        }
+      }
+      return fieldsData instanceof byte[] ? (byte[]) fieldsData : null;
     }
 
-  public void testAcrossFields() throws Exception {
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir,
-                                                     new MockAnalyzer(random(), MockTokenizer.WHITESPACE, true));
-    Document doc = new Document();
-    doc.add(new TextField("hasMaybepayload", "here we go", Field.Store.YES));
-    writer.addDocument(doc);
-    writer.close();
+    /** The value of the field as a Reader, or null.  If null, the String value,
+     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
+     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
+    public Reader readerValue() {
+      ensureOpen();
+      return fieldsData instanceof Reader ? (Reader) fieldsData : null;
+    }
 
-    writer = new RandomIndexWriter(random(), dir,
-                                   new MockAnalyzer(random(), MockTokenizer.WHITESPACE, true));
-    doc = new Document();
-    doc.add(new TextField("hasMaybepayload2", "here we go", Field.Store.YES));
-    writer.addDocument(doc);
-    writer.addDocument(doc);
-    writer.forceMerge(1);
-    writer.close();
+    /** The value of the field as a TokesStream, or null.  If null, the Reader value,
+     * String value, or binary value is used. Exactly one of stringValue(), 
+     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
+    public TokenStream tokenStreamValue() {
+      ensureOpen();
+      return fieldsData instanceof TokenStream ? (TokenStream) fieldsData : null;
+    }
 
-    dir.close();
+    
+    /** The value of the field as a String, or null.  If null, the Reader value,
+     * binary value, or TokenStream value is used.  Exactly one of stringValue(), 
+     * readerValue(), binaryValue(), and tokenStreamValue() must be set. */
+    public String stringValue() {
+      ensureOpen();
+      if (fieldsData == null) {
+        IndexInput localFieldsStream = getFieldStream();
+        try {
+          localFieldsStream.seek(pointer);
+          if (isCompressed) {
+            final byte[] b = new byte[toRead];
+            localFieldsStream.readBytes(b, 0, b.length);
+            fieldsData = new String(uncompress(b), "UTF-8");
+          } else {
+            //read in chars b/c we already know the length we need to read
+            char[] chars = new char[toRead];
+            localFieldsStream.readChars(chars, 0, toRead);
+            fieldsData = new String(chars);
+          }
+        } catch (IOException e) {
+          throw new FieldReaderException(e);
+        }
+      }
+      return fieldsData instanceof String ? (String) fieldsData : null;
+    }
+
+    public long getPointer() {
+      ensureOpen();
+      return pointer;
+    }
+
+    public void setPointer(long pointer) {
+      ensureOpen();
+      this.pointer = pointer;
+    }
+
+    public int getToRead() {
+      ensureOpen();
+      return toRead;
+    }
+
+    public void setToRead(int toRead) {
+      ensureOpen();
+      this.toRead = toRead;
+    }
+  }
+
+  private final byte[] uncompress(final byte[] input)
+          throws CorruptIndexException, IOException {
+
+    Inflater decompressor = new Inflater();
+    decompressor.setInput(input);
+
+    // Create an expandable byte array to hold the decompressed data
+    ByteArrayOutputStream bos = new ByteArrayOutputStream(input.length);
+
+    // Decompress the data
+    byte[] buf = new byte[1024];
+    while (!decompressor.finished()) {
+      try {
+        int count = decompressor.inflate(buf);
+        bos.write(buf, 0, count);
+      }
+      catch (DataFormatException e) {
+        // this will happen if the field is not compressed
+        CorruptIndexException newException = new CorruptIndexException("field data are in wrong format: " + e.toString());
+        newException.initCause(e);
+        throw newException;
+      }
+    }
+  
+    decompressor.end();
+    
+    // Get the decompressed data
+    return bos.toByteArray();
   }
   
-  /** some docs have payload att, some not */
-  public void testMixupDocs() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT, null);
-    iwc.setMergePolicy(newLogMergePolicy());
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir, iwc);
-    Document doc = new Document();
-    Field field = new TextField("field", "", Field.Store.NO);
-    TokenStream ts = new MockTokenizer(new StringReader("here we go"), MockTokenizer.WHITESPACE, true);
-    assertFalse(ts.hasAttribute(PayloadAttribute.class));
-    field.setTokenStream(ts);
-    doc.add(field);
-    writer.addDocument(doc);
-    Token withPayload = new Token("withPayload", 0, 11);
-    withPayload.setPayload(new BytesRef("test"));
-    ts = new CannedTokenStream(withPayload);
-    assertTrue(ts.hasAttribute(PayloadAttribute.class));
-    field.setTokenStream(ts);
-    writer.addDocument(doc);
-    ts = new MockTokenizer(new StringReader("another"), MockTokenizer.WHITESPACE, true);
-    assertFalse(ts.hasAttribute(PayloadAttribute.class));
-    field.setTokenStream(ts);
-    writer.addDocument(doc);
-    DirectoryReader reader = writer.getReader();
-    AtomicReader sr = reader.getSequentialSubReaders().get(0);
-    DocsAndPositionsEnum de = sr.termPositionsEnum(null, "field", new BytesRef("withPayload"));
-    de.nextDoc();
-    de.nextPosition();
-    assertEquals(new BytesRef("test"), de.getPayload());
-    writer.close();
-    reader.close();
-    dir.close();
+  // Instances of this class hold field properties and data
+  // for merge
+  final static class FieldForMerge extends AbstractField {
+    public String stringValue() {
+      return (String) this.fieldsData;
+    }
+
+    public Reader readerValue() {
+      // not needed for merge
+      return null;
+    }
+
+    public byte[] binaryValue() {
+      return (byte[]) this.fieldsData;
+    }
+
+    public TokenStream tokenStreamValue() {
+      // not needed for merge
+      return null;
+    }
+    
+    public FieldForMerge(Object value, FieldInfo fi, boolean binary, boolean compressed, boolean tokenize) {
+      this.isStored = true;  
+      this.fieldsData = value;
+      this.isCompressed = compressed;
+      this.isBinary = binary;
+      this.isTokenized = tokenize;
+
+      this.name = fi.name.intern();
+      this.isIndexed = fi.isIndexed;
+      this.omitNorms = fi.omitNorms;          
+      this.storeOffsetWithTermVector = fi.storeOffsetWithTermVector;
+      this.storePositionWithTermVector = fi.storePositionWithTermVector;
+      this.storeTermVector = fi.storeTermVector;            
+    }
+     
   }
-  
-  /** some field instances have payload att, some not */
-  public void testMixupMultiValued() throws Exception {
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
-    Document doc = new Document();
-    Field field = new TextField("field", "", Field.Store.NO);
-    TokenStream ts = new MockTokenizer(new StringReader("here we go"), MockTokenizer.WHITESPACE, true);
-    assertFalse(ts.hasAttribute(PayloadAttribute.class));
-    field.setTokenStream(ts);
-    doc.add(field);
-    Field field2 = new TextField("field", "", Field.Store.NO);
-    Token withPayload = new Token("withPayload", 0, 11);
-    withPayload.setPayload(new BytesRef("test"));
-    ts = new CannedTokenStream(withPayload);
-    assertTrue(ts.hasAttribute(PayloadAttribute.class));
-    field2.setTokenStream(ts);
-    doc.add(field2);
-    Field field3 = new TextField("field", "", Field.Store.NO);
-    ts = new MockTokenizer(new StringReader("nopayload"), MockTokenizer.WHITESPACE, true);
-    assertFalse(ts.hasAttribute(PayloadAttribute.class));
-    field3.setTokenStream(ts);
-    doc.add(field3);
-    writer.addDocument(doc);
-    DirectoryReader reader = writer.getReader();
-    SegmentReader sr = getOnlySegmentReader(reader);
-    DocsAndPositionsEnum de = sr.termPositionsEnum(null, "field", new BytesRef("withPayload"));
-    de.nextDoc();
-    de.nextPosition();
-    assertEquals(new BytesRef("test"), de.getPayload());
-    writer.close();
-    reader.close();
-    dir.close();
-  }
-  
 }

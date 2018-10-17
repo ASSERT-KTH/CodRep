@@ -1,8 +1,8 @@
-final String deploymentName = key.getName() + ":" + key.getSha1HashAsHexString();
+if (!context.isNormalServer()) {
 
 /*
  * JBoss, Home of Professional Open Source.
- * Copyright 2010, Red Hat, Inc., and individual contributors
+ * Copyright 2011, Red Hat, Inc., and individual contributors
  * as indicated by the @author tags. See the copyright.txt file in the
  * distribution for a full listing of individual contributors.
  *
@@ -22,246 +22,371 @@ final String deploymentName = key.getName() + ":" + key.getSha1HashAsHexString()
  * 02110-1301 USA, or see the FSF site: http://www.fsf.org.
  */
 
-package org.jboss.as.model;
+package org.jboss.as.controller;
 
-import org.jboss.as.deployment.DeploymentService;
-import org.jboss.as.deployment.chain.DeploymentChain;
-import org.jboss.as.deployment.chain.DeploymentChainProvider;
-import org.jboss.as.deployment.module.MountHandle;
-import org.jboss.as.deployment.module.TempFileProviderService;
-import org.jboss.as.deployment.unit.DeploymentUnitContextImpl;
-import org.jboss.as.deployment.unit.DeploymentUnitProcessingException;
-import org.jboss.logging.Logger;
-import org.jboss.msc.service.BatchBuilder;
-import org.jboss.msc.service.Location;
-import org.jboss.msc.service.ServiceActivator;
-import org.jboss.msc.service.ServiceActivatorContext;
-import org.jboss.msc.service.ServiceName;
-import org.jboss.staxmapper.XMLExtendedStreamReader;
-import org.jboss.staxmapper.XMLExtendedStreamWriter;
-import org.jboss.vfs.VFS;
-import org.jboss.vfs.VFSUtils;
-import org.jboss.vfs.VirtualFile;
+import static org.jboss.as.controller.ControllerLogger.MGMT_OP_LOGGER;
+import static org.jboss.as.controller.ControllerMessages.MESSAGES;
 
-import javax.xml.stream.XMLStreamException;
-import java.io.Closeable;
-import java.io.IOException;
-import java.util.Collection;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 
-import static org.jboss.as.deployment.attachment.VirtualFileAttachment.attachVirtualFile;
+import org.jboss.as.controller.descriptions.ModelDescriptionConstants;
+import org.jboss.as.controller.registry.ImmutableManagementResourceRegistration;
+import org.jboss.as.controller.registry.Resource;
+import org.jboss.dmr.ModelNode;
 
 /**
- * A deployment which is mapped into a {@link ServerGroupElement}.
+ * Special handler that executes subsystem boot operations in parallel.
  *
- * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
+ * @author Brian Stansberry (c) 2011 Red Hat Inc.
  */
-public final class ServerGroupDeploymentElement extends AbstractModelElement<ServerGroupDeploymentElement> implements ServiceActivator {
-    private static final long serialVersionUID = -7282640684801436543L;
-    private static final Logger log = Logger.getLogger("org.jboss.as.model");
+public class ParallelBootOperationStepHandler implements OperationStepHandler {
 
-    private final DeploymentUnitKey key;
-    private boolean start;
+    private final Executor executor;
+    private final ImmutableManagementResourceRegistration rootRegistration;
+    private final ControlledProcessState processState;
 
-    /**
-     * Construct a new instance.
-     *
-     * @param location the declaration location of this element
-     * @param deploymentName the name of the deployment unit
-     * @param deploymentHash the hash of the deployment unit
-     */
-    public ServerGroupDeploymentElement(final Location location, final String deploymentName, final byte[] deploymentHash, final boolean start) {
-        super(location);
-        if (deploymentName == null) {
-            throw new IllegalArgumentException("deploymentName is null");
-        }
-        if (deploymentHash == null) {
-            throw new IllegalArgumentException("deploymentHash is null");
-        }
-        if (deploymentHash.length != 20) {
-            throw new IllegalArgumentException("deploymentHash is not a valid length");
-        }
-        this.key = new DeploymentUnitKey(deploymentName, deploymentHash);
-        this.start = start;
+    private final Map<String, List<ParsedBootOp>> opsBySubsystem = new LinkedHashMap<String, List<ParsedBootOp>>();
+
+    ParallelBootOperationStepHandler(final ExecutorService executorService, final ImmutableManagementResourceRegistration rootRegistration,
+                                     final ControlledProcessState processState) {
+        this.executor = executorService;
+        this.rootRegistration = rootRegistration;
+        this.processState = processState;
     }
 
-    public ServerGroupDeploymentElement(XMLExtendedStreamReader reader) throws XMLStreamException {
-        super(reader);
-        // Handle attributes
-        String fileName = null;
-        byte[] sha1Hash = null;
-        String start = null;
-        final int count = reader.getAttributeCount();
-        for(int i = 0; i < count; i++) {
-            final String value = reader.getAttributeValue(i);
-            if (reader.getAttributeNamespace(i) != null) {
-                throw unexpectedAttribute(reader, i);
-            } else {
-                final Attribute attribute = Attribute.forName(reader.getAttributeLocalName(i));
-                switch (attribute) {
-                    case NAME: {
-                        fileName = value;
-                        break;
-                    }
-                    case SHA1: {
-                        try {
-                            sha1Hash = hexStringToByteArray(value);
-                        }
-                        catch (Exception e) {
-                            throw new XMLStreamException("Value " + value +
-                                    " for attribute " + attribute.getLocalName() +
-                                    " does not represent a properly hex-encoded SHA1 hash",
-                                    reader.getLocation(), e);
-                        }
-                        break;
-                    }
-                    case START: {
-                        start = value;
-                        break;
-                    }
-                    default: throw unexpectedAttribute(reader, i);
-                }
+    boolean addSubsystemOperation(final ParsedBootOp parsedOp) {
+        final String subsystemName = getSubsystemName(parsedOp.address);
+        if (subsystemName != null) {
+            List<ParsedBootOp> list = opsBySubsystem.get(subsystemName);
+            if (list == null) {
+                list = new ArrayList<ParsedBootOp>();
+                opsBySubsystem.put(subsystemName, list);
             }
+            list.add(parsedOp);
         }
-        if (fileName == null) {
-            throw missingRequired(reader, Collections.singleton(Attribute.NAME));
-        }
-        if (sha1Hash == null) {
-            throw missingRequired(reader, Collections.singleton(Attribute.SHA1));
-        }
-
-        this.key = new DeploymentUnitKey(fileName, sha1Hash);
-        this.start = start == null ? true : Boolean.valueOf(start);
-        // Handle elements
-        requireNoContent(reader);
-
-        // TODO:  Read in serialized DIs
+        return subsystemName != null;
     }
 
-    /**
-     * Gets the identifier of this deployment that's suitable for use as a map key.
-     *
-     * @return the key
-     */
-    public DeploymentUnitKey getKey() {
+    private String getSubsystemName(final PathAddress address) {
+        String key = null;
+        if (address.size() > 0 && ModelDescriptionConstants.SUBSYSTEM.equals(address.getElement(0).getKey())) {
+            key = address.getElement(0).getValue();
+        }
         return key;
     }
 
-    /**
-     * Gets the name of the deployment.
-     *
-     * @return the name
-     */
-    public String getName() {
-        return key.getName();
-    }
-
-    /**
-     * Gets a defensive copy of the sha1 hash of the deployment.
-     *
-     * @return the hash
-     */
-    public byte[] getSha1Hash() {
-        return key.getSha1Hash();
-    }
-
-    /**
-     * Gets whether the deployment should be started upon server start.
-     *
-     * @return <code>true</code> if the deployment should be started; <code>false</code>
-     *         if not.
-     */
-    public boolean isStart() {
-        return start;
-    }
-
-    /**
-     * Sets whether the deployments should be started upon server start.
-     *
-     * @param start <code>true</code> if the deployment should be started; <code>false</code>
-     *         if not.
-     */
-    void setStart(boolean start) {
-        this.start = start;
-    }
-
-    /** {@inheritDoc} */
-    public long elementHash() {
-        long hash = key.elementHash();
-        hash = Long.rotateLeft(hash, 1) ^ Boolean.valueOf(start).hashCode() & 0xffffffffL;
-        return hash;
-    }
-
-    /** {@inheritDoc} */
-    protected void appendDifference(final Collection<AbstractModelUpdate<ServerGroupDeploymentElement>> target, final ServerGroupDeploymentElement other) {
-        // FIXME implement appendDifference
-        throw new UnsupportedOperationException("implement me");
-    }
-
-    /** {@inheritDoc} */
-    protected Class<ServerGroupDeploymentElement> getElementClass() {
-        return ServerGroupDeploymentElement.class;
-    }
-
-    /** {@inheritDoc} */
-    public void writeContent(final XMLExtendedStreamWriter streamWriter) throws XMLStreamException {
-        streamWriter.writeAttribute(Attribute.NAME.getLocalName(), key.getName());
-        streamWriter.writeAttribute(Attribute.SHA1.getLocalName(), key.getSha1HashAsHexString());
-        if (!this.start) streamWriter.writeAttribute(Attribute.START.getLocalName(), "false");
-    }
-
     @Override
-    public void activate(final ServiceActivatorContext context) {
-        final String deploymentName = key.getName().replace('.', '_') + '_' + key.getSha1HashAsHexString();
-        log.info("Activating server group deployment: " + deploymentName);
+    public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
 
-        final VirtualFile deploymentRoot = VFS.getChild(getFullyQualifiedDeploymentPath(key.getName()));
-        if (!deploymentRoot.exists())
-            throw new RuntimeException("Deployment root does not exist." + deploymentRoot);
+        if (context.getType() != OperationContext.Type.SERVER) {
+            throw MESSAGES.fullServerBootRequired(getClass());
+        }
 
-        Closeable handle = null;
+        long start = System.currentTimeMillis();
+
+        // Make sure the lock has been taken
+        context.getResourceRegistrationForUpdate();
+        final Resource rootResource = context.readResourceForUpdate(PathAddress.EMPTY_ADDRESS);
+        context.acquireControllerLock();
+
+        final Map<String, List<ParsedBootOp>> runtimeOpsBySubsystem = new LinkedHashMap<String, List<ParsedBootOp>>();
+        final Map<String, ParallelBootTransactionControl> transactionControls = new LinkedHashMap<String, ParallelBootTransactionControl>();
+
+        final CountDownLatch preparedLatch = new CountDownLatch(opsBySubsystem.size());
+        final CountDownLatch committedLatch = new CountDownLatch(1);
+        final CountDownLatch completeLatch = new CountDownLatch(opsBySubsystem.size());
+        final Thread controllingThread = Thread.currentThread();
+
+        for (Map.Entry<String, List<ParsedBootOp>> entry : opsBySubsystem.entrySet()) {
+            String subsystemName = entry.getKey();
+            List<ParsedBootOp> subsystemRuntimeOps = new ArrayList<ParsedBootOp>();
+            runtimeOpsBySubsystem.put(subsystemName, subsystemRuntimeOps);
+
+            final ParallelBootTransactionControl txControl = new ParallelBootTransactionControl(subsystemName, preparedLatch, committedLatch, completeLatch);
+            transactionControls.put(entry.getKey(), txControl);
+
+            // Execute the subsystem's ops in another thread
+            ParallelBootTask subsystemTask = new ParallelBootTask(subsystemName, entry.getValue(), context, txControl,
+                    subsystemRuntimeOps, controllingThread);
+            executor.execute(subsystemTask);
+        }
+
+        // Wait for all subsystem ops to complete
         try {
-            // Mount virtual file
-            try {
-                if(deploymentRoot.isFile())
-                    handle = VFS.mountZip(deploymentRoot, deploymentRoot, TempFileProviderService.provider());
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to mount deployment archive", e);
+            preparedLatch.await();
+
+            // See if all subsystems succeeded; if not report a failure to context
+            checkForSubsystemFailures(context, transactionControls, OperationContext.Stage.MODEL);
+
+            // Add any logging subsystem steps so we get logging early in the boot
+            List<ParsedBootOp> loggingOps = runtimeOpsBySubsystem.remove("logging");
+            if (loggingOps != null) {
+                for (ParsedBootOp loggingOp : loggingOps) {
+                    context.addStep(loggingOp.response, loggingOp.operation, loggingOp.handler, OperationContext.Stage.RUNTIME);
+                }
             }
 
-            final BatchBuilder batchBuilder = context.getBatchBuilder();
-            // Create deployment service
-            final ServiceName deploymentServiceName = DeploymentService.SERVICE_NAME.append(deploymentName);
-            batchBuilder.addService(deploymentServiceName, new DeploymentService());
-
-            // Create a sub-batch for this deployment
-            final BatchBuilder deploymentSubBatch = batchBuilder.subBatchBuilder();
-
-            // Setup a batch level dependency on deployment service
-            deploymentSubBatch.addDependency(deploymentServiceName);
-
-            // Create the deployment unit context
-            final DeploymentUnitContextImpl deploymentUnitContext = new DeploymentUnitContextImpl(deploymentName, deploymentSubBatch);
-            attachVirtualFile(deploymentUnitContext, deploymentRoot);
-            deploymentUnitContext.putAttachment(MountHandle.ATTACHMENT_KEY, new MountHandle(handle));
-
-            // Execute the deployment chain
-            final DeploymentChainProvider deploymentChainProvider = DeploymentChainProvider.INSTANCE;
-            final DeploymentChain deploymentChain = deploymentChainProvider.determineDeploymentChain(deploymentRoot);
-            if(deploymentChain == null)
-                throw new RuntimeException("Failed determine the deployment chain for deployment root: " + deploymentRoot);
-            try {
-                deploymentChain.processDeployment(deploymentUnitContext);
-            } catch (DeploymentUnitProcessingException e) {
-                throw new RuntimeException("Failed to process deployment chain.", e);
+            // AS7-2561
+            // The parallel execution will have added the subsystems to their parent resource in random order.
+            // We need to restore the order that came in the XML.
+            final Map<String, Resource> subsystemResources = new LinkedHashMap<String, Resource>();
+            for (String subsystemName : opsBySubsystem.keySet()) {
+                final Resource resource = rootResource.removeChild(PathElement.pathElement(ModelDescriptionConstants.SUBSYSTEM, subsystemName));
+                if (resource != null) {
+                    subsystemResources.put(subsystemName, resource);
+                }
             }
-        } catch(Throwable t) {
-            VFSUtils.safeClose(handle);
-            throw new RuntimeException("Failed to activate deployment unit " + key.getName(), t);
+            for (Map.Entry<String, Resource> entry : subsystemResources.entrySet()) {
+                rootResource.registerChild(PathElement.pathElement(ModelDescriptionConstants.SUBSYSTEM, entry.getKey()), entry.getValue());
+            }
+
+            // Add step to execute all the runtime ops recorded by the other subsystem tasks
+            context.addStep(getRuntimeStep(runtimeOpsBySubsystem), OperationContext.Stage.RUNTIME);
+
+        } catch (InterruptedException e) {
+            context.getFailureDescription().set(new ModelNode().set(MESSAGES.subsystemBootInterrupted()));
+            Thread.currentThread().interrupt();
+        }
+
+        if (MGMT_OP_LOGGER.isDebugEnabled()) {
+            long elapsed = System.currentTimeMillis() - start;
+            MGMT_OP_LOGGER.debugf("Ran subsystem model operations in [%d] ms", elapsed);
+        }
+
+        // Continue boot
+        OperationContext.ResultAction resultAction = context.completeStep();
+
+        // Tell all the subsystem tasks the result of the operations
+        notifySubsystemTransactions(transactionControls, resultAction, committedLatch, OperationContext.Stage.RUNTIME);
+
+        // Make sure all the subsystems have completed the out path before we return
+        try {
+            completeLatch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+    }
+
+    private void checkForSubsystemFailures(OperationContext context, Map<String, ParallelBootTransactionControl> transactionControls, OperationContext.Stage stage) {
+        boolean failureRecorded = false;
+        for (Map.Entry<String, ParallelBootTransactionControl> entry : transactionControls.entrySet()) {
+            ParallelBootTransactionControl txControl = entry.getValue();
+            if (txControl.transaction == null) {
+                String failureDesc;
+                if (txControl.response.hasDefined(ModelDescriptionConstants.FAILURE_DESCRIPTION)) {
+                    failureDesc = txControl.response.get(ModelDescriptionConstants.FAILURE_DESCRIPTION).asString();
+                } else {
+                    failureDesc = MESSAGES.subsystemBootOperationFailed(entry.getKey());
+                }
+                MGMT_OP_LOGGER.error(failureDesc);
+                if (!failureRecorded) {
+                    context.getFailureDescription().set(failureDesc);
+                    failureRecorded = true;
+                }
+            } else {
+                MGMT_OP_LOGGER.debugf("Stage %s boot ops for subsystem %s succeeded", stage, entry.getKey());
+            }
         }
     }
 
-    private String getFullyQualifiedDeploymentPath(final String fileName) {
-        return System.getProperty("jboss.server.deploy.dir") + "/" + fileName;
+    private void notifySubsystemTransactions(final Map<String, ParallelBootTransactionControl> transactionControls,
+                                             final OperationContext.ResultAction resultAction,
+                                             final CountDownLatch committedLatch,
+                                             final OperationContext.Stage stage) {
+        for (Map.Entry<String, ParallelBootTransactionControl> entry : transactionControls.entrySet()) {
+            ParallelBootTransactionControl txControl = entry.getValue();
+            if (txControl.transaction != null) {
+                if (resultAction == OperationContext.ResultAction.KEEP) {
+                    txControl.transaction.commit();
+                    MGMT_OP_LOGGER.debugf("Committed transaction for %s subsystem %s stage boot operations", entry.getKey(), stage);
+                } else {
+                    txControl.transaction.rollback();
+                    MGMT_OP_LOGGER.debugf("Rolled back transaction for %s subsystem %s stage boot operations", entry.getKey(), stage);
+                }
+            }
+        }
+        committedLatch.countDown();
+    }
+
+    private OperationStepHandler getRuntimeStep(final Map<String, List<ParsedBootOp>> runtimeOpsBySubsystem) {
+
+        return new OperationStepHandler() {
+            @Override
+            public void execute(OperationContext context, ModelNode operation) throws OperationFailedException {
+
+                long start = System.currentTimeMillis();
+                // make sure the registry lock is held
+                context.getServiceRegistry(true);
+
+                final Map<String, ParallelBootTransactionControl> transactionControls = new LinkedHashMap<String, ParallelBootTransactionControl>();
+
+                final CountDownLatch preparedLatch = new CountDownLatch(runtimeOpsBySubsystem.size());
+                final CountDownLatch committedLatch = new CountDownLatch(1);
+                final CountDownLatch completeLatch = new CountDownLatch(runtimeOpsBySubsystem.size());
+                final Thread controllingThread = Thread.currentThread();
+
+                for (Map.Entry<String, List<ParsedBootOp>> entry : runtimeOpsBySubsystem.entrySet()) {
+                    String subsystemName = entry.getKey();
+                    final ParallelBootTransactionControl txControl = new ParallelBootTransactionControl(subsystemName, preparedLatch, committedLatch, completeLatch);
+                    transactionControls.put(subsystemName, txControl);
+
+                    // Execute the subsystem's ops in another thread
+                    ParallelBootTask subsystemTask = new ParallelBootTask(subsystemName, entry.getValue(), context, txControl, null, controllingThread);
+                    executor.execute(subsystemTask);
+                }
+
+                // Wait for all subsystem ops to complete
+                try {
+                    preparedLatch.await();
+
+                    // See if all subsystems succeeded; if not report a failure to context
+                    checkForSubsystemFailures(context, transactionControls, OperationContext.Stage.RUNTIME);
+
+                } catch (InterruptedException e) {
+                    context.getFailureDescription().set(new ModelNode().set(MESSAGES.subsystemBootInterrupted()));
+                    Thread.currentThread().interrupt();
+                }
+
+                if (MGMT_OP_LOGGER.isDebugEnabled()) {
+                    long elapsed = System.currentTimeMillis() - start;
+                    MGMT_OP_LOGGER.debugf("Ran subsystem runtime operations in [%d] ms", elapsed);
+                }
+
+
+                // Continue boot
+                OperationContext.ResultAction resultAction = context.completeStep();
+
+                // Tell all the subsystem tasks the result of the operations
+                notifySubsystemTransactions(transactionControls, resultAction, committedLatch, OperationContext.Stage.MODEL);
+
+                // Make sure all the subsystems have completed the out path before we return
+                try {
+                    completeLatch.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+    }
+
+    private class ParallelBootTask implements Runnable {
+
+        private final String subsystemName;
+        private final List<ParsedBootOp> bootOperations;
+        private final OperationContext primaryContext;
+        private final OperationContext.Stage executionStage;
+        private final ParallelBootTransactionControl transactionControl;
+        private final List<ParsedBootOp> runtimeOps;
+        private final Thread controllingThread;
+
+        public ParallelBootTask(final String subsystemName,
+                                final List<ParsedBootOp> bootOperations,
+                                final OperationContext primaryContext,
+                                final ParallelBootTransactionControl transactionControl,
+                                final List<ParsedBootOp> runtimeOps,
+                                final Thread controllingThread) {
+            this.subsystemName = subsystemName;
+            this.bootOperations = bootOperations;
+            this.primaryContext = primaryContext;
+            this.executionStage = primaryContext.getCurrentStage();
+            this.transactionControl = transactionControl;
+            this.runtimeOps = runtimeOps;
+            this.controllingThread = controllingThread;
+        }
+
+        @Override
+        public void run() {
+            try {
+                final OperationContext operationContext = new ParallelBootOperationContext(transactionControl, processState,
+                        primaryContext, runtimeOps, controllingThread);
+                for (ParsedBootOp op : bootOperations) {
+                    final OperationStepHandler osh = op.handler == null ? rootRegistration.getOperationHandler(op.address, op.operationName) : op.handler;
+                    operationContext.addStep(op.response, op.operation, osh, executionStage);
+                }
+                operationContext.completeStep();
+            } catch (Exception e) {
+                MGMT_OP_LOGGER.failedSubsystemBootOperations(e, subsystemName);
+                if (!transactionControl.signalled) {
+                    ModelNode failure = new ModelNode();
+                    failure.get(ModelDescriptionConstants.SUCCESS).set(false);
+                    failure.get(ModelDescriptionConstants.FAILURE_DESCRIPTION).set(e.toString());
+                    transactionControl.operationFailed(failure);
+                }
+            } finally {
+                if (!transactionControl.signalled) {
+
+                    for (ParsedBootOp op : bootOperations) {
+                        if (op.response.hasDefined(ModelDescriptionConstants.SUCCESS) && !op.response.get(ModelDescriptionConstants.SUCCESS).asBoolean()) {
+                            transactionControl.operationFailed(op.response);
+                            break;
+                        }
+                    }
+                    if (!transactionControl.signalled) {
+                        // TODO this is really debugging
+                        ModelNode failure = new ModelNode();
+                        failure.get(ModelDescriptionConstants.SUCCESS).set(false);
+                        failure.get(ModelDescriptionConstants.FAILURE_DESCRIPTION).set(MESSAGES.subsystemBootOperationFailedExecuting(subsystemName));
+                    }
+                }
+                transactionControl.operationCompleted(transactionControl.response);
+            }
+        }
+    }
+
+    private static class ParallelBootTransactionControl implements ProxyController.ProxyOperationControl {
+
+        private final String subsystemName;
+        private final CountDownLatch preparedLatch;
+        private final CountDownLatch committedLatch;
+        private final CountDownLatch completeLatch;
+        private ModelNode response;
+        private ModelController.OperationTransaction transaction;
+        private boolean signalled;
+
+        public ParallelBootTransactionControl(String subsystemName, CountDownLatch preparedLatch, CountDownLatch committedLatch, CountDownLatch completeLatch) {
+            this.preparedLatch = preparedLatch;
+            this.committedLatch = committedLatch;
+            this.completeLatch = completeLatch;
+            this.subsystemName = subsystemName;
+        }
+
+        @Override
+        public void operationFailed(ModelNode response) {
+            if (!signalled) {
+                this.response = response;
+                preparedLatch.countDown();
+                completeLatch.countDown();
+                signalled = true;
+            }
+        }
+
+        @Override
+        public void operationPrepared(ModelController.OperationTransaction transaction, ModelNode result) {
+            if (!signalled) {
+                this.transaction = transaction;
+                preparedLatch.countDown();
+                signalled = true;
+
+                try {
+                    committedLatch.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw MESSAGES.transactionInterrupted();
+                }
+            }
+        }
+
+        @Override
+        public void operationCompleted(ModelNode response) {
+            this.response = response;
+            completeLatch.countDown();
+        }
     }
 }
