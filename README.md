@@ -78,11 +78,16 @@ In addition, the top-three participants will get nice KTH goodies by post.
 
 ## Official Final Ranking
 
-To be announced on Oct 14th 2018, based on Dataset5:
+The official final ranking is based on Dataset5:
 
 | # | Team (Institution/Company) | Score |
 | --- | --- | --- |
-| ... | ... | ... |
+| (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 |
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 |
+| 2 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 |
+| 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 |
+
+\* Conflict of interest
 
 
 ### Offical Intermediate ranking
