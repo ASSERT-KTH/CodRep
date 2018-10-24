@@ -22,95 +22,25 @@ More specifically, the program  takes as input a set of pairs (source code line,
 
 The competition is organized by KTH Royal Institute of Technology, Stockholm, Sweden. The organization team is [Zimin Chen](https://www.kth.se/profile/zimin) and [Martin Monperrus](http://www.monperrus.net/martin/).
 
-## How to participate?
-
-To participate to the competition, simply send an email to [codrep@googlegroups.com](mailto:codrep@googlegroups.com)
- with your team name, members and institution/company.
- 
-To be informed about news, intermediate rankings and final results, register to the CodRep mailing list:
+To be get news about CodRep and be informed about the next edition, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
-Registered participants:
+## Official CodeRep Ranking
 
-1. [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11)
-1. [Microsoft Research](https://github.com/KTH/CodRep-competition/issues/14)
-1. [The University of Edinburgh](https://github.com/KTH/CodRep-competition/issues/15)
-1. [Inria](https://github.com/KTH/CodRep-competition/issues/16)
-1. [Siemens Technology and Services Private Limited](https://github.com/KTH/CodRep-competition/issues/17)
-1. [source{d}](https://github.com/KTH/CodRep-competition/issues/18)
-1. [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20)
-1. [IPT Sao Paulo](https://github.com/KTH/CodRep-competition/issues/22)
-1. [Singapore Management University](https://github.com/KTH/CodRep-competition/issues/23)
-1. [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25)
-1. [Otto-von-Guericke University Magdeburg](https://github.com/KTH/CodRep-competition/issues/26)
-1. [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28)
-1. [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29)
+The official CodRep ranking based on Dataset5:
 
-Important dates:
-
-* Official competition start: April 14th 2018.
-* Submission deadline for intermediate ranking: July 4th 2018. 
-* Announcement of the intermediate ranking: July 14th 2018. 
-* Final submission deadline: Oct. 4th 2018.
-* Announcement of the final ranking & end of the competition Oct 14th 2018.
-
-
-## The winners and rankings
-
-There are two rankings, an intermediate one, aiming at fostering competition, and a final one, to designate the winners.
-The intermediate and final ranking will be computed based on hidden datasets, which are not public or part of already published datasets. The hidden datasets used in intermediate and final ranking will be different, and they will be published after the respective deadlines. In order to maintain integrity, the hash or the encrypted version of the hidden datasets will be uploaded beforehand. 
-
-The winner's tool will be published after the deadline.
-
-### Prizes
-What the participants get?
-
-1. All participants get their name in the CodRep hall of fame
-1. All participants will be invited to present their solutions at a physical workshop with proceedings
-
-What the winner gets?
-
-1. The ultimate CodRep fame
-1. A travel invitation to KTH in Stockholm, all expenses paid, to meet and discuss the design of a futuristic program repair bot.
-1. An official KTH certificate
-
-In addition, the top-three participants will get nice KTH goodies by post.
-
-## Official Final Ranking
-
-The official final ranking is based on Dataset5:
-
-| # | Team (Institution/Company) | Score |
-| --- | --- | --- |
-| (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 |
-| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 |
-| 2 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 |
-| 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 |
+| # | Team (Institution/Company) | Score | Tool |
+| --- | --- | --- | --- |
+| (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 | |
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 | |
+| 2 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 | |
+| 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 | |
 
 \* Conflict of interest
 
+## CodRep Rules
 
-### Offical Intermediate ranking
-
-Based on Dataset4
-
-| Position | Team name | Score on Dataset4 | 
-| --- | --- | --- | 
-| #1 | [Thomas Durieux (INRIA)](https://github.com/KTH/CodRep-competition/issues/16) |  0.0834200326357 |
-| #2 | [Gabin An & Shin Yoo (KAIST)](https://github.com/KTH/CodRep-competition/issues/28) | 0.0884776175201 |
-| #3 | [Jesper Derehag & Olof Mogren (Ericsson & RISE)](https://github.com/KTH/CodRep-competition/issues/25) | 0.09253418191163333 |
-| #4 | [Sebastian Nielebock, Robert Heumüller, Kevin Michael Schott, Frank Ortmeier (Otto-von-Guericke University Magdeburg, Germany)](https://github.com/KTH/CodRep-competition/issues/26) | 0.11869677510133332​ |
-
-### Informal ranking
-
-Based on Dataset1
-
-| Team name | Score on Dataset1 | Score on Dataset2 | Score on Dataset3 |
-| --- | --- | --- | --- |
-| [Thomas Durieux](https://github.com/KTH/CodRep-competition/issues/16) | 0.114 | 0.085 | 0.064|
-| [César Soto-Valero](https://github.com/KTH/CodRep-competition/issues/20) | 0.118 | 0.109 | 0.075 |
-| [Egor Bogomolov](https://github.com/KTH/CodRep-competition/issues/11) | 0.164 | 0.1235 | ... |
-| [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.165 | 0.134 | ... |
+The official ranking was computed based on a hidden dataset, which was not public or part of already published datasets. In order to maintain integrity, the hash or the encrypted version of the hidden dataset was uploaded beforehand (commit [b8801401](https://github.com/KTH/CodRep-competition/commit/b88014011bdf6c526bc9092ccce519026c7b0adf)). 
 
 ## Data Structure and Format
 
@@ -152,17 +82,17 @@ We have further filtered the data  based on the following criteria (best effort)
 
 The datasets used in this competition are from:
 
-| Directory | Original dataset | Published paper |
-| --- | --- |--- |
-| Dataset1/ | [github](https://github.com/monperrus/real-bug-fixes-icse-2015/) | [*An Empirical Study on Real Bug Fixes (ICSE 2015)*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf) |
-| Dataset2/ | [HAL](https://hal.archives-ouvertes.fr/hal-00769121) | [*CVS-Vintage: A Dataset of 14 CVS Repositories of Java Software*](https://hal.archives-ouvertes.fr/hal-00769121/document) |
-| Dataset3/ | ... | [*Watch out for This Commit! A Study of Influential Software Changes*](https://arxiv.org/pdf/1606.03266.pdf) |
-| Dataset4/ | ... | [*From Aristotle to Ringelmann: a large-scale analysis of team productivity and coordination in Open Source Software projects*](https://link.springer.com/article/10.1007/s10664-015-9406-4) |
-| Dataset5/ | ... | [*Where Should the Bugs Be Fixed?*](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=6227210&tag=1), [*An Empirical Study on Developer Related Factors Characterizing Fix-Inducing Commits*](http://www.cs.wm.edu/~mtufano/publications/J1.pdf), [*Bug Prediction Based on Fine-Grained Module Histories*](https://www.researchgate.net/profile/Hideaki_Hata/publication/254041680_Bug_prediction_based_on_fine-grained_module_histories/links/5440e0810cf2d655e194428e.pdf) |
+| Directory | Origin |
+| --- | --- |
+| [Dataset1/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset1) | [*An Empirical Study on Real Bug Fixes*](http://stap.sjtu.edu.cn/images/8/86/Icse15-bugstudy.pdf) |
+| [Dataset2/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset2) | [*CVS-Vintage: A Dataset of 14 CVS Repositories of Java Software*](https://hal.archives-ouvertes.fr/hal-00769121/document) |
+| [Dataset3/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset3) | [*Watch out for This Commit! A Study of Influential Software Changes*](https://arxiv.org/pdf/1606.03266.pdf) |
+| [Dataset4/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset4) | [*From Aristotle to Ringelmann: a large-scale analysis of team productivity and coordination in Open Source Software projects*](https://link.springer.com/article/10.1007/s10664-015-9406-4) |
+| [Dataset5/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset5) | [*Where Should the Bugs Be Fixed?*](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=6227210&tag=1), [*An Empirical Study on Developer Related Factors Characterizing Fix-Inducing Commits*](http://www.cs.wm.edu/~mtufano/publications/J1.pdf), [*Bug Prediction Based on Fine-Grained Module Histories*](https://www.researchgate.net/profile/Hideaki_Hata/publication/254041680_Bug_prediction_based_on_fine-grained_module_histories/links/5440e0810cf2d655e194428e.pdf) |
 
 **Contributing**: If you like to contribute with a new dataset, drop us a new email.
 
-## Statistics on the competition
+Main Statistics about the data:
 
 | Directory | Total source code files | Lines of code (LOC) |
 | --- | --- |--- |
@@ -248,6 +178,50 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 
 Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, therefore the value of `Average line error` are comparable.
 
-## Acknowledgment
 
-[comment]: # (TODO, add contributors)
+## CodeRep'17
+ 
+Registered participants:
+
+1. [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11)
+1. [Microsoft Research](https://github.com/KTH/CodRep-competition/issues/14)
+1. [The University of Edinburgh](https://github.com/KTH/CodRep-competition/issues/15)
+1. [Inria](https://github.com/KTH/CodRep-competition/issues/16)
+1. [Siemens Technology and Services Private Limited](https://github.com/KTH/CodRep-competition/issues/17)
+1. [source{d}](https://github.com/KTH/CodRep-competition/issues/18)
+1. [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20)
+1. [IPT Sao Paulo](https://github.com/KTH/CodRep-competition/issues/22)
+1. [Singapore Management University](https://github.com/KTH/CodRep-competition/issues/23)
+1. [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25)
+1. [Otto-von-Guericke University Magdeburg](https://github.com/KTH/CodRep-competition/issues/26)
+1. [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28)
+1. [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29)
+
+Dates:
+
+* Official competition start: April 14th 2018.
+* Submission deadline for intermediate ranking: July 4th 2018. 
+* Announcement of the intermediate ranking: July 14th 2018. 
+* Final submission deadline: Oct. 4th 2018.
+* Announcement of the final ranking & end of the competition Oct 14th 2018.
+
+The official final ranking based on Dataset5 (Oct 14th 2018)
+
+| # | Team (Institution/Company) | Score |
+| --- | --- | --- |
+| (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 |
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 |
+| 2 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 |
+| 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 |
+
+\* Conflict of interest
+
+Intermediate ranking based on Dataset4 (July 4th 2018)
+
+| Position | Team name | Score on Dataset4 | 
+| --- | --- | --- | 
+| #1 | [Thomas Durieux (INRIA)](https://github.com/KTH/CodRep-competition/issues/16) |  0.0834200326357 |
+| #2 | [Gabin An & Shin Yoo (KAIST)](https://github.com/KTH/CodRep-competition/issues/28) | 0.0884776175201 |
+| #3 | [Jesper Derehag & Olof Mogren (Ericsson & RISE)](https://github.com/KTH/CodRep-competition/issues/25) | 0.09253418191163333 |
+| #4 | [Sebastian Nielebock, Robert Heumüller, Kevin Michael Schott, Frank Ortmeier (Otto-von-Guericke University Magdeburg, Germany)](https://github.com/KTH/CodRep-competition/issues/26) | 0.11869677510133332​ |
+
