@@ -25,9 +25,9 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 To be get news about CodRep and be informed about the next edition, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
-## Official CodeRep Ranking
+## CodRep Leaderboard
 
-The official CodRep ranking based on Dataset5:
+The official CodRep ranking based on Dataset5 (lower score is better):
 
 | # | Team (Institution/Company) | Score | Tool |
 | --- | --- | --- | --- |
