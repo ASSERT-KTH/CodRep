@@ -31,10 +31,10 @@ The official CodRep ranking based on Dataset5 (lower score is better):
 
 | # | Team (Institution/Company) | Score | Tool |
 | --- | --- | --- | --- |
-| (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 | |
-| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 | |
+| (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 | [tool](https://github.com/tdurieux/CodRep-competition) |
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
 | 2 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 | |
-| 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 | |
+| 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 | [tool](https://github.com/cesarsotovalero/CodRep-submission) |
 
 \* Conflict of interest
 
