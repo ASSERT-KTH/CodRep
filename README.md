@@ -1,6 +1,17 @@
 # CodRep: Machine Learning on Source Code Competition
 
-CodRep is a machine learning competition on source code data.
+CodRep is a machine learning competition on source code data. It provides the community with a curated dataset and a well-defined loss function. If you use this data, please acknolwedge it by citing the following technical report: [The CodRep Machine Learning on Source Code Competition](http://arxiv.org/pdf/1807.03200) (Zimin Chen, Martin Monperrus), arXiv 1807.03200, 2018.
+
+```
+@techreport{arXiv-1807.03200,
+ author = {Zimin Chen and Martin Monperrus},
+ title = {The CodRep Machine Learning on Source Code Competition},
+ year = {2018},
+ number = {1807.03200},
+ institution = {arXiv},
+ url = {http://arxiv.org/pdf/1807.03200},
+}
+```
 The goal of the competition is provide different communities (machine learning, software engineering, programming language) with a common playground to test and compare ideas.
 The competition is designed with the following principles:
 
@@ -64,10 +75,6 @@ public class test{
 In this example, `double b = 0.1;` is the code line to be added somewhere in the file in place of another line.
 For such an input, the competing programs output for instance `foo.txt 3`, meaning replacing line 3 (`int b = 0.1;`) with the new code line `double b = 0.1;`.
 To train the system, the correct answer for all input files is given in folder `Datasets/.../Solutions/*.txt`,  e.g. the correct answer to `Datasets/Datasets1/Tasks/1.txt` is in `Datasets/Datasets1/Solutions/1.txt`
-
-### Usage and citation
-
-This data can be used in many ways, completely outside of the scope of CodRep. If you use this data, please acknolwedge it by citing the following technical report: [The CodRep Machine Learning on Source Code Competition](https://arxiv.org/pdf/1807.03200) (Zimin Chen, Martin Monperrus), arXiv 1807.03200, 2018.   
 
 ## Data provenance
 
