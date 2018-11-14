@@ -47,6 +47,10 @@ The current CodRep ranking based on Dataset5 (lower score is better, but since D
 | 3 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
 | 4 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 | [tool](https://github.com/agb94/coldbrew) |
 | 5 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 | [tool](https://github.com/cesarsotovalero/CodRep-submission) |
+| 6 | [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11) | 0.10971915848 | [tool](https://github.com/egor-bogomolov/CodRep-competition) |
+| 7 | [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25) | 0.114314056641 | |
+| 8 | [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.14120935716477273 | |
+
 
 ## CodRep Rules
 
