@@ -38,18 +38,18 @@ To be get news about CodRep and be informed about the next edition, register to 
 
 ## CodRep Leaderboard
 
-The current CodRep ranking based on Dataset5 (lower score is better, but since Dataset5 is public now, the tool/model can overfit the data):
+Here is the current CodRep ranking based on Dataset5 (lower score is better). The official track means a results obtained for the Oct 14th 2018 deadline, the open track means from Oct 14th 2018 to present. For the open track, since Dataset5 is public now, the tool/model can overfit the data.
 
 | # | Team (Institution/Company) | Score | Tool/Source |
 | --- | --- | --- | --- |
-| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07180536507565463 | [source](https://github.com/KTH/CodRep-competition/issues/16#issuecomment-438001784)|
-| 2 | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 | [tool](https://github.com/tdurieux/CodRep-competition) |
-| 3 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
-| 4 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 | [tool](https://github.com/agb94/coldbrew) |
-| 5 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 | [tool](https://github.com/cesarsotovalero/CodRep-submission) |
-| 6 | [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11) | 0.10971915848 | [tool](https://github.com/egor-bogomolov/CodRep-competition) |
-| 7 | [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25) | 0.114314056641 | |
-| 8 | [source{d}](https://github.com/KTH/CodRep-competition/issues/18) | 0.14120935716477273 | |
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) (open track) | 0.07180536507565463 | [source](https://github.com/KTH/CodRep-competition/issues/16#issuecomment-438001784)|
+| 2 | [Inria](https://github.com/KTH/CodRep-competition/issues/16)  (open track) | 0.0722766571799 | [tool](https://github.com/tdurieux/CodRep-competition)|
+| 3 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) (official track) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
+| 4 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) (official track)| 0.079663531979 | [tool](https://github.com/agb94/coldbrew) |
+| 5 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) (official track) | 0.08577749683758787 | [tool](https://github.com/cesarsotovalero/CodRep-submission) |
+| 6 | [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11) (official track)| 0.10971915848 | [tool](https://github.com/egor-bogomolov/CodRep-competition) |
+| 7 | [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25) (official track)| 0.114314056641 | |
+| 8 | [source{d}](https://github.com/KTH/CodRep-competition/issues/18) (official track)| 0.14120935716477273 | |
 
 
 ## CodRep Rules
