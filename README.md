@@ -189,7 +189,7 @@ We provide 5 dumb systems for illustrating how to parse the data and having a ba
 Thanks to the design of the loss function, `guessFirst.py`, `guessMiddle.py`, `guessLast.py` and `randomGuess.py` have the same order of magnitude of error, therefore the value of `Average line error` are comparable.
 
 
-## CodeRep'17
+## CodeRep'18
  
 Registered participants:
 
