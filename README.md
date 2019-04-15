@@ -100,8 +100,6 @@ The datasets used in this competition are from:
 | [Dataset4/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset4) | [*From Aristotle to Ringelmann: a large-scale analysis of team productivity and coordination in Open Source Software projects*](https://link.springer.com/article/10.1007/s10664-015-9406-4) |
 | [Dataset5/](https://github.com/KTH/CodRep-competition/tree/master/Datasets/Dataset5) | [*Where Should the Bugs Be Fixed?*](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=6227210&tag=1), [*An Empirical Study on Developer Related Factors Characterizing Fix-Inducing Commits*](http://www.cs.wm.edu/~mtufano/publications/J1.pdf), [*Bug Prediction Based on Fine-Grained Module Histories*](https://www.researchgate.net/profile/Hideaki_Hata/publication/254041680_Bug_prediction_based_on_fine-grained_module_histories/links/5440e0810cf2d655e194428e.pdf) |
 
-**Contributing**: If you like to contribute with a new dataset, drop us a new email.
-
 Main Statistics about the data:
 
 | Directory | Total #diffs | Lines of code (LOC) |
