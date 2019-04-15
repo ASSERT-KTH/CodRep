@@ -104,13 +104,14 @@ The datasets used in this competition are from:
 
 Main Statistics about the data:
 
-| Directory | Total source code files | Lines of code (LOC) |
+| Directory | Total #diffs | Lines of code (LOC) |
 | --- | --- |--- |
 | Dataset1/ | 3858 | 2056900 |
 | Dataset2/ | 10088 | 5388282 |
 | Dataset3/ | 15326 | 627593 |
 | Dataset4/ | 10431 | 2308279 |
 | Dataset5/ | 18366 | 2785599 |
+| Total | 58069 | - |
 
 ## Command-line interface
 
