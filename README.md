@@ -42,9 +42,9 @@ Here is the current CodRep ranking based on Dataset5 (lower score is better). Th
 
 | # | Team (Institution/Company) | Score | Tool/Source |
 | --- | --- | --- | --- |
-| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) (open track) | 0.07180536507565463 | [source](https://github.com/KTH/CodRep-competition/issues/16#issuecomment-438001784)|
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29) (open track) | 0.07180536507565463 | [source](https://github.com/KTH/CodRep-competition/issues/16#issuecomment-438001784)|
 | 2 | [Inria](https://github.com/KTH/CodRep-competition/issues/16)  (open track) | 0.0722766571799 | [tool](https://github.com/tdurieux/CodRep-competition)|
-| 3 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) (official track) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
+| 3 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29) (official track) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
 | 4 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) (official track)| 0.079663531979 | [tool](https://github.com/agb94/coldbrew) |
 | 5 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) (official track) | 0.08577749683758787 | [tool](https://github.com/cesarsotovalero/CodRep-submission) |
 | 6 | [JetBrains Research, HSE](https://github.com/KTH/CodRep-competition/issues/11) (official track)| 0.10971915848 | [tool](https://github.com/egor-bogomolov/CodRep-competition) |
@@ -219,7 +219,7 @@ The official final ranking based on Dataset5 (Oct 14th 2018)
 | # | Team (Institution/Company) | Score | Tool |
 | --- | --- | --- | --- |
 | (1)* | [Inria](https://github.com/KTH/CodRep-competition/issues/16) | 0.0722766571799 | [tool](https://github.com/tdurieux/CodRep-competition) |
-| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRepcompetition/issues/29) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
+| 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29) | 0.07747553105298915 | [tool](https://github.com/jjhenkel/instauro) |
 | 2 | [KAIST, South Korea](https://github.com/KTH/CodRep-competition/issues/28) | 0.079663531979 | [tool](https://github.com/agb94/coldbrew) |
 | 3 | [Universidad Central "Marta Abreu" de Las Villas](https://github.com/KTH/CodRep-competition/issues/20) | 0.08577749683758787 | [tool](https://github.com/cesarsotovalero/CodRep-submission) |
 
