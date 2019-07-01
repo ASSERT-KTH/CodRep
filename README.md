@@ -36,7 +36,7 @@ The competition is organized by KTH Royal Institute of Technology, Stockholm, Sw
 To be get news about CodRep and be informed about the next edition, register to the CodRep mailing list:
 [codrep+subscribe@googlegroups.com](mailto:codrep+subscribe@googlegroups.com)
 
-## CodRep Leaderboard
+## CodRep Leaderboard on Line Number Prediction
 
 Here is the current CodRep ranking based on Dataset5 (lower score is better). The official track means a results obtained for the Oct 14th 2018 deadline, the open track means from Oct 14th 2018 to present. For the open track, since Dataset5 is public now, the tool/model can overfit the data.
 
@@ -51,6 +51,11 @@ Here is the current CodRep ranking based on Dataset5 (lower score is better). Th
 | 7 | [Ericsson & Rise](https://github.com/KTH/CodRep-competition/issues/25) (official track)| 0.114314056641 | |
 | 8 | [source{d}](https://github.com/KTH/CodRep-competition/issues/18) (official track)| 0.14120935716477273 | |
 
+## Leaderboard on Patch Generation
+
+The code prediction task has been proposed in [this paper](http://arxiv.org/pdf/1901.01808), it is not the initial competition task. Using Dataset5 as testing dataset, the results are:
+
+* [Sequencer](http://arxiv.org/pdf/1901.01808): 950/4711 perfect predictions
 
 ## CodRep Rules
 
