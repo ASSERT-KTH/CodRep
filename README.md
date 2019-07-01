@@ -40,7 +40,7 @@ To be get news about CodRep and be informed about the next edition, register to 
 
 Here is the current CodRep ranking based on Dataset5 (lower score is better). The official track means a results obtained for the Oct 14th 2018 deadline, the open track means from Oct 14th 2018 to present. For the open track, since Dataset5 is public now, the tool/model can overfit the data.
 
-| # | Team (Institution/Company) | Score | Tool/Source |
+| # | Team (Institution/Company) | Score (lower is better) | Tool/Source |
 | --- | --- | --- | --- |
 | 1 | [University of Wisconsin--Madison & Microsoft Research](https://github.com/KTH/CodRep-competition/issues/29) (open track) | 0.07180536507565463 | [source](https://github.com/KTH/CodRep-competition/issues/16#issuecomment-438001784)|
 | 2 | [Inria](https://github.com/KTH/CodRep-competition/issues/16)  (open track) | 0.0722766571799 | [tool](https://github.com/tdurieux/CodRep-competition)|
