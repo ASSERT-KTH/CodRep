@@ -55,7 +55,7 @@ Here is the current CodRep ranking based on Dataset5 (lower score is better). Th
 
 The code prediction task has been proposed in [this paper](http://arxiv.org/pdf/1901.01808), it is not the initial competition task. Using Dataset5 as testing dataset, the results are:
 
-* [Sequencer](http://arxiv.org/pdf/1901.01808): 950/4711 perfect predictions
+* [Sequencer](http://arxiv.org/pdf/1901.01808): 950/[4711](https://github.com/KTH/sequencer/blob/master/results/Golden/src-test.txt) perfect predictions
 
 ## CodRep Rules
 
