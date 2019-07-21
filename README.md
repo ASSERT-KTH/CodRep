@@ -1,6 +1,6 @@
 # CodRep: Machine Learning on Source Code Competition
 
-CodRep is a machine learning competition on source code data. It provides the community with a curated dataset and a well-defined loss function. If you use this data, please acknolwedge it by citing the following technical report: [The CodRep Machine Learning on Source Code Competition](http://arxiv.org/pdf/1807.03200) (Zimin Chen, Martin Monperrus), arXiv 1807.03200, 2018.
+CodRep is a machine learning competition on source code data. It provides the community with a curated dataset and a well-defined loss function. If you use this data, please acknowledge it by citing the following technical report: [The CodRep Machine Learning on Source Code Competition](http://arxiv.org/pdf/1807.03200) (Zimin Chen, Martin Monperrus), arXiv 1807.03200, 2018.
 
 ```
 @techreport{arXiv-1807.03200,
